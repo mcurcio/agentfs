@@ -55,8 +55,8 @@ pub(in crate::tree_actor) fn held(
         if !tree.is_named(object) {
             continue;
         }
-        if let Some(id) = tree.identities.get(&object) {
-            keys.insert(Key::File(*id));
+        if let Some(id) = tree.identity_of(object) {
+            keys.insert(Key::File(id));
         }
         keys.extend(tree.paths_of(object).map(|path| Key::Name(path.to_owned())));
     }
@@ -234,11 +234,9 @@ mod tests {
     #[test]
     fn held_keys_are_an_open_objects_identity_and_names_and_none_unnamed() {
         let mut tree = Shape::default();
-        tree.names.insert("a".into(), 5);
-        tree.names.insert("b".into(), 5);
-        tree.names.insert("c".into(), 6);
-        tree.identities.insert(5, MergeFileIdentity(50));
-        tree.identities.insert(6, MergeFileIdentity(60));
+        tree.name("a", 5, MergeFileIdentity(50));
+        tree.name("b", 5, MergeFileIdentity(50));
+        tree.name("c", 6, MergeFileIdentity(60));
         tree.add_anonymous(7, crate::tree_actor::meta::TEST_FILE, 0);
         assert_eq!(
             held(&tree, [5, 7]),

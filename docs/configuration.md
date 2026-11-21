@@ -102,7 +102,8 @@ lines; without `--include` a re-run keeps them. Every `mount` reads it with
 libgit2, which follows the includes, and:
 
 - refuses (exit 1, before the volume is staged) an include under a view's
-  mount point, where the workload could change it;
+  mount point, where the workload could change it, and a key below set to a
+  value it refuses (`operator settings: <key> = "<value>": <expected>`);
 - warns `warning: operator settings: include <path> is missing` for an
   include that does not exist (git skips it);
 - logs, at every boot, one line per key whose capability tree volumes do
@@ -110,9 +111,16 @@ libgit2, which follows the includes, and:
   `capability` one of `push` (`remote.*`, `agentfs.pushInterval`,
   `agentfs.forkRefs`, `http.proxy`), `patches` (`agentfs.patch*`,
   `agentfsPusher.*`), `lfs` (`agentfs.lfsThreshold`, `lfs.*`, a remote's
-  LFS keys) and `other` (every other key, but `agentfs.nested = exclude`,
-  which tree volumes build). The `agentfs.not_built{capability}` gauge
-  counts them ([telemetry](telemetry.md)). The mount serves anyway.
+  LFS keys) and `other` (every other key, but `agentfs.nested = exclude`
+  and the keys below, which tree volumes build). The
+  `agentfs.not_built{capability}` gauge counts them ([telemetry](telemetry.md)).
+  The mount serves anyway.
+
+`agentfs host` reads the file the same way. The keys tree volumes build:
+
+| Key | Type | Default | Meaning and validation |
+|---|---|---|---|
+| `agentfs.overlayLimit` | positive size | `32m` | Bounds each tree's overlay: the memory the actor holds for changes history has not built yet, estimated per changed entry ([trees](trees.md#history-trails-the-files)). Over it, a call that starts new work in that tree waits for the builder, as over the lag limit. Read at every mount and host; the last value set wins. A value that is not a positive size (`0`, `-1`, `x`) refuses the mount (exit 1) |
 
 ## `[agentfs]`
 
@@ -931,6 +939,15 @@ section. A subcommand with its own subcommands lists them after it.
   `approve`, `apply` and `status`.
 - `lfs`: the LFS cache, with `fetch` and `prune`
   ([operator guide](operator-guide.md#13-large-files-lfs)).
+- `verify`: check every save history flagged unverified again with this
+  binary ([trees](trees.md#when-history-cannot-check-a-save)): it takes the
+  volume's lock, opens only its `history.git` (a release of another state
+  format can run it) and prints one line per standing flag, `<step> <tree>
+  <commit> verified|mismatch-confirmed|same-release|no-evidence <path as a
+  JSON string>`, or `- - <commit> unreadable -` for a verdict note that
+  does not parse. Exit 0 when no flag stands, 2 when one does, 1 on an
+  error, 75 while another process holds the volume (the one home of this
+  contract is `crates/agentfs/src/launcher/verify.rs`).
 - `fork`: forked volumes ([forks](forks.md)), with `create`, `finish`,
   `status`, `abandon`, `list` and `deliver`; and `end`, which ends a tree
   volume's keyed fork ([trees](trees.md#forks-keys-end-and-the-drop)): exit
@@ -938,7 +955,7 @@ section. A subcommand with its own subcommands lists them after it.
 - `start`: for a volume started from another worktree's branch
   ([moving](runbooks/moving.md)), with `accept`, which accepts a tip of
   the start branch and clears the start-branch alarm. It takes no lock.
-`init`, `mount`, `host`, `fork end` and `probe` are the tree engine's (`probe`
+`init`, `mount`, `host`, `fork end`, `verify` and `probe` are the tree engine's (`probe`
 reads no state area). Every other command runs the recording engine and
 refuses a tree volume before it reads or writes
 anything: `` error: `agentfs push` runs on the recording engine only; <state>
@@ -958,8 +975,8 @@ variable). `agentfs <command> --help` prints them too.
 | Flag | Environment | Default | Commands |
 |---|---|---|---|
 | `--state DIR` | `AGENTFS_STATE` | `.` | all |
-| `--root DIR` | `AGENTFS_ROOT` | the current directory | all: the recording commands' only. Required by `record` and `serve-history`; used by `flush`, `checkpoint`, `run`, `patch apply` (and `serve-git`'s `POST /agentfs/apply`), and `restore` and `revert` without a history service; must match the backing tree for `front`. `init`, `mount`, `host` and `fork end` refuse it (exit 1): a tree volume has no backing tree |
-| `--wait-lock DURATION` | `AGENTFS_WAIT_LOCK` | `0s`: exit 75 at once | all: those that take the state-area lock wait this long for it; `lfs prune` waits this long for the LFS cache lock that restores and fetches hold. `init`, `mount`, `host` and `fork end` refuse a nonzero one (exit 1): a busy tree volume exits 75 at once |
+| `--root DIR` | `AGENTFS_ROOT` | the current directory | all: the recording commands' only. Required by `record` and `serve-history`; used by `flush`, `checkpoint`, `run`, `patch apply` (and `serve-git`'s `POST /agentfs/apply`), and `restore` and `revert` without a history service; must match the backing tree for `front`. `init`, `mount`, `host`, `fork end` and `verify` refuse it (exit 1): a tree volume has no backing tree |
+| `--wait-lock DURATION` | `AGENTFS_WAIT_LOCK` | `0s`: exit 75 at once | all: those that take the state-area lock wait this long for it; `lfs prune` waits this long for the LFS cache lock that restores and fetches hold. `init`, `mount`, `host`, `fork end` and `verify` refuse a nonzero one (exit 1): a busy tree volume exits 75 at once |
 
 **Pod flags**, which name where the volume is mounted (see [recording](recording.md)). They fill the identity
 templates' variables, the commit trailers and the telemetry resource:
@@ -967,7 +984,7 @@ templates' variables, the commit trailers and the telemetry resource:
 | Flag | Environment | Default | Commands |
 |---|---|---|---|
 | `--namespace NAME`, `--pod NAME`, `--pod-uid UID`, `--node NAME`, `--replica NAME` | `AGENTFS_NAMESPACE`, `AGENTFS_POD`, `AGENTFS_POD_UID`, `AGENTFS_NODE`, `AGENTFS_REPLICA` | empty; `--pod-uid` defaults to the replica, and `--replica` (the committer's `{replica}`) to the pod name, else the host name | `front`, `run`, `record`, `flush`, `push`, `checkpoint`, `serve-history`, `serve-git` (passed to its hooks and `patch apply` as the variables), `restore`, `revert`, `patch apply`, `fork finish`, `status` (accepted and ignored) |
-| `--namespace NAME`, `--pod NAME`, `--pod-uid UID`, `--node NAME` | `AGENTFS_NAMESPACE`, `AGENTFS_POD`, `AGENTFS_POD_UID`, `AGENTFS_NODE` | empty: absent from the commits. Each is 1 to 253 bytes of printable ASCII with no whitespace | `init`, `mount`, `host`, `fork end`: the pod context of a tree volume's commits, as `Agentfs-Namespace`, `Agentfs-Pod`, `Agentfs-Pod-Uid` and `Agentfs-Node` ([trees](trees.md#volume-identity-and-trailers)). `mount`'s are its views' writers' and its own syncs', and its telemetry resource's (the replica is the pod name, else the host name); `init`'s are the Root commit's; `host`'s are its own events' and its telemetry resource's, while each view's writer carries the pod context its open request names |
+| `--namespace NAME`, `--pod NAME`, `--pod-uid UID`, `--node NAME` | `AGENTFS_NAMESPACE`, `AGENTFS_POD`, `AGENTFS_POD_UID`, `AGENTFS_NODE` | empty: absent from the commits. Each is 1 to 253 bytes of printable ASCII with no whitespace | `init`, `mount`, `host`, `fork end`, `verify`: the pod context of a tree volume's commits, as `Agentfs-Namespace`, `Agentfs-Pod`, `Agentfs-Pod-Uid` and `Agentfs-Node` ([trees](trees.md#volume-identity-and-trailers)); `verify`'s names the committer of its verdicts' notes commits. `mount`'s are its views' writers' and its own syncs', and its telemetry resource's (the replica is the pod name, else the host name); `init`'s are the Root commit's; `host`'s are its own events' and its telemetry resource's, while each view's writer carries the pod context its open request names |
 
 **Tree volume flags** (`init`, `mount`, `host`, `fork end`; see [trees](trees.md)):
 
@@ -988,7 +1005,7 @@ templates' variables, the commit trailers and the telemetry resource:
 | `--on-stale-mount refuse\|hold\|recover` | `AGENTFS_ON_STALE_MOUNT` | `refuse` | `mount`: when a view's mount point is an agentfs mount whose daemon died, `refuse` exits 1 naming the fix, `hold` mounts nothing and takes no lock, waits for SIGTERM, detaches every stale layer and exits 1, `recover` stacks each view over its stale mount of this volume (needs `CAP_SYS_ADMIN`; a stale mount of another volume exits 1) ([trees](trees.md#restarting-after-a-crash)) |
 | `--seal-mountpoint` | `AGENTFS_SEAL_MOUNTPOINT` | off | `mount`: before mounting, make each bare mount point root's with mode 0000, so a non-root workload that reaches it while no view is mounted (a `subPath` bound while a sidecar restarts) gets `EACCES` instead of writing unrecorded; needs root |
 
-`init`, `mount`, `host` and `fork end` accept the global `--state` and its
+`init`, `mount`, `host`, `fork end` and `verify` accept the global `--state` and its
 environment equivalent. They refuse `--root` (and `AGENTFS_ROOT`) and a
 nonzero `--wait-lock`, exit 1, so an old manifest fails loudly; a busy
 volume exits 75 at once. `mount ROOT [FLAGS] -- COMMAND [ARG]...` runs

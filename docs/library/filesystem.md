@@ -698,13 +698,46 @@ requests. `--namespace`, `--pod`, `--pod-uid` and `--node` are its own
 events' pod context and its telemetry resource's; each view's writer carries
 the pod context its `open` names.
 
-**Protocol, version 1.** One JSON object per line. The host writes `Hello`
-once, then exactly one reply per request, in order; the parent sends a request
-only after the previous reply has arrived.
+**Protocol, version 2.** One JSON object per line. The host writes `Hello`
+once (`{"v":2,"volume":NAME,"id":ID}`). After it, every request and every
+reply travels in an envelope with an id, as JSON-RPC's and LSP's do:
+
+```text
+{"id":7,"body":{"op":"close","at":"/m"}}
+{"id":7,"body":"closed"}
+```
+
+The parent picks each request's id, unique among its requests still
+unanswered, and need not wait for a reply before it sends the next. The host
+answers each request once, in an envelope that echoes its id, in any order.
+A parent reads `v` first and refuses another version: the CSI driver's
+plugin answers `FAILED_PRECONDITION` (`the host of volume <v> speaks host
+protocol v<n>, this plugin v2`) and never starts that host again, because the
+node plugin's image and its `agentfs` binary must be of one release.
+
+**What a request waits for.** A request is answered at once unless a `close`
+whose view has not ended holds a resource it names, or a request already
+waiting names one of them. The resources are a view's mount point, its
+client label and, for a fork's view, its fork key:
+
+| Request | Names |
+|---|---|
+| `open` | its `at`, its `label` and, for a fork's view, the fork's key |
+| `close` | its `at` |
+| `fork_create`, `fork_end` | its `key` |
+| `reconcile` | nothing: a closing view is still live. It still waits for every `open` that arrived before it, since it ends the clients no live view uses and a waiting open is about to bind one |
+
+A closing view holds what the `open` that made it named. Requests that wait
+are answered in the order they arrived, resource by resource: when a view
+ends, its `close` is answered, then each waiting request is looked at again
+in arrival order. So a `close` that waits for a file a process still holds
+stalls only the requests about that mount, that client or that fork; an
+`open` of another claim's view at another mount point is answered at once. A
+waiting request cannot be cancelled: it waits as long as the close it waits
+for.
 
 | Request (`op`) | Fields | Reply |
 |---|---|---|
-| (none: the host's first line) | | `{"v":1,"volume":NAME,"id":ID}` |
 | `open` | `tree` (`"root"` or `{"fork":KEY}`), `at`, `label`, `read_only`, `pod` | `{"opened":{"tree":..,"stacked":BOOL}}` |
 | `close` | `at` | `"closed"`, once the view has ended: its files released and its client detached |
 | `reconcile` | | `{"reconciled":{"ended":N}}`: the launcher's clients that no open view uses are ended |
@@ -718,7 +751,8 @@ forks), `approval_not_built` (`Landing::Approval`), `mount_failed`, `stale`
 (another source's stale mount at `at`), `occupied` (a view is open there with
 another tree, label or access), `draining` and `stopped` (the actor stopped
 after a recording failure). The message carries the real error. A malformed
-line is the last one read: the host stops and exits 2.
+line, and a request whose id is already in flight, is the last one read: the
+host stops and exits 2.
 
 **Opening a view.** `at` is an existing empty directory, or a stale agentfs
 mount of the view's own source, which the view stacks over

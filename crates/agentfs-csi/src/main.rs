@@ -62,10 +62,21 @@ struct Cli {
     namespace: String,
 }
 
-#[tokio::main]
-async fn main() -> ExitCode {
+fn main() -> ExitCode {
+    // Before tokio's threads start: arenas made before it stay.
+    agentfs_core::allocator::limit_arenas();
     let cli = Cli::parse();
-    match run(cli).await {
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(e) => {
+            eprintln!("agentfs-csi: the async runtime did not start: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    match runtime.block_on(run(cli)) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("agentfs-csi: {e}");

@@ -3,8 +3,17 @@
 //! chown and times, each decided, appended and applied with no git (docs/recording.md,
 //! docs/trees.md; target git-model §7). A file's bytes are a [`FileMap`] over journal frames and
 //! the checkout as built, never bytes in memory.
+//!
+//! A close does bounded work under the actor's lock: when the file's saved
+//! map has not moved since the open and only its length changed, it takes
+//! the open's view as the save (O(1)); otherwise it snapshots what it needs
+//! ([`CloseWork`]), decides with the lock released ([`CloseWork::decide`]),
+//! and lands the decision only if the saved map it read is still current,
+//! else redoes it once under the lock ([`TreeActor::close_finish`]). Either
+//! way its save is recorded before the close returns.
 
 pub(super) mod file_map;
+pub(super) mod layout;
 pub(super) mod pages;
 
 use std::collections::BTreeSet;
@@ -16,9 +25,11 @@ use agentfs_contracts::pod::WriterAt;
 
 pub(in crate::tree_actor) use super::journal::CallHead as Call;
 use super::journal::durable::RecordNo;
+use super::journal::readback::CallReader;
 use super::journal::segment::FramePos;
 use super::journal::{
-    Change, Entry, PagePiece, RunHead, SaveOutcome, TAKE_CHUNK, Tail, TakeRecord, chunk_map,
+    Change, Entry, FoldedOpen, PagePiece, RunHead, SaveOutcome, TAKE_CHUNK, Tail, TakeRecord,
+    chunk_map,
 };
 use super::meta::{Attrs, Kind, Meta, Perm, SetTime, Times};
 use super::queue::Key;
@@ -26,6 +37,7 @@ use super::tree::{DirState, EventNumber, SavedTree};
 use super::{Error, Result, Saved, TreeActor, TreeId};
 use crate::paths::RepoPath;
 pub use file_map::FileMap;
+use layout::{Layout, Positions};
 
 /// Calls name byte positions, never lines; their bytes are in their frame's
 /// tail. Append finds EOF at save time.
@@ -118,6 +130,84 @@ fn dir_node(path: &str, state: &DirState) -> Node {
     }
 }
 
+/// The length an open's calls leave on a saved length `L`: `max(L + add,
+/// at_least)`, or `len` after a truncate. Composed per call in O(1)
+/// (max-plus), so a call is checked against the saved head without
+/// replaying the open's earlier calls. `grown` is the `add` of the calls
+/// before the first truncate: the fold from `L` fails exactly when `L +
+/// grown` does not fit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::tree_actor) enum LenRule {
+    Shift { add: u64, at_least: u64 },
+    Fixed { len: u64, grown: u64 },
+}
+
+impl LenRule {
+    /// No call: the saved length as it is.
+    pub(in crate::tree_actor) const NONE: Self = Self::Shift {
+        add: 0,
+        at_least: 0,
+    };
+
+    /// The rule with `call` after the calls `self` stands for.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::TooLarge`] where the call fails whatever the saved length:
+    /// its own bounds overflow ([`Call::len_after`]'s errors), or it appends
+    /// past `u64` from the least length the calls before it leave.
+    pub(in crate::tree_actor) fn then(self, call: &Call) -> Result<Self> {
+        Ok(match (self, call.clone()) {
+            (rule, Call::Write { len: 0, .. }) => rule,
+            (rule, Call::Write { offset, len }) => {
+                let end = offset.checked_add(len).ok_or(Error::TooLarge)?;
+                match rule {
+                    Self::Shift { add, at_least } => Self::Shift {
+                        add,
+                        at_least: at_least.max(end),
+                    },
+                    Self::Fixed { len, grown } => Self::Fixed {
+                        len: len.max(end),
+                        grown,
+                    },
+                }
+            }
+            (Self::Shift { add, at_least }, Call::Append { len }) => Self::Shift {
+                add: add.checked_add(len).ok_or(Error::TooLarge)?,
+                at_least: at_least.checked_add(len).ok_or(Error::TooLarge)?,
+            },
+            (Self::Fixed { len, grown }, Call::Append { len: n }) => Self::Fixed {
+                len: len.checked_add(n).ok_or(Error::TooLarge)?,
+                grown,
+            },
+            (Self::Shift { add, .. }, Call::Truncate(size)) => Self::Fixed {
+                len: size,
+                grown: add,
+            },
+            (Self::Fixed { grown, .. }, Call::Truncate(size)) => Self::Fixed { len: size, grown },
+        })
+    }
+
+    /// The length the calls leave on a saved length of `saved_len`.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::TooLarge`] exactly when folding [`Call::len_after`] over the
+    /// calls from `saved_len` would fail.
+    pub(in crate::tree_actor) fn on(self, saved_len: u64) -> Result<u64> {
+        match self {
+            Self::Shift { add, at_least } => Ok(saved_len
+                .checked_add(add)
+                .ok_or(Error::TooLarge)?
+                .max(at_least)),
+            Self::Fixed { len, grown } => saved_len
+                .checked_add(grown)
+                .map(|_| len)
+                .ok_or(Error::TooLarge),
+        }
+    }
+}
+
 pub(in crate::tree_actor) struct Handle {
     pub(in crate::tree_actor) tree: TreeId,
     pub(in crate::tree_actor) by: WriterAt,
@@ -125,11 +215,184 @@ pub(in crate::tree_actor) struct Handle {
     /// The open's view: the saved map at open (a clone, never a copy of
     /// bytes), its own calls and the file's page writes.
     pub(in crate::tree_actor) bytes: FileMap,
-    /// This open's calls, each with its journal number and where its bytes are.
-    pub(in crate::tree_actor) calls: Vec<(u64, Call, FramePos)>,
-    /// The saved length the calls were last checked on, and the length they
-    /// leave on it (see `call`).
-    pub(in crate::tree_actor) replayed: Option<(u64, u64)>,
+    /// The length this open's calls leave on any saved length (see `call`).
+    pub(in crate::tree_actor) lengths: LenRule,
+    /// Calls this open made; 0 -> its close reads no journal.
+    pub(in crate::tree_actor) call_count: u64,
+    /// The saved map's step when the view was taken (open, or rebase_built
+    /// moving a call-less view).
+    pub(in crate::tree_actor) base_step: Option<RecordNo>,
+    /// Its close is being decided with the lock released: only that close's
+    /// finish saves it; close_writer and save_pending leave it.
+    pub(in crate::tree_actor) closing: bool,
+}
+
+impl Handle {
+    /// A new open whose view is `bytes`, taken when the file's saved map
+    /// was the save of `base_step`.
+    fn new(
+        tree: TreeId,
+        by: &WriterAt,
+        object: u64,
+        bytes: FileMap,
+        base_step: Option<RecordNo>,
+    ) -> Self {
+        Self {
+            tree,
+            by: by.clone(),
+            object,
+            bytes,
+            lengths: LenRule::NONE,
+            call_count: 0,
+            base_step,
+            closing: false,
+        }
+    }
+
+    /// An open recovery found live, before any call is served: a recovery
+    /// close saves it at once, replaying its calls read back from the
+    /// journal. Its view is never read, so it has no base.
+    pub(in crate::tree_actor) fn recovered(folded: FoldedOpen) -> Self {
+        let FoldedOpen { open, calls } = folded;
+        let lengths = calls
+            .iter()
+            .try_fold(LenRule::NONE, |rule, (_, call, _)| rule.then(call))
+            .unwrap_or(LenRule::NONE);
+        Self {
+            lengths,
+            call_count: calls.len() as u64,
+            ..Self::new(open.tree, &open.by, open.object, FileMap::empty(), None)
+        }
+    }
+}
+
+/// What a close took under the lock: the saved map and the open's view as
+/// shared snapshots (O(1)), the file's page writes, and a reader of the
+/// open's calls when the decision replays them. With neither page writes
+/// nor a reader, the saved map has not moved since the open and the view is
+/// the save to judge.
+pub(in crate::tree_actor) struct CloseWork {
+    handle: u64,
+    tree: TreeId,
+    object: u64,
+    saved: FileMap,
+    saved_step: Option<RecordNo>,
+    view: FileMap,
+    pages: Option<(Vec<(u64, pages::Run)>, u64)>,
+    reader: Option<CallReader>,
+}
+
+/// A changed file's save as a close decided it: its layout's chunk records,
+/// what the step records before it, and the saved map, the layout laid on
+/// the saved map the close read ([`Layout::lay`]), what a replay of the
+/// records lays. Made off the lock for a close decided there.
+type Decided = (Vec<Vec<u8>>, FileMap);
+
+/// A close decided with the lock released.
+pub(in crate::tree_actor) struct CloseDecision {
+    work: CloseWork,
+    outcome: SaveOutcome,
+    map: Option<Decided>,
+    pieces: Vec<(u64, pages::Run)>,
+}
+
+/// How a close goes on after [`TreeActor::close_begin`]: saved under the
+/// lock already, or to be decided with it released.
+pub(in crate::tree_actor) enum CloseStart {
+    Done(Saved),
+    Decide(CloseWork),
+}
+
+impl CloseWork {
+    /// The close's outcome, from the snapshots alone: reads no actor state.
+    /// The view itself when the saved map did not move and the file has no
+    /// page writes, compared with the saved map only where their sources
+    /// differ; else the open's calls, read back from the journal, and the
+    /// file's chosen page-write pieces replayed on the saved map.
+    ///
+    /// # Errors
+    ///
+    /// A failed read of the journal or of the bytes compared; a call that
+    /// does not apply.
+    pub(in crate::tree_actor) fn decide(self) -> Result<CloseDecision> {
+        if self.reader.is_none() && self.pages.is_none() {
+            let ranges = self.view.differs_from(&self.saved);
+            let (outcome, map) = judge(&self.saved, self.view.clone(), &ranges, || {
+                Ok(Layout::of_view(&self.view, RecordNo::new(self.handle)))
+            })?;
+            return Ok(CloseDecision {
+                work: self,
+                outcome,
+                map,
+                pieces: Vec::new(),
+            });
+        }
+        let own = match &self.reader {
+            Some(reader) => reader.calls(self.handle)?,
+            None => Vec::new(),
+        };
+        let pieces = match &self.pages {
+            Some((writes, through)) => {
+                pages::close_pieces(self.saved.len(), &own, writes, *through)
+            }
+            None => Vec::new(),
+        };
+        let (outcome, map) = replay_judge(&self.saved, &pages::close_calls(&own, &pieces))?;
+        Ok(CloseDecision {
+            work: self,
+            outcome,
+            map,
+            pieces,
+        })
+    }
+}
+
+/// A close's outcome for `map`, the saved map with the close's calls
+/// applied, which may differ from `saved` only over `ranges`: unchanged when
+/// the length and those bytes are the same (finding 36; the owner,
+/// 2026-11-07, "1. A"), else saved with its `layout`.
+fn judge(
+    saved: &FileMap,
+    map: FileMap,
+    ranges: &[Range<u64>],
+    layout: impl FnOnce() -> Result<Layout>,
+) -> Result<(SaveOutcome, Option<Decided>)> {
+    if map.len() == saved.len() && map.same_as(saved, ranges)? {
+        return Ok((SaveOutcome::Unchanged, None));
+    }
+    let layout = layout()?;
+    Ok((layout.outcome(), Some(decided(saved, &layout, &map)?)))
+}
+
+/// What a save of `layout` records and serves: its chunk records, and the
+/// layout laid on `saved`, each place resolved from `computed`, the map the
+/// close's calls left.
+///
+/// # Errors
+///
+/// As [`Layout::lay`]: a layout its own close cannot lay is a bug.
+fn decided(saved: &FileMap, layout: &Layout, computed: &FileMap) -> Result<Decided> {
+    let known = Positions::of_map(computed);
+    let laid = layout.lay(saved, &mut |place| Ok(known.find(place)))?;
+    Ok((layout.to_chunks(), laid))
+}
+
+/// `calls` replayed on `saved` and judged: a close that applies nothing
+/// changes nothing. "As it was" compares only the bytes the calls touched.
+fn replay_judge(
+    saved: &FileMap,
+    calls: &[(Call, FramePos)],
+) -> Result<(SaveOutcome, Option<Decided>)> {
+    if calls.is_empty() {
+        return Ok((SaveOutcome::Unchanged, None));
+    }
+    let mut map = saved.clone();
+    let mut ranges = Vec::new();
+    for (call, pos) in calls {
+        ranges.extend(call.touched(map.len()));
+        map.apply(call, pos)?;
+    }
+    judge(saved, map, &ranges, || Layout::of_close(saved.len(), calls))
 }
 
 impl TreeActor {
@@ -197,11 +460,11 @@ impl TreeActor {
     }
 
     fn object_node(t: &SavedTree, object: u64) -> Result<Node> {
-        let meta = *t.meta.get(&object).ok_or(Error::NotFound)?;
+        let meta = *t.meta_of(object).ok_or(Error::NotFound)?;
         Ok(Node {
             number: Some(object),
             meta,
-            times: t.times.get(&object).copied().unwrap_or_default(),
+            times: t.times_of(object).copied().unwrap_or_default(),
             len: t.bytes.get(&object).map_or(0, FileMap::len),
             links: u32::try_from(t.names.of(object).count()).unwrap_or(u32::MAX),
         })
@@ -394,7 +657,7 @@ impl TreeActor {
         Ok(tree
             .names
             .iter()
-            .map(|(p, o)| (p.clone(), *o, tree.bytes.get(o).map_or(0, FileMap::len)))
+            .map(|(p, o)| (p.to_string(), *o, tree.bytes.get(o).map_or(0, FileMap::len)))
             .collect())
     }
 
@@ -487,17 +750,9 @@ impl TreeActor {
             .get(&object)
             .cloned()
             .unwrap_or_default();
-        self.handles.insert(
-            handle,
-            Handle {
-                tree,
-                by: by.clone(),
-                object,
-                bytes,
-                calls: Vec::new(),
-                replayed: None,
-            },
-        );
+        let base = bytes.step();
+        self.handles
+            .insert(handle, Handle::new(tree, by, object, bytes, base));
         self.pages_opened(tree, object);
         Ok(handle)
     }
@@ -520,16 +775,10 @@ impl TreeActor {
             .get_mut(&tree)
             .ok_or(Error::NotFound)?
             .add_anonymous(handle, meta, at_ns);
+        let base = self.tree(tree)?.bytes.get(&handle).and_then(FileMap::step);
         self.handles.insert(
             handle,
-            Handle {
-                tree,
-                by: by.clone(),
-                object: handle,
-                bytes: FileMap::empty(),
-                calls: Vec::new(),
-                replayed: None,
-            },
+            Handle::new(tree, by, handle, FileMap::empty(), base),
         );
         self.pages_opened(tree, handle);
         Ok(handle)
@@ -590,7 +839,7 @@ impl TreeActor {
         let mine: Vec<u64> = self
             .handles
             .iter()
-            .filter(|(_, h)| h.tree == tree && h.by.writer == *writer)
+            .filter(|(_, h)| h.tree == tree && h.by.writer == *writer && !h.closing)
             .map(|(handle, _)| *handle)
             .collect();
         for handle in &mine {
@@ -638,31 +887,32 @@ impl TreeActor {
     /// Checks the call on the writer's view and on the saved head with every
     /// earlier call, journals it with its bytes `tail`, then applies it to the
     /// view as one piece of its frame. Both checks are on lengths, which are
-    /// all `apply`'s errors depend on, and the head's replay is redone only
-    /// when the saved length moved: a call costs its own bytes, not the
-    /// file's or its open's.
+    /// all `apply`'s errors depend on, and the head's is the open's
+    /// [`LenRule`] with this call composed in: a call costs its own bytes,
+    /// not the file's or its open's. An open being closed takes no call
+    /// ([`Error::NotFound`], as a second close is): its close is decided with
+    /// the lock released, on the calls it had, and would leave a later one
+    /// out of the save.
     pub(in crate::tree_actor) fn call(
         &mut self,
         handle: u64,
         call: Call,
         tail: &[u8],
     ) -> Result<()> {
-        let h = self.handles.get(&handle).ok_or(Error::NotFound)?;
+        let h = self
+            .handles
+            .get(&handle)
+            .filter(|h| !h.closing)
+            .ok_or(Error::NotFound)?;
         call.len_after(h.bytes.len())?;
+        let lengths = h.lengths.then(&call)?;
         let saved = self
             .tree(h.tree)?
             .bytes
             .get(&h.object)
             .map_or(0, FileMap::len);
-        let replayed = match h.replayed {
-            Some((base, len)) if base == saved => len,
-            _ => h
-                .calls
-                .iter()
-                .try_fold(saved, |len, (_, c, _)| c.len_after(len))?,
-        };
-        let replayed = call.len_after(replayed)?;
-        let (seq, pos) = self.journal_record(
+        lengths.on(saved)?;
+        let (_, pos) = self.journal_record(
             Entry::Call {
                 handle,
                 call: call.clone(),
@@ -671,11 +921,10 @@ impl TreeActor {
         )?;
         let h = self.handles.get_mut(&handle).ok_or(Error::NotFound)?;
         h.bytes.apply(&call, &pos)?;
-        h.replayed = Some((saved, replayed));
+        h.lengths = lengths;
+        h.call_count += 1;
         let (tree, object) = (h.tree, h.object);
         self.pages_note_call(tree, object, &call, &pos);
-        let h = self.handles.get_mut(&handle).ok_or(Error::NotFound)?;
-        h.calls.push((seq, call, pos));
         Ok(())
     }
 
@@ -711,16 +960,150 @@ impl TreeActor {
     /// RELEASE publishes calls against this tree's head, never the stale open
     /// base. A failed save changes nothing and answers its errno: the close
     /// stays pending, its handle still counting as open, and saves first at the
-    /// next step in its tree and at restart.
+    /// next step in its tree and at restart. [`TreeActor::close_begin`],
+    /// [`CloseWork::decide`] and [`TreeActor::close_finish`] in one hold of
+    /// the lock: `Recording::close_with` releases it for the decision.
     pub fn close(&mut self, handle: u64) -> Result<Saved> {
+        match self.close_begin(handle)? {
+            CloseStart::Done(saved) => Ok(saved),
+            CloseStart::Decide(work) => match work.decide() {
+                Ok(decision) => self.close_finish(decision),
+                Err(e) => Err(self.close_failed(handle, e)),
+            },
+        }
+    }
+
+    /// A close's first half, under the lock, O(1) plus the file's page
+    /// writes. Saved here: an anonymous or orphaned file's, any close in a
+    /// tree with failed closes pending (after them, in order), an open with
+    /// no call and no page write (unchanged), and an open whose saved map
+    /// has not moved, whose file has no page writes and whose length changed,
+    /// with few pieces: its view is the save. Else the snapshots for
+    /// [`CloseWork::decide`], the handle marked closing.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Stopped`], [`Error::NotFound`] (no such open, or one being
+    /// closed); a failed save, which stays pending.
+    pub(in crate::tree_actor) fn close_begin(&mut self, handle: u64) -> Result<CloseStart> {
         if self.is_stopped() {
             return Err(Error::Stopped);
         }
-        let tree = self.handles.get(&handle).ok_or(Error::NotFound)?.tree;
-        if !self.pending_closes.contains(&handle) {
-            self.pending_closes.push(handle);
+        let h = self.handles.get(&handle).ok_or(Error::NotFound)?;
+        if h.closing {
+            return Err(Error::NotFound);
         }
-        self.run_pending_closes(tree, Some(handle))
+        let (tree, object) = (h.tree, h.object);
+        let t = self.tree(tree)?;
+        let pending = self
+            .pending_closes
+            .iter()
+            .any(|p| self.handles.get(p).is_some_and(|o| o.tree == tree));
+        if pending || t.anonymous.contains(&object) || !t.is_named(object) {
+            if !self.pending_closes.contains(&handle) {
+                self.pending_closes.push(handle);
+            }
+            return self
+                .run_pending_closes(tree, Some(handle))
+                .map(CloseStart::Done);
+        }
+        let saved = t.bytes.get(&object).ok_or(Error::NotFound)?;
+        let moved = h.base_step.is_none() || saved.step() != h.base_step;
+        let pages = self.pages_writes(tree, object);
+        let quick = if h.call_count == 0 && pages.is_none() {
+            Some((SaveOutcome::Unchanged, None))
+        } else if !moved
+            && pages.is_none()
+            && h.bytes.len() != saved.len()
+            && h.bytes.piece_count() <= file_map::SMALL_PIECES
+        {
+            let layout = Layout::of_view(&h.bytes, RecordNo::new(handle));
+            match decided(saved, &layout, &h.bytes) {
+                Ok(decided) => Some((layout.outcome(), Some(decided))),
+                Err(e) => return Err(self.close_failed(handle, e)),
+            }
+        } else {
+            None
+        };
+        if let Some((outcome, map)) = quick {
+            return match self.save_close(handle, outcome, map, Vec::new()) {
+                Ok(saved) => Ok(CloseStart::Done(saved)),
+                Err(e) => Err(self.close_failed(handle, e)),
+            };
+        }
+        let reader =
+            (h.call_count > 0 && (moved || pages.is_some())).then(|| self.journal.call_reader());
+        let work = CloseWork {
+            handle,
+            tree,
+            object,
+            saved: saved.clone(),
+            saved_step: saved.step(),
+            view: h.bytes.clone(),
+            pages,
+            reader,
+        };
+        if let Some(h) = self.handles.get_mut(&handle) {
+            h.closing = true;
+        }
+        Ok(CloseStart::Decide(work))
+    }
+
+    /// A close's second half, under the lock: the decision lands, recorded,
+    /// when what it read is still current (its open, the file named and not
+    /// anonymous, the saved map's step, the file's page writes); else the
+    /// close is redone once here, its calls read back.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Stopped`]; [`Error::NotFound`] for an open not being
+    /// closed; a failed save, which stays pending.
+    pub(in crate::tree_actor) fn close_finish(&mut self, decision: CloseDecision) -> Result<Saved> {
+        let CloseDecision {
+            work,
+            outcome,
+            map,
+            pieces,
+        } = decision;
+        let handle = work.handle;
+        if self.is_stopped() {
+            return Err(Error::Stopped);
+        }
+        let h = self
+            .handles
+            .get_mut(&handle)
+            .filter(|h| h.closing)
+            .ok_or(Error::NotFound)?;
+        h.closing = false;
+        let current = self.tree(work.tree).is_ok_and(|t| {
+            !t.anonymous.contains(&work.object)
+                && t.is_named(work.object)
+                && t.bytes.get(&work.object).map(FileMap::step) == Some(work.saved_step)
+        }) && self.pages_written(work.tree, work.object)
+            == work.pages.as_ref().map(|(w, through)| (w.len(), *through));
+        let saved = if current {
+            self.save_close(handle, outcome, map, pieces)
+        } else {
+            // Something moved while it was decided: today's close, under
+            // the lock, after the tree's pending closes.
+            if !self.pending_closes.contains(&handle) {
+                self.pending_closes.push(handle);
+            }
+            self.run_pending_closes(work.tree, Some(handle))
+        };
+        saved.map_err(|e| self.close_failed(handle, e))
+    }
+
+    /// A close that could not save: it stays pending, its handle still
+    /// counting as open, and saves at its tree's next step or at restart.
+    pub(in crate::tree_actor) fn close_failed(&mut self, handle: u64, error: Error) -> Error {
+        if let Some(h) = self.handles.get_mut(&handle) {
+            h.closing = false;
+            if !self.pending_closes.contains(&handle) {
+                self.pending_closes.push(handle);
+            }
+        }
+        error
     }
 
     /// `rename(2)`: a step. A directory moves with every entry under it,
@@ -863,7 +1246,7 @@ impl TreeActor {
             let t = self.tree(tree)?;
             let saved = t.bytes.get(&object).ok_or(Error::NotFound)?;
             let whole = 0..len;
-            if t.meta.get(&object) == Some(&meta)
+            if t.meta_of(object) == Some(&meta)
                 && map.same_as(saved, std::slice::from_ref(&whole))?
             {
                 return Ok(Saved::Unchanged);
@@ -984,14 +1367,7 @@ impl TreeActor {
         self.touch(tree, seq, keys);
         self.handles.insert(
             seq,
-            Handle {
-                tree,
-                by: by.clone(),
-                object: seq,
-                bytes: FileMap::empty(),
-                calls: Vec::new(),
-                replayed: None,
-            },
+            Handle::new(tree, by, seq, FileMap::empty(), Some(RecordNo::new(seq))),
         );
         self.pages_opened(tree, seq);
         self.count_save(started);
@@ -1076,35 +1452,59 @@ impl TreeActor {
         self.metrics.max_save_nanos = self.metrics.max_save_nanos.max(nanos);
     }
 
-    /// A close: decides its outcome on the saved map, appends the save and
-    /// applies it. The builder replays the same calls on the built map.
+    /// A close decided under the lock: its calls read back from the journal
+    /// and replayed, with the file's chosen page-write pieces, on the saved
+    /// map; then saved. The builder replays the same calls on the built map.
     fn close_step(&mut self, handle: u64) -> Result<Saved> {
         let h = self.handles.get(&handle).ok_or(Error::NotFound)?;
-        let (tree, object, by) = (h.tree, h.object, h.by.clone());
+        let (tree, object) = (h.tree, h.object);
         let t = self.tree(tree)?;
-        let mut pieces = Vec::new();
-        let mut saved_bytes = None;
-        let outcome = if t.anonymous.contains(&object) {
-            SaveOutcome::AnonymousDropped
-        } else if !t.is_named(object) {
-            SaveOutcome::OrphanDropped
-        } else {
-            pieces = self.pages_close_pieces(h);
-            let calls = pages::close_calls(&h.calls, &pieces);
-            let saved = t.bytes.get(&object).ok_or(Error::NotFound)?;
-            match changed(saved, &calls)? {
-                Some(map) => {
-                    let outcome = SaveOutcome::Saved {
-                        len: map.len(),
-                        pieces: map.digest(&own_keys(&calls)),
-                    };
-                    saved_bytes = Some(map);
-                    outcome
-                }
-                None => SaveOutcome::Unchanged,
-            }
+        if t.anonymous.contains(&object) {
+            return self.save_close(handle, SaveOutcome::AnonymousDropped, None, Vec::new());
+        }
+        if !t.is_named(object) {
+            return self.save_close(handle, SaveOutcome::OrphanDropped, None, Vec::new());
+        }
+        let own = self.own_calls(handle)?;
+        let pieces = self.pages_close_pieces(h, &own);
+        let calls = pages::close_calls(&own, &pieces);
+        let saved = t.bytes.get(&object).ok_or(Error::NotFound)?;
+        let (outcome, map) = replay_judge(saved, &calls)?;
+        self.save_close(handle, outcome, map, pieces)
+    }
+
+    /// The calls of the open `handle`, read back from the journal: none
+    /// without a read when it made none.
+    pub(in crate::tree_actor) fn own_calls(
+        &self,
+        handle: u64,
+    ) -> Result<Vec<(u64, Call, FramePos)>> {
+        match self.handles.get(&handle) {
+            Some(h) if h.call_count > 0 => self.journal.call_reader().calls(handle),
+            _ => Ok(Vec::new()),
+        }
+    }
+
+    /// A close's save, decided: its records appended (the commit point), then
+    /// applied. A changed file's save records exactly its layout's outcome,
+    /// its layout in chunk records just before the step, and the page-write
+    /// `pieces` it applied; the saved map is then the layout laid on the
+    /// saved map ([`decided`]): what a replay of the records lays. The one
+    /// writer of a Saved close. The open's keys go and its handle with them.
+    fn save_close(
+        &mut self,
+        handle: u64,
+        outcome: SaveOutcome,
+        saved_bytes: Option<Decided>,
+        pieces: Vec<(u64, pages::Run)>,
+    ) -> Result<Saved> {
+        let h = self.handles.get(&handle).ok_or(Error::NotFound)?;
+        let (tree, object, by) = (h.tree, h.object, h.by.clone());
+        let (chunks, saved_bytes) = match saved_bytes {
+            Some((chunks, laid)) => (chunks, Some(laid)),
+            None => (Vec::new(), None),
         };
-        let seq = self.next;
+        let seq = self.next + chunks.len() as u64;
         let pointers = if saved_bytes.is_some() {
             self.publish(tree, seq)
         } else {
@@ -1126,7 +1526,12 @@ impl TreeActor {
         let started = std::time::Instant::now();
         // Every close lets its open's held keys go, a changed file's or not.
         let keys = self.tree(tree)?.shape.keys(object);
-        self.record_step(by, change, pointers, &mut std::iter::empty())?;
+        let (recorded, _) =
+            self.record_step(by, change, pointers, &mut chunks.into_iter().map(Ok))?;
+        debug_assert_eq!(
+            recorded, seq,
+            "the layout's chunks come just before the step"
+        );
         self.touch(tree, seq, keys);
         self.pending_closes.retain(|pending| *pending != handle);
         self.handles.remove(&handle);
@@ -1158,6 +1563,9 @@ impl TreeActor {
 /// The map `calls` leave on `saved`, or none if they leave it as it was: a save
 /// that changes nothing commits nothing (finding 36; the owner, 2026-11-07, "1. A").
 /// "As it was" compares only the bytes the calls touched, never the whole file.
+/// The close as it was decided before the off-lock close: the property
+/// tests' oracle.
+#[cfg(test)]
 pub(in crate::tree_actor) fn changed(
     saved: &FileMap,
     calls: &[(Call, FramePos)],
@@ -1172,11 +1580,6 @@ pub(in crate::tree_actor) fn changed(
         return Ok(None);
     }
     Ok(Some(map))
-}
-
-/// The frames a close applied, as [`FileMap::digest`] names them.
-pub(in crate::tree_actor) fn own_keys(calls: &[(Call, FramePos)]) -> BTreeSet<(u64, u64)> {
-    calls.iter().map(|(_, pos)| pos.key()).collect()
 }
 
 /// A path a tree may name: a git-safe relative path ([`RepoPath`]'s rules,
@@ -1244,5 +1647,291 @@ mod tests {
         let map = changed(&saved, &other).unwrap().unwrap();
         assert_eq!(map.to_vec().unwrap(), b"abCdef");
         assert!(changed(&saved, &[]).unwrap().is_none());
+    }
+
+    /// A small deterministic generator: the properties need no crate.
+    struct Rng(u64);
+
+    impl Rng {
+        fn new(seed: u64) -> Self {
+            Self(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1)
+        }
+
+        fn next(&mut self, below: u64) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0 % below.max(1)
+        }
+
+        /// A length near zero or near `u64::MAX`, where folds overflow.
+        fn edge(&mut self) -> u64 {
+            match self.next(4) {
+                0 => self.next(16),
+                1 => u64::MAX - self.next(16),
+                2 => u64::MAX / 2 + self.next(16),
+                _ => self.next(1 << 40),
+            }
+        }
+    }
+
+    /// A2: the rule composed per call gives the fold's length from any saved
+    /// length, and fails exactly where the fold fails.
+    #[test]
+    fn a_length_rule_is_the_fold_of_its_calls() {
+        for seed in 1..2_000_u64 {
+            let mut rng = Rng::new(seed);
+            let calls: Vec<Call> = (0..1 + rng.next(6))
+                .map(|_| match rng.next(3) {
+                    0 => Call::Write {
+                        offset: rng.edge(),
+                        len: rng.edge() % 3,
+                    },
+                    1 => Call::Append { len: rng.edge() },
+                    _ => Call::Truncate(rng.edge()),
+                })
+                .collect();
+            let rule = calls
+                .iter()
+                .try_fold(LenRule::NONE, |rule, call| rule.then(call));
+            for _ in 0..8 {
+                let saved = rng.edge();
+                let fold = calls
+                    .iter()
+                    .try_fold(saved, |len, call| call.len_after(len));
+                match &rule {
+                    Ok(rule) => assert_eq!(
+                        rule.on(saved).ok(),
+                        fold.ok(),
+                        "seed {seed}: {calls:?} on {saved}: {rule:?}"
+                    ),
+                    // A rule fails only where every saved length does.
+                    Err(_) => assert!(fold.is_err(), "seed {seed}: {calls:?} on {saved}"),
+                }
+            }
+        }
+        // The erratum's case: an append that overflows only from a longer
+        // saved length, then a truncate.
+        let calls = [Call::Append { len: u64::MAX }, Call::Truncate(0)];
+        let rule = calls
+            .iter()
+            .try_fold(LenRule::NONE, |rule, call| rule.then(call))
+            .unwrap();
+        assert_eq!(rule.on(0).ok(), Some(0));
+        assert!(rule.on(1).is_err());
+    }
+
+    use crate::tree_actor::journal::{Journal, fold};
+    use crate::tree_actor::test_support::{ATTRS, new_actor, writer};
+    use crate::tree_actor::{JOURNAL, TreeId};
+
+    const PATH: &str = "f";
+
+    /// The Save record the journal holds for `handle`: what its close decided.
+    fn recorded_outcome(root: &std::path::Path, handle: u64) -> SaveOutcome {
+        let (_, frames) = Journal::open(&root.join(JOURNAL), RecordNo::ZERO).unwrap();
+        frames
+            .iter()
+            .find_map(|(record, _)| match &record.entry {
+                Entry::Step {
+                    change:
+                        Change::Save {
+                            handle: of,
+                            outcome,
+                            ..
+                        },
+                    ..
+                } if *of == handle => Some(*outcome),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("no save of {handle} in the journal"))
+    }
+
+    /// The oracle: today's close as it was before the off-lock close, on
+    /// the actor's state now, with the open's calls from a fold of the
+    /// journal (not the read-back the close uses): the outcome and the bytes
+    /// it saves.
+    fn oracle(v: &TreeActor, root: &std::path::Path, handle: u64) -> (SaveOutcome, Vec<u8>) {
+        let (_, frames) = Journal::open(&root.join(JOURNAL), RecordNo::ZERO).unwrap();
+        let folded = fold(&frames).unwrap();
+        let own = folded
+            .opens
+            .get(&handle)
+            .map(|open| open.calls.clone())
+            .unwrap_or_default();
+        let h = &v.handles[&handle];
+        let saved = v.tree(h.tree).unwrap().bytes[&h.object].clone();
+        let pieces = match v.pages_writes(h.tree, h.object) {
+            Some((writes, through)) => pages::close_pieces(saved.len(), &own, &writes, through),
+            None => Vec::new(),
+        };
+        let calls = pages::close_calls(&own, &pieces);
+        match changed(&saved, &calls).unwrap() {
+            Some(map) => (
+                Layout::of_close(saved.len(), &calls).unwrap().outcome(),
+                map.to_vec().unwrap(),
+            ),
+            None => (SaveOutcome::Unchanged, saved.to_vec().unwrap()),
+        }
+    }
+
+    /// Runs one random history of two opens of one file, closing each
+    /// against the oracle, and builds it: every build must succeed, so the
+    /// builder's own check of each save agrees with the actor's: no commit
+    /// is flagged. `pause` waits 3 ms before each close, which lets the
+    /// builder's batches run, and rebase the saved map, at other points.
+    /// `closed` gets each close's outcome.
+    fn two_opens(seed: u64, pause: bool, closed: &mut Vec<SaveOutcome>) {
+        let mut rng = Rng::new(seed);
+        let tmp = tempfile::tempdir().unwrap();
+        let mut v = new_actor(tmp.path());
+        let w = writer("w");
+        let first = v.write_open(TreeId::Root, PATH, &w, Some(ATTRS)).unwrap();
+        let seed_bytes: Vec<u8> = (0..rng.next(200)).map(|_| rng.next(256) as u8).collect();
+        v.write(first, 0, &seed_bytes, false).unwrap();
+        v.close(first).unwrap();
+        let mut open: [Option<u64>; 2] = [None, None];
+        for step in 0..80 {
+            let which = rng.next(2) as usize;
+            let Some(h) = open[which] else {
+                if rng.next(2) == 0 {
+                    open[which] = Some(v.write_open(TreeId::Root, PATH, &w, None).unwrap());
+                }
+                continue;
+            };
+            let len = v.read_open(h).unwrap().len();
+            let data: Vec<u8> = (0..1 + rng.next(40)).map(|_| rng.next(256) as u8).collect();
+            match rng.next(16) {
+                0..=4 => v.write(h, rng.next(len + 30), &data, false).unwrap(),
+                5 => v.write(h, 0, &data, true).unwrap(),
+                6 => v.truncate(h, rng.next(len + 20)).unwrap(),
+                7 => {
+                    // The same bytes again, where they are.
+                    let at = rng.next(len.max(1));
+                    let mut same = vec![0; data.len()];
+                    let n = v.read_open(h).unwrap().read(at, &mut same).unwrap();
+                    v.write(h, at, &same[..n], false).unwrap();
+                }
+                8 | 9 => v.page_writeback(h, rng.next(len + 30), &data).unwrap(),
+                10 => {
+                    // Built, so the next record rebases the saved map.
+                    if let Err(e) = v.settle() {
+                        panic!("seed {seed} step {step}: {e}");
+                    }
+                }
+                _ => {
+                    if pause {
+                        std::thread::sleep(std::time::Duration::from_millis(3));
+                    }
+                    let (outcome, bytes) = oracle(&v, tmp.path(), h);
+                    v.close(h).unwrap();
+                    open[which] = None;
+                    assert_eq!(
+                        recorded_outcome(tmp.path(), h),
+                        outcome,
+                        "seed {seed} step {step}"
+                    );
+                    assert_eq!(
+                        v.read(TreeId::Root, PATH).unwrap(),
+                        bytes,
+                        "seed {seed} step {step}"
+                    );
+                    closed.push(outcome);
+                }
+            }
+        }
+        if let Err(e) = v.settle() {
+            panic!("seed {seed} at the end: {e}");
+        }
+        assert_eq!(
+            v.verification().counts(),
+            crate::tree_actor::UnverifiedCounts::default(),
+            "seed {seed}: the builder's replay of every save agrees with its record"
+        );
+    }
+
+    /// A1: seeds 1..64 of two opens of one file (writes, appends, truncates,
+    /// the same bytes rewritten, page writes, the other open's save while
+    /// one is open, builds that rebase the saved map): each close records
+    /// the outcome and the digest the oracle gives, and saves its bytes; the
+    /// builder replays every save to the same digest.
+    #[test]
+    fn a_close_decides_as_the_oracle_does() {
+        let mut closed = Vec::new();
+        for seed in 1..64 {
+            two_opens(seed, false, &mut closed);
+        }
+        // The histories reach every outcome a named file's close has.
+        assert!(
+            closed
+                .iter()
+                .any(|o| matches!(o, SaveOutcome::Saved { .. }))
+        );
+        assert!(closed.contains(&SaveOutcome::Unchanged));
+    }
+
+    /// The histories where the builder's check of a save once disagreed
+    /// with the actor's: a close that applies part of a page write whose
+    /// rest an earlier close saved, with the saved map on its frames on one
+    /// side and rebased onto the checkout on the other.
+    #[test]
+    fn seed_11_builds_every_save() {
+        two_opens(11, false, &mut Vec::new());
+    }
+
+    #[test]
+    fn seed_19_builds_every_save() {
+        two_opens(19, false, &mut Vec::new());
+    }
+
+    #[test]
+    fn seed_26_builds_every_save_with_a_pause_before_each_close() {
+        two_opens(26, true, &mut Vec::new());
+    }
+
+    #[test]
+    fn seeds_11_and_19_build_every_save_with_a_pause_before_each_close() {
+        two_opens(11, true, &mut Vec::new());
+        two_opens(19, true, &mut Vec::new());
+    }
+
+    use crate::tree_actor::journal::readback::READERS;
+
+    fn readers() -> u64 {
+        READERS.with(std::cell::Cell::get)
+    }
+
+    /// A4 and A6: an open whose saved map did not move and whose length
+    /// changed closes in one step under the lock, without the journal: no
+    /// reader, however many calls it made (100,000 overwrites of a small
+    /// range and one length change: few pieces).
+    #[test]
+    fn a_close_whose_base_did_not_move_reads_no_journal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut v = new_actor(tmp.path());
+        let w = writer("w");
+        let h = v.write_open(TreeId::Root, PATH, &w, Some(ATTRS)).unwrap();
+        v.write(h, 0, b"0123456789", false).unwrap();
+        v.close(h).unwrap();
+        let h = v.write_open(TreeId::Root, PATH, &w, None).unwrap();
+        for n in 0..100_000_u64 {
+            v.write(h, n % 8, &[n as u8], false).unwrap();
+        }
+        v.write(h, 0, b"longer", true).unwrap();
+        let before = readers();
+        let saved = v.close(h).unwrap();
+        assert!(matches!(saved, Saved::Commit(_)), "{saved:?}");
+        assert_eq!(readers(), before, "a reader taken");
+        assert_eq!(v.read(TreeId::Root, PATH).unwrap().len(), 16);
+        // The same file with its saved map moved meanwhile reads its calls back.
+        let a = v.write_open(TreeId::Root, PATH, &w, None).unwrap();
+        let b = v.write_open(TreeId::Root, PATH, &w, None).unwrap();
+        v.write(a, 0, b"a", true).unwrap();
+        v.write(b, 0, b"b", true).unwrap();
+        v.close(b).unwrap();
+        let before = readers();
+        v.close(a).unwrap();
+        assert_eq!(readers(), before + 1);
+        assert_eq!(v.read(TreeId::Root, PATH).unwrap().len(), 18);
     }
 }

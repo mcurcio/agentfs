@@ -127,7 +127,9 @@ the directory of the file naming it, as git does) is checked:
   `http.proxy`), `patches` (`agentfs.patch*`, `agentfsPusher.*`), `lfs` and
   `other`. The `agentfs.not_built` gauge counts them by `capability`
   ([telemetry](telemetry.md)), the standing alarm for a setting that does
-  nothing yet. `agentfs.nested = exclude` is built and not listed. Every key is in
+  nothing yet. `agentfs.nested = exclude` is built and not listed, and so is
+  `agentfs.overlayLimit` (the lag gate's overlay limit, below): a value that is
+  not a positive size exits 1 before the volume is staged. Every key is in
   [configuration](configuration.md#tree-volumes-the-operator-settings-file).
 
 ### Running a command in the mount
@@ -188,7 +190,8 @@ agentfs --state STATE host --launcher ID --volume NAME   # stdin: the parent's s
 It boots as `mount` does, under the launcher `ID`: the volume checked against
 `--volume`, the operator settings read and each key not built logged, the
 volume staged and its domains restored, the view host started. It then writes
-a hello line and answers each request in order: `open` a view of the root or
+a hello line and answers each request by its id, at once unless a pending
+`close` holds the mount point, client or fork it names: `open` a view of the root or
 of the open fork under a key at a mount point, with a client label, an access
 and the pod context of its saves; `close` it; `reconcile` (end the launcher's
 clients no open view uses); `fork_create` and `fork_end` under
@@ -474,17 +477,44 @@ actor: its waiters get its error and every later call `EIO` (see
 No file's bytes are held in memory, by the views or by the builder. A file is a map: pieces of journal frames
 and of the private checkout's file as built, by file offset. A write adds one
 piece that points at its frame, so it costs its own bytes at any file size: a
-4 KiB write into a 1 GiB file copies 4 KiB, into its frame. An open starts from
-the saved map, shared until it writes (copy on write). A close applies the
-open's calls to the saved map with the same function the builder replays, and
-tells a close that changes nothing by comparing only the bytes the open's calls
-touched. A view reads a map with the actor unlocked: the lock is held only to
-clone it.
+4 KiB write into a 1 GiB file copies 4 KiB, into its frame. A map of a few
+pieces is a shared array; a large one is a persistent map ordered by offset,
+so a write costs the log of its pieces and the pieces it covers. An open starts
+from the saved map, shared until it writes (copy on write). An open handle
+keeps no list of its calls: each call is checked against the file's length
+with a rule composed per call, and a close reads the open's calls back from
+the journal when it needs them.
+
+A close does bounded work under the actor's lock:
+
+- An open that made no call saves nothing. When no other save of the file
+  landed during the open (the saved map did not move), the file has no page
+  writes, the length changed and the open's map has at most 32 pieces, the
+  open's own map is the save: the close takes it and records its step.
+- Otherwise the close takes a snapshot of the saved map and the open's map
+  under the lock, then decides with the lock released. When the saved map did
+  not move and there are no page writes, it compares the open's map with the
+  saved map only where their pieces differ. Else it replays the open's calls,
+  read back from the journal, and the file's page writes onto the saved map
+  with the same function the builder replays, and compares only the bytes the
+  calls touched. Either way it makes the save's layout. The decision lands
+  under the lock if the saved step it read is still the current one, else the
+  close is redone once under the lock. A call on the open while its close is
+  decided is refused (`NotFound`, as a second close is), so no write is
+  left out of the save.
+
+Releasing the lock lets other views and claims of the volume go on while a
+close is decided. Within one view a slow close still holds its other
+requests, since one thread answers them in order (below): a sidecar's single
+root view gains only the shorter close.
+
+Either way the step is recorded before the release is answered. A view reads
+a map with the actor unlocked: the lock is held only to clone it.
 
 - After a batch is built and checked out, the builder reads each changed file
   from its checkout instead of the frames, through a hard link in the state
-  area's `bases/` (cleared at each start), and the actor takes that map at its
-  next call where it saved the same step. A checkout writes each file to a
+  area's `bases/` (cleared at each start), and the actor takes that map at the
+  built event, where it saved the same step. A checkout writes each file to a
   temporary name and renames it over the old one, so a reader that opened the
   old version keeps reading it through its link; the link goes when the last
   map lets go of it.
@@ -502,9 +532,17 @@ clone it.
   files whole, so an edit of a file near the host's memory needs that memory
   in the `git` child. Blobs over 8 MiB stream through `git fast-import` and
   `git cat-file` (`core.bigFileThreshold`), which never hold them whole.
-- The save record holds the result's length and a digest of its pieces: the
-  close's own pieces with their places, and the bytes it kept as runs. The
-  builder's replay must reach the same digest (`Disagrees`).
+- The save record holds the save's layout: the result's length, then each
+  range the close wrote, as zeros or as journal bytes named by their record
+  and offset in its tail; every other byte keeps the value it had before the
+  save at the same offset. The layout is in the tails of chunk records just
+  before the step, 32 bytes a range, so a close of any number of pieces
+  records. The view, a restart's replay and the builder each make the saved
+  map by laying the recorded layout on the map before the save, so all three
+  hold the bytes the workload saved, however each sources the kept bytes
+  (journal frames or the checkout's file). The builder also replays the save
+  from its own inputs and compares the two layouts
+  ([When history cannot check a save](#when-history-cannot-check-a-save)).
 
 ## The library
 
@@ -587,8 +625,13 @@ at any size, so a map costs its saves' edits, not its file's bytes.
 Object numbers (which file an open handle writes to), directory numbers and
 times are not in history. They are the journal's: a checkpoint holds each tree's
 objects as of its built point, and each tree's directory numbers and times and
-its files' times (`locals`), and the steps after it move them. A checkout of
-history shows checkout times, as git's does.
+its files' times (`locals`), and the steps after it move them. Each built-log
+entry also records what its batch moved of them, tree by tree: the objects set
+or unnamed, the directories set or removed, the files' times set or dropped, a
+tree the batch made (all of it) or dropped. A start after a kill, whose built
+point is past its checkpoint, carries the checkpoint's objects and locals to the
+built point with those records and reads each tree once, at the built point. A
+checkout of history shows checkout times, as git's does.
 
 ## The journal
 
@@ -667,8 +710,9 @@ appends it and applies it to the saved state the views serve; it runs no git.
 - The state area is `volume`, `history.git`, `journal/`, `built.log`, `align/`,
   `bases/`, `actor.lock`, `format` and rebuilt private checkout caches, which the workload
   never sees. A create writes an `initializing` marker first and removes it last;
-  the next `init` starts a cut-short create over. **Earlier state formats
-  (format 8 included) do not open**, and are never converted.
+  the next `init` starts a cut-short create over. The state format is
+  `agentfs-trees-13`. **Earlier state formats (12 included) do not open**, and
+  are never converted ([upgrading](runbooks/upgrading-the-sidecar.md)).
 
 ## History trails the files
 
@@ -689,14 +733,65 @@ the private checkouts copied, the checked-out files' maps rebased onto them
 - A commit is dated by its step's record, in `+0000`. A replay after a crash may
   make other objects for steps nothing had seen built.
 - A failed batch (`tree HistoryBuildFailed: <e>`) changes nothing reachable and is
-  retried at the next step or wait; recording goes on. A batch whose replay
-  disagrees with its record (`Disagrees`) fails the same way at every retry: see
+  retried at the next step or wait; recording goes on. A save whose replay does
+  not match its record is built from the record and flagged
+  ([When history cannot check a save](#when-history-cannot-check-a-save)); only
+  a recorded layout that cannot be laid (`Disagrees`) fails the batch, the same
+  way at every retry: see
   [runbooks/recording-failures.md](runbooks/recording-failures.md). A failed copy
   after the built-log entry is logged (`tree CopyStale`) and redone whole at the next
   batch.
 - Dropping the volume builds every record appended, so a clean shutdown leaves
   history built through its last record. After a kill the builder builds what
   was left unbuilt, behind the reopened views.
+- **The repack.** Each batch is one pack, and a read's cost grows with the pack
+  count, so at each built event a task of its own rolls the small packs up,
+  one run at a time, beside `git fast-import` and never stopping the builder;
+  events that come while one runs make one more run after it. Only a built
+  event starts a run: a failed batch, or a view's shutdown, does not. A run is
+  git's incremental repack, with the deletion deferred to a later run:
+  1. `git multi-pack-index expire`, once a built event came after the last
+     roll-up ended: git deletes the packs in which the multi-pack index finds
+     no object, the ones that roll-up superseded.
+  2. The packs `git repack --geometric=2` would pick, by size, go into one new
+     pack (`git pack-objects --stdin-packs`, the call geometric repack makes):
+     whole packs, every object, reachable or not. Nothing is deleted. The
+     roll-up runs only with twice the size of the packs it takes free on the
+     store's filesystem; otherwise it is skipped and logged (`tree
+     RepackFailed: no room for a roll-up ...`), so it never fills the disk the
+     builder and the journal write to.
+  3. `git multi-pack-index write --preferred-pack=<the new pack>`, so the
+     packs it rolled up hold no object the index finds there; `objects/pack`
+     is fsynced before any of them can go.
+
+  A pack is deleted only at a run that starts on a built event after the
+  roll-up that superseded it, because git and libgit2 find a pack through the
+  index or a listing and open it later, so a pack deleted between the two
+  would read as a missing object. Which pack goes is git's judgement from the
+  index, so a roll-up that writes a pack the store already holds keeps it.
+  While a roll-up waits for its expiry no run rolls up again. Nothing prunes
+  and no ref is touched. A start expires what the last roll-up superseded
+  before the volume is served, and removes a stale `multi-pack-index.lock`
+  and an index that names a pack that is gone (git's expiry deletes packs
+  before it writes the index without them, so a power cut between the two
+  leaves one; what that expiry had yet to delete is rolled up again once). A
+  stop kills a run in progress with every process it started, but waits for
+  an expiry to finish. A failed run is
+  logged (`tree RepackFailed: <error>`) and tried again at the next built
+  event; its git children are not counted with the actor's. A failed step
+  leaves the index in doubt (a failed expiry has deleted packs the index still
+  names, and git writes a new index over the one it reads), so the task
+  removes the index and its lock at once, and its next run only writes the
+  index afresh, preferring the last roll-up it wrote; the run after expires
+  what that rewrite left unreferenced. A
+  git that died mid-write (a roll-up out of space, a killed `fast-import`)
+  leaves a temporary file (`tmp_*`), which the task removes at the next batch
+  end, built or failed, if it is still the same file. Costs: an idle
+  volume keeps the packs its last roll-up superseded until its next save or
+  start; the volume's own libgit2 handles keep the packs they opened mapped,
+  so a deleted pack's disk space comes back only when they let it go, at the
+  latest when the volume stops; loose objects (the verification notes) are
+  not rolled up.
 - No record after a checkpoint names a step the checkpoint covers: a step whose
   pointers were read before a compaction names those values as the oids they
   were built as, so a restart, which builds from the checkpoint, builds every
@@ -718,6 +813,103 @@ the private checkouts copied, the checked-out files' maps rebased onto them
   holds nothing back. Over 30 s,
   `tree HistoryLagging` is logged once; over the limit, `tree HistoryStalled`.
   The levels are constants, not settings.
+- **The overlay limit.** The actor holds, per tree, each name, directory, object
+  and file map its steps changed since the built point (its overlay), over the
+  builder's shape and maps at the built point, which it shares and never
+  copies; a built event drops what that build covers, so after each rebuild a
+  tree's overlay is its unbuilt steps' entries. A save's entries are dated by
+  the last record when the actor moves onto a built point; when that record is
+  no step (a write, an open), which no step asks the builder to build, the
+  actor asks the builder to build through it, so the overlay empties without a
+  later step. The gate estimates it at 256 bytes an entry and
+  counts entries, not a changed map's pieces (the lag's byte term covers a save's
+  bytes). So it bounds how many changed entries history trails by, not their
+  memory: a save of a million pieces is one entry, and its map's memory is not
+  held back by this limit. The actor reports every tree's overlay as it releases its lock, so the
+  gate sees it grow at each step and shrink at each rebuild, without a timer.
+  Over `agentfs.overlayLimit` (32 MiB unless set,
+  [configuration](configuration.md#tree-volumes-the-operator-settings-file)),
+  the tree's calls that start new work wait as over the lag limit, until the
+  built event whose rebuild brings the overlay under; the health is `Stalled`
+  meanwhile and `tree HistoryStalled` is logged each time the health turns to
+  `Stalled`: under a sustained burst that is at most once per built event, as
+  each rebuild brings the overlay under and the next steps take it over. The
+  check is before the
+  call, so one step larger than the limit (a rename of a directory of many
+  names) is admitted, and the calls after it wait until it is built. A failed
+  builder holds nothing back here either: the overlay cannot shrink while it
+  has failed.
+
+## When history cannot check a save
+
+The builder checks every save. It replays the save from its own inputs (the
+open's calls, the file's page writes, the saved length and the page-write
+pieces the record names) and compares the replay's layout with the one the
+save recorded. The two are equal for every save the view and the builder
+agree on. When they differ, or the replay cannot be made (a piece names no
+page write the builder holds):
+
+- History holds the bytes the workload saved: the commit is built from the
+  recorded layout, as the view served it, and building goes on. A recorded
+  byte the builder does not track is read from the journal by its record.
+- The commit is flagged. Its message ends with a trailer that names the two
+  layouts' fingerprints (a length and a 64-bit digest, for display) and the
+  build of agentfs that flagged it:
+
+  ```text
+  Agentfs-Unverified: recorded 12:6a0b99b6163a070e replayed 6:eeea0a7fac4f2c47 by agentfs 0.1.0 build 0123456789abcdef
+  ```
+
+  `replayed none` when the replay could not be made. The flag is history: it
+  travels with every clone and fork copy, and nothing rewrites it.
+- The replay's inputs are kept as evidence, metadata only (records, offsets
+  and lengths, no file bytes), in a git note on the commit under
+  `refs/notes/agentfs-verify-evidence`, JSON in its own format
+  (`agentfs-verify-evidence-1`). The builder is its only writer, and a
+  failed write is logged (`tree HistoryEvidenceNotWritten`, with the
+  evidence's text) and never fails the batch.
+- One line is logged: `tree HistoryUnverified: step=<n> tree=<tree>
+  commit=<oid> path=<JSON string>: ...`, and the gauge
+  `agentfs.history.unverified{verdict="unresolved"}` counts it
+  ([telemetry](telemetry.md)).
+
+The journal keeps nothing for a flag: the save's records compact as any
+others do. Each flag costs one evidence note in git, about 60 bytes per call
+and page-write run plus 32 bytes per layout range. Evidence is never removed.
+
+**Verdicts.** `refs/notes/agentfs-verify` holds the verdicts, one line each in
+the flagged commit's note: `Agentfs-Verdict: verified|mismatch-confirmed|acknowledged
+by <who>`. A verdict comes from a check by a release of agentfs (the binary,
+named by the first 16 hex digits of its SHA-256):
+
+- a start, before it serves, checks every standing flag that release has not
+  flagged or judged, under the volume's lock, and commits its verdicts as the
+  service;
+- `agentfs verify` does the same on demand, and opens only the store, so a
+  release of another state format can run it on a volume it cannot mount.
+
+The check replays the evidence. `verified` means this release's replay equals
+the recorded layout; `mismatch-confirmed` means it still differs. The
+evidence is the builder's tracked inputs, frozen when it flagged the save, so
+a verdict covers the replay code only: if the cause was in what the builder
+tracked or on the view's side, every later release reports
+`mismatch-confirmed`. The release that flagged a save, or judged it, writes
+nothing again (`same-release`), and a commit with no evidence that parses is
+reported `no-evidence`. A person clears a flag after looking with `git notes
+--ref=agentfs-verify append -m "Agentfs-Verdict: acknowledged by <name>"
+<commit>` ([runbook](runbooks/recording-failures.md#a-save-history-could-not-check)).
+
+The counts come from history at every start: unresolved (no verdict, or a
+verdict note that does not parse), mismatch-confirmed (the latest verdict);
+a latest verdict of `verified` or `acknowledged` counts in neither. Neither
+notes ref is a copy and neither is cached: the store's ref rebuild leaves
+`refs/notes/` alone, and each writer reads a ref's tip just before it moves
+it.
+
+What the check catches: a divergence between the view's and the builder's
+inputs (calls, page writes, the saved length, the choice of pieces) or their
+replay code. It does not catch a fault in the one function both use to apply
+a call to a file map.
 
 ## Takes
 
@@ -995,8 +1187,8 @@ What the tree views do not support:
 - **Nested forks, transactions, `Client::Outside`, view profiles, CSI, several
   view hosts, upgrades and snapshot opens** are not built. The designs for them
   are in [target-architecture](target-architecture/README.md).
-- **Telemetry export** carries one gauge, `agentfs.not_built`, and the binary's
-  own export failures, over OTLP when the `OTEL_*` variables name a collector
+- **Telemetry export** carries two gauges, `agentfs.not_built` and
+  `agentfs.history.unverified`, and the binary's own export failures, over OTLP when the `OTEL_*` variables name a collector
   ([telemetry](telemetry.md)). `--metrics-output` is the only other measurement.
 - **Large files.** A save costs its own file: the builder's memory does not
   grow with the file (17 MiB for a 1 GiB save in one local run, its history
@@ -1008,11 +1200,21 @@ What the tree views do not support:
   any over 8 MiB; and a line map keeps every deleted line, so maps of files
   edited often grow with their edits.
 - **A call can wait.** A call that starts new work in a tree waits while that
-  tree's lag is over the limit, or while an overdue compaction waits for the
+  tree's lag or overlay is over its limit, or while an overdue compaction waits for the
   builder (see [History trails the files](#history-trails-the-files)); every call
   waits while a take lands under the actor's lock. A take waits for its entry's
   write-opens to close, so a file held open holds the takes that write it. The
   model replays do not cover the waits; the mounted cases do.
+- **Work still under the actor's lock.** A close's work is bounded
+  ([File maps](#file-maps)), but the journal's compaction copies live frames
+  forward under the lock, and every call of the volume waits meanwhile (136 ms
+  after 200,000 random writes to one open file, in one local run;
+  [performance.md](performance.md#tree-views-release-build)). Sequential writes
+  are not merged into one piece, so an open of a million small appends holds a
+  million pieces (a 774 MiB peak in one local run).
+- **A restart copies every checkout.** Each start writes the private checkouts
+  of the built point whole, so its time grows with the tree (38 to 39 s for
+  100,000 files in one local run).
 - **Shared mappings have a gap.** A write through an `mmap` is saved as a page. A
   mapped store that writes the bytes its page last held records nothing, so a
   descriptor write made meanwhile stands where Linux would keep the store: with a

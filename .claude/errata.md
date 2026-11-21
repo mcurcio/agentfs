@@ -1847,3 +1847,291 @@ M8 residuals (each to become a bead):
    operator's, and each host flushes its exporter at exit, so an unreachable default would delay every host stop on
    kind. The goal's row in one-engine.md says the log line is always on and the gauge needs the operator's collector.
    For the owner (general guidance): keep the alarm opt-in under CSI, or ship a default endpoint as the sidecar does.
+
+## 2026-11-20, memory-and-stalls run 1: spec errata from the slices
+
+### 2026-11-20, agentfs-ln6.1 (close tracer): where the frozen page is wrong
+
+1. **Blocking: `LenRule::Fixed(u64)` cannot satisfy A2.** The page asks for `on(saved_len)` to fail with `TooLarge` exactly when folding `Call::len_after` over the calls from `saved_len` fails. An `Append` before a `Truncate` can overflow (`len.checked_add(n)`), and whether it does depends on the saved length. `Fixed(s)` has no room for that bound. Counter-example: calls `[Append{len: u64::MAX}, Truncate(0)]`. The fold from 0 is `Ok(0)`; the fold from 1 is `Err(TooLarge)`; the rule is `Fixed(0)` for both. Without the fix, `call` accepts a call that today's re-fold refuses (after another handle's save grows the file), and the close's replay then fails with `TooLarge`. Proposed re-cut: `Fixed { len: u64, grown: u64 }`, where `grown` is the `add` of the calls before the first truncate and `on(L)` fails iff `L + grown` overflows. Keep A2 as written. The probe "Truncate composes as Shift" still applies.
+2. **A4 and A6 in `tests/tree_close.rs` cannot read "a `#[cfg(test)]` counter in readback.rs".** An integration test compiles the crate without `cfg(test)`. Either move the reader-count assertion into a unit test (`call_path.rs` or `recording/mod.rs`), with `tree_close.rs` keeping the public `actor_lock` and `bytes_compared` deltas, or expose the count publicly (for example as a `Stages` field, which is another lane's file).
+3. **`ActorGuard { since: Instant }`:** `stages.rs` records a run only through a `Timer` it starts (its fields are private, and there is no add-a-run function). The guard must hold a `Timer`. The field is private, so this is cosmetic.
+4. **`close_frag`'s `lock_hold_max_ms` from `stages.actor_lock.max_nanos`** is the maximum over the whole process. In a full figures run it includes the create workload's holds and any compaction's. Only `--only close_frag` measures the close itself. State this in the budget text, or have the figure run alone.
+5. **A6:** "100k-call open closed on the fast path" holds only for overwrites of a small range plus one length change. 100,000 appends make about 100,000 pieces, which is above `SMALL_PIECES` (32), so the close is never fast. The test must say which.
+
+### 2026-11-20, agentfs-ln6.2 (host protocol v2): where the frozen page and the review were wrong or short
+
+1. **Frozen signatures changed by the review's amendments**:
+   - `lock_claim` is `fn lock_claim(&self, handle) -> Result<OwnedMutexGuard<()>, Error>`. It tries the lock and returns ABORTED on conflict, not an async wait (amendment 2, the CSI rule for rejecting secondary calls).
+   - `idle` is `fn idle(&self, using: &Using, volume) -> bool`. It must take the caller's guard: otherwise deciding idle and removing the host could not be one critical section (amendment 1).
+   - `HostClient::start` returns `Result<_, StartError { Gone(HostGone), Version { host, plugin } }>` (amendment 5).
+   - New `HostClient::close()` (amendment 1).
+   - `HostDriver.in_flight` is computed from `closing` and `waiting`, not stored (amendment 7).
+   - `OpenView` gains `holds: Resources`, which is where a Closing gets the fork key (amendment 7).
+   - `unpublish` takes `self: &Arc<Self>`.
+
+   The page should be re-cut to match.
+2. **`using` changed meaning (amendment 6).** It now holds only the opens in flight, not "claims with a record or an open in flight". `idle` = `using` empty and no record on disk, so the records stay the one source of truth. Sites that now decide through `idle()`: restart, release, stop_if_idle. The plugin-start reconcile goes through stop_if_idle.
+3. **Docs not changed in this commit, because they are not owned paths**:
+   - docs/library/filesystem.md:701-707 still says "Protocol, version 1 ... exactly one reply per request, in order" and shows `{"v":1,...}`.
+   - docs/library/kubernetes.md:124 still says "Each volume's calls run one at a time under a per-volume" lock.
+   - docs/csi.md should state the ABORTED answer to a secondary NodePublish or NodeUnpublish.
+
+   AGENTS.md requires library docs to travel with the code. The split to ln6.7 needs either that commit to land next, or an owner exception recorded in OWNER-GUIDANCE.md. I recorded neither.
+4. **Design page not edited (memory-and-stalls.md is not owned):**
+   - §5 needs the review's alternative written up: refuse a request that overlaps a closing view with a retryable kind, and keep no waiting queue. Why per-resource waits are better: the parent cannot tell when to retry; every refusal costs a round trip and a backoff; the order between a close and a re-open of the same mount would come from the parent's retry timing, not the host. Two costs to state: the host keeps waiting requests in memory, and none can be cancelled (there is no `$/cancelRequest`).
+   - §6 row 6 is wrong. Labels come from the target, so a re-publish at a new target shares no client with the closing view. On the plugin side the second call of the same claim is answered ABORTED, not queued. A fork claim's re-open ends in ForkTaken.
+5. **Fork waits kept (finding 10 rebutted).** Requests that name the same fork are answered in v1 order. Dropping the `fork` field would itself need a frozen-interface erratum. C3 asserts that fork_end waits.
+6. **serde limit.** `#[serde(deny_unknown_fields)]` on the internally tagged `Request` cannot reject extra fields on `reconcile`, which has none. This is pinned in the test comment.
+7. **Residuals 1 and 2 are covered by this commit.** M8 residual 1 (A-F6) is covered by launcher_host (o) with the probe "answer close at once -> fails". Residual 2 (B-F6) is covered by csi_trees `a_held_close_stalls_only_its_claim`. The commit marking them applied in .claude/errata.md is the main loop's: errata.md is not an owned path.
+8. **Still open: a waiting host request has no cancel.** A request queued behind a close that never ends waits forever at the host. The plugin side is bounded: one task per claim, retries get ABORTED. A fork_create or fork_end that waits holds the volume's start lock for the whole call, which would stall that volume's starts and stops. It can only wait while a view of that fork is closing, which in practice the controller's claim_in_use refusal prevents. This is close to B-F4 residual 3.
+
+### agentfs-ln6.3
+
+agentfs-ln6.3 frozen page, findings (none stopped the slice; nothing written to .claude/errata.md):
+
+1. `History::owners(&self) -> &Owners` cannot be written as specified. History keeps its state behind a Mutex, so it cannot hand out a reference. Nothing calls it, and an unused function would fail clippy -D warnings, so it was not added. BuiltSnapshot::owners() -> &Owners was done as specified. If History needs this question later, it should return an Owners clone (O(1)).
+
+2. The D1 probe as written does not prove the test can fail. Making `trees` (or `opens`) a BTreeMap again leaves the ratio at about 1.46, because each Tree's own maps are now persistent and cloning the outer map of a few trees is cheap. Making Tree.bytes a BTreeMap still passes too (ratio 1.6). 50 creates make only about 3 batches, so the fixed per-create cost (about 8.6 MB) hides a single map that deep-clones again. A probe that shows the class needs Shape or Tree maps back as BTreeMaps (the original code gives a ratio of 4.27), or a test that settles after each create.
+
+3. A batch is still proportional to the volume in one place. `objects: imbl::OrdMap<TreeId, Arc<Objects>>`, with `Objects = BTreeMap<u64, u64>`, is rebuilt by `objects_of(&shape)` for every tree a batch moves, which walks every name. This is most of the remaining growth in D1 (about 4 MB more at 20,000 files than at 2,000). Making it proportional to the batch means changing the `Objects` type, which journal/fold.rs, journal/commit_point.rs and history/format.rs::read_snapshot also use; none of those files are mine. It is left for whoever owns them (a later bead could update the map per step from the keys each step returns).
+
+4. Environment: worktrees -2, -4, -5 and the main checkout all have branch `work` checked out. When one lane commits, the others' HEADs move, and their indexes then show the other lane's changes as staged reverts. When I committed, my index held a staged reverse of 683bb83 (seven host and CSI files). My commit used explicit paths and contains only my 7 files, but any commit without paths from one of these worktrees would revert a sibling's work.
+
+### agentfs-ln6.5 (memory-and-stalls §4.5): an uncounted repack spawn under tree_actor/ is forbidden by a source test
+
+The frozen page puts the repack task in `crates/agentfs-core/src/tree_actor/history/repack.rs` and makes its `git repack` child "uncounted (not on the actor's path)". It also lists only repack.rs, built.rs, history/mod.rs and tree_actor/mod.rs as owned.
+
+But `crates/agentfs-core/tests/tree_stages.rs::one_spawn_site` fails on any `.spawn()`, `.output()` or `.status()` in the production code of every file under `src/tree_actor/`. Its message is "starts a process ... outside git_cli::counted", and `git_cli::counted` is the only spawn allowed.
+
+So the bead cannot land as written:
+- **Spawning through `git_cli::counted`** breaks "uncounted". A background repack would also make the process-wide count of git children, which tree_stages.rs checks per operation, nondeterministic.
+- **Spawning directly in repack.rs** fails `one_spawn_site`.
+- **`crate::repack::repack`** is excluded by the page. It is also unusable: it does nothing when there are no loose objects, and the tree history is packs only.
+
+Re-cut: add one of these to the bead's owned paths.
+- (a) `crates/agentfs-core/tests/tree_stages.rs`: exempt `tree_actor/history/repack.rs` from `one_spawn_site`, saying why: the repack task is not on the actor's path.
+- (b) `crates/agentfs-core/src/git_cli.rs`: a second named spawn site for uncounted background work, plus the guard's count changed from 1 to 2.
+
+Also for the re-cut:
+- **E5:** `ci/trees-figures.py` has no `long_history` workload on claude/kind-fermi-vvxywi at abc1ab6. Lane B's harness hasn't landed, so E5 cannot be measured yet.
+- **E2/E4 test hold:** git writes the new packs and deletes the old ones inside one process, so the hold "between git's pack write and delete" needs a test-only git wrapper per git directory. It runs the repack without `-d`, waits on a fifo, then runs the full command. The page should say so.
+- **Killing:** `join` should kill the child's whole process group. Killing only `git repack` leaves its `pack-objects` child running, holding stderr open and writing `.tmp-*` files.
+
+## 2026-11-20, memory-and-stalls run 2: spec errata from the slices
+
+### 2026-11-20, agentfs-ln6.1 (close tracer, landed 1b94d8b): where the page or the code was short
+
+1. **The A1 probe cannot fail.** The page's probe is "digest_since counts record > first instead of >=". It is an equivalent mutant. `first` is the open's own record, which is an Open, AnonymousOpen or Create step with no tail, so no frame ever has record == handle. Measured: with `>` in place, A1 passes at all 63 seeds. A probe that does fail: count every frame as the close's own. A1 then fails at seed 1, step 4. The page should name a probe that can fail.
+
+2. **A pre-existing builder disagreement, not caused by this slice.** History build "Disagrees" fires on some histories with page writes and two opens of one file.
+   - A/B on 1160def (a release of the base tree, an integration test using only the public API): seed 11 fails at record 60 there, as here. With a 3 ms pause before each close, seeds 11, 19 and 26 fail on 1160def. It depends on when the builder's batches run.
+   - Hypothesis, not verified: FileMap::digest decides which pieces are the close's own by `pos.key()` alone, ignoring a piece's `at`. A page-write run's remainder that an earlier save left in the saved map has the same key as the piece this close applies. It then counts as "own" when the saved map is on frames, and as kept when the map was rebased onto the checkout. The actor and the builder rebase at different times, so their digests differ.
+   - A compatible fix would carry each own piece's length, which changes the frozen own_keys/digest signatures. This needs its own bead and the model-verification skill.
+   - A1 therefore does not assert that settle() succeeds. It collects builder failures and prints them with --nocapture. Every close is still checked against the oracle.
+
+3. **`ActorGuard` is not exported from tree_actor/mod.rs**, and that file is not this lane's. session.rs cannot name the type, so SessionGuard holds it boxed as `Box<dyn DerefMut<Target = TreeActor> + 'a>`. That costs one small allocation per FUSE request. The page's field type `actor: ActorGuard<'a>` needs `pub use call_path::ActorGuard` added to tree_actor/mod.rs.
+
+4. **close_frag's 50 ms lock-hold bar is missed because of compaction, not the close.** On a release build, ext4, with `--only close_frag`, actor_lock max_nanos was 136.3 ms and stages.compaction max_nanos was 136.2 ms. The close itself went from 110.4 s to 0.086 s. write_1m's longest hold is compaction too: 834 ms. Section 4.1 does not bound compaction, which copies live frames forward while holding the lock, so this bar will keep warning until a slice does.
+
+5. **write_1m's peak memory got worse: 670 MiB before, 774 MiB after** (bar 256, warns either way). The likely cause is the Large `imbl::OrdMap`: a million appends at the end leave B-tree leaves about half full. This slice removed the call list, which offsets part of it. "Merging sequential write pieces" is listed as deferred on the design page.
+
+6. **The fast path only partly replaces the view path.** When the base did not move and the file has no page writes, CloseWork::decide never takes a CallReader either. So the A4 reader-count probe ("disable the fast path, then a reader is taken") is not caught by a reader count. It is caught by tests/tree_close.rs's lock-hold count, which goes from 1 to 2. Amendment 2's reader-count unit test still checks A6 (no reader for 100,000 calls) and that a moved base takes a reader.
+
+7. **Docs were not updated, because they are not owned paths:**
+   - docs/trees.md ("File maps", the close).
+   - docs/performance.md (the new figures, `--self-test-warn` and step 5).
+   - docs/library/core.md (`Recording::close_with`, ActorGuard, `TreeSession::close`).
+
+   AGENTS.md says docs travel with the code. The memory-and-stalls.md design page also stays for now.
+
+8. **pages_build_image now reads the journal under the lock** to rebuild a file's page-cache image. Each open with calls costs one walk of the segments' frame heads. That replaces walking an in-memory call list, so the first page fill after each save may stall longer than before. Not measured.
+
+### 2026-11-20, agentfs-ln6.5 run 2: the repack beside fast-import breaks Feed::finish (blocking)
+
+The frozen page has the repack task run `git repack --geometric=2 -d` "beside `git fast-import` ... never under the builder's lease and never stopping it". `crates/agentfs-core/src/tree_actor/history/feed.rs::Feed::finish` assumes fast-import is the only writer in `objects/pack`:
+- it lists the directory before and after;
+- it skips only `tmp_*` names;
+- it opens and fsyncs every other new name, and an ENOENT fails the batch.
+
+A concurrent repack's `.tmp-<pid>-pack-<hash>.{pack,idx,rev}` files appear in that difference and are renamed away before the open. The batch then fails with `BuildError::Io(2)`, and `settle()` returns `History(Failed(Io(2)))`.
+
+Measured on wip/agentfs-ln6.5 (f279d6b):
+- A probe that logged instead of failing saw several vanished `.tmp-*` names per 300-batch run.
+- `cargo test -p agentfs-core` fails `tests/tree_actor.rs::append_finishes_a_partial_line_and_close_replays_on_the_current_head` this way.
+- The slice's own E4 failed 2 times in 20 runs.
+
+The same race can also delete fast-import's own new `pack-*` before its fsync: a repack can roll that pack in and delete it before the open. That case was not observed.
+
+Re-cut: add `crates/agentfs-core/src/tree_actor/history/feed.rs` (Feed::finish only) to ln6.5's owned paths, with this rule:
+- Skip `.tmp-*` names: they are a repack's files in flight, not fast-import's.
+- Treat ENOENT on a new `pack-*` name as rolled in by a repack. git renames its new pack into place before it deletes old packs, and `core.fsync=objects,derived-metadata` fsyncs the new pack's contents. The builder's own `objects/pack` directory fsync, which follows, makes the rename durable.
+- Add a test: batches with the real task running, each settled, with no failed batch. (A scratch 300-batch stress shows the failure today.)
+
+The alternative is a mutual-exclusion between a batch's fast-import-to-fsync window and a repack. It needs builder.rs and contradicts "never stopping it".
+
+Also for the re-cut:
+- (1) The page's `child: Arc<Mutex<Option<Child>>>` holds the stop flag too: `Mutex<Slot { child, stopped }>`.
+- (2) The repacker starts in `serve` right after the volume is constructed, not inside `start_history`. A later recovery failure then stops it through Drop.
+- (3) E2's probe "Odb with refresh disabled" cannot be built through git2-rs. libgit2 refreshes the pack list on a miss.
+- (4) A daemon SIGKILL leaves an orphaned repack. Its own process group means nothing kills it. It is harmless: it is cut short or finishes, and keeps every object. PR_SET_PDEATHSIG would end it.
+
+## 2026-11-20, memory-and-stalls: the repack beside live readers (fixed in 80c92d2)
+
+1. **The design's section 4.5 was unsafe.** It ran `git repack --geometric=2 -d` in the store's own `objects/pack` beside live readers. git and libgit2 find a pack by listing the directory, then opening the index lazily, and list again only once on a miss. A reader that listed before the install and opened after the delete reported an object as missing (CI on 6cd7edf: four conformance hits). No object was lost: strace reproduction, `git cat-file -e` succeeds afterwards. Fixed in 80c92d2: each run repacks in a scratch object directory (hard links plus `GIT_ALTERNATE_OBJECT_DIRECTORIES`), links the new pack in with its index last, and deletes rolled-up packs only at a run that starts on a later built event. This is the deferral git's own incremental repack (`multi-pack-index repack`, then `expire`) uses. The repack child gets `PR_SET_PDEATHSIG`.
+2. **E2 of the ln6.5 page could not fail** for a reader between listing and opening. Replaced by `a_pack_a_reader_listed_outlives_the_run_that_rolls_it_up`.
+3. **The run-2 re-cut's "skip `.tmp-*`" rule in `Feed::finish` is moot.** No repack writes in `objects/pack` any more.
+4. **Open.** `docs/architecture.md` still says the repack runs in the git directory (the docs step owns it). `clean_packs` in `history/mod.rs` still fails a reopen on `ENOENT`; tolerating it would be more robust (residual).
+
+## 2026-11-20, memory-and-stalls run 3: errata from the slices
+
+### 2026-11-20, agentfs-ln6.4 (one copy of each fact, overlay; landed 2f6b2b9): where the page was short or wrong (none stopped the slice)
+
+1. **F1 cannot pass as measured, whatever the overlay saves.** The bar reads RssAnon once history is built. glibc keeps freed heap resident.
+   - The builder lags far behind `create`: 20 s of building after 11 s of creates at 20k files, 66 s after 30 s at 50k. During the lag the overlay holds every unbuilt change. So the peak equals the old permanent copy, and RssAnon never comes down from it.
+   - Measured on a release build, local ext4: before 2.61 to 2.70, after 2.60 to 2.71 KiB/file (20k and 50k).
+   - After `gdb -ex 'call malloc_trim(0)'`, live anonymous memory went from 52.8 to 40.0 MB at 20k and from 131.6 to 93.5 MB at 50k, about 1.87 KiB/file.
+   - Meeting the bar needs one of: malloc_trim (deferred on the design page), a builder that keeps up, or a bar read some other way. That is the owner's call.
+
+2. **The frozen write API gives no step to most overlay writes.** Shape::save, drop_object, add_anonymous and Files insert/get_mut/remove carry no step. These are lane B's call sites, so I did not change their signatures.
+   - Such entries are noted at UNSEALED (u64::MAX).
+   - I added `SavedTree::seal(last)`, which the actor runs before `rebuilt` with its last record number. This is safe because every change noted at no step happened at or before that record.
+
+3. **`rebuilt` is O(entries changed since the last built event), not O(entries dropped).**
+   - Names, Dirs and Objects are built as built map plus changed keys re-applied, so each read is one lookup and range reads (children, descendants) stay simple.
+   - Files is the page's two-layer form.
+   - Dirs needed a guard: a directory renamed in the overlay may already be numbered at its new path. F3 found this.
+
+4. **Files::get_mut and Files::iter have no caller outside tests.** With -D warnings they would fail clippy as dead code, so they carry `cfg_attr(not(test), allow(dead_code))`.
+
+5. **The actor also rebuilds in after_step, not only in on_built.** A library user has no take worker calling `progress`, and without this its changed layer would grow without bound.
+
+6. **Docs not updated:** docs/trees.md and docs/library/core.md (overlay, built.log on disk only) are not owned paths.
+
+7. **Environment:** a long TMPDIR (the scratchpad path) breaks `tests/history_service.rs` with "path must be shorter than SUN_LEN". Run with TMPDIR=/tmp. The disk filled to 100% once during the run, which broke `tree_batch_alloc` until space was freed.
+
+### 2026-11-20, agentfs-ln6.6 (memory-and-stalls §4.7, restart): the attribution contradicts the frozen page (blocking)
+
+Measured at 2f6b2b9 on a release build. The state was 100,000 `fig-create-N` files made through a FUSE mount by the `create` workload's write. History was built, the view stopped with SIGTERM, and the store held 818 packs (history.git 2.0 GB). On the restart I sampled /proc RssAnon and RssFile every 100 ms and marked each start_history and serve phase with probes. massif ran on a 25k-file state.
+
+Today's restart at 100k: VmHWM 1,087 to 1,266 MB, mount 37 to 70 s (shared 4-CPU box). Attribution of the 1,087 MB peak:
+
+| Contributor | Size |
+|---|---|
+| libgit2 pack and index mmaps | about 661 MB, 61% (570 `.pack` + 95 `.idx` over 809 index files), touched by the first full read of the head's trees and never unmapped under libgit2's default mwindow limits |
+| checkpoint branch of start_history (`built > folded_built`, the usual case after a workload) | +189 MB anon, from reading the whole tree at the checkpoint (read_trees, read_snapshot then Tree::install); replay and objects_of add under 1 MB |
+| read_trees at the built point | +55 MB anon |
+| history::owners | +47 MB kept and about 60 MB transient (`git log` of every direct save held whole, plus a 16 MiB read_to_end buffer) |
+| copy_all | 0 MB at the peak, but 14 to 45 s of the mount |
+
+What-ifs (no code landed):
+- libgit2 `set_mwindow_size(32 MiB)` + `set_mwindow_mapped_limit(64 MiB)` + `set_mwindow_file_limit(32)`: VmHWM 517 MB.
+- Store repacked to one pack: VmHWM 517 MB, mount 27.5 s (copy_all 19 s of it).
+- Both together: 517 MB, mount 19.3 s.
+
+Where the page is wrong:
+1. **The frozen interface cannot express today's semantics.** `read_tree(repo, tree, head) -> Result<Tree>` lacks the journal's object numbers (`Objects`; git-model §3: the journal's, never history's) and the bytes-map source (checkout path, `bases`, built point). Building a Tree from the head alone needs a second renumbering pass, which is the forbidden intermediate copy. Re-cut: `read_tree(repo, tree, head, objects: &Objects, map: impl FnMut(u64, &str) -> Result<Arc<FileBytes>>) -> Result<Tree>`, filling the persistent maps straight from the leaves with no `referee::Snapshot`. format.rs must join the owned paths; it is under history/ already.
+2. **The design misses the largest contributors.** (a) 61% is file-backed pack pages. The repack lane (§4.5) or libgit2 mwindow limits fix it. The limits are process-global and belong in `crate::history::init_libgit2` (history.rs, not owned by this lane). (b) The checkpoint branch reads the whole tree a second time. A re-cut should read it once, for example by carrying `objects` and `locals` as of the built point in the built log or the checkpoint, or by replaying on the one read. (c) owners holds every direct-save message at once; it should stream (tree_git.rs commit_messages, not owned). The marker lever saves mount time (copy_all), not memory.
+3. **The marker as specified is unsafe on power loss.** TreeGit::checkout_entry writes each file with `fs::write` + rename and never fsyncs it. A marker fsynced last can then outlive lost or empty checkout files, and a restart would serve wrong bytes from the base maps (principle 1). The re-cut must make the checkout's files durable before `mark_checkout`: one `syncfs` on the state area per checkout, or an fsync per written file in tree_git.rs. Otherwise markers should be written only at a clean stop, after a syncfs.
+4. **G1's bar is superseded by the amendment.** The page holds `hwm_mib <= 256` at about 50k files; the amendment holds 512 MiB VmHWM at 100k. Even with every lever above, 100k measures about 517 MB before the read_tree and owners changes. The 256 MiB at 50k bar is not reachable by this page's levers alone.
+
+Suggested re-cut owned paths: add history.rs (init_libgit2 mwindow limits) and tree_git.rs (commit_messages streaming; checkout fsync or syncfs). The marker should live outside `trees/<tree>/` (for example `trees/<tree>.files`, which remove_checkout and remove_stale_checkouts must also delete).
+
+## 2026-11-20, agentfs-ln6.8: the builder's false "Disagrees" on page writes (fixed)
+
+1. **Run 2's ln6.1 item 2 hypothesis is confirmed.** `FileMap::digest` named a close's own pieces by `FramePos::key()` (record, offset of the frame position) through `own_keys`. A page write's run part that a close applies has the same key as the run an earlier close saved, so that earlier save's remainder counted as the close's own while the saved map was on frames (the actor), and as kept once it was rebased onto the checkout (the builder). Probe at seed 11 step 60: the actor's map held `[149..160) frame(58,0)+3 own=true`, the builder's `[149..164) base`; the bytes were equal.
+2. **Fixed by making the digest a function of the saved length and the close's calls alone** (`FileMap::close_digest`): it lays the calls on a map whose bytes are all "as before" and names each visible piece by file offset, length, record and frame offset. `own_keys` and `FileMap::digest(&own)` are gone. For every history outside this bug the value is unchanged (the quick path's `digest_since` equals it: `digest_since_equals_the_close_digest_of_the_calls`), so journals recorded before replay as before; a journal holding a save of exactly this shape would still fail its check once.
+3. **A1 now fails when a build fails.** `two_opens` panics on a failed `settle()` and settles at the end of each history; seeds 11, 19 and 26 (26 with a 3 ms pause before each close) are named regression tests.
+4. **Not done: page writes in the model's and the conformance generators.** The model has no page cache (MODEL.md "Left out": no `mmap`; VERIFYING.md: "R1.4 mappings: no mmap call"). Adding it is a model extension, not a generator tweak: a new `TreeCalls` call and trace line, R1.4's semantics in the model (the per-page bases a page write diffs against, `saved_through`, which close saves a store, recovery's `calls_for_close`), a mounted replay that drives one exact page write (mmap store plus `msync` on a whole page), and new regression-seed cover and digests. It needs its own bead under the model-verification procedure.
+
+## 2026-11-20, memory-and-stalls run 4: errata
+
+### 2026-11-20 agentfs-ln6.11: invariant 3 contradicts the overlay (implementer stopped)
+
+The frozen page of agentfs-ln6.11 says that if the builder publishes no map of a flagged (tree, object) at that step, the actor keeps serving the bytes the workload saved. The code does the opposite:
+- builder.rs:737 puts the replay into the builder's trees (`t.bytes.insert(open.object, saved_map(map, seq))`). Those trees are handed out by `built_event` (builder.rs:1471).
+- In tree_actor/mod.rs:1599-1619, `on_built` runs `rebuild()`, which calls `saved.rebuilt(built, through)`.
+- tree.rs:740-743 replaces the actor's bytes with the builder's and drops the actor's own changes at or before `through`.
+- tree_actor/mod.rs:772: `start_history` reads every file from its checkout ("Each file reads from its checkout as built"). Invariant 7 leaves the kept frames out of the fold, so nothing restores the saved bytes after a restart.
+
+Result: once the builder passes a flagged step, and after every restart, the workload reads history's replay. Today's fatal `Disagrees` turns into a silent change of a file the workload can see.
+
+Decision needed (amendment 1 of the protocol review, an absolute-requirement question for the owner):
+- (a) Serve the replay, with the cost stated: "the file may silently change to history's bytes".
+- (b) Serve the saved bytes, through a named mechanism that holds across `rebuild()` and `start_history`.
+- Or keep the step fatal for that file only.
+
+Amendments 2-10 of the same review are also open:
+- tests where the replay's bytes differ from the actor's;
+- verify run with the same binary is deterministic, so it confirms the mismatch and then drops the evidence;
+- the notes lock is held across an fsync on compaction's call path;
+- flags should be keyed by (step, commit);
+- the notes ref is a primary record, yet architecture.md, git-model.md and runbook section 5 call the refs a copy;
+- a note that fails to parse blocks the mount;
+- the owner's words are mixed with design choices in OWNER-GUIDANCE.md:150 and the bead;
+- the page has no Costs section;
+- the exit-code contract differs between main.rs's doc and invariant 10.
+
+The page needs a revision and a re-cut before this bead can be built.
+
+## 2026-11-21, memory-and-stalls run 5: errata
+
+### agentfs-ln6.12
+
+agentfs-ln6.12 engine (run 4 resume), implementer findings:
+1. OWNED omits crates/agentfs-core/src/tree_actor/journal/fold.rs. Plan item B removes the only caller of `Replay::shapes`, so leaving the function in place fails `clippy -D warnings` (dead_code). Commit 018cd1d deletes `Replay::shapes` there, 14 lines and nothing else. A sibling lane editing fold.rs may need to rebase over that.
+2. Mutation probe P3 is wrong about what catches it. `git log` lists newest first, so the record at EOF is the oldest reachable commit, not the newest direct save. With P3 applied, tests/tree_actor.rs stays green (51/51). Only the unit test (c), `each_commit_message_is_streamed_once_and_whole`, fails.
+3. The page's figure of "+189 MB anon at 100k" for the double read is not what I measured. On release builds after a SIGKILL with built 400 records past the checkpoint, the sampled peak RssAnon fell from 370-386 MiB to 328-333 MiB (about 40-55 MiB), and mount_s from 46-49 s to 38-39 s.
+4. The page's arena figure "2.52 to 1.95 KiB/file" does not match this session's measurement of 2.67 to 1.64 at 50,000 files. docs/architecture.md now records the measured figures.
+
+### agentfs-ln6.13
+
+None appended: nothing in the page stopped the slice. Non-blocking findings for the main loop to record if it wants: (1) the page's `LagGate::overlay`, written as admits-before vs admits-after, costs O(unbuilt steps) on every release of the actor's lock and made the release create figure about 25% slower (63 s to 78-84 s on ext4); the slice recomputes admission only when a report crosses the limit. (2) The page's burst test needs a take worker calling `progress` at built events (as the view's take_worker does), or `admit` never returns once the tree is held, because only lock releases report the overlay. (3) With the default 32 MiB the create workload's overlay never reaches the limit and the RssAnon peak is unchanged (about 81 MiB); at 8m the peak falls only to 77.5 MiB, so the overlay is a small share of RSS. (4) docs/library/core.md's classify table calls `includeIf.<c>.path` "none: structure", but `classify` answers `Other` (left as is).
+
+## 2026-11-21, agentfs-ln6.7 (memory-and-stalls docs): residuals closed, and where the docs were behind
+
+1. **M8 residual 2 (B-F6) is done**, landed in 683bb83 (host protocol v2): a request waits only while a pending close
+   holds a resource it names, and the plugin locks per claim. csi_trees `a_held_close_stalls_only_its_claim` is the
+   done condition. M8 residual 1 (A-F6) is covered by launcher_host (o) in the same commit. Documented in
+   docs/library/filesystem.md ("The view host command"), docs/library/kubernetes.md ("The supervisor") and
+   docs/runbooks/csi-recovery.md ("A pod that will not mount").
+2. **Docs the slices left behind, now current:** docs/library/filesystem.md still described protocol v1 ("exactly
+   one reply per request, in order"); docs/library/kubernetes.md still said each volume's calls run one at a time;
+   docs/runbooks/csi-recovery.md said one held close stalls every claim; docs/trees.md's "File maps" described the
+   close applying every call under the lock and the actor taking rebased maps at its next call; docs/architecture.md
+   said the repack runs in the state area's git directory; docs/trees.md's limits named one gauge.
+3. **Design page deleted** (docs/target-architecture/future/memory-and-stalls.md). Its deferrals that are not
+   documented behaviour stay open, for a bead if wanted: untracked fsync on the view's FUSE thread (never measured);
+   trimming `owners` and `heads` at a checkpoint; merging sequential write pieces (now a stated limit in
+   docs/trees.md); compaction under the actor lock (a stated limit); the restart checkout marker of the page's
+   restart section (not built: the failpoint `tree.checkout_before_marker` is registered with no marker after it);
+   `clean_packs` failing a reopen on `ENOENT`; a waiting host request has no cancel (stated in
+   docs/library/filesystem.md).
+
+## 2026-11-21, P0: the repack task deletes a live pack and loses history (open)
+
+The forks e2e failure on 2412162 (passed in the push run, failed in the PR run) is a product bug. Root cause, reproduced locally with the image's git 2.47.3 in a library stress test (forks, landings, drops and `wake_waiters()` beside the task, 60 loops): 6 of 20 runs lost objects at 2412162, some leaving the store empty; 0 of 10 with the repack skipped; 0 of 20 at d43b95b (before ef4ad49).
+
+Mechanism (`crates/agentfs-core/src/tree_actor/history/repack.rs`): pack names are content hashes, so a later roll-up can produce the same name as a pack an earlier run set aside. The scratch run still sees set-aside packs through the store alternate (`:484`), so the output name flips A, B, A. `link_pack` treats `AlreadyExists` as installed (`:362`), and the set-aside bookkeeping is by name (`:547`, `:245`, `:233`, `:445`), so `delete()` removes the live copy. Runs with no new objects (the epoch also moves on `failed_event` and `wake_waiters`) make repeats likely; ef4ad49 deletes set-aside packs sooner, raising the rate. Evidence: the job log's `git show root:` "does not exist", `merge-base` "Not a valid commit name 969a77b", `fast-import` "Not a valid commit: b900c82". Patch of the stress test: /tmp/claude-0/forks-rca/rca-test.patch (not committed).
+
+This is the fourth defect in the bespoke repack mechanism (Feed race, reader race 80c92d2, set-aside growth ef4ad49, live-pack deletion). Per the owner's rules that is a wrong premise, not an instance to patch: options go to the owner.
+
+## 2026-11-21, PR #40 fix round: the P0 repack entry closed, and where the findings and docs were wrong
+
+1. **The P0 above (the repack deleting a live pack) is fixed** by the owner's option B. The bespoke scratch-directory task is replaced by git's incremental repack (`crates/agentfs-core/src/tree_actor/history/repack.rs`): `multi-pack-index expire` at a run on a built event after the last roll-up, then a geometric roll-up, then `multi-pack-index write --preferred-pack`. Which pack goes is git's judgement from the index, so a roll-up that writes a pack the store already holds keeps it (`a_roll_up_that_writes_a_pack_the_store_holds_keeps_it`; the same packs rolled up twice give the same name, checked with git 2.43). The RCA stress test is committed as `forks_beside_the_task_keep_every_object` (40 loops): 0 of 12 runs failed, against 2 of 10 on the old task (reviewer's run).
+2. **Where option B as worded was short.** `git multi-pack-index repack --batch-size` does not name the pack it writes, and `expire` deletes the superseded packs only if the index prefers the new pack (git breaks ties between packs of the same second by name, so without `--preferred-pack` a superseded pack can stay referenced). The roll-up is therefore written by `git pack-objects --stdin-packs`, the call `git repack --geometric` makes, which prints the new pack's name. Recorded in OWNER-GUIDANCE's bracket note; the owner may prefer the literal command.
+3. **A second writer in `objects/pack`.** `multi-pack-index write` makes `multi-pack-index.lock`; `Feed::finish` failed a batch with ENOENT when that name went before its fsync (seen once in the full suite). `Feed::finish` now tolerates any new name gone before its fsync. A stale lock goes at start in `remove_stale_locks`.
+4. **The overlay that never shrank (high)** is fixed in `TreeActor::rebuild`: when entries are left past the built point and the last record is no step, the actor asks the builder to build through it (`History::want_through`). Test: `the_overlay_goes_when_the_last_record_is_no_step`, deterministic through a test-only hook at the builder's batch start and read (`History::on_batch_read`); without the fix it reproduces the reviewer's `10240 B, built through 81, the write at 82`.
+5. **A write to an open being closed** is refused (`NotFound`, as a second close is) in `Recording::call`, rather than journalled and left out of the save.
+6. **`record()` on a restarted host that refuses the view** now removes the record and fails the publish with the refusal. Not fixed, deferred: the root cause, a restart's reconcile ending the client of an open still in `using`. A fork claim caught in that window now fails loudly (`FAILED_PRECONDITION`) on every retry, where it got OK with a stale mount.
+7. **Docs that were wrong.** docs/trees.md said `tree HistoryStalled` is logged once; the code logs each turn to `Stalled`, at most once per built event under a burst, and the doc now says so (no hysteresis added). docs/performance.md named the journal's compaction as `close_frag`'s longest lock hold; the reviewer's perf trace puts it at the rebuild dropping the 200,000-piece map (`Files::rebuilt`), and the row now says so with the reviewer's figures. Moving that drop off the lock is not done. CHANGELOG said host protocol v1; docs/csi.md's NodePublish and NodeUnpublish rows lacked `ABORTED` and the version refusal.
+8. **Left as found, reported.** Commit 683bb83's message says a v1 parent is refused at hello, which is wrong (a v1 plugin never checked `v`). History is not rewritten. The node-wide `using` lock with disk reads under it (design §4.6 asked for a volume-scoped set) is unchanged. `Disagrees` still stops all history; that is the owner's call. The unverified alarm clears only at a restart, as the runbook says. The restart checkout marker (design §4.7) is not built: the misleading comment and the unused failpoint `tree.checkout_before_marker` are removed.
+9. **Found by CI on 0021dad (phase-1 power loss, ext4 and xfs, `git fsck` at a flush checkpoint).** `git multi-pack-index expire` unlinks the packs it drops before it writes the index that leaves them out (git's `midx.c`, `expire_midx_packs`), so a power cut or a kill between the two leaves an index naming packs that are gone; `git fsck --full` fails ("failed to load pack in position 0") and so would later index writes. The start now removes such an index (`repair`, reading the index's `PNAM` chunk), and a stop lets an expiry finish rather than killing it. Test: `an_index_naming_a_deleted_pack_goes_at_the_next_open` (fails without the repair with the same fsck message); the repack tests now run `git fsck --full --strict` after each stop. The power-loss job itself needs dm-log-writes and runs only in CI.
+
+## 2026-11-21, PR #40 close-out: process lessons
+
+1. **A fix agent rebuilt a mechanism without its reviewed design.** Run 7's end fix agent, briefed to fix CI, replaced the repack (0021dad, 91ad04f) before the reviewed design page existed and before the owner's three answers. The final verify then found 7 defects that the design had already covered (failed-step index drop, free-space floor, stray sweep, built-event counter, deferral test). Lesson: a fix brief names its scope; a finding that needs a redesign returns to the main loop.
+2. **Briefs pushed root-only tests.** An agent running as root wrote a test that opened git's read-only packs for write; CI's non-root runners failed it (fixed in b217c2f). Lesson: test briefs say CI runs unprivileged.
+3. **Container restarts lost two runs.** Unfinished worktree work was saved to `wip/` branches (cf22d8e, 705e05a) and resumed; nothing was lost. Check-ins now save worktrees before relaunching.
+4. **Worktree builds filled the disk four times.** Each worktree builds its own target (20-37 GB). Check-ins now free finished worktrees.
+
+Open residuals: agentfs-ln6.9 (compaction holds the actor lock), ln6.10 (write_1m peak memory), ln6.15 (edges-file fsync), ln6.16 (.pack without .idx), ln6.17 (pin or log git's version).

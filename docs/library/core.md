@@ -28,6 +28,7 @@ recorded; [guarantees](../guarantees.md) says what the engine promises.
 | Alarms and events | `events` | `Event`, `EventSink`, `MemorySink`, `NullSink` |
 | OpenTelemetry signals | `telemetry` | `Telemetry`, `Telemetry::sink` |
 | Exclusive use of a state area | `lock`, `file_lock` | `StateLock`, `FileLock` |
+| A binary's malloc arenas | `allocator` | `limit_arenas` (glibc's `M_ARENA_MAX` to `ARENAS`, 2): a binary calls it first in `main`, before any thread; the library never does |
 | Settings from the git config | `config` | `Settings`, `Settings::load`, `KEYS` |
 | Path rules and checks | `rules`, `checks`, `paths` | `Rules`, `Checks`, `RepoPath` |
 | Restore and revert | `restore`, `operations` | `plan`, `check`, `apply`, `record_applied` |
@@ -210,7 +211,7 @@ idempotent. See the [recording-failures runbook](../runbooks/recording-failures.
 - one push loop per remote (thread `agentfs-push-<remote>`), so a slow or
   hung remote never delays another;
 - the periodic repack, on the commit thread: `git repack --geometric=2`
-  every `agentfs.repackInterval`, with memory bounds (`repack::REPACK_ARGS`).
+  every `agentfs.repackInterval`, with memory bounds (`repack::PACK_CONFIG`).
   A failed round raises `Event::RepackFailed` and is tried again later.
 
 ```rust
@@ -681,6 +682,34 @@ with. The behaviour, the state format and the current limits are in
 [trees](../trees.md); the FUSE adapter is in the [filesystem
 layer](filesystem.md#tree-views).
 
+A served volume (`Recording`) gates each call that starts new work in a tree:
+`admit(tree)` returns at once, or `admit_then(tree, then)` runs `then` at once,
+while the tree's lag and overlay are under their limits or the builder has
+failed, else at the built event that brings them under
+([trees](../trees.md#history-trails-the-files)). Each release of the actor's
+lock (`ActorGuard`'s drop) reports every tree's overlay to the gate.
+`Recording::set_overlay_limit(bytes)` sets the overlay limit (the launcher
+passes `OperatorSettings::overlay_limit()`); `History::overlay_bytes(tree)`
+gives a tree's overlay as last reported, in estimated bytes (0 before any
+report), and `History::lag()` the lags and the builder's health.
+
+Saves history could not check ([trees](../trees.md#when-history-cannot-check-a-save))
+are flagged in their commits' `Agentfs-Unverified` trailer.
+`TreeActor::verification()` gives the volume's `Verification` handle, whose
+`counts()` (`UnverifiedCounts`: `unresolved`, `mismatch_confirmed`) never
+takes the actor's lock; a launcher hands it to
+`Telemetry::observe_unverified` for the `agentfs.history.unverified` gauge.
+`tree_actor::verify_flagged(root, by, release)` is `agentfs verify`: it takes
+the state area's lock (`Error::Busy`), opens only its `history.git`, and
+checks every standing flag with `release` (`tree_actor::release()`, this
+binary as `agentfs <version> build <hash>`), answering a `VerifyReport` of
+each `Checked` flag (`Outcome::Wrote(Verdict)`, `SameRelease` or
+`NoEvidence`), the commits whose verdict note does not parse, and how many
+flags stand. The notes refs are `tree_actor::VERIFY_REF` and
+`tree_actor::EVIDENCE_REF`; `tree_git::TreeGit` reads and writes git notes in
+git's layout (`notes`, `note`, `note_tip`, `write_note`, the last a
+compare-and-swap of the notes ref).
+
 ### Operator settings
 
 `operator_settings` reads and writes a tree volume's operator settings:
@@ -701,6 +730,9 @@ its `git` children read.
 - `not_built()` lists every configured key whose capability tree volumes do not
   build yet, one per key, sorted. Each is a `NotBuilt { key, capability }`.
   Nothing configured is silently ignored.
+- `overlay_limit()` gives `agentfs.overlayLimit`, the last value set, as a
+  positive size, or `DEFAULT_OVERLAY_LIMIT` (32 MiB) unset; any other value is
+  `SettingsError::BadValue { key, value, expected }`.
 
 `classify(key, value)` is the one table. It compares the key lower-cased, and
 the first match wins:
@@ -709,6 +741,7 @@ the first match wins:
 |---|---|
 | `include.path`, `includeIf.<condition>.path` | none: structure |
 | `agentfs.nested` = `exclude` (any case) | none: tree volumes build it |
+| `agentfs.overlayLimit` | none: tree volumes build it |
 | `agentfs.lfsThreshold`, `lfs.*`, `remote.<name>.lfsurl`, `remote.<name>.lfspushurl`, `remote.<name>.agentfsLfsCredentials`, `remote.<name>.agentfsMaxLfsObjectSize` | `Lfs` |
 | `agentfs.patch*`, `agentfsPusher.*` | `Patches` |
 | `remote.*`, `agentfs.pushInterval`, `agentfs.forkRefs`, `http.proxy` | `Push` |

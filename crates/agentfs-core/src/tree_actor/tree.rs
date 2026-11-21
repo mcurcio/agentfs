@@ -1,10 +1,11 @@
 //! A tree's shared types: the event numbers a journal gives steps, and the line versions they name
 //! (docs/target-architecture/git-model.md §5, §7, §12).
 
+use std::borrow::Borrow;
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
-use std::ops::Deref;
+use std::ops::{Bound, Deref};
 use std::str::FromStr;
 use std::sync::{Arc, OnceLock};
 
@@ -251,35 +252,152 @@ impl Deref for FileBytes {
     }
 }
 
+/// One shared path string: every index of a tree holds the same allocation,
+/// and so do the actor's overlay and the builder's shape it rests on. Orders,
+/// compares and hashes as its text.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(super) struct PathName(Arc<str>);
+
+impl Borrow<str> for PathName {
+    fn borrow(&self) -> &str {
+        &self.0
+    }
+}
+
+impl Deref for PathName {
+    type Target = str;
+
+    fn deref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for PathName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl From<&str> for PathName {
+    fn from(path: &str) -> Self {
+        Self(Arc::from(path))
+    }
+}
+
+impl From<String> for PathName {
+    fn from(path: String) -> Self {
+        Self(Arc::from(path))
+    }
+}
+
+/// What one changed entry of the overlay holds in memory, measured
+/// (`tests/tree_overlay_alloc.rs` holds it to the allocation a create's
+/// entries make): [`SavedTree::overlay_bytes`]'s unit.
+pub(super) const OVERLAY_ENTRY_BYTES: u64 = 256;
+
+/// The step an overlay entry is noted at before its step is known: a save,
+/// a map or an object dropped, none of which is given its step. Sealed to the
+/// actor's last record at a built event ([`SavedTree::seal`]), so it is never
+/// dropped before the build that covers it.
+const UNSEALED: EventNumber = EventNumber(u64::MAX);
+
+/// The overlay's changed layer of one index: each key this actor's steps
+/// changed since the built point the index rests on, with the last step that
+/// changed it. `None` for the builder's own shapes, which rest on nothing.
+#[derive(Clone, Debug)]
+struct Changed<K>(Option<BTreeMap<K, EventNumber>>);
+
+impl<K> Default for Changed<K> {
+    fn default() -> Self {
+        Self(None)
+    }
+}
+
+impl<K> Changed<K> {
+    /// How many keys are noted: O(1).
+    fn len(&self) -> usize {
+        self.0.as_ref().map_or(0, BTreeMap::len)
+    }
+}
+
+impl<K: Ord + Clone> Changed<K> {
+    fn tracking() -> Self {
+        Self(Some(BTreeMap::new()))
+    }
+
+    /// `key` changed at `step`: steps come in order, so the last noted is
+    /// the latest.
+    fn note(&mut self, key: &K, step: EventNumber) {
+        if let Some(changed) = &mut self.0 {
+            changed.insert(key.clone(), step);
+        }
+    }
+
+    /// Every entry noted at no known step is noted at `last`.
+    fn seal(&mut self, last: EventNumber) {
+        for step in self.0.iter_mut().flat_map(BTreeMap::values_mut) {
+            if *step == UNSEALED {
+                *step = last;
+            }
+        }
+    }
+
+    /// The keys changed after `through`, with their steps: what a build
+    /// through `through` does not hold yet.
+    fn after(&self, through: EventNumber) -> impl Iterator<Item = (&K, EventNumber)> {
+        self.0
+            .iter()
+            .flatten()
+            .filter(move |(_, step)| **step > through)
+            .map(|(key, step)| (key, *step))
+    }
+}
+
 /// A tree's names, by path and by object: a view's lookups by name and by
 /// inode cost one map lookup, not a scan of the tree. Reads go through
 /// `Deref` to the map by path; every change goes through these methods, so
-/// the two maps cannot disagree.
+/// the two maps cannot disagree. Persistent maps: a copy shares every node
+/// and costs O(1), a change copies only its path. The actor's names are an
+/// overlay: the builder's names at the built point, with each path changed
+/// since laid over them ([`SavedTree::rebuilt`]).
 #[derive(Clone, Debug, Default)]
 pub(super) struct Names {
-    by_path: BTreeMap<String, u64>,
+    by_path: imbl::OrdMap<PathName, u64>,
     /// One entry per (object, path), not a set per object: a set's node costs
     /// hundreds of bytes for the one path most objects have.
-    by_object: BTreeSet<(u64, String)>,
+    by_object: imbl::OrdSet<(u64, PathName)>,
+    changed: Changed<PathName>,
 }
 
 impl Names {
-    pub(super) fn insert(&mut self, path: String, object: u64) -> Option<u64> {
+    pub(super) fn insert(&mut self, path: PathName, object: u64, step: EventNumber) -> Option<u64> {
+        self.changed.note(&path, step);
+        self.put(path, object)
+    }
+
+    pub(super) fn remove(&mut self, path: &str, step: EventNumber) -> Option<u64> {
+        let (path, object) = self.by_path.remove_with_key(path)?;
+        self.by_object.remove(&(object, path.clone()));
+        self.changed.note(&path, step);
+        Some(object)
+    }
+
+    fn put(&mut self, path: PathName, object: u64) -> Option<u64> {
         let replaced = self.by_path.insert(path.clone(), object);
         if let Some(replaced) = replaced {
-            self.unindex(replaced, &path);
+            self.by_object.remove(&(replaced, path.clone()));
         }
         self.by_object.insert((object, path));
         replaced
     }
 
-    pub(super) fn remove(&mut self, path: &str) -> Option<u64> {
-        let object = self.by_path.remove(path)?;
-        self.unindex(object, path);
-        Some(object)
-    }
-
-    pub(super) fn clear(&mut self) {
+    fn clear(&mut self, step: EventNumber) {
+        if self.changed.0.is_some() {
+            let paths: Vec<PathName> = self.by_path.keys().cloned().collect();
+            for path in &paths {
+                self.changed.note(path, step);
+            }
+        }
         self.by_path.clear();
         self.by_object.clear();
     }
@@ -287,20 +405,40 @@ impl Names {
     /// The paths naming `object`, in path order.
     pub(super) fn of(&self, object: u64) -> impl Iterator<Item = &str> {
         self.by_object
-            .range((object, String::new())..)
+            .range((object, PathName::from(""))..)
             .take_while(move |(o, _)| *o == object)
-            .map(|(_, path)| path.as_str())
+            .map(|(_, path)| &**path)
     }
 
-    fn unindex(&mut self, object: u64, path: &str) {
-        self.by_object.remove(&(object, path.to_owned()));
+    /// `built`'s names with every path this overlay changed after `through`
+    /// as this overlay has it.
+    fn rebuilt(&self, built: &Self, through: EventNumber) -> Self {
+        let mut next = Self {
+            by_path: built.by_path.clone(),
+            by_object: built.by_object.clone(),
+            changed: Changed::tracking(),
+        };
+        for (path, step) in self.changed.after(through) {
+            match self.by_path.get(path) {
+                Some(object) => {
+                    next.put(path.clone(), *object);
+                }
+                None => {
+                    if let Some(object) = next.by_path.remove(path) {
+                        next.by_object.remove(&(object, path.clone()));
+                    }
+                }
+            }
+            next.changed.note(path, step);
+        }
+        next
     }
 }
 
 impl Deref for Names {
-    type Target = BTreeMap<String, u64>;
+    type Target = imbl::OrdMap<PathName, u64>;
 
-    fn deref(&self) -> &BTreeMap<String, u64> {
+    fn deref(&self) -> &imbl::OrdMap<PathName, u64> {
         &self.by_path
     }
 }
@@ -319,16 +457,23 @@ pub(super) struct DirState {
 /// A tree's directories, by path (`""` the root) and by number: a view's
 /// lookups cost one map lookup. Reads go through `Deref` to the map by path;
 /// every change goes through these methods, so the two maps cannot disagree.
+/// Persistent maps and an overlay, as [`Names`].
 #[derive(Clone, Debug, Default)]
 pub(super) struct Dirs {
-    by_path: BTreeMap<String, DirState>,
-    by_number: BTreeMap<u64, String>,
+    by_path: imbl::OrdMap<PathName, DirState>,
+    by_number: imbl::OrdMap<u64, PathName>,
+    changed: Changed<PathName>,
 }
 
 impl Dirs {
-    fn insert(&mut self, path: String, state: DirState) {
+    fn insert(&mut self, path: PathName, state: DirState, step: EventNumber) {
+        self.changed.note(&path, step);
+        self.put(path, state);
+    }
+
+    fn put(&mut self, path: PathName, state: DirState) {
         if let Some(old) = self.by_path.remove(&path) {
-            self.by_number.remove(&old.number);
+            self.unnumber(old.number, &path);
         }
         if !path.is_empty() {
             self.by_number.insert(state.number, path.clone());
@@ -336,35 +481,280 @@ impl Dirs {
         self.by_path.insert(path, state);
     }
 
-    fn remove(&mut self, path: &str) -> Option<DirState> {
-        let state = self.by_path.remove(path)?;
-        if !path.is_empty() {
-            self.by_number.remove(&state.number);
+    /// Drops `number`'s entry while it names `path`: a directory renamed in
+    /// an overlay may already be numbered at its new path.
+    fn unnumber(&mut self, number: u64, path: &str) {
+        if self.by_number.get(&number).is_some_and(|at| &**at == path) {
+            self.by_number.remove(&number);
         }
+    }
+
+    fn remove(&mut self, path: &str, step: EventNumber) -> Option<DirState> {
+        let (path, state) = self.by_path.remove_with_key(path)?;
+        self.unnumber(state.number, &path);
+        self.changed.note(&path, step);
         Some(state)
     }
 
     /// The directory's state, to change all but its number.
-    fn get_mut(&mut self, path: &str) -> Option<&mut DirState> {
+    fn get_mut(&mut self, path: &str, step: EventNumber) -> Option<&mut DirState> {
+        if self.changed.0.is_some() {
+            let (key, _) = self.by_path.get_key_value(path)?;
+            let key = key.clone();
+            self.changed.note(&key, step);
+        }
         self.by_path.get_mut(path)
     }
 
     /// The path of directory `number`; never the root's.
     pub(super) fn path_of(&self, number: u64) -> Option<&str> {
-        self.by_number.get(&number).map(String::as_str)
+        self.by_number.get(&number).map(|path| &**path)
     }
 
-    fn clear(&mut self) {
+    fn clear(&mut self, step: EventNumber) {
+        if self.changed.0.is_some() {
+            let paths: Vec<PathName> = self.by_path.keys().cloned().collect();
+            for path in &paths {
+                self.changed.note(path, step);
+            }
+        }
         self.by_path.clear();
         self.by_number.clear();
+    }
+
+    /// As [`Names::rebuilt`].
+    fn rebuilt(&self, built: &Self, through: EventNumber) -> Self {
+        let mut next = Self {
+            by_path: built.by_path.clone(),
+            by_number: built.by_number.clone(),
+            changed: Changed::tracking(),
+        };
+        for (path, step) in self.changed.after(through) {
+            match self.by_path.get(path) {
+                Some(state) => next.put(path.clone(), state.clone()),
+                None => {
+                    if let Some(state) = next.by_path.remove(path) {
+                        next.unnumber(state.number, path);
+                    }
+                }
+            }
+            next.changed.note(path, step);
+        }
+        next
     }
 }
 
 impl Deref for Dirs {
-    type Target = BTreeMap<String, DirState>;
+    type Target = imbl::OrdMap<PathName, DirState>;
 
-    fn deref(&self) -> &BTreeMap<String, DirState> {
+    fn deref(&self) -> &imbl::OrdMap<PathName, DirState> {
         &self.by_path
+    }
+}
+
+/// One object's merge identity, explicit: never "absent means the object".
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Identity {
+    /// No identity: no merge file is on the object.
+    None,
+    /// The object's own: the identity numbered as the object.
+    Own,
+    /// Another's: a fresh name renamed over a file took that file's.
+    Merged(MergeFileIdentity),
+}
+
+impl Identity {
+    /// `object`'s identity `id`, as this type keeps it.
+    const fn of(object: u64, id: MergeFileIdentity) -> Self {
+        if id.0 == object {
+            Self::Own
+        } else {
+            Self::Merged(id)
+        }
+    }
+
+    /// The identity this is of `object`, if any.
+    const fn of_object(self, object: u64) -> Option<MergeFileIdentity> {
+        match self {
+            Self::None => None,
+            Self::Own => Some(MergeFileIdentity(object)),
+            Self::Merged(id) => Some(id),
+        }
+    }
+}
+
+/// One object's state: its metadata, times, whether its name is fresh (made
+/// by this tree's own create, never moved since) and its merge identity.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct ObjectState {
+    pub(super) meta: Meta,
+    pub(super) times: Times,
+    pub(super) fresh: bool,
+    pub(super) identity: Identity,
+}
+
+/// A tree's objects' states by object number: persistent, and an overlay, as
+/// [`Names`].
+#[derive(Clone, Debug, Default)]
+struct Objects {
+    map: imbl::OrdMap<u64, ObjectState>,
+    changed: Changed<u64>,
+}
+
+impl Objects {
+    fn get(&self, object: u64) -> Option<&ObjectState> {
+        self.map.get(&object)
+    }
+
+    fn get_mut(&mut self, object: u64, step: EventNumber) -> Option<&mut ObjectState> {
+        let state = self.map.get_mut(&object)?;
+        self.changed.note(&object, step);
+        Some(state)
+    }
+
+    fn insert(&mut self, object: u64, state: ObjectState, step: EventNumber) {
+        self.changed.note(&object, step);
+        self.map.insert(object, state);
+    }
+
+    fn remove(&mut self, object: u64, step: EventNumber) {
+        if self.map.remove(&object).is_some() {
+            self.changed.note(&object, step);
+        }
+    }
+
+    /// As [`Names::rebuilt`].
+    fn rebuilt(&self, built: &Self, through: EventNumber) -> Self {
+        let mut next = Self {
+            map: built.map.clone(),
+            changed: Changed::tracking(),
+        };
+        for (object, step) in self.changed.after(through) {
+            match self.map.get(object) {
+                Some(state) => {
+                    next.map.insert(*object, state.clone());
+                }
+                None => {
+                    next.map.remove(object);
+                }
+            }
+            next.changed.note(object, step);
+        }
+        next
+    }
+}
+
+/// The actor's saved maps by object: the builder's maps at the built point
+/// (`built`, shared, never copied) with each map this actor saved, replaced
+/// or dropped since laid over them (`changed`, read first).
+#[derive(Clone, Default)]
+pub(super) struct Files {
+    built: imbl::OrdMap<u64, Arc<FileBytes>>,
+    changed: BTreeMap<u64, (EventNumber, Option<FileMap>)>,
+}
+
+impl Files {
+    pub(super) fn get(&self, object: &u64) -> Option<&FileMap> {
+        match self.changed.get(object) {
+            Some((_, map)) => map.as_ref(),
+            None => self.built.get(object).map(|bytes| &***bytes),
+        }
+    }
+
+    /// The map, to change: a built one is first copied into the changed
+    /// layer (O(1): a map's pieces are shared).
+    #[cfg_attr(
+        not(test),
+        allow(
+            dead_code,
+            reason = "the saved maps' API; tests change maps through it"
+        )
+    )]
+    pub(super) fn get_mut(&mut self, object: &u64) -> Option<&mut FileMap> {
+        if !self.changed.contains_key(object) {
+            let map = (**self.built.get(object)?).clone();
+            self.changed.insert(*object, (UNSEALED, Some(map)));
+        }
+        self.changed_mut(object)
+    }
+
+    /// The map if it is in the changed layer: none for one the built layer
+    /// gives.
+    pub(super) fn changed_mut(&mut self, object: &u64) -> Option<&mut FileMap> {
+        let (step, map) = self.changed.get_mut(object)?;
+        *step = UNSEALED;
+        map.as_mut()
+    }
+
+    pub(super) fn insert(&mut self, object: u64, map: FileMap) -> Option<FileMap> {
+        let old = self.get(&object).cloned();
+        self.changed.insert(object, (UNSEALED, Some(map)));
+        old
+    }
+
+    /// Drops the map: a dropped map stays in the changed layer, as none,
+    /// until a build drops it too.
+    pub(super) fn remove(&mut self, object: &u64) -> Option<FileMap> {
+        let old = self.get(object).cloned();
+        if old.is_some() {
+            self.changed.insert(*object, (UNSEALED, None));
+        }
+        old
+    }
+
+    /// The changed layer's maps: the built layer's are the builder's to move.
+    pub(super) fn values_mut(&mut self) -> impl Iterator<Item = &mut FileMap> {
+        self.changed
+            .values_mut()
+            .filter_map(|(_, map)| map.as_mut())
+    }
+
+    /// Every object's map, in object order.
+    #[cfg_attr(
+        not(test),
+        allow(dead_code, reason = "the saved maps' API; tests read maps through it")
+    )]
+    pub(super) fn iter(&self) -> impl Iterator<Item = (&u64, &FileMap)> {
+        let mut built = self
+            .built
+            .iter()
+            .filter(|(object, _)| !self.changed.contains_key(object))
+            .map(|(object, bytes)| (object, &***bytes))
+            .peekable();
+        let mut changed = self
+            .changed
+            .iter()
+            .filter_map(|(object, (_, map))| Some((object, map.as_ref()?)))
+            .peekable();
+        std::iter::from_fn(move || match (built.peek(), changed.peek()) {
+            (Some((a, _)), Some((b, _))) if a < b => built.next(),
+            (_, Some(_)) => changed.next(),
+            (Some(_), None) => built.next(),
+            (None, None) => None,
+        })
+    }
+
+    fn seal(&mut self, last: EventNumber) {
+        for (step, _) in self.changed.values_mut() {
+            if *step == UNSEALED {
+                *step = last;
+            }
+        }
+    }
+
+    /// `built`'s maps with every map changed after `through` as this has it.
+    fn rebuilt(&mut self, built: &imbl::OrdMap<u64, Arc<FileBytes>>, through: EventNumber) {
+        self.built = built.clone();
+        self.changed.retain(|_, (step, _)| *step > through);
+    }
+}
+
+#[cfg(test)]
+impl std::ops::Index<&u64> for Files {
+    type Output = FileMap;
+
+    fn index(&self, object: &u64) -> &FileMap {
+        self.get(object).expect("a map for the object")
     }
 }
 
@@ -394,14 +784,14 @@ fn moved(path: &str, from: &str, to: &str) -> String {
 /// start with `prefix`, in order: a child directory's subtree is jumped
 /// over, never walked.
 fn direct_children<'a, V>(
-    map: &'a BTreeMap<String, V>,
+    map: &'a imbl::OrdMap<PathName, V>,
     prefix: &'a str,
 ) -> impl Iterator<Item = (&'a str, &'a V)> + 'a {
     let mut cursor = prefix.to_owned();
     std::iter::from_fn(move || {
         loop {
             let (key, value) = map
-                .range::<str, _>((
+                .range::<_, str>((
                     std::ops::Bound::Included(cursor.as_str()),
                     std::ops::Bound::Unbounded,
                 ))
@@ -418,7 +808,7 @@ fn direct_children<'a, V>(
                 Some(at) => cursor = format!("{prefix}{}0", &rest[..at]),
                 None => {
                     cursor = format!("{key}\0");
-                    return Some((key.as_str(), value));
+                    return Some((&**key, value));
                 }
             }
         }
@@ -443,27 +833,154 @@ pub(super) const fn taken_dir_number(step: EventNumber, index: u64) -> Result<u6
 
 /// The names-level state of one tree, which both projections of the journal
 /// keep: the actor's saved state and the builder's trees. [`Shape::apply`] is
-/// its one transition. Each file's and link's metadata and times are by
-/// object, each directory's in its [`DirState`].
+/// its one transition. Each file's and link's state is by object (its
+/// [`ObjectState`]), each directory's in its [`DirState`]. Every map is
+/// persistent: a shape's copy is O(1), so the builder's batch and the actor's
+/// saved state share what neither changed. The actor's shape is an overlay
+/// on the builder's ([`SavedTree::rebuilt`]).
 #[derive(Clone, Debug, Default)]
 pub(super) struct Shape {
     pub(super) names: Names,
     pub(super) dirs: Dirs,
-    pub(super) anonymous: BTreeSet<u64>,
-    pub(super) identities: BTreeMap<u64, MergeFileIdentity>,
-    pub(super) fresh_names: BTreeSet<u64>,
-    pub(super) meta: BTreeMap<u64, Meta>,
-    pub(super) times: BTreeMap<u64, Times>,
+    pub(super) anonymous: imbl::OrdSet<u64>,
+    objects: Objects,
 }
 
 impl Shape {
     /// Adds an object that has no name.
     pub(super) fn add_anonymous(&mut self, object: u64, meta: Meta, at_ns: u64) {
         self.anonymous.insert(object);
-        self.identities.insert(object, MergeFileIdentity(object));
-        self.fresh_names.insert(object);
-        self.meta.insert(object, meta);
-        self.times.insert(object, Times::at(at_ns));
+        self.add_object(object, meta, at_ns, UNSEALED);
+    }
+
+    /// A new object's state: its own identity, a fresh name.
+    fn add_object(&mut self, object: u64, meta: Meta, at_ns: u64, step: EventNumber) {
+        let state = ObjectState {
+            meta,
+            times: Times::at(at_ns),
+            fresh: true,
+            identity: Identity::Own,
+        };
+        self.objects.insert(object, state, step);
+    }
+
+    /// `object`'s state.
+    pub(super) fn object(&self, object: u64) -> Option<&ObjectState> {
+        self.objects.get(object)
+    }
+
+    /// `object`'s merge identity, if it has one.
+    pub(super) fn identity_of(&self, object: u64) -> Option<MergeFileIdentity> {
+        self.object(object)?.identity.of_object(object)
+    }
+
+    /// Whether `object`'s name is fresh: made by this tree's own create and
+    /// never moved since.
+    pub(super) fn is_fresh(&self, object: u64) -> bool {
+        self.object(object).is_some_and(|state| state.fresh)
+    }
+
+    /// Every object whose name is fresh, in order.
+    pub(super) fn fresh_objects(&self) -> impl Iterator<Item = u64> {
+        self.objects
+            .map
+            .iter()
+            .filter(|(_, state)| state.fresh)
+            .map(|(object, _)| *object)
+    }
+
+    /// `object`'s metadata: the read the call path and the journal use, so
+    /// the per-object state can change shape behind it.
+    pub(super) fn meta_of(&self, object: u64) -> Option<&Meta> {
+        self.object(object).map(|state| &state.meta)
+    }
+
+    /// `object`'s times, as [`Shape::meta_of`].
+    pub(super) fn times_of(&self, object: u64) -> Option<&Times> {
+        self.object(object).map(|state| &state.times)
+    }
+
+    /// The overlay's changed layer, kept from now on: the actor's shape.
+    fn tracked(&self) -> Self {
+        let mut shape = self.clone();
+        shape.names.changed = Changed::tracking();
+        shape.dirs.changed = Changed::tracking();
+        shape.objects.changed = Changed::tracking();
+        shape
+    }
+
+    /// As [`SavedTree::rebuilt`]: the anonymous objects are this shape's.
+    fn rebuilt(&self, built: &Self, through: EventNumber) -> Self {
+        Self {
+            names: self.names.rebuilt(&built.names, through),
+            dirs: self.dirs.rebuilt(&built.dirs, through),
+            anonymous: self.anonymous.clone(),
+            objects: self.objects.rebuilt(&built.objects, through),
+        }
+    }
+
+    /// Every object a path or an object's state names differently here than
+    /// in `before`: O(changes) where the two share their maps' nodes, as a
+    /// shape and the copy it was changed from do.
+    pub(super) fn objects_changed_since(&self, before: &Shape) -> BTreeSet<u64> {
+        let mut changed = BTreeSet::new();
+        for item in before.names.by_path.diff(&self.names.by_path) {
+            match item {
+                imbl::ordmap::DiffItem::Add(_, object)
+                | imbl::ordmap::DiffItem::Remove(_, object) => {
+                    changed.insert(*object);
+                }
+                imbl::ordmap::DiffItem::Update { old, new } => {
+                    changed.insert(*old.1);
+                    changed.insert(*new.1);
+                }
+            }
+        }
+        for item in before.objects.map.diff(&self.objects.map) {
+            let object = match item {
+                imbl::ordmap::DiffItem::Add(object, _)
+                | imbl::ordmap::DiffItem::Remove(object, _) => object,
+                imbl::ordmap::DiffItem::Update { new, .. } => new.0,
+            };
+            changed.insert(*object);
+        }
+        changed
+    }
+
+    /// Names `object` at `path`, its identity `id`: a test's tree, built
+    /// without the steps that would make it.
+    #[cfg(test)]
+    pub(super) fn name(&mut self, path: &str, object: u64, id: MergeFileIdentity) {
+        self.names.insert(path.into(), object, UNSEALED);
+        let state = ObjectState {
+            meta: super::meta::TEST_FILE,
+            times: Times::default(),
+            fresh: false,
+            identity: Identity::of(object, id),
+        };
+        self.objects.insert(object, state, UNSEALED);
+    }
+
+    /// No object's name is fresh, an unnamed object's included.
+    fn clear_fresh(&mut self, step: EventNumber) {
+        let fresh: Vec<u64> = self
+            .objects
+            .map
+            .iter()
+            .filter(|(_, state)| state.fresh)
+            .map(|(object, _)| *object)
+            .collect();
+        for object in fresh {
+            if let Some(state) = self.objects.get_mut(object, step) {
+                state.fresh = false;
+            }
+        }
+    }
+
+    fn seal(&mut self, last: EventNumber) {
+        self.names.changed.seal(last);
+        self.dirs.changed.seal(last);
+        self.objects.changed.seal(last);
     }
 
     /// The paths naming `object`, in path order.
@@ -483,7 +1000,7 @@ impl Shape {
             return Some(Kind::Dir);
         }
         let object = self.names.get(path)?;
-        Some(self.meta.get(object).map_or(Kind::File, |meta| meta.kind))
+        Some(self.meta_of(*object).map_or(Kind::File, |meta| meta.kind))
     }
 
     /// The entries directly in directory `dir`, in name order: each one's
@@ -508,7 +1025,7 @@ impl Shape {
             };
             if take_file {
                 let (path, object) = files.next()?;
-                let kind = self.meta.get(object).map_or(Kind::File, |m| m.kind);
+                let kind = self.meta_of(*object).map_or(Kind::File, |m| m.kind);
                 Some((path, *object, kind))
             } else {
                 let (path, state) = dirs.next()?;
@@ -535,15 +1052,15 @@ impl Shape {
         let prefix = under(dir);
         let files = self
             .names
-            .range(prefix.clone()..)
+            .range::<_, str>((Bound::Included(prefix.as_str()), Bound::Unbounded))
             .take_while(|(path, _)| path.starts_with(&prefix))
-            .map(|(path, object)| (path.clone(), *object))
+            .map(|(path, object)| (path.to_string(), *object))
             .collect();
         let dirs = self
             .dirs
-            .range(prefix.clone()..)
+            .range::<_, str>((Bound::Included(prefix.as_str()), Bound::Unbounded))
             .take_while(|(path, _)| path.starts_with(&prefix))
-            .map(|(path, _)| path.clone())
+            .map(|(path, _)| path.to_string())
             .collect();
         (files, dirs)
     }
@@ -669,8 +1186,8 @@ impl Shape {
 
     /// The keys a change to `object` touches: its identity and every path naming it.
     fn keys_of(&self, object: u64, keys: &mut BTreeSet<queue::Key>) {
-        if let Some(id) = self.identities.get(&object) {
-            keys.insert(queue::Key::File(*id));
+        if let Some(id) = self.identity_of(object) {
+            keys.insert(queue::Key::File(id));
         }
         keys.extend(
             self.paths_of(object)
@@ -679,52 +1196,50 @@ impl Shape {
     }
 
     /// Directory `dir`'s entries changed at `at_ns`: its mtime and ctime move.
-    fn dir_modified(&mut self, dir: &str, at_ns: u64) {
-        if let Some(state) = self.dirs.get_mut(dir) {
+    fn dir_modified(&mut self, dir: &str, at_ns: u64, step: EventNumber) {
+        if let Some(state) = self.dirs.get_mut(dir, step) {
             state.times.modified(at_ns);
         }
     }
 
-    fn object_changed(&mut self, object: u64, at_ns: u64) {
-        if let Some(times) = self.times.get_mut(&object) {
-            times.changed(at_ns);
+    fn object_changed(&mut self, object: u64, at_ns: u64, step: EventNumber) {
+        if let Some(state) = self.objects.get_mut(object, step) {
+            state.times.changed(at_ns);
         }
     }
 
     /// Adds a file or link object at `path`, new at `at_ns`.
-    fn add_named(&mut self, path: &str, object: u64, meta: Meta, at_ns: u64) {
-        self.names.insert(path.to_owned(), object);
-        self.identities.insert(object, MergeFileIdentity(object));
-        self.fresh_names.insert(object);
-        self.meta.insert(object, meta);
-        self.times.insert(object, Times::at(at_ns));
-        self.dir_modified(parent_of(path), at_ns);
+    fn add_named(&mut self, path: &str, object: u64, meta: Meta, at_ns: u64, step: EventNumber) {
+        self.names.insert(path.into(), object, step);
+        self.add_object(object, meta, at_ns, step);
+        self.dir_modified(parent_of(path), at_ns, step);
     }
 
-    fn add_dir(&mut self, path: &str, number: u64, meta: Meta, at_ns: u64) {
+    fn add_dir(&mut self, path: &str, number: u64, meta: Meta, at_ns: u64, step: EventNumber) {
         self.dirs.insert(
-            path.to_owned(),
+            path.into(),
             DirState {
                 number,
                 meta,
                 times: Times::at(at_ns),
                 subdirs: 0,
             },
+            step,
         );
         let parent = parent_of(path);
-        if let Some(state) = self.dirs.get_mut(parent) {
+        if let Some(state) = self.dirs.get_mut(parent, step) {
             state.subdirs += 1;
         }
-        self.dir_modified(parent, at_ns);
+        self.dir_modified(parent, at_ns, step);
     }
 
-    fn remove_dir(&mut self, path: &str, at_ns: u64) -> Option<DirState> {
-        let state = self.dirs.remove(path)?;
+    fn remove_dir(&mut self, path: &str, at_ns: u64, step: EventNumber) -> Option<DirState> {
+        let state = self.dirs.remove(path, step)?;
         let parent = parent_of(path);
-        if let Some(state) = self.dirs.get_mut(parent) {
+        if let Some(state) = self.dirs.get_mut(parent, step) {
             state.subdirs = state.subdirs.saturating_sub(1);
         }
-        self.dir_modified(parent, at_ns);
+        self.dir_modified(parent, at_ns, step);
         Some(state)
     }
 
@@ -752,81 +1267,102 @@ impl Shape {
         match change {
             Change::Create { path, meta, .. } | Change::Symlink { path, meta, .. } => {
                 let object = step.object();
-                self.add_named(path, object, *meta, at_ns);
+                self.add_named(path, object, *meta, at_ns, step);
                 self.keys_of(object, &mut keys);
             }
             Change::Mkdir { path, meta, .. } => {
-                self.add_dir(path, step.get(), *meta, at_ns);
+                self.add_dir(path, step.get(), *meta, at_ns, step);
                 keys.insert(queue::Key::Name(path.clone()));
             }
             Change::Rmdir { path, .. } => {
-                self.remove_dir(path, at_ns);
+                self.remove_dir(path, at_ns, step);
                 keys.insert(queue::Key::Name(path.clone()));
             }
             Change::Link { object, path, .. } => {
                 self.anonymous.remove(object);
-                self.names.insert(path.clone(), *object);
-                self.object_changed(*object, at_ns);
-                self.dir_modified(parent_of(path), at_ns);
+                self.names.insert(path.as_str().into(), *object, step);
+                self.object_changed(*object, at_ns, step);
+                self.dir_modified(parent_of(path), at_ns, step);
                 self.keys_of(*object, &mut keys);
             }
             Change::Rename { from, to, .. } if from == to => {}
             Change::Rename { from, to, .. } if self.dirs.contains_key(from.as_str()) => {
-                self.rename_dir(from, to, at_ns, &mut keys);
+                self.rename_dir(from, to, at_ns, step, &mut keys);
             }
             Change::Rename { from, to, .. } => {
-                let object = self.names.get(from).copied().ok_or(Error::NotFound)?;
+                let object = self
+                    .names
+                    .get(from.as_str())
+                    .copied()
+                    .ok_or(Error::NotFound)?;
                 self.keys_of(object, &mut keys);
-                let replaced = self.names.get(to).copied();
+                let replaced = self.names.get(to.as_str()).copied();
                 if let Some(replaced) = replaced {
                     self.keys_of(replaced, &mut keys);
                 }
-                self.names.remove(from);
-                match replaced {
-                    Some(replaced) if self.fresh_names.contains(&object) => {
-                        let id = *self.identities.get(&replaced).ok_or(Error::Format)?;
-                        self.identities.insert(object, id);
-                        if !self.fresh_names.contains(&replaced) {
-                            self.fresh_names.remove(&object);
-                        }
+                self.names.remove(from, step);
+                let (identity, fresh) = match replaced {
+                    Some(replaced) if self.is_fresh(object) => {
+                        let id = self.identity_of(replaced).ok_or(Error::Format)?;
+                        (Some(Identity::of(object, id)), self.is_fresh(replaced))
                     }
-                    _ => {
-                        self.fresh_names.remove(&object);
-                    }
+                    _ => (None, false),
+                };
+                if let Some(state) = self.objects.get_mut(object, step) {
+                    state.identity = identity.unwrap_or(state.identity);
+                    state.fresh = fresh;
+                    state.times.changed(at_ns);
                 }
-                self.names.insert(to.clone(), object);
-                self.object_changed(object, at_ns);
-                self.dir_modified(parent_of(from), at_ns);
-                self.dir_modified(parent_of(to), at_ns);
+                self.names.insert(to.as_str().into(), object, step);
+                self.dir_modified(parent_of(from), at_ns, step);
+                self.dir_modified(parent_of(to), at_ns, step);
                 keys.insert(queue::Key::Name(to.clone()));
             }
             Change::Unlink { path, .. } => {
-                let object = self.names.get(path).copied().ok_or(Error::NotFound)?;
+                let object = self
+                    .names
+                    .get(path.as_str())
+                    .copied()
+                    .ok_or(Error::NotFound)?;
                 self.keys_of(object, &mut keys);
-                self.names.remove(path);
-                self.object_changed(object, at_ns);
-                self.dir_modified(parent_of(path), at_ns);
+                self.names.remove(path, step);
+                self.object_changed(object, at_ns, step);
+                self.dir_modified(parent_of(path), at_ns, step);
             }
             Change::SetMeta { path, meta, .. } => {
-                if let Some(state) = self.dirs.get_mut(path) {
+                if let Some(state) = self.dirs.get_mut(path, step) {
                     state.meta = *meta;
                     state.times.changed(at_ns);
                     keys.insert(queue::Key::Name(path.clone()));
                 } else {
-                    let object = self.names.get(path).copied().ok_or(Error::NotFound)?;
-                    self.meta.insert(object, *meta);
-                    self.object_changed(object, at_ns);
+                    let object = self
+                        .names
+                        .get(path.as_str())
+                        .copied()
+                        .ok_or(Error::NotFound)?;
+                    if let Some(state) = self.objects.get_mut(object, step) {
+                        state.meta = *meta;
+                        state.times.changed(at_ns);
+                    }
                     self.keys_of(object, &mut keys);
                 }
             }
             Change::SetTimes {
                 path, atime, mtime, ..
             } => {
-                let times = match self.dirs.get_mut(path) {
+                let times = match self.dirs.get_mut(path, step) {
                     Some(state) => &mut state.times,
                     None => {
-                        let object = self.names.get(path).copied().ok_or(Error::NotFound)?;
-                        self.times.entry(object).or_default()
+                        let object = self
+                            .names
+                            .get(path.as_str())
+                            .copied()
+                            .ok_or(Error::NotFound)?;
+                        &mut self
+                            .objects
+                            .get_mut(object, step)
+                            .ok_or(Error::NotFound)?
+                            .times
                     }
                 };
                 if let Some(atime) = atime {
@@ -841,19 +1377,21 @@ impl Shape {
             // A save of the file there, with its new metadata; for a new
             // path, a create and then a save.
             Change::Replace { path, meta, .. } => {
-                let object = match self.names.get(path).copied() {
+                let object = match self.names.get(path.as_str()).copied() {
                     Some(object) => {
-                        self.meta.insert(object, *meta);
+                        if let Some(state) = self.objects.get_mut(object, step) {
+                            state.meta = *meta;
+                        }
                         object
                     }
                     None => {
                         let object = step.object();
-                        self.add_named(path, object, *meta, at_ns);
+                        self.add_named(path, object, *meta, at_ns, step);
                         object
                     }
                 };
-                if let Some(times) = self.times.get_mut(&object) {
-                    times.modified(at_ns);
+                if let Some(state) = self.objects.get_mut(object, step) {
+                    state.times.modified(at_ns);
                 }
                 self.keys_of(object, &mut keys);
             }
@@ -866,37 +1404,46 @@ impl Shape {
     /// directory keeping its number and each file its object and identity.
     /// A moved file's name is no longer fresh. An empty directory at `to` is
     /// replaced.
-    fn rename_dir(&mut self, from: &str, to: &str, at_ns: u64, keys: &mut BTreeSet<queue::Key>) {
+    fn rename_dir(
+        &mut self,
+        from: &str,
+        to: &str,
+        at_ns: u64,
+        step: EventNumber,
+        keys: &mut BTreeSet<queue::Key>,
+    ) {
         let (files, dirs) = self.descendants(from);
         if self.dirs.contains_key(to) {
-            self.remove_dir(to, at_ns);
+            self.remove_dir(to, at_ns, step);
         }
         keys.insert(queue::Key::Name(from.to_owned()));
         keys.insert(queue::Key::Name(to.to_owned()));
-        if let Some(mut state) = self.remove_dir(from, at_ns) {
+        if let Some(mut state) = self.remove_dir(from, at_ns, step) {
             state.times.changed(at_ns);
             let subdirs = state.subdirs;
-            self.add_dir(to, state.number, state.meta, at_ns);
-            if let Some(moved_state) = self.dirs.get_mut(to) {
+            self.add_dir(to, state.number, state.meta, at_ns, step);
+            if let Some(moved_state) = self.dirs.get_mut(to, step) {
                 moved_state.times = state.times;
                 moved_state.subdirs = subdirs;
             }
         }
         for dir in dirs {
-            if let Some(state) = self.dirs.remove(&dir) {
+            if let Some(state) = self.dirs.remove(&dir, step) {
                 let new = moved(&dir, from, to);
                 keys.insert(queue::Key::Name(dir));
                 keys.insert(queue::Key::Name(new.clone()));
-                self.dirs.insert(new, state);
+                self.dirs.insert(new.into(), state, step);
             }
         }
         for (path, object) in files {
             self.keys_of(object, keys);
-            self.names.remove(&path);
+            self.names.remove(&path, step);
             let new = moved(&path, from, to);
             keys.insert(queue::Key::Name(new.clone()));
-            self.names.insert(new, object);
-            self.fresh_names.remove(&object);
+            self.names.insert(new.into(), object, step);
+            if let Some(state) = self.objects.get_mut(object, step) {
+                state.fresh = false;
+            }
         }
     }
 
@@ -913,8 +1460,8 @@ impl Shape {
         match outcome {
             SaveOutcome::AnonymousDropped => self.drop_object(object),
             SaveOutcome::Saved { .. } => {
-                if let Some(times) = self.times.get_mut(&object) {
-                    times.modified(at_ns);
+                if let Some(state) = self.objects.get_mut(object, UNSEALED) {
+                    state.times.modified(at_ns);
                 }
                 self.keys_of(object, &mut keys);
             }
@@ -925,10 +1472,7 @@ impl Shape {
 
     pub(super) fn drop_object(&mut self, object: u64) {
         self.anonymous.remove(&object);
-        self.identities.remove(&object);
-        self.fresh_names.remove(&object);
-        self.meta.remove(&object);
-        self.times.remove(&object);
+        self.objects.remove(object, UNSEALED);
     }
 
     /// A take: the files, names and directories it changed laid over this
@@ -945,12 +1489,12 @@ impl Shape {
         // Each named file: its object, path and whether its name is fresh.
         let mut files: BTreeMap<MergeFileIdentity, (u64, String, bool)> = BTreeMap::new();
         for (path, object) in self.names.iter() {
-            let id = *self.identities.get(object).ok_or(Error::Format)?;
+            let id = self.identity_of(*object).ok_or(Error::Format)?;
             files
                 .entry(id)
-                .or_insert_with(|| (*object, path.clone(), self.fresh_names.contains(object)));
+                .or_insert_with(|| (*object, path.to_string(), self.is_fresh(*object)));
         }
-        let before: BTreeSet<String> = self.names.keys().cloned().collect();
+        let before: BTreeSet<PathName> = self.names.keys().cloned().collect();
         for (id, file) in &take.files {
             keys.insert(queue::Key::File(*id));
             if let Some((_, path, _)) = files.get(id) {
@@ -964,11 +1508,15 @@ impl Shape {
                             files.insert(*id, (file.object, String::new(), false));
                         }
                     }
-                    self.meta.insert(file.object, file.meta);
-                    self.times
-                        .entry(file.object)
-                        .or_insert_with(|| Times::at(at_ns))
-                        .modified(at_ns);
+                    let mut state = self.object(file.object).cloned().unwrap_or(ObjectState {
+                        meta: file.meta,
+                        times: Times::at(at_ns),
+                        fresh: false,
+                        identity: Identity::None,
+                    });
+                    state.meta = file.meta;
+                    state.times.modified(at_ns);
+                    self.objects.insert(file.object, state, step);
                 }
                 None => {
                     files.remove(id);
@@ -985,19 +1533,19 @@ impl Shape {
             entry.1 = history.path()?.ok_or(Error::Format)?.to_owned();
             entry.2 = history.head_version()?.over.is_none();
         }
-        self.names.clear();
-        self.fresh_names.clear();
+        // No name is fresh but those the take leaves.
+        self.names.clear(step);
+        self.clear_fresh(step);
         let mut objects = BTreeSet::new();
         for (id, (object, path, fresh)) in files {
             if !objects.insert(object) || path.is_empty() {
                 return Err(Error::Format);
             }
             keys.insert(queue::Key::Name(path.clone()));
-            self.names.insert(path, object);
-            self.identities.insert(object, id);
-            if fresh {
-                self.fresh_names.insert(object);
-            }
+            self.names.insert(path.into(), object, step);
+            let state = self.objects.get_mut(object, step).ok_or(Error::Format)?;
+            state.identity = Identity::of(object, id);
+            state.fresh = fresh;
         }
         // Directories: parents before children when adding, children
         // before parents when removing.
@@ -1007,13 +1555,13 @@ impl Shape {
         for (path, meta) in &dirs {
             let Some(meta) = meta else { continue };
             keys.insert(queue::Key::Name(path.clone()));
-            match self.dirs.get_mut(path) {
+            match self.dirs.get_mut(path, step) {
                 Some(state) => {
                     state.meta = *meta;
                     state.times.changed(at_ns);
                 }
                 None => {
-                    self.add_dir(path, taken_dir_number(step, added)?, *meta, at_ns);
+                    self.add_dir(path, taken_dir_number(step, added)?, *meta, at_ns, step);
                     added += 1;
                 }
             }
@@ -1021,13 +1569,13 @@ impl Shape {
         for (path, meta) in dirs.iter().rev() {
             if meta.is_none() {
                 keys.insert(queue::Key::Name(path.clone()));
-                self.remove_dir(path, at_ns).ok_or(Error::Format)?;
+                self.remove_dir(path, at_ns, step).ok_or(Error::Format)?;
             }
         }
         // Entries added or removed: their directories' mtimes move.
-        let after: BTreeSet<String> = self.names.keys().cloned().collect();
+        let after: BTreeSet<PathName> = self.names.keys().cloned().collect();
         for path in before.symmetric_difference(&after) {
-            self.dir_modified(parent_of(path), at_ns);
+            self.dir_modified(parent_of(path), at_ns, step);
         }
         self.check_d1()
     }
@@ -1044,7 +1592,7 @@ impl Shape {
             .filter(|path| !path.is_empty())
             .all(|path| self.dirs.contains_key(parent_of(path)));
         let files_ok = self.names.keys().all(|path| {
-            self.dirs.contains_key(parent_of(path)) && !self.dirs.contains_key(path.as_str())
+            self.dirs.contains_key(parent_of(path)) && !self.dirs.contains_key(&**path)
         });
         if dirs_ok && files_ok {
             Ok(())
@@ -1059,15 +1607,13 @@ impl Shape {
             dirs: self
                 .dirs
                 .iter()
-                .map(|(path, state)| (path.clone(), (state.number, state.times)))
+                .map(|(path, state)| (path.to_string(), (state.number, state.times)))
                 .collect(),
             files: self
                 .names
                 .values()
                 .chain(self.anonymous.iter())
-                .filter_map(|object| {
-                    Some((self.identities.get(object)?.0, *self.times.get(object)?))
-                })
+                .filter_map(|object| Some((self.identity_of(*object)?.0, *self.times_of(*object)?)))
                 .collect(),
         }
     }
@@ -1076,11 +1622,11 @@ impl Shape {
     /// each directory's number and times, each file's times.
     /// [`Error::Format`] for a directory `locals` lacks.
     pub(super) fn restore_locals(&mut self, locals: &TreeLocals) -> Result<()> {
-        let dirs: Vec<(String, DirState)> = self
+        let dirs: Vec<(PathName, DirState)> = self
             .dirs
             .iter()
             .map(|(path, state)| {
-                let (number, times) = *locals.dirs.get(path).ok_or(Error::Format)?;
+                let (number, times) = *locals.dirs.get(&**path).ok_or(Error::Format)?;
                 Ok((
                     path.clone(),
                     DirState {
@@ -1091,17 +1637,19 @@ impl Shape {
                 ))
             })
             .collect::<Result<_>>()?;
-        self.dirs.clear();
+        self.dirs.clear(UNSEALED);
         for (path, state) in dirs {
-            self.dirs.insert(path, state);
+            self.dirs.insert(path, state, UNSEALED);
         }
         let objects: Vec<u64> = self.names.values().copied().collect();
         for object in objects {
-            let Some(id) = self.identities.get(&object) else {
+            let Some(id) = self.identity_of(object) else {
                 continue;
             };
-            if let Some(times) = locals.files.get(&id.0) {
-                self.times.insert(object, *times);
+            if let Some(times) = locals.files.get(&id.0)
+                && let Some(state) = self.objects.get_mut(object, UNSEALED)
+            {
+                state.times = *times;
             }
         }
         Ok(())
@@ -1110,16 +1658,17 @@ impl Shape {
     /// Installs `dirs`, each directory's metadata, as this shape's
     /// directories: numbers and times wait for [`Shape::restore_locals`].
     fn install_dirs(&mut self, dirs: &BTreeMap<String, Meta>) {
-        self.dirs.clear();
+        self.dirs.clear(UNSEALED);
         for (path, meta) in dirs {
             self.dirs.insert(
-                path.clone(),
+                path.as_str().into(),
                 DirState {
                     number: 0,
                     meta: *meta,
                     times: Times::default(),
                     subdirs: 0,
                 },
+                UNSEALED,
             );
         }
         let parents: Vec<String> = dirs
@@ -1128,7 +1677,7 @@ impl Shape {
             .map(|path| parent_of(path).to_owned())
             .collect();
         for parent in parents {
-            if let Some(state) = self.dirs.get_mut(&parent) {
+            if let Some(state) = self.dirs.get_mut(&parent, UNSEALED) {
                 state.subdirs += 1;
             }
         }
@@ -1137,10 +1686,16 @@ impl Shape {
 
 /// The actor's saved state of one tree: its shape and each object's saved
 /// map. No line map and no name history: those are the builder's.
+///
+/// An overlay: the builder's
+/// shape and maps at the last built point, shared, with each name,
+/// directory, object and map the actor's steps changed since laid over them.
+/// A built event moves it onto the new built point ([`SavedTree::rebuilt`]),
+/// so the actor holds one copy of what is built, the builder's.
 #[derive(Clone, Default)]
 pub(super) struct SavedTree {
     pub(super) shape: Shape,
-    pub(super) bytes: BTreeMap<u64, FileMap>,
+    pub(super) bytes: Files,
 }
 
 impl Deref for SavedTree {
@@ -1152,21 +1707,50 @@ impl Deref for SavedTree {
 }
 
 impl SavedTree {
-    /// The saved state a built tree shows: its maps shared, never copied.
+    /// The saved state a built tree shows: its shape and maps shared (O(1)),
+    /// never copied, with nothing changed over them.
     pub(super) fn of(tree: &Tree) -> Self {
         Self {
-            shape: tree.shape.clone(),
-            bytes: tree
-                .bytes
-                .iter()
-                .map(|(object, bytes)| (*object, (**bytes).clone()))
-                .collect(),
+            shape: tree.shape.tracked(),
+            bytes: Files {
+                built: tree.bytes.clone(),
+                changed: BTreeMap::new(),
+            },
         }
+    }
+
+    /// At a built event through `through`: adopt the builder's shape and maps
+    /// and drop every changed entry whose step <= through, keeping the rest
+    /// over them. O(entries changed since the last built event). Entries noted
+    /// at no step must be sealed first ([`SavedTree::seal`]), or they stay.
+    pub(super) fn rebuilt(&mut self, built: &Tree, through: EventNumber) {
+        self.shape = self.shape.rebuilt(&built.shape, through);
+        self.bytes.rebuilt(&built.bytes, through);
+    }
+
+    /// Every changed entry noted at no step (a save, a map, a drop) is noted
+    /// at `last`, the last record whose step the actor applied: none is newer.
+    pub(super) fn seal(&mut self, last: EventNumber) {
+        self.shape.seal(last);
+        self.bytes.seal(last);
     }
 
     pub(super) fn add_anonymous(&mut self, object: u64, meta: Meta, at_ns: u64) {
         self.shape.add_anonymous(object, meta, at_ns);
         self.bytes.insert(object, FileMap::empty());
+    }
+
+    /// The overlay's memory, estimated: its changed entries (names,
+    /// directories, objects and maps changed since the built point) at
+    /// [`OVERLAY_ENTRY_BYTES`] each. O(1): each changed layer's length. A
+    /// changed map's own pieces are not counted (the lag gate's byte term
+    /// covers a save's bytes).
+    pub(super) fn overlay_bytes(&self) -> u64 {
+        let entries = self.shape.names.changed.len()
+            + self.shape.dirs.changed.len()
+            + self.shape.objects.changed.len()
+            + self.bytes.changed.len();
+        (entries as u64).saturating_mul(OVERLAY_ENTRY_BYTES)
     }
 
     pub(super) fn drop_object(&mut self, object: u64) {
@@ -1176,14 +1760,15 @@ impl SavedTree {
 }
 
 /// The builder's state of one tree: its shape, bytes, line maps and name
-/// histories. A step builds on a copy and installs it after its commit is
-/// built, so file bytes and line maps sit behind `Arc`.
+/// histories. A batch builds on a copy and keeps it once its commits are
+/// built: every map is persistent, so the copy is O(1), and file bytes and
+/// line maps sit behind `Arc`.
 #[derive(Clone, Default)]
 pub(super) struct Tree {
     pub(super) shape: Shape,
-    pub(super) bytes: BTreeMap<u64, Arc<FileBytes>>,
-    pub(super) lines: BTreeMap<u64, Arc<Lines>>,
-    pub(super) namespace: BTreeMap<MergeFileIdentity, NameHistory>,
+    pub(super) bytes: imbl::OrdMap<u64, Arc<FileBytes>>,
+    pub(super) lines: imbl::OrdMap<u64, Arc<Lines>>,
+    pub(super) namespace: imbl::OrdMap<MergeFileIdentity, NameHistory>,
 }
 
 impl Deref for Tree {
@@ -1219,8 +1804,8 @@ impl Tree {
         snapshot: referee::Snapshot,
         mut map: impl FnMut(MergeFileIdentity, u64, &str) -> Result<Arc<FileBytes>>,
     ) -> Result<()> {
-        self.shape.names.clear();
-        self.shape.fresh_names.clear();
+        self.shape.names.clear(UNSEALED);
+        self.shape.clear_fresh(UNSEALED);
         self.shape.install_dirs(&snapshot.dirs);
         let mut objects = BTreeSet::new();
         for (id, file) in snapshot.files {
@@ -1229,17 +1814,24 @@ impl Tree {
             }
             let history = snapshot.names.get(&id).ok_or(Error::Format)?;
             let path = history.path()?.ok_or(Error::Format)?;
-            if history.head_version()?.over.is_none() {
-                self.shape.fresh_names.insert(file.object);
-            }
-            self.shape.names.insert(path.to_owned(), file.object);
+            let fresh = history.head_version()?.over.is_none();
+            self.shape.names.insert(path.into(), file.object, UNSEALED);
             self.bytes.insert(file.object, map(id, file.object, path)?);
             self.lines.insert(file.object, Arc::new(file.lines));
-            self.shape.identities.insert(file.object, id);
-            self.shape.meta.insert(file.object, file.meta);
-            self.shape.times.entry(file.object).or_default();
+            let times = self
+                .shape
+                .times_of(file.object)
+                .copied()
+                .unwrap_or_default();
+            let state = ObjectState {
+                meta: file.meta,
+                times,
+                fresh,
+                identity: Identity::of(file.object, id),
+            };
+            self.shape.objects.insert(file.object, state, UNSEALED);
         }
-        self.namespace = snapshot.names;
+        self.namespace = snapshot.names.into_iter().collect();
         self.shape.check_d1()
     }
 
@@ -1249,24 +1841,29 @@ impl Tree {
         let files = self
             .names
             .values()
-            .map(|object| {
-                (
-                    self.identities[object],
+            .filter_map(|object| {
+                let state = self.object(*object)?;
+                Some((
+                    state.identity.of_object(*object)?,
                     referee::File {
                         object: *object,
                         lines: (*self.lines[object]).clone(),
-                        meta: self.meta[object],
+                        meta: state.meta,
                     },
-                )
+                ))
             })
             .collect();
         referee::Snapshot {
             files,
-            names: self.namespace.clone(),
+            names: self
+                .namespace
+                .iter()
+                .map(|(id, history)| (*id, history.clone()))
+                .collect(),
             dirs: self
                 .dirs
                 .iter()
-                .map(|(path, state)| (path.clone(), state.meta))
+                .map(|(path, state)| (path.to_string(), state.meta))
                 .collect(),
         }
     }
@@ -1415,6 +2012,381 @@ impl NameHistory {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tree_actor::meta::SetTime;
+
+    #[test]
+    fn identities_map_to_object_states_and_back() {
+        // Today's three cases of an object's entry in a map of identities:
+        // none, its own number, another's.
+        let object = 7;
+        let cases = [
+            (None, Identity::None),
+            (Some(MergeFileIdentity(7)), Identity::Own),
+            (
+                Some(MergeFileIdentity(3)),
+                Identity::Merged(MergeFileIdentity(3)),
+            ),
+        ];
+        for (entry, identity) in cases {
+            let state = entry.map_or(Identity::None, |id| Identity::of(object, id));
+            assert_eq!(state, identity, "{entry:?}");
+            let mut shape = Shape::default();
+            let times = Times::default();
+            let meta = super::super::meta::TEST_FILE;
+            let state = ObjectState {
+                meta,
+                times,
+                fresh: false,
+                identity: state,
+            };
+            shape.objects.insert(object, state, UNSEALED);
+            assert_eq!(shape.identity_of(object), entry, "{identity:?}");
+        }
+    }
+
+    #[test]
+    fn an_object_without_identity_reads_none() {
+        // A take's new object before it is named has metadata and times but
+        // no identity: it is not its own, and its change touches no file key.
+        let mut shape = Shape::default();
+        let state = ObjectState {
+            meta: super::super::meta::TEST_FILE,
+            times: Times::default(),
+            fresh: false,
+            identity: Identity::None,
+        };
+        shape.objects.insert(9, state, UNSEALED);
+        assert_eq!(shape.identity_of(9), None);
+        assert!(shape.keys(9).is_empty());
+        assert!(shape.meta_of(9).is_some());
+    }
+
+    /// splitmix64: a test's seeded random numbers.
+    struct Rng(u64);
+
+    impl Rng {
+        fn below(&mut self, n: u64) -> u64 {
+            self.0 = self.0.wrapping_add(0x9e37_79b9_7f4a_7c15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+            (z ^ (z >> 31)) % n.max(1)
+        }
+
+        fn pick<'a, T>(&mut self, all: &'a [T]) -> Option<&'a T> {
+            all.get(usize::try_from(self.below(all.len() as u64)).unwrap())
+        }
+    }
+
+    const DIR: Meta = Meta {
+        kind: Kind::Dir,
+        mode: Perm::from_mode(0o755),
+        uid: 1000,
+        gid: 1000,
+    };
+
+    /// One step of the overlay test, as the actor and the builder each run it.
+    #[derive(Clone)]
+    enum Op {
+        Change(Change),
+        Save(u64),
+        Anonymous,
+        Drop(u64),
+        Remap(u64),
+    }
+
+    /// A saved map of step `seq`.
+    fn map_at(seq: u64) -> FileMap {
+        let mut map = FileMap::empty();
+        map.saved_at(crate::tree_actor::journal::durable::RecordNo::new(seq));
+        map
+    }
+
+    /// The actor's run of one step on its saved tree, or the oracle's on a
+    /// plain shape and map of maps.
+    fn run_saved(
+        shape: &mut Shape,
+        bytes: &mut dyn FnMut(u64, Option<FileMap>),
+        op: &Op,
+        seq: u64,
+    ) {
+        let at_ns = seq * 10;
+        match op {
+            Op::Change(change) => {
+                shape.apply(change, EventNumber::new(seq), at_ns).unwrap();
+                if matches!(change, Change::Create { .. } | Change::Symlink { .. }) {
+                    bytes(seq, Some(map_at(seq)));
+                }
+            }
+            Op::Save(object) => {
+                let outcome = SaveOutcome::Saved { len: 0, chunks: 0 };
+                shape.save(*object, outcome, at_ns);
+                bytes(*object, Some(map_at(seq)));
+            }
+            Op::Anonymous => {
+                shape.add_anonymous(seq, super::super::meta::TEST_FILE, at_ns);
+                bytes(seq, Some(FileMap::empty()));
+            }
+            Op::Drop(object) => {
+                shape.save(*object, SaveOutcome::AnonymousDropped, at_ns);
+                shape.drop_object(*object);
+                bytes(*object, None);
+            }
+            Op::Remap(object) => bytes(*object, Some(map_at(seq))),
+        }
+    }
+
+    /// A random step the oracle's tree takes.
+    fn random_op(rng: &mut Rng, shape: &Shape) -> Option<Op> {
+        let dirs: Vec<String> = shape.dirs.keys().map(|p| p.to_string()).collect();
+        let files: Vec<(String, u64)> = shape
+            .names
+            .iter()
+            .map(|(p, o)| (p.to_string(), *o))
+            .collect();
+        let anonymous: Vec<u64> = shape.anonymous.iter().copied().collect();
+        let path = |rng: &mut Rng| {
+            let dir = rng.pick(&dirs).cloned().unwrap_or_default();
+            let name = format!("n{}", rng.below(5));
+            if dir.is_empty() {
+                name
+            } else {
+                format!("{dir}/{name}")
+            }
+        };
+        let tree = "root".to_owned();
+        let existing = |rng: &mut Rng| -> Option<String> {
+            if rng.below(2) == 0 {
+                rng.pick(&files).map(|(p, _)| p.clone())
+            } else {
+                rng.pick(&dirs).cloned()
+            }
+        };
+        let change = match rng.below(14) {
+            0 | 1 => Change::Create {
+                tree,
+                path: path(rng),
+                meta: super::super::meta::TEST_FILE,
+            },
+            2 => Change::Symlink {
+                tree,
+                path: path(rng),
+                meta: Meta {
+                    kind: Kind::Symlink,
+                    ..super::super::meta::TEST_FILE
+                },
+            },
+            3 => Change::Mkdir {
+                tree,
+                path: path(rng),
+                meta: DIR,
+            },
+            4 => Change::Rmdir {
+                tree,
+                path: rng.pick(&dirs)?.clone(),
+            },
+            5 => Change::Unlink {
+                tree,
+                path: rng.pick(&files)?.0.clone(),
+            },
+            6 | 7 => Change::Rename {
+                tree,
+                from: existing(rng)?,
+                to: if rng.below(3) == 0 {
+                    existing(rng)?
+                } else {
+                    path(rng)
+                },
+            },
+            8 => {
+                let path = existing(rng)?;
+                let kind = shape.kind_at(&path)?;
+                Change::SetMeta {
+                    tree,
+                    path,
+                    meta: Meta {
+                        kind,
+                        mode: Perm::from_mode(0o600 + rng.below(0o100) as u32),
+                        uid: 1000,
+                        gid: 1000,
+                    },
+                }
+            }
+            9 => Change::SetTimes {
+                tree,
+                path: existing(rng)?,
+                atime: Some(SetTime::At(rng.below(1000))),
+                mtime: (rng.below(2) == 0).then_some(SetTime::Now),
+            },
+            10 => Change::Link {
+                tree,
+                object: *rng.pick(&anonymous)?,
+                path: path(rng),
+            },
+            11 => return Some(Op::Save(rng.pick(&files)?.1)),
+            12 => {
+                return Some(if rng.below(2) == 0 || anonymous.is_empty() {
+                    Op::Anonymous
+                } else {
+                    Op::Drop(*rng.pick(&anonymous)?)
+                });
+            }
+            _ => return Some(Op::Remap(rng.pick(&files)?.1)),
+        };
+        shape.check(&change).ok()?;
+        Some(Op::Change(change))
+    }
+
+    /// Every read the call path makes of a saved tree, the actor's and the
+    /// oracle's, equal.
+    fn assert_reads_equal(
+        actor: &SavedTree,
+        oracle: &Shape,
+        bytes: &BTreeMap<u64, FileMap>,
+        at: &str,
+    ) {
+        let names = |s: &Shape| -> Vec<(String, u64)> {
+            s.names.iter().map(|(p, o)| (p.to_string(), *o)).collect()
+        };
+        assert_eq!(names(actor), names(oracle), "names, {at}");
+        let dirs = |s: &Shape| -> Vec<(String, DirState)> {
+            s.dirs
+                .iter()
+                .map(|(p, d)| (p.to_string(), d.clone()))
+                .collect()
+        };
+        assert_eq!(dirs(actor), dirs(oracle), "dirs, {at}");
+        assert_eq!(actor.anonymous, oracle.anonymous, "anonymous, {at}");
+        let objects: BTreeSet<u64> = oracle
+            .objects
+            .map
+            .keys()
+            .chain(actor.objects.map.keys())
+            .copied()
+            .collect();
+        for object in objects {
+            assert_eq!(
+                actor.object(object),
+                oracle.object(object),
+                "{object}, {at}"
+            );
+            assert_eq!(actor.meta_of(object), oracle.meta_of(object), "{at}");
+            assert_eq!(actor.times_of(object), oracle.times_of(object), "{at}");
+            assert!(actor.paths_of(object).eq(oracle.paths_of(object)), "{at}");
+            assert_eq!(actor.keys(object), oracle.keys(object), "{at}");
+        }
+        for (path, state) in oracle.dirs.iter() {
+            assert_eq!(
+                actor.children(path, 0, usize::MAX),
+                oracle.children(path, 0, usize::MAX),
+                "children of {path:?}, {at}"
+            );
+            if !path.is_empty() {
+                assert_eq!(actor.dirs.path_of(state.number), Some(&**path), "{at}");
+            }
+        }
+        for path in oracle.names.keys().chain(oracle.dirs.keys()) {
+            assert_eq!(actor.kind_at(path), oracle.kind_at(path), "{path}, {at}");
+            assert_eq!(actor.names.get(&**path), oracle.names.get(&**path), "{at}");
+        }
+        let actor_maps: Vec<(u64, Option<u64>)> = actor
+            .bytes
+            .iter()
+            .map(|(o, m)| (*o, m.step().map(|s| s.get())))
+            .collect();
+        let oracle_maps: Vec<(u64, Option<u64>)> = bytes
+            .iter()
+            .map(|(o, m)| (*o, m.step().map(|s| s.get())))
+            .collect();
+        assert_eq!(actor_maps, oracle_maps, "maps, {at}");
+        for object in bytes.keys() {
+            assert_eq!(
+                actor.bytes.get(object).map(FileMap::step),
+                bytes.get(object).map(FileMap::step),
+                "{at}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_overlay_reads_as_the_shape_it_stands_for() {
+        for seed in 1..=64 {
+            let mut rng = Rng(seed);
+            let mut built = Tree::default();
+            built
+                .shape
+                .install_dirs(&BTreeMap::from([(String::new(), DIR)]));
+            let mut oracle = built.shape.clone();
+            let mut oracle_bytes: BTreeMap<u64, FileMap> = BTreeMap::new();
+            let mut actor = SavedTree::of(&built);
+            let mut ops: Vec<(u64, Op)> = Vec::new();
+            let mut through = 0;
+            let mut seq = 0;
+            while seq < 300 {
+                let Some(op) = random_op(&mut rng, &oracle) else {
+                    continue;
+                };
+                seq += 1;
+                run_saved(
+                    &mut oracle,
+                    &mut |o, map| match map {
+                        Some(map) => {
+                            oracle_bytes.insert(o, map);
+                        }
+                        None => {
+                            oracle_bytes.remove(&o);
+                        }
+                    },
+                    &op,
+                    seq,
+                );
+                let files = &mut actor.bytes;
+                run_saved(
+                    &mut actor.shape,
+                    &mut |o, map| match map {
+                        Some(map) if matches!(op, Op::Remap(_)) => {
+                            *files.get_mut(&o).unwrap() = map;
+                        }
+                        Some(map) => {
+                            files.insert(o, map);
+                        }
+                        None => {
+                            files.remove(&o);
+                        }
+                    },
+                    &op,
+                    seq,
+                );
+                ops.push((seq, op));
+                if rng.below(6) == 0 {
+                    // A built event: the builder runs the steps through a
+                    // point at or behind the actor's last.
+                    let next = through + rng.below(seq - through + 1);
+                    for (step, op) in ops.iter().filter(|(s, _)| *s > through && *s <= next) {
+                        let tree = &mut built;
+                        let mut maps = Vec::new();
+                        run_saved(
+                            &mut tree.shape,
+                            &mut |o, map| maps.push((o, map)),
+                            op,
+                            *step,
+                        );
+                        for (o, map) in maps {
+                            match map {
+                                Some(map) => tree.bytes.insert(o, Arc::new(map.into())),
+                                None => tree.bytes.remove(&o),
+                            };
+                        }
+                    }
+                    through = next;
+                    actor.seal(EventNumber::new(seq));
+                    actor.rebuilt(&built, EventNumber::new(through));
+                }
+                let at = format!("seed {seed}, step {seq}, built through {through}");
+                assert_reads_equal(&actor, &oracle, &oracle_bytes, &at);
+            }
+        }
+    }
 
     #[test]
     fn taken_directory_numbers_never_wrap() {
@@ -1434,15 +2406,16 @@ mod tests {
     #[test]
     fn names_index_each_object_by_its_paths() {
         let mut names = Names::default();
-        names.insert("b".into(), 2);
-        names.insert("a".into(), 2);
-        names.insert("c".into(), 3);
+        let step = EventNumber::new(1);
+        names.insert("b".into(), 2, step);
+        names.insert("a".into(), 2, step);
+        names.insert("c".into(), 3, step);
         assert_eq!(names.of(2).collect::<Vec<_>>(), ["a", "b"]);
         // Renaming over a name moves it to the new object.
-        assert_eq!(names.insert("a".into(), 3), Some(2));
+        assert_eq!(names.insert("a".into(), 3, step), Some(2));
         assert_eq!(names.of(2).collect::<Vec<_>>(), ["b"]);
         assert_eq!(names.of(3).collect::<Vec<_>>(), ["a", "c"]);
-        assert_eq!(names.remove("b"), Some(2));
+        assert_eq!(names.remove("b", step), Some(2));
         assert_eq!(names.of(2).count(), 0);
         assert_eq!(names.of(1).count(), 0);
     }

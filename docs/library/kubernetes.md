@@ -121,23 +121,43 @@ class takes `fork` and `landing` only ([CSI](../csi.md#14-forks)).
 ## The supervisor
 
 `Supervisor::new(NodeConfig, Arc<dyn Launcher>, Arc<dyn Mounter>)` owns every
-host on the node. Each volume's calls run one at a time under a per-volume
-async lock; every on-demand start and stop happens under it.
+host on the node. Three locks order its calls, each named for what it orders:
+
+- **A claim's lock** is held by its publish or unpublish, from the one-pod
+  check to the record's write. A second NodePublish or NodeUnpublish of a
+  claim whose call still runs is answered `ABORTED` at once (the CSI
+  specification's "operation pending for volume"), and the kubelet retries;
+  calls of other claims go on. Each call runs as a task of its own to the end,
+  so a kubelet that gives up drops only its wait.
+- **A volume's start lock** orders its host's start and stop, the replay,
+  every write of the volume's records and every detach of its targets. It is
+  held across a host's reply only while a host starts (replay and reconcile,
+  on a host no other call sees yet), while it stops, and for a fork's create
+  or end. An open or close of a running host's view is never under it, so one
+  close that waits on a held file stalls only its own claim.
+- **`using`**, a short lock never held across a wait on a host, holds each
+  volume's claims whose open is in flight. A volume is idle when none is and
+  it has no published record; deciding that and taking the host out of
+  service are one step under it, so a publish never gets a host being
+  stopped.
 
 - **Ensure** runs `agentfs init` and installs the profile's rule files
   (`agentfs_core::operator_settings::install_rules`) into
   `state/history.git/info/`. It refuses while the volume is served, since its
   settings change only while it is not.
 - **Starting a host** installs the rule files again, spawns `agentfs host`
-  (`launcher::host_spec`), reads its `Hello` (checking the volume's name), then
-  opens every recorded view of the volume whose target is still there, stacked
-  over a stale mount a crashed host left, and sends `reconcile`. A recorded
-  view whose target is gone is dropped.
+  (`launcher::host_spec`), reads its `Hello` (checking the volume's name and
+  the protocol version: another version is `FAILED_PRECONDITION` and never
+  tried again), then opens every recorded view of the volume whose target is
+  still there, stacked over a stale mount a crashed host left, and sends
+  `reconcile`. Only then do other calls see the host. A recorded view whose
+  target is gone is dropped.
 - **Publish** allows one pod per claim: a claim published at another target is
   `FAILED_PRECONDITION` (`several pods on one volume are not built`), at the
   same target with another read-only flag `ALREADY_EXISTS`, at the same target
   with the same flag a success.
-- **Stopping a host** drops its `HostClient`: the task closes the stream.
+- **Stopping a host** calls `HostClient::close`: the stream closes, whatever
+  clones of the client other tasks still hold.
   With no view open (every stop the supervisor asks for) the host drains and
   exits 0 once Volume releases the volume; with views open (the plugin's
   shutdown) it exits 3 at once and leaves them stale for the next host
@@ -157,10 +177,17 @@ async lock; every on-demand start and stop happens under it.
   (`ReconcileReport`).
 - **Shutdown** stops every host and waits for each to exit.
 
-`HostClient::start(stream)` reads the `Hello`; `call(request)` sends one request
-and awaits its reply. One task owns the stream: a caller whose wait the
-kubelet's deadline cancels only drops its wait, and the task still reads and
-discards that reply, so the replies that follow stay in step.
+`HostClient::start(stream)` reads the `Hello` and answers
+`StartError::Version { host, plugin }` for another protocol version (the
+stream closed) or `StartError::Gone`; `call(request)` sends one request and
+awaits its reply; `close()` closes the stream. Two tasks own the stream ([host
+protocol v2](filesystem.md#the-view-host-command)): a writer gives each call
+an id (from 1, never used again) and writes its request in an envelope, and a
+reader hands each reply to the call its id names, in whatever order the host
+answers. Calls do not wait for each other. A caller whose wait the kubelet's
+deadline cancels drops only its own wait: its id stays pending until its
+reply arrives, and that reply is discarded. A reply with an id no call has is
+a broken protocol: every waiter gets `HostGone` and the stream closes.
 
 ## Where things live
 

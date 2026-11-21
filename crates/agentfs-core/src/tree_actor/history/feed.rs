@@ -2,10 +2,29 @@
 //! and commits on its stdin, which writes one pack (docs/architecture.md,
 //! "Technology choices"). Its durability is ours: [`Feed::finish`] fsyncs the
 //! pack files it installed and `objects/pack` before anything names them.
+//!
+//! The history's repack task ([`super::repack`]) runs beside fast-import, so
+//! `objects/pack` has two writers. The task's git writes whole packs in,
+//! index last, and expires the packs a roll-up superseded a built event
+//! later, so [`Feed::finish`] may see another pack's new name, which it
+//! fsyncs too. A new name that is gone before its fsync was a pack rolled
+//! up and expired by the task, or a temporary file of the task's git (the
+//! multi-pack index's lock), which is not an error:
+//! - **No object is lost** (history is the product). git expires a pack
+//!   only when the multi-pack index finds none of its objects there, after
+//!   the task has fsynced `objects/pack` with the roll-up's pack in it;
+//!   nothing prunes. So a batch's objects are always in a pack whose name
+//!   is in `objects/pack`.
+//! - **History is durable before the journal is trimmed.** The repack runs
+//!   with `core.fsync=pack,pack-metadata` and `core.fsyncMethod=fsync`, so
+//!   git fsyncs the new pack's files, and the task fsyncs `objects/pack`
+//!   after writing them. [`Feed::finish`] fsyncs `objects/pack` after its
+//!   own files in any case. The builder records a batch as built, after
+//!   which the journal may drop its records, only after `finish` returns.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
-use std::io::{BufWriter, Read, Write};
+use std::io::{self, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin};
 
@@ -277,13 +296,20 @@ impl Feed {
         let after = entries(&self.pack_dir)?;
         let mut synced = 0_u64;
         for name in after.difference(&self.before) {
-            if name.to_string_lossy().starts_with("tmp_") {
+            let text = name.to_string_lossy();
+            // fast-import's temporary files.
+            if text.starts_with("tmp_") {
                 continue;
             }
-            File::open(self.pack_dir.join(name))
-                .and_then(|f| f.sync_all())
-                .map_err(BuildError::from)?;
-            synced += 1;
+            match File::open(self.pack_dir.join(name)).and_then(|f| f.sync_all()) {
+                Ok(()) => synced += 1,
+                // The repack task rolled this pack into one of its own and
+                // expired it, or this was one of its git's temporary files
+                // (`multi-pack-index.lock`), renamed since (see the module
+                // docs).
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => return Err(BuildError::from(e)),
+            }
         }
         File::open(&self.pack_dir)
             .and_then(|d| d.sync_all())

@@ -10,7 +10,7 @@ use git2::Oid;
 use std::io;
 
 use super::Objects;
-use super::built::BuiltSnapshot;
+use super::built::{BuiltSnapshot, Owners};
 use super::format::{self, read_snapshot};
 use super::message;
 use super::refs;
@@ -32,7 +32,7 @@ type RecordAt = (Oid, Option<MergeFileIdentity>, String);
 /// fork's head as the model finds it: back through each parent holding the same value.
 struct LandedInto<'a> {
     repo: &'a TreeGit,
-    owners: &'a BTreeMap<EventNumber, Oid>,
+    owners: &'a Owners,
     upstream: Oid,
     reached: BTreeMap<Oid, bool>,
     fork_head: Oid,

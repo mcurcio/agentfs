@@ -8,10 +8,13 @@
 //! order: pack, then index (git's own), the pack files and directory fsynced,
 //! then the built-log entry fsynced. Only then are refs, `config` and the
 //! checkouts copied and the built event sent. It decides nothing: outcomes,
-//! dates and take decisions are in the records, and a replay that disagrees
-//! with its record (`Disagrees`) stops building with the alarm.
+//! dates and take decisions are in the records. A save is built from its
+//! recorded layout: when the builder's own replay of it does not match, the
+//! commit is flagged and building goes on ([`super::verify`]); only a layout
+//! that cannot be laid (`Disagrees`) stops building with the alarm.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::ops::Bound;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -20,15 +23,16 @@ use agentfs_contracts::pod::{PodContext, WriterAt};
 use agentfs_contracts::volume::VolumeIdentity;
 use git2::Oid;
 
-use super::built::BuiltObjects;
-use super::built::{BuildError, History};
+use super::built::{BuildError, BuiltObjects, History, Owners};
 use super::built_log::{BuiltEntry, BuiltLog, BuiltValue};
 use super::feed::{BuildRef, CommitSpec, Feed, Parent};
 use super::format::{self, BlobRef};
 use super::message::{self, Action, Message};
 use super::upstreams::Upstreams;
-use super::{Objects, checkout, objects_of, refs};
+use super::verify::{self, Evidence, Flag, Inputs, Verification};
+use super::{Objects, TreeMoved, checkout, objects_after, objects_of, refs};
 use crate::tree_actor::journal::durable::{Durability, RecordNo};
+use crate::tree_actor::journal::readback::CallReader;
 use crate::tree_actor::journal::segment::{FramePos, Relocations, Segment};
 use crate::tree_actor::journal::{
     At, Change, Entry, Frame, Record, RowRecord, SaveOutcome, Tail, TakeHead, TakeRecord, Target,
@@ -37,7 +41,8 @@ use crate::tree_actor::journal::{
 use crate::tree_actor::pointers::Pointers;
 use crate::tree_actor::queue::Key;
 use crate::tree_actor::recording::file_map::BaseFile;
-use crate::tree_actor::recording::{Call, FileMap, own_keys, pages};
+use crate::tree_actor::recording::layout::{Layout, Positions};
+use crate::tree_actor::recording::{Call, FileMap, pages};
 use crate::tree_actor::stages::{Timer, Which};
 use crate::tree_actor::tree::{
     EventNumber, FileBytes, Lines, MergeFileIdentity, NameHistory, Tree, Versions,
@@ -159,29 +164,38 @@ impl JournalReader {
 struct BuildOpen {
     tree: TreeId,
     object: u64,
-    calls: Vec<(u64, Call, FramePos)>,
+    calls: imbl::Vector<(u64, Call, FramePos)>,
 }
 
 /// What the builder has built: the trees with line maps and name histories,
 /// the pointers as built (a batch's own commits as marks until it finishes),
 /// the live opens' calls and page writes.
+///
+/// Every map that grows with the volume is persistent, so a batch's copy
+/// (`next = state.clone()`) is O(1) and shares every node it does not
+/// change: a batch allocates in proportion to its own steps, and a failed
+/// batch is still dropped whole.
 #[derive(Clone)]
 pub(in crate::tree_actor) struct BuildState {
-    trees: BTreeMap<TreeId, Tree>,
+    trees: imbl::OrdMap<TreeId, Tree>,
+    /// O(refs), copied as it is.
     pointers: Pointers<Parent>,
     upstreams: Upstreams,
-    opens: BTreeMap<u64, BuildOpen>,
-    pages: BTreeMap<(TreeId, u64), Vec<(u64, pages::Run)>>,
-    owners: BTreeMap<EventNumber, Parent>,
+    opens: imbl::OrdMap<u64, BuildOpen>,
+    pages: imbl::OrdMap<(TreeId, u64), imbl::Vector<(u64, pages::Run)>>,
+    /// Each direct save's commit, as built: History's snapshot, shared.
+    owners: Owners,
     /// Each step's head, for a later record naming it (`Target::Step`).
-    heads: BTreeMap<RecordNo, Parent>,
+    heads: imbl::OrdMap<RecordNo, Parent>,
     /// Trees whose head's tree is not known to match the built tree (after a
     /// fast-forward): the next commit lists the whole tree.
-    whole: BTreeSet<TreeId>,
+    whole: imbl::OrdSet<TreeId>,
     /// Each tree's object numbers as built, as History publishes them.
-    objects: BTreeMap<TreeId, Arc<Objects>>,
+    objects: BuiltObjects,
     /// Chunk records no take has taken yet.
-    bytes: Vec<(u64, Tail)>,
+    bytes: imbl::Vector<(u64, Tail)>,
+    /// Files whose built map still reads journal frames: what rebase visits.
+    framed: imbl::OrdSet<(TreeId, u64)>,
 }
 
 /// A map for a file the builder's state just took: a save, a create, a take.
@@ -202,12 +216,29 @@ struct Batch<'a> {
     values: Vec<(RecordNo, String, Parent)>,
     /// The last commit each scratch ref got.
     scratch: BTreeMap<BuildRef, u64>,
+    /// This batch's direct saves, by their commit's mark: History's owners
+    /// once the pack is installed.
+    owners: BTreeMap<EventNumber, u64>,
     /// A fork made or dropped: `config`'s branch merges change.
     forked: bool,
     /// Trees whose names or objects a step moved.
     moved: BTreeSet<TreeId>,
     /// Files whose map a step replaced: History hands the new maps to the actor.
     files: BTreeSet<(TreeId, u64)>,
+    /// This batch's flagged saves, by their commit's mark.
+    flags: Vec<Flagged>,
+}
+
+/// A save the batch flagged: its commit's mark, what its log line and its
+/// evidence say, and when it was recorded.
+struct Flagged {
+    mark: u64,
+    step: RecordNo,
+    tree: TreeId,
+    path: String,
+    flag: Flag,
+    evidence: Evidence,
+    at_ns: u64,
 }
 
 impl Batch<'_> {
@@ -268,30 +299,68 @@ fn disagrees(step: u64) -> Error {
     build_error(BuildError::Disagrees(RecordNo::new(step)))
 }
 
+/// A recorded layout that could not be read or laid: [`disagrees`]; any
+/// other failure as it is.
+fn unlaid(e: Error, step: u64) -> Error {
+    match e {
+        Error::Format => disagrees(step),
+        e => e,
+    }
+}
+
 impl BuildState {
     /// Moves every position the state holds (live opens' calls, held page
     /// writes, take chunks, file maps) to where compaction carried its
     /// frame, letting go of the dropped segments.
+    ///
+    /// Only a file in `framed` reads frames, so only those maps are visited,
+    /// and only what moved is changed (a persistent map copies what changes).
     fn relocate(&mut self, moved: &Relocations) {
-        for open in self.opens.values_mut() {
-            for (_, _, pos) in &mut open.calls {
-                pos.relocate(moved);
+        let carried = |pos: &FramePos| pos.relocated(moved).is_some();
+        let opens: Vec<u64> = self
+            .opens
+            .iter()
+            .filter(|(_, open)| open.calls.iter().any(|(_, _, pos)| carried(pos)))
+            .map(|(handle, _)| *handle)
+            .collect();
+        for handle in opens {
+            if let Some(open) = self.opens.get_mut(&handle) {
+                for (_, _, pos) in open.calls.iter_mut() {
+                    pos.relocate(moved);
+                }
             }
         }
-        for runs in self.pages.values_mut() {
-            pages::relocate_runs(runs, moved);
-        }
-        for (_, tail) in &mut self.bytes {
-            tail.pos.relocate(moved);
-        }
-        for tree in self.trees.values_mut() {
-            for bytes in tree.bytes.values_mut() {
-                if !bytes.on_frames() {
-                    continue;
+        let held: Vec<(TreeId, u64)> = self
+            .pages
+            .iter()
+            .filter(|(_, runs)| runs.iter().any(|(_, run)| carried(&run.at)))
+            .map(|(key, _)| *key)
+            .collect();
+        for key in held {
+            if let Some(runs) = self.pages.get_mut(&key) {
+                for (_, run) in runs.iter_mut() {
+                    run.at.relocate(moved);
                 }
-                let mut map = (**bytes).clone();
-                if map.relocate(moved) {
-                    *bytes = Arc::new(bytes.with_map(map));
+            }
+        }
+        if self.bytes.iter().any(|(_, tail)| carried(&tail.pos)) {
+            for (_, tail) in self.bytes.iter_mut() {
+                tail.pos.relocate(moved);
+            }
+        }
+        let framed: Vec<(TreeId, u64)> = self.framed.iter().copied().collect();
+        for (tree, object) in framed {
+            let Some(t) = self.trees.get(&tree) else {
+                continue;
+            };
+            let Some(bytes) = t.bytes.get(&object) else {
+                continue;
+            };
+            let mut map = (**bytes).clone();
+            if map.relocate(moved) {
+                let relocated = Arc::new(bytes.with_map(map));
+                if let Some(t) = self.trees.get_mut(&tree) {
+                    t.bytes.insert(object, relocated);
                 }
             }
         }
@@ -310,13 +379,13 @@ impl BuildState {
         opens: &BTreeMap<u64, crate::tree_actor::journal::FoldedOpen>,
         pages: BTreeMap<(TreeId, u64), Vec<(u64, pages::Run)>>,
         bytes: Vec<(u64, Tail)>,
-        owners: &BTreeMap<EventNumber, Oid>,
+        owners: &Owners,
         heads: BTreeMap<RecordNo, Oid>,
     ) -> Result<Self> {
         let mut trees = trees;
         let objects = trees
             .iter()
-            .map(|(id, tree)| Ok((*id, Arc::new(objects_of(&tree.shape)?))))
+            .map(|(id, tree)| Ok((*id, objects_of(&tree.shape)?)))
             .collect::<Result<_>>()?;
         for folded in opens.values() {
             if folded.open.anonymous {
@@ -330,8 +399,17 @@ impl BuildState {
                     );
             }
         }
+        let framed = trees
+            .iter()
+            .flat_map(|(id, tree)| {
+                tree.bytes
+                    .iter()
+                    .filter(|(_, bytes)| bytes.on_frames())
+                    .map(|(object, _)| (*id, *object))
+            })
+            .collect();
         Ok(Self {
-            trees,
+            trees: trees.into_iter().collect(),
             pointers: Pointers::new(
                 pointers
                     .iter()
@@ -347,28 +425,91 @@ impl BuildState {
                         BuildOpen {
                             tree: folded.open.tree,
                             object: folded.open.object,
-                            calls: folded.calls.clone(),
+                            calls: folded.calls.iter().cloned().collect(),
                         },
                     )
                 })
                 .collect(),
-            pages,
-            owners: owners
-                .iter()
-                .map(|(event, oid)| (*event, Parent::Built(*oid)))
+            pages: pages
+                .into_iter()
+                .map(|(key, runs)| (key, imbl::Vector::from(runs)))
                 .collect(),
+            owners: owners.clone(),
             heads: heads
                 .into_iter()
                 .map(|(step, oid)| (step, Parent::Built(oid)))
                 .collect(),
-            whole: BTreeSet::new(),
+            whole: imbl::OrdSet::new(),
             objects,
-            bytes,
+            bytes: bytes.into_iter().collect(),
+            framed,
         })
     }
 
     fn tree(&self, tree: TreeId) -> Result<&Tree> {
         self.trees.get(&tree).ok_or(Error::Format)
+    }
+
+    /// Each tree's objects as built: the published map, else (a tree no
+    /// batch has moved yet) its shape's.
+    fn objects_of_tree(&self, tree: TreeId, t: &Tree) -> Result<Objects> {
+        match self.objects.get(&tree) {
+            Some(objects) => Ok(objects.clone()),
+            None => objects_of(&t.shape),
+        }
+    }
+
+    /// What `next`, this state after a batch, moved of each tree's object
+    /// numbers and locals: the built-log entry's `moved`. Visits the diffs of
+    /// the persistent maps only (O(trees) plus what moved).
+    fn moved_to(&self, next: &Self) -> Result<Vec<TreeMoved>> {
+        let trees: BTreeSet<TreeId> = self
+            .trees
+            .keys()
+            .chain(next.trees.keys())
+            .copied()
+            .collect();
+        let mut moved = Vec::new();
+        for tree in trees {
+            let before = match self.trees.get(&tree) {
+                Some(t) => Some((t, self.objects_of_tree(tree, t)?)),
+                None => None,
+            };
+            let after = match next.trees.get(&tree) {
+                Some(t) => Some((t, next.objects_of_tree(tree, t)?)),
+                None => None,
+            };
+            let change = TreeMoved::between(
+                tree,
+                before.as_ref().map(|(t, o)| (&t.shape, o)),
+                after.as_ref().map(|(t, o)| (&t.shape, o)),
+            )?;
+            // The unit tests' check, at every batch: the moves carry the
+            // before-state's objects and locals to the after-state's.
+            #[cfg(test)]
+            {
+                let (mut objects, mut locals) = (BTreeMap::new(), BTreeMap::new());
+                if let Some((t, _)) = &before {
+                    objects.insert(tree, objects_of(&t.shape)?);
+                    locals.insert(tree, t.shape.locals());
+                }
+                if let Some(change) = &change {
+                    change.apply(&mut objects, &mut locals)?;
+                }
+                let (mut want_objects, mut want_locals) = (BTreeMap::new(), BTreeMap::new());
+                if let Some((t, _)) = &after {
+                    want_objects.insert(tree, objects_of(&t.shape)?);
+                    want_locals.insert(tree, t.shape.locals());
+                }
+                assert_eq!(
+                    (objects, locals),
+                    (want_objects, want_locals),
+                    "{tree}: a batch's moves disagree with its trees"
+                );
+            }
+            moved.extend(change);
+        }
+        Ok(moved)
     }
 
     fn head(&self, tree: TreeId) -> Result<Parent> {
@@ -404,14 +545,14 @@ impl BuildState {
                     .get_mut(handle)
                     .ok_or(Error::Format)?
                     .calls
-                    .push((seq, call.clone(), tail.pos.clone()));
+                    .push_back((seq, call.clone(), tail.pos.clone()));
             }
             Entry::PageWrite { tree, object, runs } => self
                 .pages
                 .entry((tree.parse::<TreeId>()?, *object))
                 .or_default()
                 .extend(runs_from_frame(runs, tail)?.into_iter().map(|r| (seq, r))),
-            Entry::Bytes => self.bytes.push((seq, tail.clone())),
+            Entry::Bytes => self.bytes.push_back((seq, tail.clone())),
             Entry::Step {
                 by,
                 change,
@@ -428,7 +569,7 @@ impl BuildState {
             BuildOpen {
                 tree,
                 object,
-                calls: Vec::new(),
+                calls: imbl::Vector::new(),
             },
         );
         self.pages.entry((tree, object)).or_default();
@@ -450,7 +591,7 @@ impl BuildState {
         at_ns: u64,
         batch: &mut Batch<'_>,
     ) -> Result<Parent> {
-        let whole = self.whole.remove(&tree);
+        let whole = self.whole.remove(&tree).is_some();
         let after = self.trees.get(&tree).ok_or(Error::Format)?;
         let edits = format::edits(after, (!whole).then_some(changed), |bytes| {
             batch.blob(bytes)
@@ -552,6 +693,7 @@ impl BuildState {
                 tree,
                 event,
                 open,
+                unverified: None,
             }
             .render(ctx.identity)
         };
@@ -575,7 +717,7 @@ impl BuildState {
                 t.bytes.insert(object, saved_map(FileMap::empty(), seq));
                 t.lines.insert(object, Arc::default());
                 batch.files.insert((id, object));
-                let identity = *t.identities.get(&object).ok_or(Error::Format)?;
+                let identity = t.identity_of(object).ok_or(Error::Format)?;
                 t.namespace
                     .insert(identity, NameHistory::created(event, path.clone()));
                 let message = direct(Action::Create, id, None)?;
@@ -596,7 +738,7 @@ impl BuildState {
                 t.bytes.insert(object, Arc::new(map.into()));
                 t.lines.insert(object, Arc::new(lines));
                 batch.files.insert((id, object));
-                let identity = *t.identities.get(&object).ok_or(Error::Format)?;
+                let identity = t.identity_of(object).ok_or(Error::Format)?;
                 t.namespace
                     .insert(identity, NameHistory::created(event, path.clone()));
                 let message = direct(Action::Symlink, id, None)?;
@@ -628,7 +770,7 @@ impl BuildState {
                 let id = tree.parse::<TreeId>()?;
                 let t = self.tree_mut(id)?;
                 let keys = t.shape.apply(change, event, at_ns)?;
-                let identity = *t.identities.get(object).ok_or_else(|| disagrees(seq))?;
+                let identity = t.identity_of(*object).ok_or_else(|| disagrees(seq))?;
                 t.namespace
                     .insert(identity, NameHistory::created(event, path.clone()));
                 let message = direct(Action::Create, id, None)?;
@@ -653,35 +795,106 @@ impl BuildState {
                     SaveOutcome::AnonymousDropped => {
                         t.bytes.remove(&open.object);
                         t.lines.remove(&open.object);
+                        self.framed.remove(&(id, open.object));
                     }
                     SaveOutcome::Unchanged | SaveOutcome::OrphanDropped => {}
-                    SaveOutcome::Saved {
-                        len,
-                        pieces: digest,
-                    } => {
-                        let writes = self.pages.get(&(id, open.object));
-                        let (map, calls) = pages::replay_close(
-                            t.bytes.get(&open.object).ok_or_else(|| disagrees(seq))?,
-                            &open.calls,
-                            writes.map_or(&[][..], Vec::as_slice),
-                            pieces,
-                        )?
-                        .ok_or_else(|| disagrees(seq))?;
-                        if map.len() != *len || map.digest(&own_keys(&calls)) != *digest {
-                            return Err(disagrees(seq));
+                    SaveOutcome::Saved { len, chunks } => {
+                        let chunks = self.take_chunks(seq, *chunks)?;
+                        // The record wins: a layout that cannot be read or
+                        // laid is the only disagreement that stops building.
+                        let recorded = Layout::read(*len, &chunks).map_err(|e| unlaid(e, seq))?;
+                        let writes: Vec<(u64, pages::Run)> = self
+                            .pages
+                            .get(&(id, open.object))
+                            .map(|runs| runs.iter().cloned().collect())
+                            .unwrap_or_default();
+                        let own: Vec<(u64, Call, FramePos)> = open.calls.iter().cloned().collect();
+                        let t = self.trees.get_mut(&id).ok_or(Error::Format)?;
+                        let saved = t.bytes.get(&open.object).ok_or_else(|| disagrees(seq))?;
+                        let replayed = Layout::replay(saved.len(), &own, &writes, pieces)?;
+                        // Each place from the calls and runs tracked here,
+                        // else from the journal by its record.
+                        let mut known = Positions::default();
+                        for (_, _, pos) in &own {
+                            known.add(pos);
                         }
+                        for (_, run) in &writes {
+                            known.add(&run.at);
+                        }
+                        let mut journal: Option<CallReader> = None;
+                        let map = recorded
+                            .lay(saved, &mut |place| {
+                                if let Some(pos) = known.find(place) {
+                                    return Ok(Some(pos));
+                                }
+                                let reader = match &mut journal {
+                                    Some(reader) => reader,
+                                    empty => empty.insert(CallReader::of_segments(
+                                        ctx.durability.segments(),
+                                        ctx.salt,
+                                    )?),
+                                };
+                                Ok(reader
+                                    .record(place.record)?
+                                    .map(|(_, tail)| tail.pos.at(place.at)))
+                            })
+                            .map_err(|e| unlaid(e, seq))?;
                         let base = t.bytes.get(&open.object).ok_or_else(|| disagrees(seq))?;
                         let old = t.lines.get(&open.object).ok_or_else(|| disagrees(seq))?;
-                        let appended = calls
-                            .iter()
-                            .all(|(call, _)| matches!(call, Call::Append { .. }));
+                        let appended = recorded.only_extends(base.len());
+                        let before_len = base.len();
                         let lines = saved_lines(ctx.root, old, base, &map, appended, event)?;
                         t.lines.insert(open.object, Arc::new(lines));
                         t.bytes.insert(open.object, saved_map(map, seq));
                         batch.files.insert((id, open.object));
-                        let message = direct(Action::Direct, id, Some(*handle))?;
-                        head =
-                            Some(self.commit_direct(id, &keys, &message, record.at_ns, batch)?);
+                        let flag = (replayed.as_ref() != Some(&recorded)).then(|| Flag {
+                            recorded: recorded.fingerprint(),
+                            replayed: replayed.as_ref().map(Layout::fingerprint),
+                            builder: verify::release_or_unknown(),
+                        });
+                        let message = Message::Direct {
+                            action: Action::Direct,
+                            by,
+                            tree: id,
+                            event,
+                            open: Some(*handle),
+                            unverified: flag.as_ref(),
+                        }
+                        .render(ctx.identity)?;
+                        let commit =
+                            self.commit_direct(id, &keys, &message, record.at_ns, batch)?;
+                        if let (Some(flag), Parent::Mark(mark)) = (flag, &commit) {
+                            let path = self
+                                .tree(id)?
+                                .names
+                                .of(open.object)
+                                .next()
+                                .unwrap_or_default()
+                                .to_owned();
+                            let evidence = Evidence::of(&Inputs {
+                                step: record.seq,
+                                handle: *handle,
+                                tree: id,
+                                object: open.object,
+                                path: &path,
+                                before_len,
+                                own: &own,
+                                writes: &writes,
+                                pieces,
+                                recorded: &recorded,
+                                replayed: replayed.as_ref(),
+                            });
+                            batch.flags.push(Flagged {
+                                mark: *mark,
+                                step: record.seq,
+                                tree: id,
+                                path,
+                                flag,
+                                evidence,
+                                at_ns: record.at_ns,
+                            });
+                        }
+                        head = Some(commit);
                         owner = true;
                     }
                 }
@@ -700,12 +913,12 @@ impl BuildState {
                 let prefix = format!("{from}/");
                 let moved: Vec<(String, u64)> = t
                     .names
-                    .range(prefix.clone()..)
+                    .range::<_, str>((Bound::Included(prefix.as_str()), Bound::Unbounded))
                     .take_while(|(path, _)| path.starts_with(&prefix))
-                    .map(|(path, object)| (path.clone(), *object))
+                    .map(|(path, object)| (path.to_string(), *object))
                     .collect();
                 for (path, object) in moved {
-                    let identity = *t.identities.get(&object).ok_or(Error::Format)?;
+                    let identity = t.identity_of(object).ok_or(Error::Format)?;
                     t.namespace
                         .get_mut(&identity)
                         .ok_or(Error::Format)?
@@ -720,10 +933,10 @@ impl BuildState {
             Change::Rename { tree, from, to } => {
                 let id = tree.parse::<TreeId>()?;
                 let t = self.tree_mut(id)?;
-                let object = *t.names.get(from).ok_or_else(|| disagrees(seq))?;
-                let source = *t.identities.get(&object).ok_or_else(|| disagrees(seq))?;
-                match t.names.get(to).copied() {
-                    Some(replaced) if t.fresh_names.contains(&object) => {
+                let object = *t.names.get(from.as_str()).ok_or_else(|| disagrees(seq))?;
+                let source = t.identity_of(object).ok_or_else(|| disagrees(seq))?;
+                match t.names.get(to.as_str()).copied() {
+                    Some(replaced) if t.is_fresh(object) => {
                         t.namespace
                             .get_mut(&source)
                             .ok_or(Error::Format)?
@@ -740,7 +953,7 @@ impl BuildState {
                     }
                     replaced => {
                         if let Some(replaced) = replaced {
-                            let replaced = *t.identities.get(&replaced).ok_or(Error::Format)?;
+                            let replaced = t.identity_of(replaced).ok_or(Error::Format)?;
                             t.namespace
                                 .get_mut(&replaced)
                                 .ok_or(Error::Format)?
@@ -762,8 +975,8 @@ impl BuildState {
             Change::Unlink { tree, path } => {
                 let id = tree.parse::<TreeId>()?;
                 let t = self.tree_mut(id)?;
-                let object = *t.names.get(path).ok_or_else(|| disagrees(seq))?;
-                let identity = *t.identities.get(&object).ok_or(Error::Format)?;
+                let object = *t.names.get(path.as_str()).ok_or_else(|| disagrees(seq))?;
+                let identity = t.identity_of(object).ok_or(Error::Format)?;
                 t.namespace
                     .get_mut(&identity)
                     .ok_or(Error::Format)?
@@ -786,6 +999,24 @@ impl BuildState {
                 if self.whole.contains(&upstream) {
                     self.whole.insert(fork);
                 }
+                // The fork's maps are the upstream's: so are those that read
+                // frames, noted or replaced earlier in this batch.
+                let fork_tree = self.tree(fork)?;
+                let framed: Vec<u64> = self
+                    .framed
+                    .range((upstream, 0)..=(upstream, u64::MAX))
+                    .chain(batch.files.range((upstream, 0)..=(upstream, u64::MAX)))
+                    .map(|(_, object)| *object)
+                    .filter(|object| {
+                        fork_tree
+                            .bytes
+                            .get(object)
+                            .is_some_and(|bytes| bytes.on_frames())
+                    })
+                    .collect();
+                for object in framed {
+                    self.framed.insert((fork, object));
+                }
                 head = Some(self.head(upstream)?);
                 batch.forked = true;
                 batch.moved.insert(fork);
@@ -804,10 +1035,10 @@ impl BuildState {
                 ..
             } => {
                 let id = tree.parse::<TreeId>()?;
-                let chunks = take_chunks(&mut self.bytes, seq, *chunks)?;
+                let chunks = self.take_chunks(seq, *chunks)?;
                 let map = chunk_map(&chunks, *len, record.seq)?;
                 let t = self.tree_mut(id)?;
-                let existing = t.names.get(path).copied();
+                let existing = t.names.get(path.as_str()).copied();
                 let keys = t.shape.apply(change, event, at_ns)?;
                 let object = existing.unwrap_or(event.object());
                 let lines = match existing {
@@ -820,7 +1051,7 @@ impl BuildState {
                         event,
                     )?,
                     None => {
-                        let identity = *t.identities.get(&object).ok_or(Error::Format)?;
+                        let identity = t.identity_of(object).ok_or(Error::Format)?;
                         t.namespace
                             .insert(identity, NameHistory::created(event, path.clone()));
                         batch.moved.insert(id);
@@ -853,7 +1084,22 @@ impl BuildState {
                 self.upstreams.remove(fork);
                 self.objects.remove(&fork);
                 self.whole.remove(&fork);
-                self.pages.retain(|(tree, _), _| *tree != fork);
+                let held: Vec<(TreeId, u64)> = self
+                    .pages
+                    .range((fork, 0)..=(fork, u64::MAX))
+                    .map(|(key, _)| *key)
+                    .collect();
+                for key in held {
+                    self.pages.remove(&key);
+                }
+                let framed: Vec<(TreeId, u64)> = self
+                    .framed
+                    .range((fork, 0)..=(fork, u64::MAX))
+                    .copied()
+                    .collect();
+                for key in framed {
+                    self.framed.remove(&key);
+                }
                 batch.moved.remove(&fork);
                 batch.files.retain(|(tree, _)| *tree != fork);
                 batch.forked = true;
@@ -862,7 +1108,14 @@ impl BuildState {
         if let Some(head) = head {
             self.heads.insert(record.seq, head);
             if owner {
-                self.owners.insert(event, head);
+                match head {
+                    Parent::Mark(mark) => {
+                        batch.owners.insert(event, mark);
+                    }
+                    Parent::Built(oid) => {
+                        self.owners.insert(event, oid);
+                    }
+                }
             }
         }
         // After the change, its rows: a row chain's `Step(n)` is step `n`'s
@@ -915,7 +1168,7 @@ impl BuildState {
         batch: &mut Batch<'_>,
     ) -> Result<Option<Parent>> {
         let event = EventNumber::new(seq);
-        let chunks = take_chunks(&mut self.bytes, seq, take.chunks)?;
+        let chunks = self.take_chunks(seq, take.chunks)?;
         let current = self.tree(id)?;
         let mut snapshot = current.snapshot();
         for (identity, file) in &take.files {
@@ -964,7 +1217,7 @@ impl BuildState {
         let mut shape = current.shape.clone();
         shape.apply(change, event, at_ns)?;
         if *shape.names != *t.shape.names
-            || shape.fresh_names != t.shape.fresh_names
+            || shape.fresh_objects().ne(t.shape.fresh_objects())
             || shape.dirs.keys().ne(t.shape.dirs.keys())
         {
             return Err(disagrees(seq));
@@ -982,11 +1235,10 @@ impl BuildState {
         for tree in [current, &t] {
             for (path, object) in tree.names.iter() {
                 if tree
-                    .identities
-                    .get(object)
-                    .is_some_and(|i| identities.contains(i))
+                    .identity_of(*object)
+                    .is_some_and(|i| identities.contains(&i))
                 {
-                    changed.insert(Key::Name(path.clone()));
+                    changed.insert(Key::Name(path.to_string()));
                 }
             }
         }
@@ -1041,8 +1293,15 @@ impl BuildState {
         Ok(head)
     }
 
-    /// Every mark replaced by its object, once the batch's pack is installed.
-    fn resolve(&mut self, marks: &BTreeMap<u64, Oid>) -> Result<()> {
+    /// Every mark replaced by its object, once the batch's pack is installed:
+    /// the pointers (O(refs)), the heads of the batch's steps (`from` on) and
+    /// the batch's direct saves (`owners`, by mark).
+    fn resolve(
+        &mut self,
+        marks: &BTreeMap<u64, Oid>,
+        from: RecordNo,
+        owners: &BTreeMap<EventNumber, u64>,
+    ) -> Result<()> {
         let resolve = |value: &mut Parent| -> Result<()> {
             if let Parent::Mark(mark) = *value {
                 *value = Parent::Built(*marks.get(&mark).ok_or(Error::Format)?);
@@ -1056,13 +1315,62 @@ impl BuildState {
             pointers.insert(name.clone(), value);
         }
         self.pointers = Pointers::new(pointers);
-        for value in self.owners.values_mut() {
-            resolve(value)?;
+        for (event, mark) in owners {
+            self.owners
+                .insert(*event, *marks.get(mark).ok_or(Error::Format)?);
         }
-        for value in self.heads.values_mut() {
-            resolve(value)?;
+        let marked: Vec<RecordNo> = self
+            .heads
+            .range(from..)
+            .filter(|(_, value)| matches!(value, Parent::Mark(_)))
+            .map(|(step, _)| *step)
+            .collect();
+        for step in marked {
+            if let Some(value) = self.heads.get_mut(&step) {
+                resolve(value)?;
+            }
         }
         Ok(())
+    }
+
+    /// A take's or replace's chunks ([`take_chunks`]) from the records no
+    /// take has taken yet: few, and none at rest.
+    fn take_chunks(&mut self, seq: u64, n: u64) -> Result<Vec<Tail>> {
+        let mut pending: Vec<(u64, Tail)> = self.bytes.iter().cloned().collect();
+        let chunks = take_chunks(&mut pending, seq, n)?;
+        self.bytes = pending.into_iter().collect();
+        Ok(chunks)
+    }
+
+    /// The unit tests' check, at every batch: `framed` holds every built map
+    /// that reads frames, so rebase and relocation visit them all.
+    #[cfg(test)]
+    fn check_framed(&self) {
+        for (id, tree) in &self.trees {
+            for (object, bytes) in &tree.bytes {
+                assert!(
+                    !bytes.on_frames() || self.framed.contains(&(*id, *object)),
+                    "{id} {object} reads frames but is not noted"
+                );
+            }
+        }
+    }
+
+    /// Notes whether each of `files`, whose maps a batch replaced, still
+    /// reads frames.
+    fn note_framed(&mut self, files: &BTreeSet<(TreeId, u64)>) {
+        for (tree, object) in files {
+            let framed = self
+                .trees
+                .get(tree)
+                .and_then(|t| t.bytes.get(object))
+                .is_some_and(|bytes| bytes.on_frames());
+            if framed {
+                self.framed.insert((*tree, *object));
+            } else {
+                self.framed.remove(&(*tree, *object));
+            }
+        }
     }
 
     /// The pointers as oids; [`Error::Format`] while a mark is unresolved.
@@ -1077,16 +1385,6 @@ impl BuildState {
                 .collect::<Result<_>>()?,
         ))
     }
-
-    fn built_owners(&self) -> BTreeMap<EventNumber, Oid> {
-        self.owners
-            .iter()
-            .filter_map(|(event, value)| match value {
-                Parent::Built(oid) => Some((*event, *oid)),
-                Parent::Mark(_) => None,
-            })
-            .collect()
-    }
 }
 
 /// What every step's build reads and never changes.
@@ -1096,6 +1394,10 @@ pub(in crate::tree_actor) struct Context<'a> {
     pub repo: &'a TreeGit,
     /// The state area: where an alignment writes the files `git diff` reads.
     pub root: &'a Path,
+    /// The journal's segments and salt: where a save's bytes the builder
+    /// does not track are read by record.
+    pub durability: &'a Arc<Durability>,
+    pub salt: u32,
 }
 
 /// The line map of `after`'s bytes over `old`, the map of `before`'s: one
@@ -1164,8 +1466,9 @@ pub(in crate::tree_actor) struct Builder {
     pub checked_out: BTreeMap<TreeId, Oid>,
     /// A copy failed: the next batch rebuilds refs, config and checkouts whole.
     pub stale: bool,
-    /// The built log's entries since its last rewrite.
-    pub log: Vec<BuiltEntry>,
+    /// The volume's flagged commits by state: each flag counted once its
+    /// batch is built.
+    pub verification: Verification,
 }
 
 impl Builder {
@@ -1184,17 +1487,21 @@ impl Builder {
     /// installed, or nothing reachable changed.
     fn batch(&mut self) -> std::result::Result<(), BuildError> {
         crate::failpoints::hit("tree.build_before_batch")?;
+        #[cfg(test)]
+        self.history.batch_read(None);
         let started = std::time::Instant::now();
         let checkpointed = self.history.checkpointed_through();
         if self
-            .log
-            .first()
-            .is_some_and(|entry| entry.through <= checkpointed)
+            .built_log
+            .first_through()
+            .is_some_and(|through| through <= checkpointed)
         {
-            self.log.retain(|entry| entry.through > checkpointed);
-            self.built_log.rewrite(&self.log)?;
+            let keep = self.built_log.entries_after(checkpointed)?;
+            self.built_log.rewrite(&keep)?;
         }
         let through = self.durability.appended();
+        #[cfg(test)]
+        self.history.batch_read(Some(through));
         self.durability
             .make_durable(through)
             .map_err(|e| BuildError::Io(e.errno()))?;
@@ -1218,7 +1525,14 @@ impl Builder {
         };
         // No record after the checkpoint names a step it covers
         // (`TreeActor::resolve_compacted`): those heads are never read again.
-        self.state.heads.retain(|step, _| *step > checkpointed);
+        if self
+            .state
+            .heads
+            .get_min()
+            .is_some_and(|(step, _)| *step <= checkpointed)
+        {
+            self.state.heads = self.state.heads.split(&checkpointed).1;
+        }
         self.state.relocate(self.durability.relocations());
         let mut next = self.state.clone();
         let marks_path = self.root.join("build.marks");
@@ -1228,6 +1542,8 @@ impl Builder {
             service: &self.service,
             repo: &repo,
             root: &self.root,
+            durability: &self.durability,
+            salt: self.reader.salt,
         };
         let mut batch = Batch {
             repo: &repo,
@@ -1236,9 +1552,11 @@ impl Builder {
             blobs: HashMap::new(),
             values: Vec::new(),
             scratch: BTreeMap::new(),
+            owners: BTreeMap::new(),
             forked: false,
             moved: BTreeSet::new(),
             files: BTreeSet::new(),
+            flags: Vec::new(),
         };
         for (record, tail) in &frames {
             next.apply(record, tail, &ctx, &mut batch)
@@ -1251,13 +1569,30 @@ impl Builder {
             }
             None => BTreeMap::new(),
         };
-        next.resolve(&marks).map_err(to_build_error)?;
+        let from = frames.first().map_or(through, |(record, _)| record.seq);
+        next.resolve(&marks, from, &batch.owners)
+            .map_err(to_build_error)?;
+        next.note_framed(&batch.files);
+        #[cfg(test)]
+        next.check_framed();
         for tree in &batch.moved {
-            let objects = objects_of(&next.tree(*tree).map_err(to_build_error)?.shape)
-                .map_err(to_build_error)?;
-            next.objects.insert(*tree, Arc::new(objects));
+            let after = &next.tree(*tree).map_err(to_build_error)?.shape;
+            // A tree this batch made (a fork) has none to start from.
+            let objects = match (self.state.trees.get(tree), self.state.objects.get(tree)) {
+                (Some(before), Some(objects)) => objects_after(&before.shape, objects, after),
+                _ => objects_of(after),
+            }
+            .map_err(to_build_error)?;
+            // The unit tests' check, at every batch: the objects moved are
+            // all the tree's.
+            #[cfg(test)]
+            assert!(
+                objects_of(after).is_ok_and(|all| all == objects),
+                "{tree}: the objects a batch moved disagree with its tree's"
+            );
+            next.objects.insert(*tree, objects);
         }
-        let objects: Arc<BuiltObjects> = Arc::new(next.objects.clone());
+        let objects = next.objects.clone();
         for (bytes, mark) in batch.blobs.values() {
             if let Some(oid) = marks.get(mark) {
                 bytes.set_blob(*oid);
@@ -1274,16 +1609,48 @@ impl Builder {
             values.push(BuiltValue {
                 step: *step,
                 name: name.clone(),
-                oid: oid.to_string(),
+                oid,
             });
         }
+        let moved = self.state.moved_to(&next).map_err(to_build_error)?;
+        // Each flag's commit is in the pack: its evidence, best effort. The
+        // flag itself is the commit's trailer, already durable.
+        let mut flagged = Vec::with_capacity(batch.flags.len());
+        for pending in std::mem::take(&mut batch.flags) {
+            let commit = *marks
+                .get(&pending.mark)
+                .ok_or_else(|| BuildError::Packer("an unknown mark".into()))?;
+            write_evidence(&repo, commit, &pending);
+            flagged.push((commit, pending));
+        }
         crate::failpoints::hit("tree.build_after_pack")?;
-        let entry = BuiltEntry { through, values };
+        let entry = BuiltEntry {
+            through,
+            values,
+            moved,
+        };
         self.built_log.append(&entry)?;
-        self.log.push(entry);
+        // Built: each flag counts once, whatever builds the batch again.
+        self.verification.add_unresolved(flagged.len() as u64);
+        for (commit, pending) in &flagged {
+            let replayed = pending
+                .flag
+                .replayed
+                .map_or_else(|| "none".to_owned(), |f| f.to_string());
+            eprintln!(
+                "tree HistoryUnverified: step={} tree={} commit={commit} path={}: the builder's \
+                 replay of this save does not match its recorded layout (recorded {}, replayed \
+                 {replayed}); history holds the bytes the workload saved \
+                 (docs/runbooks/recording-failures.md)",
+                pending.step.get(),
+                pending.tree,
+                serde_json::to_string(&pending.path).unwrap_or_default(),
+                pending.flag.recorded,
+            );
+        }
         self.reader.advance(offset, through);
         let built = next.built_pointers().map_err(to_build_error)?;
-        let owners = next.built_owners();
+        let owners = next.owners.clone();
         let scratch: Vec<(BuildRef, Oid)> = batch
             .scratch
             .iter()
@@ -1302,15 +1669,18 @@ impl Builder {
         };
         let maps = self.rebase(through, &checked_out, files);
         self.history.publish_maps(maps);
+        let trees = self.state.trees.clone();
         self.history
-            .built_event(through, built, owners, objects, started.elapsed());
+            .built_event(through, built, (owners, objects, trees), started.elapsed());
         Ok(())
     }
 
-    /// The files of each tree checked out through `through` read from the
-    /// checkout as built, letting go of their frames; returns those maps and
-    /// every map in `files`, for the actor to take where it saved the same
-    /// step. A file that cannot be opened keeps its frames.
+    /// The files of each tree checked out through `through` that still read
+    /// frames, read from the checkout as built, letting go of their frames;
+    /// returns those maps and every map in `files`, for the actor to take
+    /// where it saved the same step. A file that cannot be opened keeps its
+    /// frames. Visits `framed` within `checked_out`, and `files`: O(batch),
+    /// never every name.
     fn rebase(
         &mut self,
         through: RecordNo,
@@ -1318,40 +1688,58 @@ impl Builder {
         files: BTreeSet<(TreeId, u64)>,
     ) -> Vec<(TreeId, u64, FileMap)> {
         let mut changed = files;
-        for tree in checked_out {
-            let Some(t) = self.state.trees.get_mut(tree) else {
+        let visit: Vec<(TreeId, u64)> = checked_out
+            .iter()
+            .flat_map(|tree| {
+                self.state
+                    .framed
+                    .range((*tree, 0)..=(*tree, u64::MAX))
+                    .copied()
+            })
+            .collect();
+        for (tree, object) in visit {
+            let state = &mut self.state;
+            let Some(bytes) = state
+                .trees
+                .get(&tree)
+                .and_then(|t| t.bytes.get(&object))
+                .filter(|bytes| bytes.on_frames())
+                .cloned()
+            else {
+                state.framed.remove(&(tree, object));
                 continue;
             };
-            let named: Vec<(String, u64)> = t
-                .names
-                .iter()
-                .map(|(path, object)| (path.clone(), *object))
-                .collect();
-            for (path, object) in named {
-                let Some(bytes) = t.bytes.get(&object) else {
-                    continue;
-                };
-                if !bytes.on_frames() {
+            // A file no name reaches has no checkout: it keeps its frames.
+            let Some(path) = state
+                .trees
+                .get(&tree)
+                .and_then(|t| t.names.of(object).next())
+                .map(str::to_owned)
+            else {
+                continue;
+            };
+            let base = match BaseFile::open(
+                &self.root.join(super::BASES),
+                &super::checkout_path(&self.root, tree, &path),
+                through,
+                bytes.known_blob(),
+            ) {
+                Ok(base) => base,
+                Err(e) => {
+                    eprintln!("tree BaseFile: {tree} {path}: {e}");
                     continue;
                 }
-                let base = match BaseFile::open(
-                    &self.root.join(super::BASES),
-                    &super::checkout_path(&self.root, *tree, &path),
-                    through,
-                    bytes.known_blob(),
-                ) {
-                    Ok(base) => base,
-                    Err(e) => {
-                        eprintln!("tree BaseFile: {tree} {path}: {e}");
-                        continue;
-                    }
-                };
-                let mut map = (**bytes).clone();
-                map.rebase(base);
-                let rebased = Arc::new(bytes.with_map(map));
-                t.bytes.insert(object, rebased);
-                changed.insert((*tree, object));
+            };
+            let mut map = (*bytes).clone();
+            map.rebase(base);
+            let rebased = Arc::new(bytes.with_map(map));
+            if !rebased.on_frames() {
+                state.framed.remove(&(tree, object));
             }
+            if let Some(t) = state.trees.get_mut(&tree) {
+                t.bytes.insert(object, rebased);
+            }
+            changed.insert((tree, object));
         }
         changed
             .into_iter()
@@ -1422,6 +1810,25 @@ impl Builder {
         }
         self.stale = false;
         Ok(rewritten)
+    }
+}
+
+/// A flagged save's evidence, under the notes ref, committed by the builder's
+/// commit identity at the step's record time. Any failure is logged with the
+/// evidence's text and never fails the batch: the flag is in the commit.
+fn write_evidence(repo: &TreeGit, commit: Oid, pending: &Flagged) {
+    let written = (|| -> Result<()> {
+        let seconds = i64::try_from(pending.at_ns / 1_000_000_000).unwrap_or(i64::MAX);
+        let committer =
+            git2::Signature::new("agentfs", "agentfs@localhost", &git2::Time::new(seconds, 0))?;
+        verify::write_evidence(repo, commit, &pending.evidence, &committer)
+    })();
+    if let Err(e) = written {
+        let text = verify::render_evidence(&pending.evidence).unwrap_or_default();
+        eprintln!(
+            "tree HistoryEvidenceNotWritten: commit={commit}: {e}; the evidence was: {}",
+            text.trim_end()
+        );
     }
 }
 

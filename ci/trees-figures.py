@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """The tree views' release figures (docs/performance.md, "Tree views, release build").
 
-Runs four flat workloads through a mounted tree view, each against its own
+Runs six flat workloads through a mounted tree view, each against its own
 deadline, compares each figure with its bar in ci/trees-budget.json, and
 writes the report as JSON. A figure that misses its bar sets `warn`. A gated
 one (`"gate": true` in the budget: the many-file `create`) prints an
@@ -9,14 +9,43 @@ one (`"gate": true` in the budget: the many-file `create`) prints an
 other prints a `::warning::` line. A workload that
 runs out of time reports what it reached by its deadline; no figure is
 extrapolated, because a save's cost grows with the tree. ci/e2e-trees-tracer.sh
-runs it as its step 4. Standard library only.
+runs it as its step 4, and again after it restarts the view (step 5) with
+--baseline. Standard library only.
 
     trees-figures.py --view DIR --filesystem FS --image ID --budget PATH --output PATH
                      [--build release] [--only WORKLOAD]...
+    trees-figures.py --view DIR ... --baseline REPORT --restart-mount-s S
+                     --restart-peak PATH --output PATH
+    trees-figures.py --sample-peak PID --stop-file PATH --peak-output PATH
     trees-figures.py --self-test --budget PATH
+    trees-figures.py --self-test-warn --budget PATH
 
 `--self-test` judges a synthetic report whose `create` fell one file short of
 its count, with no view, and exits as a run would: 1 while `create` is gated.
+`--self-test-warn` judges one where every other bar is missed, and exits as a
+run would: 0 while only `create` is gated (owner, 2026-11-20: the new bars
+warn, they do not fail CI).
+
+With --baseline, the view was restarted on the state the first run left:
+the script reports `restart` and runs `long_history` only, and writes the
+first run's report with those two added.
+
+Every memory figure is the sampled peak of the view's RssAnon: its anonymous
+resident memory, what the kernel cannot reclaim (clean file-backed git index
+pages are not counted, owner 2026-11-20). A PeakSampler reads
+/proc/PID/status every 20 ms on a thread of its own from just before the
+workload until its history is built (after drain, so the build is inside the
+window); a spike shorter than the interval can fall between two samples.
+Each memory bar warns and never fails: it is a mark for regressions, not a
+target (owner, 2026-11-20: "I dont have a number in mind. Im just looking to
+cut waste").
+
+`--sample-peak` samples one process the same way until the stop file exists,
+then writes `{"peak_anon_kib": N, "samples": M}` to --peak-output (exit 1
+when the process was gone before any sample). The tracer starts it on the
+restarted view as soon as `docker run -d` returns and the container's pid is
+read, so the view's first milliseconds are unsampled, and touches the stop
+file once the view is mounted: that output is --restart-peak.
 
 Every timed save ends with a stat(2) of the file. The view saves a file when
 the kernel releases it, which reaches agentfs just after close(2) returns,
@@ -41,14 +70,35 @@ commit, not only the close.
                bytes at any file size)
     history_1g the 1 GiB save's drain_s: from its close and stat to the built
                point reaching it (needs --metrics)
-    memory_1g  the view process's peak resident memory over its resident
-               memory before the 1 GiB workload, through its save and its
-               build, in MiB: the kernel's high-water mark, reset first
-               (/proc/PID/clear_refs, 5) and read once (needs --view-pid)
-    memory_create the view process's resident memory after the `create`
-               workload's history is built, over its resident memory before
-               the workload, per file created, in KiB: what the view holds for
-               each file of a tree (needs --view-pid and --metrics)
+    memory_1g  `peak_extra_mib`, the view's sampled RssAnon peak through the
+               1 GiB workload, its save and its build, over its RssAnon
+               before, and `peak_anon_mib`, that peak (needs --view-pid)
+    memory_create `kib_per_file`, the view's sampled RssAnon peak through
+               the `create` workload and its build, over its RssAnon before,
+               per file created: what the view holds for each file of a tree,
+               and `peak_anon_mib`, that peak (needs --view-pid and
+               --metrics). `create`'s `first_2000_ms` is the mean ms of its
+               first 2,000 creates
+    close_frag one 64 MiB file written in 1 MiB blocks and closed, then
+               opened again for 200,000 64-byte writes at random offsets,
+               closed and statted: `close_s`, the close and stat alone, and
+               `lock_hold_max_ms`, the longest hold of the volume's actor lock
+               (stages.actor_lock.max_nanos in the metrics file, read once its
+               history is built; needs --metrics). The maximum is the whole
+               process's: only a run with `--only close_frag` holds the close
+               alone, which is how the bar is read
+    write_1m   1,000,000 sequential 64-byte appends in one open, closed and
+               statted: `close_s`, and `peak_extra_mib` and `peak_anon_mib`,
+               read through the save and its build as memory_1g's are (needs
+               --view-pid)
+    restart    (--baseline) the view stopped and mounted again on the state
+               the first run left (about 50,000 files): `mount_s`, from the
+               start to its `mounted` line (the tracer's --restart-mount-s),
+               and `peak_anon_mib`, the new view's sampled RssAnon peak from
+               its start to its `mounted` line (--restart-peak)
+    long_history (--baseline) 2,000 more creates on the restarted view:
+               `ratio`, their mean ms over the first run's `create`
+               `first_2000_ms`
 
 Each workload runs on a worker thread. One the deadline catches inside a
 save gets `grace_s` more to come back; one still blocked then is stuck in
@@ -60,6 +110,7 @@ import argparse
 import json
 import math
 import os
+import random
 import statistics
 import subprocess
 import sys
@@ -71,6 +122,10 @@ BIG_BYTES = 64 * MIB
 HUGE_BYTES = 1024 * MIB
 SMALL_FILES = 32
 LAST_WRITES = 64
+FRAG_WRITES = 200_000
+SMALL_WRITE = 64
+APPENDS = 1_000_000
+HISTORY_CREATES = 2_000
 GUARANTEE = ("saved before the view answers any later request; "
              "history built later (drain_s: from the workload's end to the built point reaching it)")
 FUSECTL = "/sys/fs/fuse/connections"
@@ -242,6 +297,89 @@ def close_1g(view, run, _target, metrics=None):
     run.finished = True
 
 
+def write_all(fd, data):
+    chunk = memoryview(data)
+    while chunk:
+        chunk = chunk[os.write(fd, chunk):]
+
+
+def close_frag(view, run, _target):
+    """A 64 MiB file fragmented by 200,000 random small writes in one open,
+    then closed: the close that held every view of the volume for 99 s."""
+    path = os.path.join(view, "fig-frag")
+    block = bytearray(os.urandom(MIB))
+    run.extra.update(writes=0)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+    try:
+        for n in range(BIG_BYTES // MIB):
+            if not run.open():
+                return
+            block[:8] = n.to_bytes(8, "little")
+            write_all(fd, block)
+    finally:
+        os.close(fd)
+    os.stat(path)
+    # The same offsets and bytes in every run.
+    rng = random.Random(1)
+    closing = None
+    fd = os.open(path, os.O_WRONLY)
+    try:
+        for n in range(FRAG_WRITES):
+            if n % 1000 == 0 and not run.open():
+                return
+            os.pwrite(fd, rng.randbytes(SMALL_WRITE), rng.randrange(BIG_BYTES - SMALL_WRITE))
+            run.extra["writes"] += 1
+        closing = time.monotonic()
+    finally:
+        os.close(fd)
+    os.stat(path)
+    end = time.monotonic()
+    if end > run.deadline:
+        return
+    run.samples.append(end - closing)
+    run.finished = True
+
+
+def write_1m(view, run, _target):
+    """1,000,000 sequential 64-byte appends in one open, then closed."""
+    path = os.path.join(view, "fig-appends")
+    line = b"x" * (SMALL_WRITE - 1) + b"\n"
+    run.extra.update(writes=0)
+    start = time.monotonic()
+    closing = None
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_APPEND, 0o644)
+    try:
+        for n in range(APPENDS):
+            if n % 1000 == 0 and not run.open():
+                return
+            write_all(fd, line)
+            run.extra["writes"] += 1
+        closing = time.monotonic()
+    finally:
+        os.close(fd)
+    os.stat(path)
+    end = time.monotonic()
+    if end > run.deadline:
+        return
+    run.samples.append(end - closing)
+    run.extra["total_s"] = round(end - start, 3)
+    run.finished = True
+
+
+def long_history(view, run, target):
+    """`create`'s files again, on the restarted view of a long history."""
+    for n in range(1, target + 1):
+        if not run.open():
+            return
+        path = os.path.join(view, f"fig-history-{n}")
+        start = time.monotonic()
+        write_file(path, f"{n}\n".encode())
+        os.stat(path)
+        if not run.done(start):
+            return
+    run.finished = True
+
+
 def by_tree_size(samples, start_files):
     """The cost of a save against the files in the tree, in windows of saves
     ending at 1, 2 and 5 times each power of ten, and the last save."""
@@ -272,11 +410,19 @@ def figures(name, run, budget):
         if samples:
             figure.update(p50_ms=ms(statistics.median(samples)), p99_ms=ms(p99(samples)))
     elif name == "create":
+        first = samples[:HISTORY_CREATES]
         figure.update(target=budget["count"], count=len(samples),
                       total_s=round(sum(samples), 3),
+                      first_2000_ms=(ms(statistics.mean(first))
+                                     if len(first) == HISTORY_CREATES else None),
                       cost_by_tree_size=by_tree_size(samples, run.extra["tree_files_at_start"]))
-    elif name == "close_1g":
-        figure.update(bytes=HUGE_BYTES)
+    elif name == "long_history":
+        figure.update(target=budget["count"], count=len(samples))
+        if samples:
+            figure.update(ms_per_create=ms(statistics.mean(samples)))
+    elif name in ("close_1g", "close_frag", "write_1m"):
+        figure.update(bytes={"close_1g": HUGE_BYTES, "close_frag": BIG_BYTES,
+                             "write_1m": APPENDS * SMALL_WRITE}[name])
         if samples:
             figure.update(close_s=round(samples[0], 3))
     else:
@@ -290,15 +436,19 @@ def figures(name, run, budget):
 
 def missed(figure, budget, filesystem):
     """Whether a figure misses its bar: a finish is required, and a metric,
-    when it has one, is within its `max` (one number, or one per filesystem)."""
+    when it has one, is within its `max` (one number, or one per filesystem);
+    `metrics` holds several, each with its own max."""
     if not figure["finished"]:
         return True
-    if "metric" not in budget:
-        return False
-    value = budget["max"]
-    limit = value[filesystem] if isinstance(value, dict) else value
-    found = figure.get(budget["metric"])
-    return found is None or found > limit
+    bars = dict(budget.get("metrics", {}))
+    if "metric" in budget:
+        bars[budget["metric"]] = budget["max"]
+    for metric, value in bars.items():
+        limit = value[filesystem] if isinstance(value, dict) else value
+        found = figure.get(metric)
+        if found is None or found > limit:
+            return True
+    return False
 
 
 def gated_misses(workloads, budgets):
@@ -328,6 +478,23 @@ def self_test(budgets, filesystem="ext4"):
     for workload in workloads:
         if workload["warn"]:
             report_miss(workload["name"], held, value, filesystem)
+    return 1 if gated_misses(workloads, budgets) else 0
+
+
+def self_test_warn(budgets, filesystem="ext4"):
+    """Judges a synthetic report where every bar but `create`'s is missed
+    (unfinished) and `create` met its count: the exit status a run with
+    those figures has, 0 while each of them only warns."""
+    workloads = []
+    for name, held in budgets.items():
+        if name == "create":
+            value = {"finished": True, "target": held["count"], "count": held["count"]}
+        else:
+            value = {"finished": False}
+        warn = missed(value, held, filesystem)
+        workloads.append({"name": name, **value, "warn": warn})
+        if warn:
+            report_miss(name, held, value, filesystem)
     return 1 if gated_misses(workloads, budgets) else 0
 
 
@@ -425,17 +592,69 @@ def proc_kib(pid, field):
     return None
 
 
-def reset_peak(pid):
-    """Resets the process's resident high-water mark; returns its resident
-    memory now, in KiB, or None."""
-    try:
-        with open(f"/proc/{pid}/clear_refs", "w") as control:
-            control.write("5")
-    except OSError as error:
-        print(f"::warning title=tree views::could not reset the view's peak memory: {error}",
-              flush=True)
-        return None
-    return proc_kib(pid, "VmRSS")
+def mib(kib):
+    """KiB as MiB to one place, or None."""
+    return None if kib is None else round(kib / 1024, 1)
+
+
+class PeakSampler:
+    """The peak of a process's RssAnon (anonymous resident memory, in KiB),
+    read from /proc/PID/status every `interval_s` on a daemon thread between
+    start and stop. Measurement only: nothing waits on a sample, and a spike
+    shorter than the interval can fall between two."""
+
+    def __init__(self, pid: int, interval_s: float = 0.02):
+        self.pid, self.interval_s = pid, interval_s
+        self.peak, self.samples = None, 0
+        self._stopped = threading.Event()
+        self._thread = None
+
+    def _sample(self):
+        value = proc_kib(self.pid, "RssAnon")
+        if value is not None:
+            self.samples += 1
+            self.peak = value if self.peak is None else max(self.peak, value)
+        return value
+
+    def _run(self):
+        while not self._stopped.wait(self.interval_s):
+            self._sample()
+
+    def start(self) -> int | None:
+        """Reads RssAnon now and starts sampling; returns that first read
+        (the `before` of a figure), or None."""
+        before = self._sample()
+        self._thread = threading.Thread(target=self._run, name=f"peak-{self.pid}", daemon=True)
+        self._thread.start()
+        return before
+
+    def stop(self) -> int | None:
+        """Stops sampling after one last read; returns the peak seen, or None
+        when no sample was read."""
+        self._stopped.set()
+        if self._thread is not None:
+            self._thread.join()
+        self._sample()
+        return self.peak
+
+
+def sample_peak(pid, stop_file, output):
+    """--sample-peak: samples `pid` until `stop_file` exists (or the process
+    is gone), then writes its peak; 1 when no sample was read."""
+    sampler = PeakSampler(pid)
+    sampler.start()
+    while not os.path.exists(stop_file) and os.path.exists(f"/proc/{pid}"):
+        time.sleep(sampler.interval_s)
+    peak = sampler.stop()
+    if peak is None:
+        print(f"::warning title=tree views::process {pid} was gone before any sample", flush=True)
+        return 1
+    temporary = output + ".tmp"
+    with open(temporary, "w") as out:
+        json.dump({"peak_anon_kib": peak, "samples": sampler.samples}, out)
+        out.write("\n")
+    os.replace(temporary, output)
+    return 0
 
 
 def abort_connection(dev):
@@ -454,17 +673,54 @@ def abort_connection(dev):
 
 
 WORKLOADS = [("close_4k", close_4k), ("create", create), ("close_64m", close_64m),
-             ("close_1g", close_1g)]
+             ("close_1g", close_1g), ("close_frag", close_frag), ("write_1m", write_1m),
+             ("long_history", long_history)]
+# Run only on a view restarted on the first run's state (--baseline).
+AFTER_RESTART = ("long_history",)
+# Workloads whose memory a PeakSampler reads: memory_create, memory_1g, write_1m.
+PEAKS = ("create", "close_1g", "write_1m")
+
+
+
+def lock_hold_ms(metrics):
+    """The longest hold of the actor's lock so far, process-wide, in ms, from
+    the view's metrics file; None without one."""
+    now = metrics_of(metrics)
+    try:
+        return round(now["stages"]["actor_lock"]["max_nanos"] / 1e6, 3)
+    except (KeyError, TypeError):
+        return None
+
+
+def restarted(args, baseline):
+    """The `restart` figure: the tracer's time to mount and the new view's
+    sampled RssAnon peak through its mount (--restart-peak), on the state the
+    first run left."""
+    files = {w["name"]: w for w in baseline["workloads"]}.get("create", {}).get("count")
+    peak = None
+    if args.restart_peak:
+        try:
+            with open(args.restart_peak) as file:
+                peak = json.load(file).get("peak_anon_kib")
+        except (OSError, ValueError) as error:
+            print(f"::warning title=tree views::could not read the restart's peak: {error}",
+                  flush=True)
+    return {"finished": args.restart_mount_s is not None and peak is not None,
+            "mount_s": args.restart_mount_s,
+            "peak_anon_mib": mib(peak),
+            "create_files": files}
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--self-test", action="store_true",
                         help="judge a synthetic report whose create fell short, and exit as a run would")
+    parser.add_argument("--self-test-warn", action="store_true",
+                        help="judge a synthetic report where every bar but create's missed, and exit as a run would")
     parser.add_argument("--view")
     parser.add_argument("--filesystem")
     parser.add_argument("--image")
-    parser.add_argument("--budget", required=True)
+    parser.add_argument("--budget")
     parser.add_argument("--output")
     parser.add_argument("--build", default="release",
                         help="the build measured, as the report names it (the image ships release)")
@@ -473,24 +729,58 @@ def main():
     parser.add_argument("--drain-cap", type=float, default=900.0,
                         help="how long to wait for history to be built after a workload")
     parser.add_argument("--view-pid", type=int,
-                        help="the view's process: close_1g then reports its peak memory")
+                        help="the view's process: the memory figures then read it")
     parser.add_argument("--only", action="append", choices=[n for n, _ in WORKLOADS],
                         help="run only this workload (repeatable; a probe's shortcut)")
+    parser.add_argument("--baseline",
+                        help="the first run's report: the view was restarted on its state, so "
+                             "report restart and run long_history, adding both to that report")
+    parser.add_argument("--restart-mount-s", type=float,
+                        help="with --baseline: the seconds the restarted view took to mount")
+    parser.add_argument("--restart-peak",
+                        help="with --baseline: --sample-peak's output for the restarted view's mount")
+    parser.add_argument("--sample-peak", type=int, metavar="PID",
+                        help="sample PID's RssAnon until --stop-file exists, then write its peak")
+    parser.add_argument("--stop-file", help="with --sample-peak: stop once this file exists")
+    parser.add_argument("--peak-output", help="with --sample-peak: where the peak is written")
     args = parser.parse_args()
+    if args.sample_peak is not None:
+        if args.stop_file is None or args.peak_output is None:
+            parser.error("--sample-peak needs --stop-file and --peak-output")
+        sys.exit(sample_peak(args.sample_peak, args.stop_file, args.peak_output))
+    if args.budget is None:
+        parser.error("--budget is required")
     with open(args.budget) as file:
         policy = json.load(file)
     budgets, grace = policy["budgets"], policy["grace_s"]
     if args.self_test:
         sys.exit(self_test(budgets))
+    if args.self_test_warn:
+        sys.exit(self_test_warn(budgets))
     for needed in ("view", "filesystem", "image", "output"):
         if getattr(args, needed) is None:
             parser.error(f"--{needed} is required")
+    baseline_report = None
+    if args.baseline:
+        with open(args.baseline) as file:
+            baseline_report = json.load(file)
     # Read before any workload: a stat of the view blocks while it is stuck.
     dev = os.stat(args.view).st_dev
 
     workloads, stopped, aborted = [], False, False
+    if baseline_report is not None:
+        # Read before any workload: the restarted view's peak through its mount.
+        value = restarted(args, baseline_report)
+        held = budgets["restart"]
+        warn = missed(value, held, args.filesystem)
+        workloads.append({"name": "restart", "budget": held["text"], **value, "warn": warn})
+        print(f"restart on {args.filesystem}: {json.dumps(value)}", flush=True)
+        if warn:
+            report_miss("restart", held, value, args.filesystem)
     for name, work in WORKLOADS:
         if args.only and name not in args.only:
+            continue
+        if (name in AFTER_RESTART) != (baseline_report is not None):
             continue
         budget = budgets[name]
         entry = {"name": name, "budget": budget["text"], "guarantee": GUARANTEE}
@@ -501,8 +791,10 @@ def main():
             report_miss(name, budget, value, args.filesystem)
             continue
         run = Run(time.monotonic() + budget["deadline_s"])
-        baseline = reset_peak(args.view_pid) if args.view_pid and name == "close_1g" else None
-        resident = proc_kib(args.view_pid, "VmRSS") if args.view_pid and name == "create" else None
+        # The memory figures' window: from before the workload until its
+        # history is built (after drain), so the build is inside it.
+        sampler = PeakSampler(args.view_pid) if args.view_pid and name in PEAKS else None
+        before = sampler.start() if sampler else None
 
         def worker(work=work, run=run, target=budget.get("count")):
             try:
@@ -525,17 +817,33 @@ def main():
             figure = figures(name, run, budget)
         if args.metrics and not stopped:
             figure["drain_s"] = drain(args.metrics, args.drain_cap)
+        peak = sampler.stop() if sampler else None
+        extra = peak - before if peak is not None and before is not None else None
+        if name == "close_frag":
+            # Read once its history is built: a metrics file written after it.
+            held = lock_hold_ms(args.metrics) if figure.get("drain_s") is not None else None
+            figure.update(lock_hold_max_ms=held,
+                          lock_hold_scope="process" if not args.only else "--only " + " ".join(args.only))
+            figure["finished"] = figure["finished"] and held is not None
+        if name == "write_1m":
+            figure.update(peak_extra_mib=mib(extra), peak_anon_mib=mib(peak))
+            figure["finished"] = figure["finished"] and extra is not None
+        if name == "long_history":
+            first = {w["name"]: w for w in baseline_report["workloads"]}.get("create", {}).get(
+                "first_2000_ms")
+            mine = figure.get("ms_per_create")
+            figure.update(create_first_2000_ms=first,
+                          ratio=round(mine / first, 3) if mine and first else None)
         found = [(name, budget, figure)]
         if name == "create":
-            # memory_create: read once its history is built, so the builder's
-            # trees are in it.
-            after = proc_kib(args.view_pid, "VmRSS") if resident is not None else None
+            # memory_create: the peak through its history's build, so the
+            # builder's trees are in it.
             count = figure.get("count", 0)
-            measured = after is not None and figure.get("drain_s") is not None and count > 0
+            measured = extra is not None and figure.get("drain_s") is not None and count > 0
             found.append(("memory_create", budgets["memory_create"],
                           {"finished": figure["finished"] and measured,
-                           "kib_per_file": round((after - resident) / count, 2) if measured else None,
-                           "rss_mib": None if after is None else round(after / 1024, 1)}))
+                           "kib_per_file": round(extra / count, 2) if measured else None,
+                           "peak_anon_mib": mib(peak)}))
         if name == "close_1g":
             # write_1g: the same run's writes, held to its own bar.
             derived = budgets["write_1g"]
@@ -546,11 +854,9 @@ def main():
             found.append(("history_1g", budgets["history_1g"],
                           {"finished": figure["finished"] and drained is not None,
                            "drain_s": drained}))
-            peak = proc_kib(args.view_pid, "VmHWM") if baseline is not None else None
             found.append(("memory_1g", budgets["memory_1g"],
-                          {"finished": figure["finished"] and peak is not None,
-                           "peak_extra_mib": None if peak is None else round((peak - baseline) / 1024, 1),
-                           "peak_mib": None if peak is None else round(peak / 1024, 1)}))
+                          {"finished": figure["finished"] and extra is not None,
+                           "peak_extra_mib": mib(extra), "peak_anon_mib": mib(peak)}))
         for shown, held, value in found:
             warn = missed(value, held, args.filesystem)
             workloads.append({**entry, "name": shown, "budget": held["text"], **value, "warn": warn})
@@ -560,13 +866,18 @@ def main():
 
     report = {"build": args.build, "filesystem": args.filesystem, "image": args.image,
               "host": host(), "connection_aborted": aborted, "workloads": workloads}
+    if baseline_report is not None:
+        report = {**baseline_report,
+                  "connection_aborted": baseline_report.get("connection_aborted", False) or aborted,
+                  "workloads": baseline_report["workloads"] + workloads}
     temporary = args.output + ".tmp"
     with open(temporary, "w") as out:
         json.dump(report, out, indent=2)
         out.write("\n")
     os.replace(temporary, args.output)
     sys.stdout.flush()
-    # A worker still blocked in the view must not hold the exit.
+    # A worker still blocked in the view must not hold the exit. Only this
+    # run's figures decide it: a first run's were judged by that run.
     os._exit(1 if gated_misses(workloads, budgets) else 0)
 
 

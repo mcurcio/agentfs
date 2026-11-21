@@ -51,8 +51,9 @@ use crate::file_lock::{FileLock, Mode};
 use crate::git_cli;
 use crate::service::Stop;
 
-/// The arguments after `git`.
-pub const REPACK_ARGS: [&str; 16] = [
+/// The memory bounds of every repack's `git` (see the module docs), before
+/// its subcommand; the tree history's repack task runs with them too.
+pub const PACK_CONFIG: [&str; 12] = [
     "-c",
     "repack.writeBitmaps=false",
     "-c",
@@ -65,11 +66,10 @@ pub const REPACK_ARGS: [&str; 16] = [
     "core.bigFileThreshold=64m",
     "-c",
     "core.packedGitLimit=128m",
-    "repack",
-    "-d",
-    "-q",
-    "--geometric=2",
 ];
+
+/// The repack after [`PACK_CONFIG`].
+const REPACK: [&str; 4] = ["repack", "-d", "-q", "--geometric=2"];
 
 /// How often a running repack checks for a stop.
 const POLL: Duration = Duration::from_millis(100);
@@ -200,7 +200,8 @@ pub fn repack(
 /// The git command, in an environment of its own (see the module docs).
 fn command(git: &Path, git_dir: &Path) -> Command {
     let mut cmd = git_cli::command(git, git_dir);
-    cmd.args(REPACK_ARGS)
+    cmd.args(PACK_CONFIG)
+        .args(REPACK)
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
     cmd

@@ -10,6 +10,10 @@
 //!
 //! An entry is fsynced before anything it names is reachable, so a frame that
 //! does not check is an append cut short: it and what follows are cut off.
+//!
+//! The log lives on disk only: a start reads it once, and a checkpoint's
+//! rewrite reads it again ([`BuiltLog::entries_after`]); nothing keeps its
+//! entries in memory.
 
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
@@ -20,30 +24,54 @@ use std::path::{Path, PathBuf};
 use git2::Oid;
 use serde::{Deserialize, Serialize};
 
+use super::TreeMoved;
 use crate::tree_actor::journal::durable::RecordNo;
 
 const MAGIC: &[u8; 4] = b"AFB1";
 const HEADER: usize = 12;
 
-/// One batch: every record through `through` is built, and each pointer a
-/// step's record named as `Target::Step(step)` got `oid`.
+/// One batch: every record through `through` is built, each pointer a
+/// step's record named as `Target::Step(step)` got `oid`, and `moved` is what
+/// the batch moved of each tree's object numbers and locals, so a start after
+/// a kill folds a checkpoint's forward without reading any tree.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(in crate::tree_actor) struct BuiltEntry {
     pub through: RecordNo,
     pub values: Vec<BuiltValue>,
+    pub moved: Vec<TreeMoved>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(in crate::tree_actor) struct BuiltValue {
     pub step: RecordNo,
     pub name: String,
-    pub oid: String,
+    /// Stored as its hex text, as every entry before it was.
+    #[serde(with = "oid_hex")]
+    pub oid: Oid,
+}
+
+/// An object id as its 40-digit hex text.
+mod oid_hex {
+    use git2::Oid;
+    use serde::{Deserialize, Deserializer, Serializer, de::Error};
+
+    pub(super) fn serialize<S: Serializer>(oid: &Oid, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(oid)
+    }
+
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Oid, D::Error> {
+        let text = String::deserialize(deserializer)?;
+        Oid::from_str(&text).map_err(D::Error::custom)
+    }
 }
 
 pub(in crate::tree_actor) struct BuiltLog {
     path: PathBuf,
     file: File,
     length: u64,
+    /// The first entry's `through`: whether a checkpoint lets the log drop
+    /// any, without reading it.
+    first: Option<RecordNo>,
 }
 
 fn frame(entry: &BuiltEntry) -> io::Result<Vec<u8>> {
@@ -117,6 +145,7 @@ impl BuiltLog {
                 path: path.to_owned(),
                 file,
                 length: end as u64,
+                first: entries.first().map(|entry| entry.through),
             },
             entries,
         ))
@@ -136,7 +165,26 @@ impl BuiltLog {
             return Err(e);
         }
         self.length += bytes.len() as u64;
+        self.first.get_or_insert(entry.through);
         Ok(())
+    }
+
+    /// The first entry's `through`, if the log holds one.
+    pub(in crate::tree_actor) fn first_through(&self) -> Option<RecordNo> {
+        self.first
+    }
+
+    /// The entries after a checkpoint whose redo starts at `checkpointed`,
+    /// read from the file: what a rewrite keeps.
+    pub(in crate::tree_actor) fn entries_after(
+        &self,
+        checkpointed: RecordNo,
+    ) -> io::Result<Vec<BuiltEntry>> {
+        let mut bytes = vec![0; usize::try_from(self.length).map_err(io::Error::other)?];
+        self.file.read_exact_at(&mut bytes, 0)?;
+        let (mut entries, _) = parse(&bytes);
+        entries.retain(|entry| entry.through > checkpointed);
+        Ok(entries)
     }
 
     /// Replaces the log with `keep`: a temporary file, fsynced, renamed, the
@@ -162,6 +210,7 @@ impl BuiltLog {
         sync_parent(&self.path)?;
         self.file = OpenOptions::new().read(true).write(true).open(&self.path)?;
         self.length = length;
+        self.first = keep.first().map(|entry| entry.through);
         Ok(())
     }
 }
@@ -178,8 +227,7 @@ pub(in crate::tree_actor) fn values(
     let mut values = BTreeMap::new();
     for entry in entries {
         for value in &entry.values {
-            let oid = Oid::from_str(&value.oid).map_err(io::Error::other)?;
-            values.insert((value.step, value.name.clone()), oid);
+            values.insert((value.step, value.name.clone()), value.oid);
         }
     }
     Ok(values)
@@ -195,9 +243,82 @@ mod tests {
             values: vec![BuiltValue {
                 step: RecordNo::new(through),
                 name: "refs/heads/root".into(),
-                oid: "0123456789012345678901234567890123456789".into(),
+                oid: Oid::from_str("0123456789012345678901234567890123456789").unwrap(),
             }],
+            moved: Vec::new(),
         }
+    }
+
+    #[test]
+    fn an_entry_is_stored_as_its_pinned_line() {
+        // An object id as its hex text; `moved` is required.
+        let line = r#"{"through":3,"values":[{"step":3,"name":"refs/heads/root","oid":"0123456789012345678901234567890123456789"}],"moved":[]}"#;
+        assert_eq!(serde_json::to_string(&entry(3)).unwrap(), line);
+        assert_eq!(serde_json::from_str::<BuiltEntry>(line).unwrap(), entry(3));
+        assert!(serde_json::from_str::<BuiltEntry>(&line.replace("0123", "zz23")).is_err());
+        // An entry of an older format, with no `moved`, does not parse.
+        let older = line.replace(r#","moved":[]"#, "");
+        assert!(serde_json::from_str::<BuiltEntry>(&older).is_err());
+    }
+
+    /// An entry's moves (a set object, an unnamed identity, a directory set
+    /// and one removed, a file's times set and one dropped, a dropped tree)
+    /// come back from the file as written.
+    #[test]
+    fn an_entry_with_moves_round_trips() {
+        let times = crate::tree_actor::Times {
+            atime_ns: 1,
+            mtime_ns: 2,
+            ctime_ns: 3,
+        };
+        let mut moving = entry(5);
+        moving.moved = vec![
+            TreeMoved {
+                tree: "root".into(),
+                dropped: false,
+                objects: vec![(4, 9)],
+                unnamed: vec![7],
+                dirs: vec![("a".into(), Some((12, times))), ("b".into(), None)],
+                files: vec![(4, Some(times)), (7, None)],
+            },
+            TreeMoved {
+                tree: "fork/3".into(),
+                dropped: true,
+                ..TreeMoved::default()
+            },
+        ];
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("built.log");
+        let (mut log, _) = BuiltLog::open(&path).unwrap();
+        log.append(&moving).unwrap();
+        drop(log);
+        let (_, entries) = BuiltLog::open(&path).unwrap();
+        assert_eq!(entries, vec![moving]);
+    }
+
+    #[test]
+    fn a_rewrite_keeps_the_entries_after_the_checkpoint_read_from_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("built.log");
+        let (mut log, _) = BuiltLog::open(&path).unwrap();
+        assert_eq!(log.first_through(), None);
+        for through in [3, 7, 9] {
+            log.append(&entry(through)).unwrap();
+        }
+        assert_eq!(log.first_through(), Some(RecordNo::new(3)));
+        let keep = log.entries_after(RecordNo::new(7)).unwrap();
+        assert_eq!(keep, vec![entry(9)]);
+        log.rewrite(&keep).unwrap();
+        assert_eq!(log.first_through(), Some(RecordNo::new(9)));
+        log.append(&entry(11)).unwrap();
+        assert_eq!(
+            log.entries_after(RecordNo::ZERO).unwrap(),
+            vec![entry(9), entry(11)]
+        );
+        drop(log);
+        let (log, entries) = BuiltLog::open(&path).unwrap();
+        assert_eq!(entries, vec![entry(9), entry(11)]);
+        assert_eq!(log.first_through(), Some(RecordNo::new(9)));
     }
 
     #[test]

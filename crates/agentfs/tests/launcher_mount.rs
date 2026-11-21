@@ -229,6 +229,33 @@ fn not_built_settings_are_logged_and_the_view_records() {
     assert_eq!(v.history("c").as_deref(), Some("c\n"));
 }
 
+/// (b2) The operator's `agentfs.overlayLimit` reaches the lag gate: under a
+/// limit of 1 KiB, a few creates take the overlay over it, so new work
+/// waits for the builder and `tree HistoryStalled` is logged; every file is
+/// recorded. Under the default 32 MiB these creates never stall.
+#[test]
+#[ignore = "needs root and /dev/fuse: ci/fuse-tests.sh"]
+fn the_operators_overlay_limit_holds_new_work() {
+    let Some(v) = Volume::new() else { return };
+    let include = v.p("operator.conf");
+    std::fs::write(&include, "[agentfs]\n\toverlayLimit = 1k\n").unwrap();
+    let out = v.run(&[
+        "init",
+        "--volume",
+        "t",
+        "--include",
+        include.to_str().unwrap(),
+    ]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    let root = v.root().display().to_string();
+    let script = format!("for i in $(seq 1 50); do echo $i > {root}/f$i; done");
+    let out = v.mount(&["--", "sh", "-c", &script]);
+    let err = text(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "{err}");
+    assert!(err.contains("tree HistoryStalled"), "{err}");
+    assert_eq!(v.history("f50").as_deref(), Some("50\n"));
+}
+
 /// (c) `probe` answers 0 on a live tree view: run as the mount's command.
 #[test]
 #[ignore = "needs root and /dev/fuse: ci/fuse-tests.sh"]

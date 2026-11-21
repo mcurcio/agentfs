@@ -122,19 +122,19 @@ thread_local! {
 /// A place in one record's tail: the record's bytes, read from the segment
 /// that holds its frame now.
 #[derive(Clone)]
-pub(in crate::tree_actor) struct FramePos {
-    pub segment: Arc<Segment>,
+pub struct FramePos {
+    pub(in crate::tree_actor) segment: Arc<Segment>,
     /// The frame's record: with `offset`, the name of these bytes.
-    pub record: RecordNo,
+    pub(in crate::tree_actor) record: RecordNo,
     /// Where the record's tail starts in `segment`.
-    pub tail: u64,
+    pub(in crate::tree_actor) tail: u64,
     /// Bytes into the tail.
-    pub offset: u64,
+    pub(in crate::tree_actor) offset: u64,
 }
 
 impl FramePos {
     /// The start of `record`'s tail, at byte `tail` of `segment`.
-    pub fn new(segment: Arc<Segment>, record: RecordNo, tail: u64) -> Self {
+    pub(in crate::tree_actor) fn new(segment: Arc<Segment>, record: RecordNo, tail: u64) -> Self {
         Self {
             segment,
             record,
@@ -144,7 +144,7 @@ impl FramePos {
     }
 
     /// The position `offset` bytes further into the same tail.
-    pub fn at(&self, offset: u64) -> Self {
+    pub(in crate::tree_actor) fn at(&self, offset: u64) -> Self {
         Self {
             segment: Arc::clone(&self.segment),
             record: self.record,
@@ -154,14 +154,14 @@ impl FramePos {
     }
 
     /// Reads `buf.len()` bytes from `offset` into the tail.
-    pub fn read(&self, offset: u64, buf: &mut [u8]) -> io::Result<()> {
+    pub(in crate::tree_actor) fn read(&self, offset: u64, buf: &mut [u8]) -> io::Result<()> {
         self.segment
             .read_exact_at(buf, self.tail + self.offset + offset)
     }
 
     /// Reads from where compaction carried the frame, if it moved from the
     /// segment this position reads.
-    pub fn relocate(&mut self, moved: &Relocations) {
+    pub(in crate::tree_actor) fn relocate(&mut self, moved: &Relocations) {
         if let Some(to) = self.relocated(moved) {
             *self = to;
         }
@@ -169,7 +169,7 @@ impl FramePos {
 
     /// The same bytes where compaction carried their frame, if it moved
     /// from the segment this position reads.
-    pub fn relocated(&self, moved: &Relocations) -> Option<Self> {
+    pub(in crate::tree_actor) fn relocated(&self, moved: &Relocations) -> Option<Self> {
         let (segment, tail) = moved.find(self.record)?;
         (segment.first != self.segment.first).then(|| Self {
             segment,
@@ -181,7 +181,7 @@ impl FramePos {
 
     /// The tail's bytes `offset..offset + len`, read into memory: for tests.
     #[cfg(test)]
-    pub fn bytes(&self, offset: u64, len: u64) -> io::Result<Vec<u8>> {
+    pub(in crate::tree_actor) fn bytes(&self, offset: u64, len: u64) -> io::Result<Vec<u8>> {
         let len = usize::try_from(len).map_err(|_| io::Error::from_raw_os_error(libc::EFBIG))?;
         let mut buf = vec![0; len];
         self.read(offset, &mut buf)?;
@@ -192,8 +192,22 @@ impl FramePos {
     /// The same bytes: the record and the offset into its tail. Stable
     /// across the actor's and the builder's handles on one segment, and
     /// across compaction carrying the frame to another.
-    pub fn key(&self) -> (u64, u64) {
+    pub(in crate::tree_actor) fn key(&self) -> (u64, u64) {
         (self.record.get(), self.offset)
+    }
+}
+
+/// A position names its bytes by its record and offset ([`FramePos::key`]).
+impl crate::tree_actor::recording::layout::Located for FramePos {
+    fn place(&self) -> crate::tree_actor::recording::layout::Place {
+        crate::tree_actor::recording::layout::Place {
+            record: self.record,
+            at: self.offset,
+        }
+    }
+
+    fn at(&self, by: u64) -> Self {
+        FramePos::at(self, by)
     }
 }
 

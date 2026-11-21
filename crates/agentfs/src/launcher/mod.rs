@@ -21,8 +21,10 @@ mod host;
 mod mountpoint;
 mod serving;
 mod settings;
+mod verify;
 
 pub use self::host::{HostArgs, host};
+pub use self::verify::{VerifyArgs, verify};
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -62,6 +64,31 @@ const EXIT_NOT_STARTED: u8 = 127;
 
 /// What the runbook that moves an old state area aside is called.
 const UPGRADE_RUNBOOK: &str = "docs/runbooks/upgrading-the-sidecar.md";
+
+/// The gauge of the volume's flagged saves (`agentfs.history.unverified`),
+/// registered on `telemetry`: it reads the staged volume's counts while the
+/// returned handle lives, never the actor's lock.
+///
+/// # Errors
+///
+/// The actor stopped before the gauge could be registered.
+fn observe_unverified(
+    telemetry: &agentfs_core::telemetry::Telemetry,
+    domains: &Domains,
+) -> Result<UnverifiedGauge> {
+    let verification = domains
+        .sessions
+        .recording()
+        .actor()
+        .context("reading the volume's flagged saves")?
+        .verification();
+    let gauge: UnverifiedGauge = std::sync::Arc::new(move || verification.counts());
+    telemetry.observe_unverified(std::sync::Arc::downgrade(&gauge));
+    Ok(gauge)
+}
+
+/// What keeps the gauge of [`observe_unverified`] read.
+type UnverifiedGauge = std::sync::Arc<dyn Fn() -> tree_actor::UnverifiedCounts + Send + Sync>;
 
 /// Says another process holds the state area, and answers its exit status.
 fn busy() -> ExitCode {
@@ -381,9 +408,9 @@ pub fn mount(state: &Path, args: MountArgs, minter: Minter) -> Result<ExitCode> 
         .chain(fork.as_ref().map(|f| f.spec.at.as_path()))
         .collect();
     mountpoint::outside_the_state_area(state, &views)?;
-    let not_built = settings::at_boot(state, &views)?;
+    let boot = settings::at_boot(state, &views)?;
     let otel = crate::otel::init(name.as_str(), &identity(name.as_str(), &args.pod));
-    otel.telemetry().observe_not_built(&not_built);
+    otel.telemetry().observe_not_built(&boot.not_built);
     let expect: Vec<mountpoint::Expect> = std::iter::once(mountpoint::Expect::Source(
         agentfs_fuse::tree_view::view_source(name.as_str(), TreeId::Root),
     ))
@@ -418,6 +445,8 @@ pub fn mount(state: &Path, args: MountArgs, minter: Minter) -> Result<ExitCode> 
         metrics_output: args.metrics_output,
         command: args.command,
         volume: name,
+        overlay_limit: boot.overlay_limit,
+        telemetry: otel.telemetry().clone(),
     };
     let code = mount.run(state, root, fork, minter);
     drop(otel);
@@ -488,6 +517,10 @@ struct Mount {
     /// `-- COMMAND`: empty for none.
     command: Vec<OsString>,
     volume: VolumeName,
+    /// The lag gate's overlay limit, from the operator settings.
+    overlay_limit: u64,
+    /// The process's telemetry: the flagged saves' gauge registers on it.
+    telemetry: agentfs_core::telemetry::Telemetry,
 }
 
 /// What a view that could not open says.
@@ -554,10 +587,13 @@ impl Mount {
         minter: Minter,
     ) -> Result<ExitCode> {
         let cap = root_cap(&minter)?;
-        let mut staged = match serving::stage::<MountTrigger>(state, &self.at, cap, minter)? {
+        let staged =
+            serving::stage::<MountTrigger>(state, &self.at, cap, minter, self.overlay_limit)?;
+        let mut staged = match staged {
             Ok(staged) => staged,
             Err(code) => return Ok(code),
         };
+        let _gauge = observe_unverified(&self.telemetry, &staged.domains)?;
         let domains = &mut staged.domains;
         let mut specs = vec![root];
         if let Some(ForkView { mut spec, key }) = fork {

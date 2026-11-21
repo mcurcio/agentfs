@@ -1286,10 +1286,12 @@ impl View {
             self.handles()?.entries.remove(&fh.0);
             return Ok(());
         }
-        let mut v = self.actor()?;
+        // The handles' lock, then the actor's, never both: a close decides
+        // with the actor unlocked (`TreeSession::close`), and this view's
+        // requests stay in order on its one FUSE thread.
         let entry = self.handles()?.entries.remove(&fh.0).ok_or(Errno::EBADF)?;
         if let Open::Write { handle, .. } = entry
-            && v.close(handle).map_err(errno)? == Saved::OrphanDropped
+            && self.session.close(handle).map_err(errno)? == Saved::OrphanDropped
         {
             eprintln!(
                 "tree OrphanDropped: tree={} open={handle}",
