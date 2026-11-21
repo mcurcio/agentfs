@@ -815,7 +815,7 @@ impl TreeActor {
             heads,
         )?;
         let objects = objects.into_iter().collect();
-        let history = History::new(repo, built, pointers.clone(), owners, objects);
+        let history = History::new(repo, built, pointers.clone(), owners, objects)?;
         history.checkpointed(folded_built);
         // The steps replayed past the built point are the builder's to build,
         // and the lag gate's to count, as at their call.

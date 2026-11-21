@@ -184,6 +184,29 @@ impl TreeSession {
     pub fn durable_all_then(&self, then: Then) {
         self.sessions.recording.durable_all_then(then);
     }
+
+    /// FLUSH of an open ([`Recording::flush`]): answered without a wait for
+    /// the disk. Not built yet: the view's FLUSH still waits
+    /// (docs/target-architecture/future/latency-upkeep.md, slice 6).
+    ///
+    /// # Errors
+    ///
+    /// As [`Recording::flush`].
+    pub fn flush(&self, handle: u64) -> Result<()> {
+        self.sessions.recording.flush(handle)
+    }
+
+    /// Every record so far made durable, blocking the caller, never under
+    /// the actor's lock ([`Recording::durable_all`]): what a move from the
+    /// untracked area into the tree waits for before it unlinks the area's
+    /// file. Not built yet: nothing calls it before slice 6.
+    ///
+    /// # Errors
+    ///
+    /// A failed fsync (the actor stops).
+    pub fn durable_all(&self) -> Result<()> {
+        self.sessions.recording.durable_all()
+    }
 }
 
 /// `handle` is an open of `tree` by the writer `writes_as`.

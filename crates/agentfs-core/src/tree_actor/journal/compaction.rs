@@ -60,15 +60,19 @@ pub(in crate::tree_actor) const CHECKPOINT_TMP: &str = "checkpoint.tmp";
 /// | `pointers` | History's built pointers at B, every value an oid |
 /// | `objects` | History's built object numbers at B |
 /// | `locals` | History's built trees at B: each tree's shape's locals |
-/// | `upstreams` | the recovery fold over the records at or below B |
-/// | `opens` | the fold: each live write-open with `by`, `anonymous` and `meta` |
-/// | `page_saved` | the fold's last saving step per file with a live write-open |
-/// | `page_writes` | the fold's held page writes, by record |
-/// | `chunks` | the fold's chunk records no take or replace step has taken yet |
-/// | `step_heads` | the latest step head of every pointer at B: for each pointer the fold names as `Step(s)`, `s` and History's built value of that pointer (row chains excepted, as today) |
+/// | `upstreams` | the recovery fold over the records at or below B (`Folded::upstreams`) |
+/// | `opens` | the fold: each live write-open with `by`, `anonymous` and `meta` (`Folded::opens`; the builder's `BuildOpen` has no `by`, so it is not the source) |
+/// | `page_saved` | the fold's last saving step per file with a live write-open (`Folded::saved_through`) |
+/// | `page_writes` | the page writes recovery holds (`TreeActor::pages_restore` keeps every one the fold gives): the record numbers in `Folded::page_writes`, sorted, each once |
+/// | `chunks` | the fold's chunk records no take or replace step has taken yet (`Folded::bytes`) |
+/// | `step_heads` | History's step heads at B ([`History::at_built`]): for every pointer, row chains included (today's exception for them rests on compaction switching the actor's pointers in its own hold, which no longer happens), the latest step at or below B that set it and the oid it built, kept until History's built point passes the record at which the actor switched that pointer to an oid (C3, C4) |
 /// | `carried` | the carry files this checkpoint names live frames in |
 ///
-/// `next` is `built + 1`: records after B carry their own numbers.
+/// `next` is `built + 1`: records after B carry their own numbers. Today's
+/// `Entry::Checkpoint` takes `locals` from the actor's shapes, which equal
+/// history's only when every step is built; at B they are history's.
+///
+/// [`History::at_built`]: crate::tree_actor::History::at_built
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(in crate::tree_actor) struct Checkpoint {
     pub salt: u32,

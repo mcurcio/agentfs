@@ -289,6 +289,22 @@ impl Recording {
         }
     }
 
+    /// FLUSH (close(2)) of write-open `open`: its records were appended at
+    /// each call, so it answers at once, never waiting for an fsync and never
+    /// returning a journal fsync's error (D1 in
+    /// docs/target-architecture/future/latency-upkeep.md bounds what a power
+    /// cut then loses). Takes neither the actor's lock nor Durability's
+    /// fsync. Not built yet: the view's FLUSH still calls
+    /// [`Recording::durable_then`] (slice 6).
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Stopped`] once a journal fsync has failed: sticky, as for
+    /// every later call (`Durability::has_failed`).
+    pub fn flush(&self, open: u64) -> Result<(), Error> {
+        todo!("{open}")
+    }
+
     /// [`Recording::durable_all`] without blocking the caller.
     pub fn durable_all_then(&self, then: Then) {
         self.durability.then(self.durability.appended(), then);
