@@ -2106,3 +2106,11 @@ None appended: nothing in the page stopped the slice. Non-blocking findings for 
    restart section (not built: the failpoint `tree.checkout_before_marker` is registered with no marker after it);
    `clean_packs` failing a reopen on `ENOENT`; a waiting host request has no cancel (stated in
    docs/library/filesystem.md).
+
+## 2026-11-21, P0: the repack task deletes a live pack and loses history (open)
+
+The forks e2e failure on 2412162 (passed in the push run, failed in the PR run) is a product bug. Root cause, reproduced locally with the image's git 2.47.3 in a library stress test (forks, landings, drops and `wake_waiters()` beside the task, 60 loops): 6 of 20 runs lost objects at 2412162, some leaving the store empty; 0 of 10 with the repack skipped; 0 of 20 at d43b95b (before ef4ad49).
+
+Mechanism (`crates/agentfs-core/src/tree_actor/history/repack.rs`): pack names are content hashes, so a later roll-up can produce the same name as a pack an earlier run set aside. The scratch run still sees set-aside packs through the store alternate (`:484`), so the output name flips A, B, A. `link_pack` treats `AlreadyExists` as installed (`:362`), and the set-aside bookkeeping is by name (`:547`, `:245`, `:233`, `:445`), so `delete()` removes the live copy. Runs with no new objects (the epoch also moves on `failed_event` and `wake_waiters`) make repeats likely; ef4ad49 deletes set-aside packs sooner, raising the rate. Evidence: the job log's `git show root:` "does not exist", `merge-base` "Not a valid commit name 969a77b", `fast-import` "Not a valid commit: b900c82". Patch of the stress test: /tmp/claude-0/forks-rca/rca-test.patch (not committed).
+
+This is the fourth defect in the bespoke repack mechanism (Feed race, reader race 80c92d2, set-aside growth ef4ad49, live-pack deletion). Per the owner's rules that is a wrong premise, not an instance to patch: options go to the owner.
