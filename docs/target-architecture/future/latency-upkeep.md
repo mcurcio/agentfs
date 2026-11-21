@@ -152,7 +152,7 @@ interface LockFigures {
 - **C3.** History forgets the built-log entries and step heads a checkpoint covers only after that checkpoint is published.
 - **C4.** A record folds the same on the old checkpoint and on the new one.
 - **C5.** A torn journal tail can never remove a checkpoint, because a checkpoint is not in a segment.
-- **C6.** Space held by unlinked segments that readers still use counts toward the journal's length and the tree's space limit. A holder moves to the carried copy without a walk under the lock.
+- **C6.** Space held by unlinked segments that readers still use counts toward the journal's length. A holder moves to the carried copy without a walk under the lock.
 
 **Who is given what:**
 
@@ -327,7 +327,7 @@ The interfaces are committed as compiling code with `todo!()` bodies and no beha
 
 | Lane | Owns (repo-relative) |
 |---|---|
-| A | `crates/agentfs-core/src/tree_actor/journal/`; `crates/agentfs-core/src/tree_actor/history/{compactor.rs,built.rs,lag.rs,built_log.rs}`; `crates/agentfs-core/src/tree_actor/{mod.rs,call_path.rs,stages.rs}`; `crates/agentfs-core/src/{session.rs,store.rs,telemetry.rs,failpoints.rs}`; `crates/agentfs-core/tests/{tree_actor.rs,tree_stages.rs,crash_points.rs}`; `crates/agentfs-fuse/src/tree_view.rs`, `crates/agentfs-fuse/src/tree_view/untracked.rs`; `crates/agentfs-conformance/`; `ci/power-loss-trees.sh`, `ci/power-loss-trees-check.sh`, `ci/trees-figures.py`; `docs/target-architecture/git-model.md`, `docs/trees.md`, `docs/guarantees.md`, `docs/telemetry.md`, `docs/architecture.md`, `docs/configuration.md`, `docs/runbooks/upgrading-the-sidecar.md` |
+| A | `crates/agentfs-core/src/tree_actor/journal/`; `crates/agentfs-core/src/tree_actor/history/{compactor.rs,built.rs,lag.rs,built_log.rs}`; `crates/agentfs-core/src/tree_actor/{mod.rs,call_path.rs,stages.rs}`; `crates/agentfs-core/src/{session.rs,store.rs,telemetry.rs,failpoints.rs}`; `crates/agentfs-core/tests/{tree_actor.rs,tree_stages.rs,crash_points.rs}`; `crates/agentfs-fuse/src/tree_view.rs`, `crates/agentfs-fuse/src/tree_view/untracked.rs`; `crates/agentfs-conformance/`; `ci/power-loss-trees.sh`, `ci/power-loss-trees-check.sh`, `ci/trees-figures.py`; one line of `crates/agentfs-core/src/tree_actor/recording/pages.rs` (slice 2's guard); `docs/target-architecture/git-model.md`, `docs/trees.md`, `docs/guarantees.md`, `docs/telemetry.md`, `docs/architecture.md`, `docs/configuration.md`, `docs/runbooks/upgrading-the-sidecar.md` |
 | B | `crates/agentfs-core/src/tree_actor/history/retired.rs` |
 | C | `crates/agentfs-core/src/tree_actor/recording/{pages.rs,layout.rs,mod.rs}`; `crates/agentfs-core/src/tree_actor/history/{builder.rs,verify.rs}` |
 
@@ -339,17 +339,18 @@ The interfaces are committed as compiling code with `todo!()` bodies and no beha
 
 **Bead:** agentfs-ln6.9. **Lane A, first.** **Delivers:** another view's call never waits for compaction. The overdue stop is gone. Slice 0 measured compaction as the only cause of the longest stall in another view: 1,244 ms in `close_1g`, 1,166 ms in `write_1m`, 233 ms in `close_frag`.
 
-**Settled here (parked above):**
-- **C4: step heads are kept per pointer.** A checkpoint keeps, for each pointer whose latest step at or below B is a step, that step and the oid it built. The step comes from the fold (`Folded::pointers` gives `Target::Step(s)`). The oid is History's built value of the pointer at B, which is that step's head because no later step at or below B set the pointer. Heads of the previous checkpoint whose pointer no step in between set are carried over. A pointer the actor switched to an oid at or before record B + 1 has no head. So there is at most one head per pointer. The builder is unchanged: `BuildState::at` already takes `heads`, and it drops heads at or below `checkpointed_through()`, which never passes `Published::oldest_head() - 1`.
-- **The actor switches its pointers at each built event**, under its lock (`TreeActor::switch_built`), and tells History before its next record (`History::switched(pointer, at)`). That replaces the switch compaction made in its own hold.
-- **C6: holders move at the built event, as a named fallback.** The compactor copies live frames into `carry-<B>` files and records each copy in `Relocations`. A holder that still names an unlinked segment keeps reading it, because a segment is shared as `Arc<Segment>`, and those bytes count in `JournalCompaction::len` until the last holder lets go. The builder moves its own positions at its next batch, as today. The actor moves its positions in `TreeActor::relocate_if_moved`, which `on_built` runs only when `Relocations::generation()` moved. That walk is the one piece of compaction left under the lock, timed as `Hold::Compaction` (design rule 1: "named and measured"). It runs only when the compactor carried frames, which happens only when a live open's dead neighbours outweigh its own frames. No workload in slice 0 did that.
+**Settled here (parked above; amended after the protocol review, see "Review responses (slice 2)"):**
+- **C4: one step head per pointer, let go once a published checkpoint has counted its switch.** A record after B names `Step(s)` for a pointer set at step s ≤ B until the actor switches that pointer to its oid: as a target, or as a change's `old`. Row chains are included because a row step names its chain's current value as `old` (`mod.rs:1543-1550`) and recovery's fold checks every `old` (`fold.rs:535`). Today's code leaves chains out only because its compaction switches every pointer in the same hold (`commit_point.rs:191-198`). A checkpoint at B sets `step_heads[p] = s` for every pointer the fold gives as `Target::Step(s)`, unless `AtBuilt::switched[p] == (s, at)` with `at ≤ B + 1`. No oid is stored: at B it is `Checkpoint::pointers[p]`, and on a restart it is the built log's value `(s, p)` (`mod.rs:505-523`), which `checkpointed_through` keeps. The fold seeds `Folded::pointers` with `Target::Step(s)` for each head of the checkpoint it starts from. So a head that no step in between set comes out of the fold again, and there is no separate carry-over rule.
+- **The switch record.** At each built event, under its lock, `TreeActor::switch_built` turns every pointer whose value is a step at or below History's built point into the oid built for it, row chains included. It tells History each switch before its next record: `History::switched(pointer, step, at)`, with `at` the actor's next record number. The record is keyed by pointer and tied to its step, so a later step on the same pointer is never taken for the switched one. **History keeps it until `History::published` reports a checkpoint with `built ≥ at`.** A compaction that read `AtBuilt` before the switch has `B < at`, because B is at most the last record appended at the read. So no checkpoint misses a switch it should count, and the head goes at the first compaction at or after `at - 1`. That bounds it: at most one switch record and one head per pointer. The stubs' "reaches `at`" (`built.rs:545-549`) and "passes" (`compactor.rs:42-47`) are both replaced by this rule. So is the second review's "until its built point passes the record", which names the earliest moment the head may go, not the rule. The builder is unchanged. Recovery gives it no row-chain heads (`mod.rs:800-805`), and it drops heads at or below `checkpointed_through()`, which never passes `Published::oldest_head() - 1`.
+- **C6: holders move at the built event, as a named fallback.** The compactor copies live frames into `carry-<B>` files and records each copy in `Relocations`. A holder that still names an unlinked segment keeps reading it through its `Arc<Segment>`, and those bytes count in `JournalCompaction::len` until the last holder lets go. The builder moves its positions at its next batch, as today. The actor moves its positions in `TreeActor::relocate_if_moved`, which `on_built` runs only when `Relocations::generation()` moved. That walk is the one piece of compaction left under the lock, timed as `Hold::Compaction` (design rule 1: "named and measured"). It runs only when a live open's dead neighbours outweigh its own frames.
 - **The compactor has its own thread**, started beside the builder, ended once History is stopping, and joined by `TreeActor`'s shutdown before the builder's join and before the lease is released. A publish in flight finishes or leaves only `checkpoint.tmp`.
-- **The due rule has one home**, `history::compactor::compact_at`, read only by the compactor, which owns its threshold. `commit_point::compact_at` and `TreeActor::compact_threshold` are deleted.
+- **When to compact has one home**, `history::compactor::compact_at`. Only the compactor thread reads it, at a built event, together with the coverage rule below. `commit_point::compact_at` and `TreeActor::compact_threshold` are deleted. The only other decider is the compaction gate, which exists only in failpoints builds and compacts at every built event.
+- **Open does not compact.** History's trees are empty until the builder's first built event (`built.rs:157-159`, `:309`), so a checkpoint made before then would carry empty `locals`. `State::trees` becomes `Option<imbl::OrdMap<TreeId, Tree>>`, `None` until then. `History::at_built` returns `None` while it is, and `built_trees` reads the same `Option` in place of its `is_empty` guard (`built.rs:869`). A reopened volume compacts at its first built event, once due. Tests that relied on every open compacting (`tests/tree_actor.rs:1255`, `:1904`, `:1937`) drive compaction through the gate instead. This replaces "open still compacts". Conformance still compacts across reopens through the gate (2.7).
 - **B may fall between a take's chunk records and its step.** The fold's `bytes` (chunks with no step yet) become the checkpoint's `chunks`, and `carry` copies them.
-- **The segment table and the journal's length have one owner: `Durability`**, which already holds `segments`, `add_segment` and `remove_segment`. Lock order: the actor, then History, then Durability, then Relocations. The `Journal` the actor holds keeps only its append position.
-- **TreeActor::open still compacts before serving**, through `compact_once`, when History's built point covers a segment. That keeps conformance's reopen coverage of compaction.
+- **`Durability` is the one owner of the segment table and the journal's length.** It already holds `segments`, `add_segment` and `remove_segment`. **C2 and C2a are one rule there: a segment is covered when the next segment in the table starts at or before B + 1.** The actor adds each segment under its lock before appending to it (`durable.rs:289-295`; `journal/mod.rs:1038`, `:1157`). That call is the roll event the second review asked for. The newest segment, whose end is not yet known, is never covered. `History::rolled` and `AtBuilt::rolled` are deleted. Lock order: the actor, then History, then Durability, then Relocations. The `Journal` the actor holds keeps only its append position.
+- **One order, enforced when each value is built:** `wait_durable`, `fold_through`, the checkpoint built with `carried` empty, `carry(&checkpoint)`, `Sealed::new(checkpoint, durable, carried)`, `publish(&sealed)`, `History::published`, then `unlink_covered`. `Sealed::new` is the only maker of the only value `publish` takes. It refuses a checkpoint whose `built` passes `durable.through` with `NotPublished`, which is logged and retried. It writes `Checkpoint::carried` from the `Carried` it consumes, the one source of that list. The check runs when the seal is made, not at compile time: the types force the order, and the record numbers are compared at run time.
 
-**Signatures (committed; bodies are this slice's work).** `crates/agentfs-core/src/tree_actor/journal/compaction.rs`:
+**Signatures (committed in 5a80783 to a5ef18e; this slice changes the ones marked `// changed`, and the bodies are its work).** `crates/agentfs-core/src/tree_actor/journal/compaction.rs`:
 
 ```rust
 pub(in crate::tree_actor) const CHECKPOINT: &str = "checkpoint";
@@ -367,18 +368,25 @@ pub(in crate::tree_actor) struct Checkpoint {
     pub page_saved: Vec<(String, u64, u64)>,
     pub page_writes: Vec<RecordNo>,
     pub chunks: Vec<RecordNo>,
-    pub step_heads: BTreeMap<String, (RecordNo, String)>,
-    pub carried: Vec<RecordNo>,
+    pub step_heads: BTreeMap<String, RecordNo>,  // changed: pointer -> step; its oid is `pointers[pointer]`
+    pub carried: Vec<RecordNo>,                  // written only by `Sealed::new`
 }
 impl Checkpoint { pub(in crate::tree_actor) fn next(&self) -> RecordNo; }
 
-pub(in crate::tree_actor) struct Durable { through: RecordNo }          // only wait_durable makes one
-pub(in crate::tree_actor) struct Published { built: RecordNo, carried: Vec<RecordNo>, oldest_head: Option<RecordNo> } // only publish makes one
+pub(in crate::tree_actor) struct Durable { through: RecordNo }                 // changed: not Copy; only wait_durable makes one
+pub(in crate::tree_actor) struct Carried { files: Vec<RecordNo>, bytes: u64 }  // changed: private; only carry makes one
+impl Carried { pub(in crate::tree_actor) fn bytes(&self) -> u64; }
+pub(in crate::tree_actor) struct Sealed { checkpoint: Checkpoint }             // new: only Sealed::new makes one
+impl Sealed {
+    pub(in crate::tree_actor) fn new(checkpoint: Checkpoint, durable: Durable, carried: Carried) -> Result<Self, CompactionError>;
+    pub(in crate::tree_actor) fn checkpoint(&self) -> &Checkpoint;
+}
+pub(in crate::tree_actor) struct Published { built: RecordNo, carried: Vec<RecordNo>, oldest_head: Option<RecordNo> } // publish, or Journal::open
 impl Published {
     pub(in crate::tree_actor) fn built(&self) -> RecordNo;
     pub(in crate::tree_actor) fn oldest_head(&self) -> Option<RecordNo>;
+    pub(in crate::tree_actor::journal) fn of_open(checkpoint: &Checkpoint) -> Self; // new: Journal::open's, after its directory fsync
 }
-pub(in crate::tree_actor) struct Carried { pub built: RecordNo, pub files: Vec<RecordNo>, pub bytes: u64 }
 
 #[derive(Debug, thiserror::Error)]
 pub(in crate::tree_actor) enum CompactionError {
@@ -390,9 +398,9 @@ pub(in crate::tree_actor) enum CompactionError {
 impl JournalCompaction {
     pub(in crate::tree_actor) fn new(dir: PathBuf, durability: Arc<Durability>) -> Self;
     pub(in crate::tree_actor) fn wait_durable(&self, through: RecordNo) -> Result<Durable, DurableError>;
-    pub(in crate::tree_actor) fn fold_through(&self, built: &Durable) -> Result<Folded, CompactionError>;
+    pub(in crate::tree_actor) fn fold_through(&self, durable: &Durable) -> Result<Folded, CompactionError>;
     pub(in crate::tree_actor) fn carry(&self, checkpoint: &Checkpoint) -> Result<Carried, CompactionError>;
-    pub(in crate::tree_actor) fn publish(&self, checkpoint: &Checkpoint, durable: &Durable, carried: &Carried) -> Result<Published, CompactionError>;
+    pub(in crate::tree_actor) fn publish(&self, sealed: &Sealed) -> Result<Published, CompactionError>; // changed
     pub(in crate::tree_actor) fn unlink_covered(&self, published: &Published) -> Result<DropStats, CompactionError>;
     pub(in crate::tree_actor) fn len(&self) -> u64;
 }
@@ -407,8 +415,7 @@ pub(in crate::tree_actor) struct AtBuilt {
     pub pointers: Arc<Pointers>,
     pub objects: BuiltObjects,
     pub trees: imbl::OrdMap<TreeId, Tree>,
-    pub switched: imbl::OrdMap<String, RecordNo>,
-    pub rolled: RecordNo,
+    pub switched: imbl::OrdMap<String, (RecordNo, RecordNo)>,  // changed: pointer -> (step, at); `rolled` deleted
 }
 pub(in crate::tree_actor) fn compact_at(len_after_last: u64) -> u64;   // max(64 MiB, 2 × len), moved from commit_point.rs
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -418,16 +425,17 @@ impl Compactor {
     pub(in crate::tree_actor) fn start(history: History, journal: JournalCompaction) -> std::io::Result<Self>;
     pub(in crate::tree_actor) fn join(self);
 }
+/// The thread's one sequence, and the unit tests'. `None` before History's
+/// first built event since open, or when nothing is covered past the last checkpoint.
 pub(in crate::tree_actor) fn compact_once(history: &History, journal: &JournalCompaction) -> Result<Option<DropStats>, CompactionError>;
 ```
 
 `History` (`history/built.rs`), each O(1) or O(log pointers) under History's lock, never across I/O:
 
 ```rust
-pub(in crate::tree_actor) fn at_built(&self) -> AtBuilt;
-pub(in crate::tree_actor) fn rolled(&self, first: RecordNo);
-pub(in crate::tree_actor) fn switched(&self, pointer: &str, at: RecordNo);
-pub(in crate::tree_actor) fn published(&self, published: &Published);   // replaces `checkpointed`
+pub(in crate::tree_actor) fn at_built(&self) -> Option<AtBuilt>;                          // changed: None until the first built event
+pub(in crate::tree_actor) fn switched(&self, pointer: &str, step: RecordNo, at: RecordNo); // changed: the step it switched from
+pub(in crate::tree_actor) fn published(&self, published: &Published);  // replaces `checkpointed`; drops switches with at <= built
 ```
 
 The actor (`journal/commit_point.rs`) and the segment table (`journal/segment.rs`):
@@ -440,12 +448,14 @@ impl TreeActor {
 impl Relocations { pub(in crate::tree_actor) fn generation(&self) -> u64; }
 ```
 
-The guard, new in `stages.rs` (design rule 1, landed with this slice as the review asked):
+The guard, new in `stages.rs`, landed with this slice as the review asked:
 
 ```rust
 /// Work that never runs while this thread holds the actor's lock, except in
-/// a hold of a named exemption: `Hold::Close` (a close redone under the
-/// lock, a client death's closes) and `Hold::ForkCopy`.
+/// a hold of a named exemption, each measured as its own `lock_hold` kind:
+/// `Hold::Close` (a close decided or redone under the lock, a client death's
+/// closes), `Hold::ForkCopy`, and `Hold::PageImage` (a page fill or writeback
+/// building a file's image from every live open's calls).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(in crate::tree_actor) enum Unlocked { Fsync, JournalRead, Unlink }
 
@@ -454,46 +464,81 @@ pub(in crate::tree_actor) enum Unlocked { Fsync, JournalRead, Unlink }
 pub(in crate::tree_actor) fn assert_unlocked(work: Unlocked);
 ```
 
-Called at `Segment::sync`, at every unlink of a segment or carry file, and at `CallReader`'s frame reads.
+It is called at `Segment::sync`, at every unlink of a segment or carry file, and at `CallReader::calls`. **Design rule 1, as this slice builds it:** under the lock, nothing fsyncs, unlinks, or reads an open's calls back from the journal, except in the holds named above. Reading a call's own bytes from a map on frames, such as a page fill's `size` bytes, is proportional to the call and is not guarded. Calls are read under the lock today in three places:
+- `own_calls`, in a close redo and in pending closes (`recording/mod.rs:1473`, `:1488`), as `Hold::Close`.
+- `TreeActor::close` deciding in its hold (`recording/mod.rs:967-975`, into `:332`), as `Hold::Close`.
+- The page image (`pages.rs:475-493`, from `page_fill` `:355` and `page_writeback` `:385`), as `Hold::Other`.
 
-**Deleted:** `commit_point::{compact, compact_if_due, compact_at, relocate_frames, resolve_compacted}`, `TreeActor::{compacted, compact_threshold, pages_saved_through, pages_held}`, `commit_point::holds`, `CompactError`, `Journal::{checkpoint, drop_behind}`, the checkpoint as a segment's first frame, `History::{checkpointed, compaction_overdue}` and `History::steps_built` if nothing else reads it, `LagGate::compaction_overdue` and its term, and `GateCause::Overdue` with its `overdue` stage, OpenTelemetry label and figures column. `Entry::Checkpoint` becomes `Entry::Checkpoint(Checkpoint)`, the frame kept in the checkpoint file. A segment holding one is `Error::Format`, as today.
+`Hold::PageImage` is new: slice 2 adds it in `stages.rs`, `telemetry.rs`, `ci/trees-figures.py` and `docs/telemetry.md`. It also writes **one line in lane C's `recording/pages.rs`**: `let _kind = section(Hold::PageImage);` at the top of `pages_build_image`. Slice 5 rewrites that function's loop, and whichever lands second rebases. Moving the image build off the lock belongs to neither slice. It is a residual for after slice 5, when the image reads one copy of the calls.
 
-**Recovery (C5, C7).** `Journal::open` reads `journal/checkpoint` first. The salt, the redo start `built + 1` and "no record after `built`" come from it. It ignores `checkpoint.tmp`. It reads the `carry-*` files the checkpoint names as carried frames. It skips records at or below `built` in segments that survived, except the live frames the checkpoint names. A missing or wholly torn segment after `built` is a torn tail, not corruption. A volume with no checkpoint file does not open. `Journal::create(dir, first: &Checkpoint)` writes the checkpoint file, then the first segment named `first.next()`. State format `agentfs-trees-13` becomes `agentfs-trees-14`, and 13 does not open (trees.md policy, no conversion).
+**Deleted:** `commit_point::{compact, compact_if_due, compact_at, relocate_frames, resolve_compacted}`, `TreeActor::{compacted, compact_threshold, pages_saved_through, pages_held}`, `commit_point::holds`, `CompactError`, `Journal::{checkpoint, drop_behind}`, the checkpoint as a segment's first frame, compaction in `TreeActor::open` (`mod.rs:1034-1043`), `History::{checkpointed, compaction_overdue, rolled}`, `History::steps_built` if nothing else reads it, `LagGate::compaction_overdue` and its term, and `GateCause::Overdue` with its `overdue` stage, OpenTelemetry label and figures column. `Entry::Checkpoint` becomes `Entry::Checkpoint(Checkpoint)`, the frame kept in the checkpoint file. A segment holding one is `Error::Format`, as today.
 
-**Contract.** C1 to C9 as written in `compaction.rs`'s module doc and on this page.
+**Recovery (C5, C7).** `Journal::open` reads `journal/checkpoint` first. The salt, the redo start `built + 1` and "no record after `built`" come from it. It ignores `checkpoint.tmp`. It reads the `carry-*` files the checkpoint names as carried frames. It skips records at or below `built` in segments that survived, except the live frames the checkpoint names. It reads each frame once: when a carry and its original both survive (after `NotDropped`), the carried copy wins. **A gap in record numbers after `built` (a missing segment), or a wholly torn segment, counts as the first invalid frame, and today's rules judge it (trees.md, the durable mark):**
+- A later valid frame whose mark passes the last valid record means corruption.
+- So do valid records that end before the built log's point.
+- Anything else is a torn tail, saved to `journal/torn` and cut.
+
+So the journal opens in C7's two power-loss cases, where nothing after B was durable. It refuses when a lost segment held a record that a later frame or the built log proves durable. One case is not caught, as today: a durable record that is not yet built, whose segment is lost with no later frame. A volume with no checkpoint file does not open. Before it returns, `Journal::open` fsyncs the journal directory and returns `Published::of_open` of its checkpoint as well. `start_history` passes that to `History::published` in place of `checkpointed(folded_built)` (`mod.rs:819`). So a checkpoint renamed but not dir-synced before a crash is durable before the builder trims `built.log` by it. `Journal::create(dir, first: &Checkpoint)` writes the checkpoint file, then the first segment, named `first.next()`. State format `agentfs-trees-13` becomes `agentfs-trees-14`, and 13 does not open (trees.md policy, no conversion).
+
+**Contract.** C1 to C9 as written in `compaction.rs`'s module doc and on this page. Where that doc's step-heads row, C2a and C7 differ from this page, this page wins, and the slice rewrites the doc.
 
 **Acceptance criteria and mutation probes.** Each probe is planted, run and reverted before the slice lands. The slice report names the test that caught it.
 
-| # | Criterion (from "Proven by" and the corrections) | Test that proves it | Mutation probe |
+| # | Criterion | Test that proves it | Mutation probe |
 |---|---|---|---|
-| 2.1 | A kill at any gap of a compaction loses nothing returned and the volume opens with the same reads (C1 to C5) | `compactor.rs::tests::a_kill_at_each_gap_keeps_every_returned_call`: for each `Gap`, park the compactor (below), copy the state area as it stands, release, then open the copy and compare every read with the uninterrupted volume | **P2.1** call `History::published` before `JournalCompaction::publish`: the copy taken at `Written` fails to open or reads differently |
-| 2.2 | A segment is unlinked only after the actor rolled past it (C2a) | `compactor.rs::tests::an_append_during_the_coverage_gap_survives_a_kill`: park at `Covered` while the actor's newest segment is covered by B, append one call and return it, release, kill, reopen, read the call | **P2.2** drop the `rolled` check in `unlink_covered`: the returned call is gone after the reopen |
-| 2.3 | The journal always opens (C7) | power-loss marks "covered segments unlinked, next segment's first frame not durable" and "no segment left" (2.6), and `compactor.rs::tests::a_checkpoint_with_no_segment_after_it_opens` | **P2.3** treat a missing segment after `built` as corruption in `Journal::open`: the "no segment left" case refuses to open |
-| 2.4 | A record after B that names a step at or below B folds the same on the old and the new checkpoint (C3, C4) | `compactor.rs::tests::a_step_named_after_the_checkpoint_folds_on_both`: a pointer set at step s, built through B ≥ s, compacted before the actor's built event switches it, one more step naming Step(s), reopen at each of the two checkpoints | **P2.4** leave the head out of `step_heads` once the fold gives `Target::Step` (only switched pointers kept): the reopen fails with `Format` |
+| 2.1 | A kill at any gap of a compaction loses nothing returned, and the volume opens with the same reads (C1 to C5) | `compactor.rs::tests::a_kill_at_each_gap_keeps_every_returned_call`: for each `Gap`, park the compactor. While it is parked, append a step that sets a pointer and wait for its built event, so a builder batch runs and trims `built.log` at its start (`builder.rs:1493-1500`). Then copy the state area, release, open the copy and compare every read with the uninterrupted volume | **P2.1** call `History::published` before `publish`: the copy taken at `Written` fails to open (`Format` in `resolve_pointers`) |
+| 2.2 | A segment is unlinked only once the next segment starts at or before B + 1 (C2, C2a) | `compactor.rs::tests::an_append_during_the_coverage_gap_survives_a_kill`: park at `Covered` while the actor's newest segment starts at or before B, append one call and return it, release, kill, reopen, read the call | **P2.2** judge a segment covered by its own first record: the returned call is gone after the reopen |
+| 2.3 | The journal opens when nothing after B was durable (C7) | power-loss marks "covered segments unlinked, next segment's first frame not durable" and "no segment left" (2.6), and `compactor.rs::tests::a_checkpoint_with_no_segment_after_it_opens` | **P2.3** treat a missing segment after `built` as corruption: the "no segment left" case refuses to open |
+| 2.4 | A record after B that names a step at or below B folds the same on the old and the new checkpoint (C3, C4) | `compactor.rs::tests::a_step_named_after_the_checkpoint_folds_on_both`: a pointer set at step s, built through B ≥ s, compacted before the actor's built event switches it, then one more step naming `Step(s)`; reopen at each of the two checkpoints. Run once with a branch pointer and once with a row chain | **P2.4** leave the head out of `step_heads` when the fold gives `Target::Step`: the reopen fails with `PointerMoved` or `Format` |
 | 2.5 | No lock the actor takes is held across I/O or a wait (C9) | `compactor.rs::tests::calls_run_while_the_compactor_is_parked`: parked at each `Gap`, another thread appends a call, runs `durable_all` and catches up, each finishing (a 10-second bound fails the test rather than hanging it) | **P2.5** hold Durability's state lock across `unlink_covered`'s unlink: the append blocks at `BeforeUnlink` |
 | 2.6 | Power loss at each step of a compaction, with records after B not yet durable, keeps the journal a prefix of what was appended and every record up to the last returned fsync | `ci/power-loss-trees.sh`: new marks at `Written`, `Renamed`, `DirSynced`, `BeforeUnlink` and after the unlink, plus the two C7 marks, driven through the compaction gate; each replayed from an empty device and checked by `power-loss-trees-check.sh` | **P2.6** skip the directory fsync in `publish`: the mark after `Renamed` replays with no checkpoint (run locally under root with dm-log-writes, or on CI) |
-| 2.7 | Phase-1 coverage of compaction across model steps | the conformance leg: `phase1-replay library` and the mounted replay at the regression seeds with `AGENTFS_COMPACT_GATE` set, compacting at every built event and parking at each gap in turn while the replay goes on | **P2.7** the same plant as P2.4: the leg reports the seed and call where the library left the model |
+| 2.7 | Phase-1 coverage of compaction across model steps and reopens | the conformance leg: `phase1-replay library` and the mounted replay at the regression seeds with `AGENTFS_COMPACT_GATE` set, compacting at every built event and parking at each gap in turn while the replay goes on | **P2.7** the same plant as P2.4: the leg reports the seed and call where the library left the model |
 | 2.8 | New work is admitted while history trails past twice the due length (the overdue stop is gone) | `lag.rs` unit test `a_long_journal_holds_no_tree`, and `compactor.rs::tests::creates_go_on_while_history_trails` with the builder held at its batch start (`History::batch_read` hook) and the journal past `2 × compact_at(0)` | **P2.8** restore the overdue term in `LagGate::admits`: both tests fail |
-| 2.9 | A call never waits for compaction (the purpose) | figures (warn only): `close_1g` and `write_1m` with `--metrics --probe --probe-view`, local release build on ext4: `lock_hold.compaction` longest under 1 ms and the other view's longest probe call under 50 ms (slice 0: 1,244 and 1,166 ms) | none: a figure. Read in the report. |
-| 2.10 | The guard holds | the whole workspace test run in debug: `assert_unlocked` panics on any unexempted fsync, journal read or unlink under the lock | **P2.10** add a `Segment::sync` call inside `relocate_if_moved`: `compactor.rs`'s tests panic in the guard |
+| 2.9 | A call never waits for compaction (the purpose), and the walk left under the lock is measured | figures (warn only), local release build on ext4. `close_1g` and `write_1m` with `--metrics --probe --probe-view`: the other view's longest probe call under 50 ms (slice 0: 1,244 and 1,166 ms). A new `held_open` workload, shaped like the power-loss HC leg, so the compactor carries frames and `relocate_if_moved` runs: report `lock_hold.compaction`'s longest hold, and file a residual bead if it is over 10 ms | none: figures. Read in the report. |
+| 2.10 | The guard holds | the whole workspace test run in debug, `tests/tree_pages.rs:291` `a_fill_reads_every_opens_calls` included: `assert_unlocked` panics on any fsync, journal read or unlink under the lock outside the named holds | **P2.10a** add a `Segment::sync` call inside `relocate_if_moved`: 2.14's test panics in the guard. **P2.10b** remove the `Hold::PageImage` section: the page tests panic |
+| 2.11 | A head goes once a published checkpoint has counted its switch, and the built log is trimmed past it (C3, C4) | `compactor.rs::tests::a_switched_head_is_let_go`: the 2.4 scenario, then records so the switch lands at r > B + 1, then a build and a compaction at B2 ≥ r with no step on the pointer since. `step_heads` lacks it, `oldest_head()` is `None`, `checkpointed_through()` is B2, and the next batch trims `built.log`. Then the 2.4 scenario again on the same pointer at a later step, with no compaction between the first switch and that step: the reopen folds | **P2.11a** drop a switch at the built event once built ≥ `at`: the head stays and `checkpointed_through()` stays below s. **P2.11b** key `switched` by pointer alone: the second reopen fails |
+| 2.12 | No checkpoint is published without History's trees at B (C8) | `compactor.rs::tests::a_compaction_after_reopen_keeps_dir_and_file_times`: directories and files with distinct times; reopen; one step; compact at its built event; reopen again. Every directory's number and time and every file's time equal the uninterrupted volume's | **P2.12** have `at_built` return `Some` with empty trees before the first built event, and compact once at start: the second reopen fails with `Format` (`restore_locals`, `mod.rs:528-535`) |
+| 2.13 | A lost segment after B that held a record proven durable refuses to open (C7) | `journal/mod.rs` test `a_lost_durable_segment_refuses_to_open`, two cases. First: durable records after B, a roll, one more durable record, then the middle segment unlinked by hand. Second: the built log past the lost records, with no later segment. Both refuse to open | **P2.13** treat a missing segment after `built` as a torn tail without the two checks: both open |
+| 2.14 | A carried open survives every gap, and the actor moves to the carry (C6) | `compactor.rs::tests::a_carried_open_survives_each_gap`: an open with a few calls is held while another file's saved calls outweigh them in its segment and the journal rolls. Build, then compact so that its frames are carried. For each `Gap`, park, copy, release, open the copy and close the open: every byte is read once. Repeat with the unlink failing (`NotDropped`, through a failpoint). After the next built event, `relocate_if_moved` has run, and once the builder has moved, `len()` no longer counts the unlinked segment | **P2.14** read a carried frame and its surviving original both: the copy after `NotDropped` saves the bytes twice or fails with `Format` |
 
-**The test hook, unit tests only.** The tests of 2.1 to 2.5 and 2.8 are unit tests in `history/compactor.rs` (they open a `TreeActor` and copy its state area, which integration tests cannot reach). They park the compactor through a hook on History, stored beside today's `batch_read` hook in `history/built.rs` and run at each `Gap` before the compactor's next step:
+**The test hook, unit tests only.** The tests of 2.1, 2.2, 2.4, 2.5, 2.8, 2.11, 2.12 and 2.14 are unit tests in `history/compactor.rs`: they open a `TreeActor` and copy its state area, which integration tests cannot reach. They park the compactor through a hook on History, stored beside today's `batch_read` hook in `history/built.rs`, which runs at each `Gap` before the compactor's next step:
 
 ```rust
 #[cfg(test)]
 pub(in crate::tree_actor) fn hold_compactor_with(&self, hook: impl Fn(Gap) + Send + Sync + 'static);
 ```
 
-**The compaction gate, failpoints builds only.** `AGENTFS_COMPACT_GATE=<dir>` holds FIFOs `at` and `go`, the way `AGENTFS_TAKE_GATE` does. With it set, the compactor compacts at every built event, ignoring `compact_at`. At each `Gap` it writes the gap's name to `at` and waits for a line on `go`. The test, the conformance leg and the power-loss driver each use this one mechanism, which is event-driven with no sleeps. `docs/configuration.md` gets its row.
+**The compaction gate, failpoints builds only.** `AGENTFS_COMPACT_GATE=<dir>` holds FIFOs `at` and `go`, the way `AGENTFS_TAKE_GATE` does. With it set, the compactor compacts at every built event and ignores `compact_at`. At each `Gap` it writes the gap's name to `at` and waits for a line on `go`. The integration tests, the conformance leg and the power-loss driver all use this one mechanism, which is event-driven and has no sleeps. `docs/configuration.md` gets its row.
 
 **Gates (durability changes):**
-1. **The model-verification regression tier.** `cargo test --workspace` runs the model's scenarios, the regression seeds and conformance's replays. `phase-1.yml` runs on the PR. Not the full sweep (owner, 2026-11-13): no rule of the model changes, since the journal is modelled only as rule 12. git-model §3's compaction paragraph and §12's journal row are amended through `crates/agentfs-model/VERIFYING.md` "The procedure".
-2. **The power-loss runs.** `ci/power-loss-trees.sh` with the marks of 2.6, in the `ci.yml` crash-injection job. Run them locally under root with dm-log-writes before pushing if the container allows it, otherwise mark them NOT RUN locally and let CI judge.
-3. fmt, clippy `-D warnings`, `cargo test --workspace`. CI `ci` and `image` green on the pushed SHA.
+1. **The model-verification regression tier.** `cargo test --workspace` runs the model's scenarios, the regression seeds and conformance's replays, and `phase-1.yml` runs on the PR. Not the full sweep (owner, 2026-11-13), because no rule of the model changes: the model has the journal only as rule 12. git-model §3's compaction paragraph and §12's journal row are amended through `crates/agentfs-model/VERIFYING.md` "The procedure".
+2. **The power-loss runs.** `ci/power-loss-trees.sh` with the marks of 2.6, in the `ci.yml` crash-injection job. Run them locally under root with dm-log-writes if the container allows it. Otherwise mark them NOT RUN locally and let CI judge.
+3. fmt, clippy `-D warnings`, and `cargo test --workspace`. CI `ci` and `image` green on the pushed SHA.
 
-**Docs in the same commit:** `docs/trees.md` (the journal, compaction, the lag gate without the overdue stop, state format 14), `docs/telemetry.md` (no `overdue` cause; what `lock_hold.compaction` now measures), `docs/architecture.md` (the `commit_point.rs`, `compactor.rs`, `compaction.rs`, `journal/mod.rs` and `lag.rs` rows), `docs/configuration.md` (`AGENTFS_COMPACT_GATE`), `docs/runbooks/upgrading-the-sidecar.md` (format 14), git-model §3 and §12.
+**Docs in the same commit:** `docs/trees.md` (the journal, compaction, the lag gate without the overdue stop, state format 14), `docs/telemetry.md` (no `overdue` cause, the `page_image` hold, and what `lock_hold.compaction` now measures), `docs/architecture.md` (the `commit_point.rs`, `compactor.rs`, `compaction.rs`, `journal/mod.rs` and `lag.rs` rows), `docs/configuration.md` (`AGENTFS_COMPACT_GATE`), `docs/runbooks/upgrading-the-sidecar.md` (format 14), and git-model §3 and §12.
 
-**Costs this slice states in trees.md:** restarts replay from B, so they take longer while history trails. Nothing bounds the journal's length except the tree's space limit (C6): the overdue stop used to bound it, and nothing replaces it. A long-lived open whose frames were carried pins the old segment until the actor's next built event. A failed compaction is reported at the next built event, not at a call.
+**Costs this slice states in trees.md:**
+- Restarts replay from B, so they take longer while history trails.
+- With the overdue stop gone, only the lag gate bounds what follows B. Each tree's unbuilt steps are held to its lag and overlay limits (`lag.rs:186-191`), so that bound grows with the number of trees. A live open's calls are bounded by nothing but the open. Once the builder has failed, the gate admits everything, and the journal grows until the state area's disk fills and `ENOSPC` on the journal stops recording (trees.md, the untracked area).
+- Each compaction re-reads the records from the last checkpoint through B, which the builder has already read. While it runs, its fold holds every live open's calls as `(seq, Call, FramePos)` (`fold.rs:516-521`). Under `write_1m` that is one more transient copy of a 1M-call open, on the compactor thread: the memory slice 5 exists to cut. Slice 5's 5.3 report says whether a compaction ran during its run (`journal_dropped` in `--metrics`). A fold that keeps the opens without their calls is a residual if it does.
+- A long-lived open whose frames were carried pins the old segment until the actor's next built event.
+- A failed compaction is reported at the next built event, not at a call.
+- A reopened volume compacts at its first built event, not at open.
+
+**Review responses (slice 2), protocol review of ca2d098:**
+- High, head leak (C3/C4): fixed. Switches are kept until a published checkpoint has counted them and are tied to their step. Probes in 2.11. Row chains stay in, for the reason given under C4.
+- High, empty `locals` at open: fixed. `at_built` returns `None` before the first built event, open no longer compacts, and 2.12 tests it.
+- High, guard against the page image: named exemption `Hold::PageImage`, measured, with its one line in `pages.rs` owned by slice 2. Design rule 1 restated and P2.10b added. Moving the build off the lock is a residual after slice 5.
+- High, C7 refusals: kept. A gap is the first invalid frame under the durable-mark and built-log rules, and 2.13 tests it. What stays uncovered is stated.
+- Medium, two sources for "rolled past": fixed. The segment table is the one source, and `History::rolled` is deleted.
+- Medium, proof types: `Sealed` binds `Durable` and `Carried` to the checkpoint. The check runs when the seal is made, and the page says so.
+- Medium, no carry tested: 2.14, P2.10a moved there, and `held_open` in 2.9.
+- Medium, P2.1 could survive: 2.1 now runs a builder batch while parked.
+- Medium, wrong bound: the costs now name the lag gate, the failed builder and `ENOSPC`.
+- Low, refold cost: stated against slice 5's figure, and not fixed here, because a fold without calls is a second fold until a figure asks for it.
+- Low, `Folded` lacked the old heads: the fold seeds `pointers` from `step_heads`, so `Folded` needs no new field.
+- Low, three deciders: open's compaction is deleted. The gate is the one stated exception, for tests.
+- Low, the brief described the CSI host channel: not this page, so no change.
 
 ### Slice 6: a close returns once its change is in the journal
 
