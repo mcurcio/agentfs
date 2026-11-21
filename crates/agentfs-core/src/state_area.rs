@@ -49,22 +49,30 @@ impl TreeStateArea {
     }
 }
 
-/// The Volume domain's word for a tree actor's failure; its kind from the
-/// one mapping (`store::io_kind`).
-fn volume_error(error: &tree_actor::Error) -> VolumeError {
+/// The Volume domain's word for a tree actor's failure at the state area
+/// `root`; its kind from the one mapping (`store::io_kind`). The Volume
+/// domain's `NotDurable` carries the kind alone, so the failure itself, and
+/// the state area it is on, are said here (a full filesystem is named).
+fn volume_error(root: &Path, error: &tree_actor::Error) -> VolumeError {
     match error {
         tree_actor::Error::Busy => VolumeError::Busy,
         tree_actor::Error::NotCreated => VolumeError::NotCreated,
         tree_actor::Error::Format => VolumeError::OtherFormat,
         tree_actor::Error::Rules(refusal) => VolumeError::RulesRefused(refusal.to_string()),
-        other => VolumeError::NotDurable(io_kind(other)),
+        other => {
+            eprintln!(
+                "tree NotDurable: the state area {}: {other}",
+                root.display()
+            );
+            VolumeError::NotDurable(io_kind(other))
+        }
     }
 }
 
 impl StateArea for TreeStateArea {
     fn inspect(&self) -> Result<Found, VolumeError> {
         tree_actor::inspect(&self.root)
-            .map_err(|e| VolumeError::NotDurable(io_kind(&tree_actor::Error::Io(e))))
+            .map_err(|e| volume_error(&self.root, &tree_actor::Error::Io(e)))
     }
 
     /// [`Recording::create`] takes the state area's lock and inspects again
@@ -92,15 +100,16 @@ impl StateArea for TreeStateArea {
                 // Another create is under way.
                 Found::Nothing => Err(VolumeError::Busy),
             },
-            Err(e) => Err(volume_error(&e)),
+            Err(e) => Err(volume_error(&self.root, &e)),
         }
     }
 
     fn open(&mut self, at: &PodContext) -> Result<VolumeIdentity, VolumeError> {
-        let recording = Recording::open(&self.root, at).map_err(|e| volume_error(&e))?;
+        let recording =
+            Recording::open(&self.root, at).map_err(|e| volume_error(&self.root, &e))?;
         let identity = recording
             .actor()
-            .map_err(|e| volume_error(&e))?
+            .map_err(|e| volume_error(&self.root, &e))?
             .identity()
             .clone();
         let store = TreeStore::new(Arc::clone(&recording));
@@ -123,10 +132,17 @@ impl VolumeStore for TreeStateArea {
         by: &Principal,
         at: Option<&PodContext>,
     ) -> Result<(), StoreError> {
-        match self.served.as_mut() {
+        let result = match self.served.as_mut() {
             Some((_, store)) => store.record(state, event, by, at),
             None => Err(StoreError::Stopped),
+        };
+        if let Err(StoreError::NotDurable(kind)) = &result {
+            eprintln!(
+                "tree NotDurable: the state area {}: the volume's row was not written: {kind:?}",
+                self.root.display()
+            );
         }
+        result
     }
 }
 

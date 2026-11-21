@@ -24,12 +24,23 @@
 //!   fsyncs the directory;
 //! - the store's packs that run rolled up are set aside: later runs leave
 //!   them out, and they are deleted only at a run that starts on a built
-//!   event that came after that run ended. A reader fails only if one
-//!   listing of its spans a whole built batch.
+//!   event that came after that run ended. Each run's are judged by its own
+//!   end, so runs back to back beside a busy builder never hold back an
+//!   earlier run's: at most the last two runs' packs are set aside. A reader
+//!   fails only if one listing of its spans a whole built batch.
+//!
+//! **A stop leaves no copy behind for the next process.** The packs set
+//! aside are named in `repack/rolled-up`, written once their roll-up is
+//! linked in and fsynced. The next start deletes them, and every scratch
+//! directory an earlier process left, before the volume is served: every
+//! listing it makes is after the roll-up was installed, and git and libgit2
+//! skip a listed pack they cannot open for the next pack holding the
+//! object. Without it the copies a stop left stay, and the restart's first
+//! run rolls them up again beside them: a large file three times over.
 //!
 //! A stop kills a repack in progress, with every process it started (its
 //! own process group). A process outliving its parent (a daemon killed) only
-//! ever writes in its scratch directory, which the next run removes. git
+//! ever writes in its scratch directory, which the next start removes. git
 //! fsyncs the pack it writes and the task fsyncs `objects/pack` after linking
 //! it, so a batch whose pack is rolled up is as durable as one that is not
 //! (history/feed.rs).
@@ -40,7 +51,7 @@
 
 use std::collections::BTreeSet;
 use std::fs::{self, File};
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Stdio};
@@ -79,6 +90,9 @@ const FSYNC: [&str; 4] = [
 
 /// The git directory's folder of the runs' scratch object directories.
 const SCRATCH: &str = "repack";
+
+/// The file in [`SCRATCH`] naming the store's packs set aside, one a line.
+const ROLLED_UP: &str = "rolled-up";
 
 /// A pack's files the scratch directory links, its index last: a reader
 /// finds a pack by its index. A `.keep` keeps a pack out of the roll-up
@@ -123,11 +137,42 @@ enum Ran {
     Stopped,
 }
 
-/// The store's packs a run rolled up, kept until a built event after `after`.
+/// The store's packs each run rolled up, with the built epoch that run
+/// ended at: each run's are kept until a built event after its own end.
 #[derive(Default)]
 struct Aside {
-    packs: Packs,
-    after: u64,
+    runs: Vec<(Packs, u64)>,
+}
+
+impl Aside {
+    /// Every pack set aside.
+    fn packs(&self) -> Packs {
+        self.runs
+            .iter()
+            .flat_map(|(packs, _)| packs.iter().cloned())
+            .collect()
+    }
+
+    /// The packs of every run that ended before built event `seen`.
+    fn due(&self, seen: u64) -> Packs {
+        self.runs
+            .iter()
+            .filter(|(_, after)| seen > *after)
+            .flat_map(|(packs, _)| packs.iter().cloned())
+            .collect()
+    }
+
+    /// Forgets the packs [`Aside::due`] gave for `seen`, once deleted.
+    fn deleted(&mut self, seen: u64) {
+        self.runs.retain(|(_, after)| seen <= *after);
+    }
+
+    /// Sets aside the packs a run that ended at built epoch `after` rolled up.
+    fn add(&mut self, packs: Packs, after: u64) {
+        if !packs.is_empty() {
+            self.runs.push((packs, after));
+        }
+    }
 }
 
 impl Repacker {
@@ -139,6 +184,11 @@ impl Repacker {
     ///
     /// The thread could not be started.
     pub(in crate::tree_actor) fn start(history: History, git_dir: PathBuf) -> io::Result<Self> {
+        // Before the rest of the open needs room. A failure is said and the
+        // volume served (keep operating).
+        if let Err(error) = clear_leftovers(&git_dir) {
+            eprintln!("tree RepackFailed: {error}");
+        }
         let child = Arc::new(Mutex::new(Slot::default()));
         let slot = Arc::clone(&child);
         let thread = std::thread::Builder::new()
@@ -168,9 +218,9 @@ fn lock(slot: &Mutex<Slot>) -> MutexGuard<'_, Slot> {
 
 /// The task: one repack per built event seen, until History stops. A failed
 /// repack is logged when it differs from the last and tried again at the
-/// next event (keep operating). Packs set aside at a stop stay: a later
-/// run rolls them up again, with the objects they share with the new pack
-/// written once.
+/// next event (keep operating). The packs set aside are named in
+/// [`ROLLED_UP`] whenever they change, for the next start to delete should
+/// a stop come first.
 fn run(history: &History, git_dir: &Path, slot: &Mutex<Slot>) {
     let mut seen = 0;
     let mut last: Option<String> = None;
@@ -180,22 +230,23 @@ fn run(history: &History, git_dir: &Path, slot: &Mutex<Slot>) {
         if history.stopping() {
             return;
         }
-        let result = if !aside.packs.is_empty() && seen > aside.after {
-            delete(git_dir, &aside.packs).map(|()| aside.packs.clear())
-        } else {
+        let due = aside.due(seen);
+        let result = if due.is_empty() {
             Ok(())
+        } else {
+            delete(git_dir, &due)
+                .map(|()| aside.deleted(seen))
+                .and_then(|()| record(git_dir, &aside.packs()))
         };
         let result = result.and_then(|()| {
-            repack_once(&program(git_dir), git_dir, slot, &aside.packs).map(|ran| match ran {
+            match repack_once(&program(git_dir), git_dir, slot, &aside.packs())? {
+                Ran::Done(rolled) if rolled.is_empty() => Ok(true),
                 Ran::Done(rolled) => {
-                    if !rolled.is_empty() {
-                        aside.packs.extend(rolled);
-                        aside.after = history.wait_epoch_for(u64::MAX, Duration::ZERO);
-                    }
-                    true
+                    aside.add(rolled, history.wait_epoch_for(u64::MAX, Duration::ZERO));
+                    record(git_dir, &aside.packs()).map(|()| true)
                 }
-                Ran::Stopped => false,
-            })
+                Ran::Stopped => Ok(false),
+            }
         });
         match result {
             Ok(true) => last = None,
@@ -233,22 +284,15 @@ struct Scratch {
 impl Scratch {
     /// A new scratch object directory whose `pack/` links every pack of
     /// `git_dir`'s store but those in `aside`: the store's packs it linked.
-    /// What another process's runs left (a killed daemon's) is removed
-    /// first, as far as it can be; this process's own go when dropped.
+    /// It goes when dropped; what another process's runs left (a killed
+    /// daemon's) went at start ([`clear_leftovers`]).
     fn new(git_dir: &Path, aside: &Packs) -> Result<(Self, Packs), TaskError> {
         static RUNS: AtomicU64 = AtomicU64::new(0);
-        let ours = format!("{}-", process_token());
-        let root = git_dir.join(SCRATCH);
-        if let Ok(entries) = fs::read_dir(&root) {
-            for entry in entries.flatten() {
-                if !entry.file_name().to_string_lossy().starts_with(&ours) {
-                    let _ = fs::remove_dir_all(entry.path());
-                }
-            }
-        }
         let run = RUNS.fetch_add(1, Ordering::Relaxed);
         let scratch = Self {
-            dir: root.join(format!("{ours}{run}")),
+            dir: git_dir
+                .join(SCRATCH)
+                .join(format!("{}-{run}", process_token())),
         };
         let pack_dir = scratch.dir.join("pack");
         fs::create_dir_all(&pack_dir).map_err(io_error("creating", &pack_dir))?;
@@ -329,6 +373,71 @@ fn sync_dir(dir: &Path) -> Result<(), TaskError> {
     File::open(dir)
         .and_then(|d| d.sync_all())
         .map_err(io_error("syncing", dir))
+}
+
+/// What an earlier process's task left in `git_dir`: every scratch
+/// directory, removed, and the packs [`ROLLED_UP`] names, deleted, then that
+/// file. Each named pack's roll-up was linked in and fsynced before the file
+/// named it, so every object it holds is in another pack.
+fn clear_leftovers(git_dir: &Path) -> Result<(), TaskError> {
+    let root = git_dir.join(SCRATCH);
+    let entries = match fs::read_dir(&root) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(io_error("listing", &root)(e)),
+    };
+    for entry in entries {
+        let entry = entry.map_err(io_error("listing", &root))?;
+        let path = entry.path();
+        if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+            fs::remove_dir_all(&path).map_err(io_error("removing", &path))?;
+        }
+    }
+    let list = root.join(ROLLED_UP);
+    let text = match fs::read_to_string(&list) {
+        Ok(text) => text,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(io_error("reading", &list)(e)),
+    };
+    let aside: Packs = text
+        .lines()
+        .filter(|name| {
+            name.strip_prefix("pack-")
+                .is_some_and(|hash| !hash.is_empty() && hash.bytes().all(|b| b.is_ascii_hexdigit()))
+        })
+        .map(str::to_owned)
+        .collect();
+    delete(git_dir, &aside)?;
+    fs::remove_file(&list).map_err(io_error("removing", &list))
+}
+
+/// Names the packs `aside` in [`ROLLED_UP`], durably, or removes the file
+/// when there are none. Called only once each is rolled up into a pack the
+/// store holds durably.
+fn record(git_dir: &Path, aside: &Packs) -> Result<(), TaskError> {
+    let root = git_dir.join(SCRATCH);
+    let list = root.join(ROLLED_UP);
+    if aside.is_empty() {
+        return match fs::remove_file(&list) {
+            Err(e) if e.kind() != io::ErrorKind::NotFound => Err(io_error("removing", &list)(e)),
+            _ => Ok(()),
+        };
+    }
+    fs::create_dir_all(&root).map_err(io_error("creating", &root))?;
+    let temporary = root.join(format!("{ROLLED_UP}.tmp"));
+    let mut text = String::new();
+    for name in aside {
+        text.push_str(name);
+        text.push('\n');
+    }
+    File::create(&temporary)
+        .and_then(|mut file| {
+            file.write_all(text.as_bytes())?;
+            file.sync_all()
+        })
+        .map_err(io_error("writing", &temporary))?;
+    fs::rename(&temporary, &list).map_err(io_error("renaming", &temporary))?;
+    sync_dir(&root)
 }
 
 /// Deletes the store's packs `aside`, each index first, then fsyncs
@@ -838,6 +947,74 @@ exec git "$@" -d"#;
                 "{name:?} is left"
             );
         }
+        drop(v);
+    }
+
+    /// Each run's packs are judged by that run's own end: a later run that
+    /// rolls up again, beside a builder that keeps installing batches, never
+    /// holds back an earlier run's packs (they were all kept until a built
+    /// event after the last run, so a busy builder kept every copy of a
+    /// large file each run wrote).
+    #[test]
+    fn a_later_run_never_holds_back_an_earlier_runs_packs() {
+        let names = |names: &[&str]| -> Packs { names.iter().map(|n| (*n).to_owned()).collect() };
+        let mut aside = Aside::default();
+        aside.add(names(&["pack-a"]), 5);
+        aside.add(Packs::new(), 5);
+        aside.add(names(&["pack-b"]), 6);
+        assert_eq!(aside.packs(), names(&["pack-a", "pack-b"]));
+        assert_eq!(
+            aside.due(5),
+            Packs::new(),
+            "no built event after either run"
+        );
+        assert_eq!(aside.due(6), names(&["pack-a"]));
+        aside.deleted(6);
+        assert_eq!(aside.packs(), names(&["pack-b"]));
+        assert_eq!(aside.due(7), names(&["pack-b"]));
+        aside.deleted(7);
+        assert_eq!(aside.packs(), Packs::new());
+    }
+
+    /// The packs set aside when the task stops, and a killed daemon's
+    /// scratch directory, are gone once the volume opens again, and every
+    /// object reads: the restart neither keeps the copies nor rolls them up
+    /// again into a third.
+    #[test]
+    fn a_stops_copies_go_at_the_next_open() {
+        let tmp = tempfile::tempdir().unwrap();
+        let git_dir = tmp.path().join("history.git");
+        let mut v = new_actor(tmp.path());
+        script(&git_dir.join(WRAPPER), SKIP);
+        batches(&mut v, 0, 16);
+        let reachable = read_reachable(&git_dir);
+        let objects = all_objects(&git_dir);
+        // The task's state at a stop: a run rolled packs up, no built event
+        // came after it.
+        let slot = Mutex::new(Slot::default());
+        let rolled = done(repack_once(Path::new("git"), &git_dir, &slot, &Packs::new()).unwrap());
+        assert!(!rolled.is_empty());
+        record(&git_dir, &rolled).unwrap();
+        drop(v);
+        assert!(
+            listed(&git_dir).is_superset(&rolled),
+            "a stop deletes nothing"
+        );
+        let killed = git_dir.join(SCRATCH).join("1.2-0").join("pack");
+        std::fs::create_dir_all(&killed).unwrap();
+        std::fs::write(killed.join("tmp_pack_x"), b"a killed repack's pack").unwrap();
+
+        let v = reopen(tmp.path());
+        assert!(listed(&git_dir).is_disjoint(&rolled), "{rolled:?} left");
+        // A run of the reopened task's may be under way beside this.
+        let left: Vec<_> = std::fs::read_dir(git_dir.join(SCRATCH))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| !name.starts_with(&format!("{}-", process_token())))
+            .collect();
+        assert!(left.is_empty(), "{left:?} left in the scratch folder");
+        assert_eq!(read_reachable(&git_dir), reachable);
+        assert!(all_objects(&git_dir).is_superset(&objects));
         drop(v);
     }
 

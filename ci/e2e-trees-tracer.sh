@@ -94,8 +94,9 @@ mkdir -p "$VIEW" "$RECEIPTS"
 rm -f "$RECEIPTS"/*
 chmod 0777 "$RECEIPTS"
 if [ -n "$FS" ]; then
-  # close_1g's 1 GiB needs about 4 GiB while history builds: its journal
-  # segments, the pack (the blob and its line map) and the checkout.
+  # close_1g's 1 GiB needs about 5 GiB while history builds: its journal
+  # segments (1 GiB), its pack and the pack a repack rolls it into, both
+  # kept until the next built event (2.5 GiB), and the checkout (1.5 GiB).
   sudo truncate -s 8G "$LOOP_IMG"
   if [ "$FS" = xfs ]; then
     sudo mkfs.xfs -q -f -m reflink=1 "$LOOP_IMG"
@@ -131,6 +132,8 @@ state_hashes() {
 }
 # The mount's own line once every view is up (docs/trees.md, "Run it").
 mounted() { docker logs "$NAME" 2>&1 | grep -F 'mounted volume t at /agentfs/root' >/dev/null; }
+# Mounted, or the view's container has exited.
+settled() { mounted || [ "$(docker inspect --format '{{.State.Running}}' "$NAME" 2>/dev/null)" != true ]; }
 # With SAMPLE_PEAK=1, the view's RssAnon is sampled from just after `docker
 # run -d` returns until its `mounted` line (trees-figures.py --sample-peak):
 # the peak is $RESTART_PEAK. The first milliseconds, before the container's
@@ -155,8 +158,17 @@ mount_view() { # [mount flags]
       --stop-file "$DATA/restart.stop" --peak-output "$RESTART_PEAK" &
     sampler=$!
   fi
-  # A bound on a hang; step 5's restart reads a long history first.
-  wait_for "${MOUNT_WAIT:-60}" mounted || { docker logs "$NAME" >&2; fail 'the tree view did not mount'; }
+  # A bound on a hang; step 5's restart reads a long history first. A view
+  # that exited never mounts: no wait for the bound then. What the state
+  # filesystem holds is shown, so a full one says what filled it.
+  wait_for "${MOUNT_WAIT:-60}" settled && mounted || {
+    docker logs "$NAME" >&2
+    if [ -n "$FS" ]; then
+      df -m "$DATA" >&2
+      sudo du -sm "$DATA"/state/* "$DATA"/state/history.git/* "$DATA"/state/history.git/objects/pack/* >&2 || true
+    fi
+    fail 'the tree view did not mount'
+  }
   if [ -n "$sampler" ]; then
     sudo touch "$DATA/restart.stop"
     # A memory figure warns, never fails: an unsampled peak leaves `restart` unfinished.
