@@ -4,19 +4,21 @@
 //! pack files it installed and `objects/pack` before anything names them.
 //!
 //! The history's repack task ([`super::repack`]) runs beside fast-import, so
-//! `objects/pack` has two writers. The task only links whole packs in, index
-//! last, and deletes packs it rolled up a built event later, so
-//! [`Feed::finish`] may see another pack's new name, which it fsyncs too. A
-//! new `pack-*` name that is gone before its fsync was rolled up and deleted
-//! by the task, which is not an error:
-//! - **No object is lost** (history is the product). The task links the new
-//!   pack into `objects/pack` and fsyncs it before it deletes any pack that
-//!   pack rolled up; nothing prunes. So a batch's objects are always in a
-//!   pack whose name is in `objects/pack`.
+//! `objects/pack` has two writers. The task's git writes whole packs in,
+//! index last, and expires the packs a roll-up superseded a built event
+//! later, so [`Feed::finish`] may see another pack's new name, which it
+//! fsyncs too. A new name that is gone before its fsync was a pack rolled
+//! up and expired by the task, or a temporary file of the task's git (the
+//! multi-pack index's lock), which is not an error:
+//! - **No object is lost** (history is the product). git expires a pack
+//!   only when the multi-pack index finds none of its objects there, after
+//!   the task has fsynced `objects/pack` with the roll-up's pack in it;
+//!   nothing prunes. So a batch's objects are always in a pack whose name
+//!   is in `objects/pack`.
 //! - **History is durable before the journal is trimmed.** The repack runs
 //!   with `core.fsync=pack,pack-metadata` and `core.fsyncMethod=fsync`, so
 //!   git fsyncs the new pack's files, and the task fsyncs `objects/pack`
-//!   after linking them in. [`Feed::finish`] fsyncs `objects/pack` after its
+//!   after writing them. [`Feed::finish`] fsyncs `objects/pack` after its
 //!   own files in any case. The builder records a batch as built, after
 //!   which the journal may drop its records, only after `finish` returns.
 
@@ -302,8 +304,10 @@ impl Feed {
             match File::open(self.pack_dir.join(name)).and_then(|f| f.sync_all()) {
                 Ok(()) => synced += 1,
                 // The repack task rolled this pack into one of its own and
-                // deleted it (see the module docs).
-                Err(e) if e.kind() == io::ErrorKind::NotFound && text.starts_with("pack-") => {}
+                // expired it, or this was one of its git's temporary files
+                // (`multi-pack-index.lock`), renamed since (see the module
+                // docs).
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
                 Err(e) => return Err(BuildError::from(e)),
             }
         }

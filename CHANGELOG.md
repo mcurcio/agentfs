@@ -49,8 +49,11 @@ design was reviewed on 2026-10-12.
   --volume <name> --include <profile>.config` and installs the profile's rule
   files; the node plugin runs one `agentfs host` per volume in use on its node,
   driving it over the child's standard input (a Unix socket only the plugin
-  holds; JSON lines, protocol v1: `open`, `close`, `reconcile`, `fork_create`,
-  `fork_end`). EOF, SIGTERM or SIGINT drains a host with no view open; a host
+  holds; JSON lines, protocol v2: `open`, `close`, `reconcile`, `fork_create`,
+  `fork_end`, each request and reply in an envelope with an id, answered in
+  any order, so a close that waits for a held file stalls only the requests
+  about its mount, client or fork). A plugin refuses a host of another
+  protocol version (`FAILED_PRECONDITION`). EOF, SIGTERM or SIGINT drains a host with no view open; a host
   with views open exits 3 at once and leaves their mounts stale, as a crash
   does, so a plugin restart keeps every pod's view and a fork claim's one
   writer. A drain logs `tree DrainBlocked` naming the clients of other

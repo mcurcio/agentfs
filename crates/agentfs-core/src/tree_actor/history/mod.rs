@@ -324,7 +324,13 @@ pub(in crate::tree_actor) fn remove_stale_locks(gitdir: &Path) -> io::Result<()>
         Ok(())
     }
     refs(&gitdir.join("refs"))?;
-    for name in ["HEAD.lock", "config.lock", "packed-refs.lock", "index.lock"] {
+    for name in [
+        "HEAD.lock",
+        "config.lock",
+        "packed-refs.lock",
+        "index.lock",
+        "objects/pack/multi-pack-index.lock",
+    ] {
         let path = gitdir.join(name);
         if path.is_file() {
             fs::remove_file(path)?;
@@ -444,9 +450,6 @@ pub(in crate::tree_actor) fn checkout(
     fs::create_dir_all(&dir)?;
     let files = format::files_tree(repo, head)?;
     repo.checkout_tree(files, &dir, previous)?;
-    // A checkout's files are written; its marker, which a restart trusts, is
-    // written after this point (agentfs-ln6.6).
-    crate::failpoints::hit("tree.checkout_before_marker")?;
     Ok(files)
 }
 

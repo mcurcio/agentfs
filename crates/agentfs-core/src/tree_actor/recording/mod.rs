@@ -889,14 +889,21 @@ impl TreeActor {
     /// view as one piece of its frame. Both checks are on lengths, which are
     /// all `apply`'s errors depend on, and the head's is the open's
     /// [`LenRule`] with this call composed in: a call costs its own bytes,
-    /// not the file's or its open's.
+    /// not the file's or its open's. An open being closed takes no call
+    /// ([`Error::NotFound`], as a second close is): its close is decided with
+    /// the lock released, on the calls it had, and would leave a later one
+    /// out of the save.
     pub(in crate::tree_actor) fn call(
         &mut self,
         handle: u64,
         call: Call,
         tail: &[u8],
     ) -> Result<()> {
-        let h = self.handles.get(&handle).ok_or(Error::NotFound)?;
+        let h = self
+            .handles
+            .get(&handle)
+            .filter(|h| !h.closing)
+            .ok_or(Error::NotFound)?;
         call.len_after(h.bytes.len())?;
         let lengths = h.lengths.then(&call)?;
         let saved = self

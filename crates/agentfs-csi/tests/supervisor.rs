@@ -48,6 +48,8 @@ struct World {
     fork_refusal: Option<RefusalKind>,
     /// The version hosts' hellos name, instead of this protocol's.
     hello_v: Option<u32>,
+    /// A target every host but the first refuses to open (`fork_taken`).
+    refuse_reopen: Option<PathBuf>,
 }
 
 #[derive(Clone)]
@@ -165,15 +167,24 @@ impl Launcher for Fake {
         let (ours, theirs) = tokio::net::UnixStream::pair()?;
         let requests = Arc::new(Mutex::new(Vec::new()));
         let (kill, mut killed) = oneshot::channel();
-        let (eof_exit, hello_v) = {
+        let (eof_exit, hello_v, refuse) = {
             let mut world = self.world.lock().unwrap();
+            let refuse = if world.hosts.is_empty() {
+                None
+            } else {
+                world.refuse_reopen.clone()
+            };
             world.hosts.push(FakeHost {
                 volume: volume.clone(),
                 requests: requests.clone(),
                 exit: exit_tx.clone(),
                 kill: Some(kill),
             });
-            (world.eof_exit, world.hello_v.unwrap_or(HOST_PROTOCOL))
+            (
+                world.eof_exit,
+                world.hello_v.unwrap_or(HOST_PROTOCOL),
+                refuse,
+            )
         };
         Self::event(&self.log, format!("spawn host {volume}"));
         let log = self.log.clone();
@@ -207,6 +218,12 @@ impl Launcher for Fake {
                             serde_json::from_str::<Envelope<Request>>(&line).unwrap();
                         Fake::event(&log, describe(&request));
                         let reply = match &request {
+                            Request::Open(view) if refuse.as_ref() == Some(&view.at) => {
+                                Reply::Refused(Refusal {
+                                    kind: RefusalKind::ForkTaken,
+                                    message: "refused: ForkTaken".into(),
+                                })
+                            }
                             Request::Open(_) => Reply::Opened {
                                 tree: agentfs_contracts::tree::TreeId::Root,
                                 stacked: false,
@@ -938,6 +955,51 @@ async fn shutdown_closes_a_host_an_unpublish_still_waits_on() {
         "the view is left for the next plugin, its record kept"
     );
     assert!(n.table.detaches.lock().unwrap().is_empty());
+}
+
+/// A host that exits while a publish's open is in flight, and whose
+/// restart refuses that view (a fork's writer its reconcile ended): the
+/// publish fails with the refusal and leaves no record, rather than giving
+/// the pod OK for a view no host serves.
+#[tokio::test(start_paused = true)]
+async fn a_publish_the_restarted_host_refuses_fails_and_records_nothing() {
+    let n = Node::new();
+    n.volume("v");
+    let (b, c) = (n.target("b"), n.target("c"));
+    n.sup.publish(n.view("c", "v", &c)).await.unwrap();
+    n.fake.world.lock().unwrap().refuse_reopen = Some(b.clone());
+    let (open_b, open_c) = (
+        format!("open {}", b.display()),
+        format!("open {}", c.display()),
+    );
+    n.fake.hold(&open_b);
+    let publish = spawn_publish(&n, n.view("b", "v", &b));
+    n.fake.until(&open_b, 1).await;
+    // The restart's replay is held at c's open, under the start lock, so
+    // b's record waits for it.
+    n.fake.hold(&open_c);
+    n.fake.exit(0, Exit::Code(1));
+    n.fake.until(&open_c, 2).await;
+    n.fake.release(&open_b);
+    settle().await;
+    assert!(
+        !publish.is_finished(),
+        "the record waits for the start lock"
+    );
+    n.fake.release(&open_c);
+    let result = publish.await.unwrap();
+    assert!(
+        matches!(result, Err(Error::FailedPrecondition(_))),
+        "{result:?}"
+    );
+    let on_new: Vec<String> = n.fake.requests(1).iter().map(describe).collect();
+    assert!(
+        on_new.contains(&open_b),
+        "b was opened on the new host: {on_new:?}"
+    );
+    let records = records::load_published(&n.layout).0;
+    assert_eq!(records.len(), 1, "{records:?}");
+    assert_eq!(records[0].handle, "c");
 }
 
 /// An unpublish racing a restarted host's replay: the replay holds the

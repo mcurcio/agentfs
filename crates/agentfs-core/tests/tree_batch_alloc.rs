@@ -89,8 +89,11 @@ fn a_batch_allocates_in_proportion_to_the_batch_not_the_volume() {
     let small = batch_bytes(2_000);
     let large = batch_bytes(20_000);
     eprintln!("batch of {BATCH} creates: {small} B at 2,000 files, {large} B at 20,000");
+    // A change to a persistent map copies its path, which grows with the
+    // log of the volume: about 1.34 times from 2,000 files to 20,000. A copy
+    // of one tree map sized to the volume, once a batch, makes it about 1.8.
     assert!(
-        large <= 2 * small,
-        "a batch at 20,000 files allocated {large} B, over twice the {small} B at 2,000"
+        2 * large <= 3 * small,
+        "a batch at 20,000 files allocated {large} B, over 1.5 times the {small} B at 2,000"
     );
 }

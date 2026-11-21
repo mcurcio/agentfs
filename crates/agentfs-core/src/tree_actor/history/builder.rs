@@ -1487,6 +1487,8 @@ impl Builder {
     /// installed, or nothing reachable changed.
     fn batch(&mut self) -> std::result::Result<(), BuildError> {
         crate::failpoints::hit("tree.build_before_batch")?;
+        #[cfg(test)]
+        self.history.batch_read(None);
         let started = std::time::Instant::now();
         let checkpointed = self.history.checkpointed_through();
         if self
@@ -1498,6 +1500,8 @@ impl Builder {
             self.built_log.rewrite(&keep)?;
         }
         let through = self.durability.appended();
+        #[cfg(test)]
+        self.history.batch_read(Some(through));
         self.durability
             .make_durable(through)
             .map_err(|e| BuildError::Io(e.errno()))?;

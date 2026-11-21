@@ -211,7 +211,7 @@ idempotent. See the [recording-failures runbook](../runbooks/recording-failures.
 - one push loop per remote (thread `agentfs-push-<remote>`), so a slow or
   hung remote never delays another;
 - the periodic repack, on the commit thread: `git repack --geometric=2`
-  every `agentfs.repackInterval`, with memory bounds (`repack::REPACK_ARGS`).
+  every `agentfs.repackInterval`, with memory bounds (`repack::PACK_CONFIG`).
   A failed round raises `Event::RepackFailed` and is tried again later.
 
 ```rust

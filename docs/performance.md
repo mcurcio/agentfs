@@ -566,13 +566,13 @@ On one 4-CPU container (ext4, release build; local observations, not CI):
 | `memory_create`, 50,000 files, persistent maps and overlay in place | 2.67 KiB a file (2.61 to 2.70 before the overlay) | 1.64 KiB a file with the arena cap |
 | `create`'s RssAnon peak, 50,000 files, default `agentfs.overlayLimit` | | about 81 MiB; with an 8 MiB limit 77.5 MiB, so the overlay is a small part of it |
 | Restart after a kill, 100,000 files, built point 400 records past the checkpoint: RssAnon peak (mount) | 370 to 386 MiB (46 to 49 s) | 328 to 333 MiB (38 to 39 s), each tree read once, at the built point |
-| `close_frag`: the close of 200,000 random writes | 110.4 s under the actor lock | 0.086 s; the longest lock hold, 136 ms, is the journal's compaction, not the close |
+| `close_frag`: the close of 200,000 random writes | 110.4 s under the actor lock | 0.47 to 0.52 s (three runs); the longest lock hold, 68 to 89 ms, is the built event's rebuild dropping the save's 200,000-piece map under the lock (`Files::rebuilt`), not the close; the journal's compaction held it at most 1 to 9 ms |
 | `write_1m`: peak over memory before | 670 MiB | 774 MiB: a million appends leave the large map's leaves about half full |
 
 `close_frag` and `write_1m` miss their bars and warn. A close's work no
 longer runs under the actor lock (docs/trees.md, "File maps"), but the
-journal's compaction still copies live frames forward under it, and
-sequential write pieces are not merged.
+rebuild at the save's built event still drops its old map under it, in time
+proportional to the map's pieces, and sequential write pieces are not merged.
 
 ## Performance budget
 

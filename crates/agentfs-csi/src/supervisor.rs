@@ -904,7 +904,11 @@ impl Supervisor {
     /// Writes the record of a view the host of `generation` opened, under
     /// the volume's start lock, and leaves `using`. A host started since
     /// then replayed the records before this one was written: the view is
-    /// opened on it too. Any later start replays the record.
+    /// opened on it too. Any later start replays the record. Should that
+    /// host refuse it (its reconcile ended the client of the open in
+    /// flight, and a fork's writer outlives its client), the record goes
+    /// and the publish fails with the refusal: no host serves the view, and
+    /// a replay would be refused the same way.
     async fn record(
         &self,
         record: &PublishedRecord,
@@ -930,6 +934,13 @@ impl Supervisor {
         {
             match current.call(Request::Open(view_request(record))).await {
                 Ok(Reply::Opened { .. }) => {}
+                Ok(Reply::Refused(refusal)) => {
+                    let start = self.lock_start(&record.volume).await;
+                    let removed = records::remove_published(self.layout(), &record.handle);
+                    drop(start);
+                    removed?;
+                    return Err(refused(refusal));
+                }
                 other => eprintln!(
                     "volume {}: opening the view of {} at {} on the restarted host: {other:?}; \
                      the next start replays it",

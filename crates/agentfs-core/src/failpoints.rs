@@ -58,7 +58,6 @@ pub const POINTS: &[&str] = &[
     "tree.build_after_pack",
     "tree.build_after_built_log",
     "tree.build_after_ref_copy",
-    "tree.checkout_before_marker",
     // The synchronous step.
     "pending.after_freeze",
     "journal.before_write",

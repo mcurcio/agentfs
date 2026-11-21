@@ -841,13 +841,21 @@ fn a_fork_has_one_writer() {
 /// name nothing a holds are answered by id before it: an open elsewhere,
 /// another view's close, a reconcile. An open at a's mount, the end of a's
 /// fork, and a reconcile behind that open wait, each in arrival order, and
-/// are answered once a has ended and its `closed` is written. Each check is
-/// the next line read: the socket's read timeout only guards a hang.
+/// are answered once a has ended and its `closed` is written. So is an open
+/// at d that names nothing a holds but shares a label with the waiting open
+/// at a's mount: a resource's requests are answered in arrival order. Each
+/// check is the next line read: the socket's read timeout only guards a
+/// hang.
 #[test]
 #[ignore = "needs root and /dev/fuse: ci/fuse-tests.sh"]
 fn a_held_close_waits_alone() {
     let Some(v) = Volume::mounted() else { return };
-    let (a, b, c) = (mkdir(&v, "a"), mkdir(&v, "b"), mkdir(&v, "c"));
+    let (a, b, c, d) = (
+        mkdir(&v, "a"),
+        mkdir(&v, "b"),
+        mkdir(&v, "c"),
+        mkdir(&v, "d"),
+    );
     let mut host = v.host(&[]);
     host.reader
         .get_ref()
@@ -882,6 +890,8 @@ fn a_held_close_waits_alone() {
     ));
     // Each of these names something a holds, or waits behind one that does.
     let reopen = host.send(&open(TreeRef::Root, &a, "a2", PodContext::default()));
+    // Behind the open at a's mount only: they share the label a2.
+    let chained = host.send(&open(TreeRef::Root, &d, "a2", PodContext::default()));
     let end = host.send(&Request::ForkEnd { key: key("k") });
     let reconcile = host.send(&Request::Reconcile);
     assert_eq!(
@@ -898,10 +908,14 @@ fn a_held_close_waits_alone() {
             stacked: false
         }
     );
+    let at_d = host.reply_to(chained);
     assert_eq!(host.reply_to(end), Reply::Ended);
     assert!(matches!(host.reply_to(reconcile), Reply::Reconciled { .. }));
     assert_eq!(host.ask(&close(&a)), Reply::Closed);
     assert_eq!(host.ask(&close(&c)), Reply::Closed);
+    if matches!(at_d, Reply::Opened { .. }) {
+        assert_eq!(host.ask(&close(&d)), Reply::Closed);
+    }
     let (status, log) = host.eof();
     assert_eq!(status.code(), Some(0), "{log}");
 }
@@ -914,6 +928,11 @@ fn a_duplicate_id_in_flight_is_malformed() {
     let Some(v) = Volume::mounted() else { return };
     let a = mkdir(&v, "a");
     let mut host = v.host(&[]);
+    // Only guards a hang: a host that does not stop answers nothing here.
+    host.reader
+        .get_ref()
+        .set_read_timeout(Some(std::time::Duration::from_secs(60)))
+        .unwrap();
     host.hello();
     assert!(matches!(
         host.ask(&open(TreeRef::Root, &a, "a", PodContext::default())),
@@ -929,6 +948,39 @@ fn a_duplicate_id_in_flight_is_malformed() {
     let log = host.log.take().unwrap().join().unwrap();
     assert_eq!(status.code(), Some(2), "{log}");
     assert!(log.contains("id 5 is already in flight"), "{log}");
+    agentfs_fuse::stale::detach_stale_layers(&a, 4).unwrap();
+}
+
+/// (p) An id a waiting request holds is in flight too: the host stops with
+/// exit 2, so no two replies carry one id.
+#[test]
+#[ignore = "needs root and /dev/fuse: ci/fuse-tests.sh"]
+fn a_duplicate_of_a_waiting_id_is_malformed() {
+    let Some(v) = Volume::mounted() else { return };
+    let a = mkdir(&v, "a");
+    let mut host = v.host(&[]);
+    // Only guards a hang: a host that does not stop answers nothing here.
+    host.reader
+        .get_ref()
+        .set_read_timeout(Some(std::time::Duration::from_secs(60)))
+        .unwrap();
+    host.hello();
+    assert!(matches!(
+        host.ask(&open(TreeRef::Root, &a, "a", PodContext::default())),
+        Reply::Opened { .. }
+    ));
+    std::fs::write(a.join("f"), "f\n").unwrap();
+    let held = std::fs::File::open(a.join("f")).unwrap();
+    host.send_as(5, &close(&a));
+    // Waits behind a's close: it names a's mount.
+    host.send_as(6, &open(TreeRef::Root, &a, "a2", PodContext::default()));
+    host.send_as(6, &Request::Reconcile);
+    assert_eq!(host.line(), None, "no reply: the host stopped");
+    let status = host.child.wait().unwrap();
+    drop(held);
+    let log = host.log.take().unwrap().join().unwrap();
+    assert_eq!(status.code(), Some(2), "{log}");
+    assert!(log.contains("id 6 is already in flight"), "{log}");
     agentfs_fuse::stale::detach_stale_layers(&a, 4).unwrap();
 }
 

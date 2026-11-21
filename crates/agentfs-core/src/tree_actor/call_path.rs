@@ -696,6 +696,134 @@ mod tests {
         assert_eq!(actor.read(TreeId::Root, "b").unwrap(), b"b");
     }
 
+    /// The overlay is let go once the builder catches up, though the last
+    /// record is no step: a batch reads its record to build through after
+    /// the last save, and a write to another open is appended before that
+    /// batch's built event. The saves' entries are sealed at the write's
+    /// record, which no step asks the builder to build; the actor asks for
+    /// it, so the overlay empties with no step after it and no settle.
+    #[test]
+    fn the_overlay_goes_when_the_last_record_is_no_step() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rec = Recording::serve(new_actor(tmp.path())).unwrap();
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        // The view's take worker: at each built event it moves the actor
+        // onto the built point.
+        let worker = {
+            let (rec, stop) = (Arc::clone(&rec), Arc::clone(&stop));
+            std::thread::spawn(move || {
+                let mut epoch = 0;
+                while !stop.load(std::sync::atomic::Ordering::Acquire) {
+                    rec.progress().unwrap();
+                    epoch = rec.wait_for_work(epoch);
+                }
+            })
+        };
+        let w = writer("w");
+        let log = rec
+            .actor()
+            .unwrap()
+            .write_open(TreeId::Root, "log", &w, Some(ATTRS))
+            .unwrap();
+        rec.settle().unwrap();
+        let (wrote, written) = mpsc::channel::<RecordNo>();
+        let (open_gate, gate) = mpsc::channel::<()>();
+        let last_save = Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX));
+        {
+            let (writer_rec, last_save) = (Arc::clone(&rec), Arc::clone(&last_save));
+            let (mut gate, mut once) = (Some(gate), Some(wrote));
+            rec.history().on_batch_read(move |read| match read {
+                // The next batch waits at its start until every save is
+                // appended: no built event comes between the saves and the
+                // write, so no rebuild dates the saves' entries before it.
+                None => {
+                    if let Some(gate) = gate.take() {
+                        let _ = gate.recv();
+                    }
+                }
+                // The batch that reads through the last save: the write
+                // comes after its read and before its built event.
+                Some(through) => {
+                    if through.get() >= last_save.load(std::sync::atomic::Ordering::Acquire)
+                        && let Some(wrote) = once.take()
+                    {
+                        let mut actor = writer_rec.actor().unwrap();
+                        actor.write(log, 0, b"a line", false).unwrap();
+                        let _ = wrote.send(actor.durability().appended());
+                    }
+                }
+            });
+        }
+        {
+            let mut actor = rec.actor().unwrap();
+            for i in 0..20 {
+                let h = actor
+                    .write_open(TreeId::Root, &format!("f{i}"), &w, Some(ATTRS))
+                    .unwrap();
+                actor.write(h, 0, b"saved", false).unwrap();
+                actor.close(h).unwrap();
+            }
+            last_save.store(
+                actor.durability().appended().get(),
+                std::sync::atomic::Ordering::Release,
+            );
+        }
+        open_gate.send(()).unwrap();
+        let call = written
+            .recv_timeout(std::time::Duration::from_secs(60))
+            .unwrap();
+        let history = rec.history().clone();
+        // Event-driven: each built event wakes this; the deadline only
+        // guards against a hang.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let mut epoch = 0;
+        while history.overlay_bytes(TreeId::Root) > 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the overlay stayed at {} B, built through {:?}, the write at {call:?}",
+                history.overlay_bytes(TreeId::Root),
+                history.built_through()
+            );
+            epoch = history.wait_epoch_for(epoch, std::time::Duration::from_millis(100));
+        }
+        assert!(history.built_through() >= call);
+        rec.actor().unwrap().close(log).unwrap();
+        rec.settle().unwrap();
+        history.on_batch_read(|_| {});
+        stop.store(true, std::sync::atomic::Ordering::Release);
+        rec.wake_workers();
+        worker.join().unwrap();
+    }
+
+    /// A write to the open being closed, while its close is decided with
+    /// the lock released, is refused: the decision is on the calls the open
+    /// had, so an accepted write would be journalled and left out of the
+    /// save.
+    #[test]
+    fn a_write_to_an_open_being_closed_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rec = Recording::serve(new_actor(tmp.path())).unwrap();
+        let h = held_close(&rec);
+        let (inside, release) = hold_first_decide(&rec);
+        let saved = std::thread::scope(|scope| {
+            let closing = scope.spawn(|| rec.close_with(h, |_| Ok(())));
+            inside.recv().unwrap();
+            let late = rec.actor().unwrap().write(h, 5, b"ZZ", false);
+            release.send(()).unwrap();
+            assert!(matches!(late, Err(Error::NotFound)), "{late:?}");
+            closing.join().unwrap().unwrap()
+        });
+        assert!(matches!(saved, Saved::Commit(_)), "{saved:?}");
+        rec.settle().unwrap();
+        let actor = rec.actor().unwrap();
+        assert_eq!(actor.read(TreeId::Root, "a").unwrap(), b"01AB456789");
+        assert_eq!(
+            actor.verification().counts().unresolved,
+            0,
+            "no save is flagged"
+        );
+    }
+
     /// A5: another open saves the file while a close is being decided: the
     /// decision is stale, the close is redone under the lock on the new
     /// save, and its save is in the journal before `close_with` returns.

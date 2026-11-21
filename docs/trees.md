@@ -499,7 +499,14 @@ A close does bounded work under the actor's lock:
   with the same function the builder replays, and compares only the bytes the
   calls touched. Either way it makes the save's layout. The decision lands
   under the lock if the saved step it read is still the current one, else the
-  close is redone once under the lock.
+  close is redone once under the lock. A call on the open while its close is
+  decided is refused (`NotFound`, as a second close is), so no write is
+  left out of the save.
+
+Releasing the lock lets other views and claims of the volume go on while a
+close is decided. Within one view a slow close still holds its other
+requests, since one thread answers them in order (below): a sidecar's single
+root view gains only the shorter close.
 
 Either way the step is recorded before the release is answered. A view reads
 a map with the actor unlocked: the lock is held only to clone it.
@@ -738,24 +745,36 @@ the private checkouts copied, the checked-out files' maps rebased onto them
   history built through its last record. After a kill the builder builds what
   was left unbuilt, behind the reopened views.
 - **The repack.** Each batch is one pack, and a read's cost grows with the pack
-  count, so at each built event a task of its own runs `git repack
-  --geometric=2 -d`, one at a time, beside `git fast-import` and never stopping
-  the builder; events that come while one runs make one more run after it.
-  Geometric repack packs whole packs: it keeps every object, reachable or not,
-  prunes nothing and touches no ref. A run never works in the store's own
-  `objects/pack`, because git and libgit2 find a pack by listing that directory
-  and opening the index later, so a pack deleted between the two would read as
-  a missing object. Each run works in a scratch object directory under
-  `history.git/repack/`, on hard links to the store's packs with the store as
-  an alternate; the task links each new pack into `objects/pack`, its index
-  last, and fsyncs the directory. The packs a run rolled up are set aside,
-  named in `repack/rolled-up`, and deleted only at a run that starts on a
-  later built event, as git's incremental repack defers its `expire`: at most
-  the last two runs' packs are set aside. A start deletes the packs a stop set
-  aside, and any scratch directory a killed daemon left, before the volume is
-  served. A stop kills a repack in progress with every process it started. A
-  failed run is logged (`tree RepackFailed: <error>`) and tried again at the
-  next built event; its git child is not counted with the actor's.
+  count, so at each built event a task of its own rolls the small packs up,
+  one run at a time, beside `git fast-import` and never stopping the builder;
+  events that come while one runs make one more run after it. A run is git's
+  incremental repack, with the deletion deferred to a later run:
+  1. `git multi-pack-index expire`, once a built event came after the last
+     roll-up ended: git deletes the packs in which the multi-pack index finds
+     no object, the ones that roll-up superseded.
+  2. The packs `git repack --geometric=2` would pick, by size, go into one new
+     pack (`git pack-objects --stdin-packs`, the call geometric repack makes):
+     whole packs, every object, reachable or not. Nothing is deleted.
+  3. `git multi-pack-index write --preferred-pack=<the new pack>`, so the
+     packs it rolled up hold no object the index finds there; `objects/pack`
+     is fsynced before any of them can go.
+
+  A pack is deleted only at a run that starts on a built event after the
+  roll-up that superseded it, because git and libgit2 find a pack through the
+  index or a listing and open it later, so a pack deleted between the two
+  would read as a missing object. Which pack goes is git's judgement from the
+  index, so a roll-up that writes a pack the store already holds keeps it.
+  While a roll-up waits for its expiry no run rolls up again. Nothing prunes
+  and no ref is touched. A start expires what the last roll-up superseded
+  before the volume is served, and removes a stale `multi-pack-index.lock`. A
+  stop kills a run in progress with every process it started. A failed run is
+  logged (`tree RepackFailed: <error>`) and tried again at the next built
+  event; its git children are not counted with the actor's. Costs: an idle
+  volume keeps the packs its last roll-up superseded until its next save or
+  start; the volume's own libgit2 handles keep the packs they opened mapped,
+  so a deleted pack's disk space comes back only when they let it go, at the
+  latest when the volume stops; loose objects (the verification notes) are
+  not rolled up.
 - No record after a checkpoint names a step the checkpoint covers: a step whose
   pointers were read before a compaction names those values as the oids they
   were built as, so a restart, which builds from the checkpoint, builds every
@@ -781,15 +800,24 @@ the private checkouts copied, the checked-out files' maps rebased onto them
   and file map its steps changed since the built point (its overlay), over the
   builder's shape and maps at the built point, which it shares and never
   copies; a built event drops what that build covers, so after each rebuild a
-  tree's overlay is its unbuilt steps' entries. The gate estimates it at 256 bytes an entry and
+  tree's overlay is its unbuilt steps' entries. A save's entries are dated by
+  the last record when the actor moves onto a built point; when that record is
+  no step (a write, an open), which no step asks the builder to build, the
+  actor asks the builder to build through it, so the overlay empties without a
+  later step. The gate estimates it at 256 bytes an entry and
   counts entries, not a changed map's pieces (the lag's byte term covers a save's
-  bytes). The actor reports every tree's overlay as it releases its lock, so the
+  bytes). So it bounds how many changed entries history trails by, not their
+  memory: a save of a million pieces is one entry, and its map's memory is not
+  held back by this limit. The actor reports every tree's overlay as it releases its lock, so the
   gate sees it grow at each step and shrink at each rebuild, without a timer.
   Over `agentfs.overlayLimit` (32 MiB unless set,
   [configuration](configuration.md#tree-volumes-the-operator-settings-file)),
   the tree's calls that start new work wait as over the lag limit, until the
   built event whose rebuild brings the overlay under; the health is `Stalled`
-  meanwhile and `tree HistoryStalled` is logged once. The check is before the
+  meanwhile and `tree HistoryStalled` is logged each time the health turns to
+  `Stalled`: under a sustained burst that is at most once per built event, as
+  each rebuild brings the overlay under and the next steps take it over. The
+  check is before the
   call, so one step larger than the limit (a rename of a directory of many
   names) is admitted, and the calls after it wait until it is built. A failed
   builder holds nothing back here either: the overlay cannot shrink while it

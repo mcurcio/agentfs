@@ -346,6 +346,13 @@ mod tests {
         assert_eq!(next.await.unwrap().unwrap(), Reply::Closed);
     }
 
+    /// `f`, failing the test rather than hanging when it does not finish.
+    async fn within<T>(what: &str, f: impl std::future::Future<Output = T>) -> T {
+        tokio::time::timeout(std::time::Duration::from_secs(10), f)
+            .await
+            .unwrap_or_else(|_| panic!("{what} did not finish"))
+    }
+
     /// A reply whose id no call has: every waiter gets HostGone, and the
     /// stream closes (the fake host sees EOF).
     #[tokio::test]
@@ -356,10 +363,12 @@ mod tests {
         let two = spawn_call(&client, close("/b"));
         fake.request().await;
         fake.reply(99, Reply::Closed);
-        assert!(one.await.unwrap().is_err());
-        assert!(two.await.unwrap().is_err());
-        assert!(fake.requests.recv().await.is_none(), "the fake saw EOF");
-        assert!(client.call(Request::Reconcile).await.is_err());
+        assert!(within("the first waiter", one).await.unwrap().is_err());
+        assert!(within("the second waiter", two).await.unwrap().is_err());
+        let eof = within("the stream's close", fake.requests.recv()).await;
+        assert!(eof.is_none(), "the fake saw EOF");
+        let after = within("a call after", client.call(Request::Reconcile)).await;
+        assert!(after.is_err());
     }
 
     /// `close` ends the stream while clones remain and a call waits: the

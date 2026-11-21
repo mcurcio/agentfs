@@ -131,7 +131,16 @@ pub(in crate::tree_actor) struct Inner {
     repo: TreeGit,
     state: Mutex<State>,
     changed: Condvar,
+    /// Tests: runs at each batch's start and once it has read the record it
+    /// builds through ([`History::batch_read`]).
+    #[cfg(test)]
+    batch_read: Mutex<Option<BatchRead>>,
 }
+
+/// Tests: a hook given `None` at each batch's start and the record it
+/// builds through once read.
+#[cfg(test)]
+type BatchRead = Box<dyn FnMut(Option<RecordNo>) + Send>;
 
 /// History's state, behind one lock. Every change notifies `changed`.
 struct State {
@@ -288,6 +297,8 @@ impl History {
                     gated: Vec::new(),
                 }),
                 changed: Condvar::new(),
+                #[cfg(test)]
+                batch_read: Mutex::new(None),
             }),
         }
     }
@@ -348,6 +359,56 @@ impl History {
         state.oldest_unbuilt.get_or_insert(now);
         state.unbuilt.push_back((step, now));
         state.wanted = state.wanted.max(step);
+        state.requests += 1;
+        drop(state);
+        self.notify();
+    }
+
+    /// Tests: `hook` runs at each batch's start (`None`), before it reads
+    /// anything, and once it has read the record it builds through, before
+    /// it builds anything.
+    #[cfg(test)]
+    pub(in crate::tree_actor) fn on_batch_read(
+        &self,
+        hook: impl FnMut(Option<RecordNo>) + Send + 'static,
+    ) {
+        *self
+            .inner
+            .batch_read
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(Box::new(hook));
+    }
+
+    /// Tests: the builder's batch starts (`None`) or has read `through`
+    /// ([`History::on_batch_read`]).
+    #[cfg(test)]
+    pub(in crate::tree_actor) fn batch_read(&self, through: Option<RecordNo>) {
+        let hook = self
+            .inner
+            .batch_read
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        if let Some(mut hook) = hook {
+            hook(through);
+            self.inner
+                .batch_read
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .get_or_insert(hook);
+        }
+    }
+
+    /// Asks the builder to build through record `through`, steps or not,
+    /// without waiting: the actor's overlay holds entries sealed at a record
+    /// after the last step (a call, an open), which only a build through it
+    /// lets go ([`TreeActor::rebuild`](crate::tree_actor::TreeActor)).
+    pub(in crate::tree_actor) fn want_through(&self, through: RecordNo) {
+        let mut state = self.state();
+        if state.wanted >= through {
+            return;
+        }
+        state.wanted = through;
         state.requests += 1;
         drop(state);
         self.notify();

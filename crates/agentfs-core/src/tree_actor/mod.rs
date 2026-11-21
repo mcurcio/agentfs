@@ -1635,20 +1635,29 @@ impl TreeActor {
     /// moved: what is built is held once, the builder's, and only what the
     /// actor's steps changed since is the actor's own. Every step so far is
     /// applied, so each change of no known step is at or before the last
-    /// record.
+    /// record. That record may be no step (a call, an open), which the
+    /// builder is not asked to build: when entries are left past the built
+    /// point, the builder is asked to build through it, so the overlay is
+    /// let go at that build even if no step follows (docs/trees.md, "History
+    /// trails the files").
     fn rebuild(&mut self) {
         let Some((through, built)) = self.history.built_trees(self.rebuilt) else {
             return;
         };
         let last = EventNumber::new(self.next.saturating_sub(1));
         let through_step = EventNumber::new(through.get());
+        let mut left = false;
         for (tree, saved) in &mut self.trees {
             saved.seal(last);
             if let Some(built) = built.get(tree) {
                 saved.rebuilt(built, through_step);
             }
+            left |= saved.overlay_bytes() > 0;
         }
         self.rebuilt = through;
+        if left && last.get() > through.get() {
+            self.history.want_through(RecordNo::new(last.get()));
+        }
     }
 
     /// After a step is applied: the saved trees onto a new built point, and a
