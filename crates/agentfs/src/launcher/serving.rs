@@ -45,9 +45,9 @@ pub(super) struct Staged<T> {
 }
 
 /// Stages the volume as `cap` (it recovers it, and never creates one),
-/// installs the stop on SIGTERM and SIGINT, and restores Trees and Clients
-/// on one store. `Err` holds the exit status of a refusal: busy (75) or
-/// another format (1).
+/// sets the lag gate's `overlay_limit` before any view opens, installs the
+/// stop on SIGTERM and SIGINT, and restores Trees and Clients on one store.
+/// `Err` holds the exit status of a refusal: busy (75) or another format (1).
 ///
 /// # Errors
 ///
@@ -57,6 +57,7 @@ pub(super) fn stage<T: Send + 'static>(
     at: &PodContext,
     cap: LaunchCap,
     minter: Minter,
+    overlay_limit: u64,
 ) -> Result<std::result::Result<Staged<T>, ExitCode>> {
     let events = DomainEvents::default();
     let clients = ClientsSlot::new(None);
@@ -73,6 +74,7 @@ pub(super) fn stage<T: Send + 'static>(
         .area()
         .recording()
         .context("opening tree state: the staged volume is not served")?;
+    recording.set_overlay_limit(overlay_limit);
     let domains = Domains::restore(
         recording,
         (minter, cap, at.clone()),

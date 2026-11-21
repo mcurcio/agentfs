@@ -6,7 +6,7 @@
 //!
 use std::collections::BTreeMap;
 use std::io;
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Condvar, LazyLock, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use git2::Oid;
@@ -17,8 +17,13 @@ use super::{Objects, refs};
 use crate::tree_actor::call_path::Then;
 use crate::tree_actor::pointers::Pointers;
 use crate::tree_actor::recording::FileMap;
-use crate::tree_actor::tree::EventNumber;
+use crate::tree_actor::tree::{EventNumber, Tree};
 use crate::tree_git::TreeGit;
+
+/// Each direct save's commit by its event, as built: the snapshot the
+/// builder hands History at each built event. Persistent, so the handover is
+/// O(1) and a batch adds only its own saves.
+pub(in crate::tree_actor) type Owners = imbl::OrdMap<EventNumber, Oid>;
 
 /// Why the builder could not build a batch. Recording goes on; the batch is
 /// retried at the next step appended or the next wait.
@@ -30,9 +35,13 @@ pub enum BuildError {
     /// A read or write of the store or the built log failed with this errno.
     #[error("history build: errno {0}")]
     Io(i32),
-    /// The builder's replay of this step disagrees with its record (outcome,
-    /// length or checksum): building stops with the alarm until an operator
-    /// acts (docs/runbooks/recording-failures.md).
+    /// The builder cannot build this step as recorded: a save's recorded
+    /// layout cannot be laid (a place no linked journal record holds,
+    /// malformed chunks, or bytes kept "as before" past the end of the file
+    /// the builder holds), or the step names a file or open the builder
+    /// lacks. Building stops with the alarm until an operator acts
+    /// (docs/runbooks/recording-failures.md). A save the builder can lay but
+    /// not reproduce is built and flagged instead (`super::verify`).
     #[error("history build disagrees with step {}", .0.get())]
     Disagrees(RecordNo),
     /// A commit the built log or a checkpoint names is not in the store.
@@ -122,7 +131,16 @@ pub(in crate::tree_actor) struct Inner {
     repo: TreeGit,
     state: Mutex<State>,
     changed: Condvar,
+    /// Tests: runs at each batch's start and once it has read the record it
+    /// builds through ([`History::batch_read`]).
+    #[cfg(test)]
+    batch_read: Mutex<Option<BatchRead>>,
 }
+
+/// Tests: a hook given `None` at each batch's start and the record it
+/// builds through once read.
+#[cfg(test)]
+type BatchRead = Box<dyn FnMut(Option<RecordNo>) + Send>;
 
 /// History's state, behind one lock. Every change notifies `changed`.
 struct State {
@@ -131,9 +149,12 @@ struct State {
     /// Every pointer as built.
     pointers: Arc<Pointers>,
     /// Each direct save's commit, by its step: what a sync asks of a save.
-    owners: Arc<BTreeMap<EventNumber, Oid>>,
+    owners: Owners,
     /// Each tree's object numbers as built.
-    objects: Arc<BuiltObjects>,
+    objects: BuiltObjects,
+    /// The builder's trees as built: what the actor's saved trees rest on
+    /// (`SavedTree::rebuilt`). None until the first built event.
+    trees: imbl::OrdMap<TreeId, Tree>,
     failed: Option<BuildError>,
     /// The request count the failed batch started at: a wait asked after it
     /// waits for the retry.
@@ -142,8 +163,10 @@ struct State {
     wanted: RecordNo,
     /// Bumped at each request: a failed builder retries at the next one.
     requests: u64,
-    /// Bumped at each built or failed event.
+    /// Bumped at each built or failed event, and at [`History::wake_waiters`].
     epoch: u64,
+    /// The batches ended so far: what the repack task waits on.
+    ends: Ends,
     /// When the first step past the built point was appended.
     oldest_unbuilt: Option<Instant>,
     /// Steps appended past the built point, with when each was appended.
@@ -165,6 +188,14 @@ struct State {
     gated: Vec<(TreeId, Then)>,
 }
 
+/// How many batches have ended since History started: `built` counts the
+/// built events, `ended` the built and the failed ones.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(in crate::tree_actor) struct Ends {
+    pub built: u64,
+    pub ended: u64,
+}
+
 /// The built state at one built point: heads, refs and the commits behind
 /// them. Only History constructs one, and only at or before the built point,
 /// so nothing past it is reachable (the private fields are the guarantee).
@@ -172,12 +203,13 @@ pub struct BuiltSnapshot {
     inner: Arc<Inner>,
     at: RecordNo,
     pointers: Arc<Pointers>,
-    owners: Arc<BTreeMap<EventNumber, Oid>>,
-    objects: Arc<BuiltObjects>,
+    owners: Owners,
+    objects: BuiltObjects,
 }
 
-/// Every tree's object numbers at one built point.
-pub(in crate::tree_actor) type BuiltObjects = BTreeMap<TreeId, Arc<Objects>>;
+/// Every tree's object numbers at one built point: persistent, as
+/// [`Objects`].
+pub(in crate::tree_actor) type BuiltObjects = imbl::OrdMap<TreeId, Objects>;
 
 impl BuiltSnapshot {
     /// The built point this snapshot is at.
@@ -207,21 +239,25 @@ impl BuiltSnapshot {
         &self.pointers
     }
 
-    pub(in crate::tree_actor) fn owners(&self) -> &BTreeMap<EventNumber, Oid> {
+    /// Each direct save's commit by its event, as built at this point.
+    pub(in crate::tree_actor) fn owners(&self) -> &Owners {
         &self.owners
     }
 
     /// `tree`'s object numbers as built; none for a tree not built.
     pub(in crate::tree_actor) fn objects(&self, tree: TreeId) -> &Objects {
-        static NONE: Objects = Objects::new();
-        self.objects.get(&tree).map_or(&NONE, |o| o)
+        static NONE: LazyLock<Objects> = LazyLock::new(Objects::new);
+        self.objects.get(&tree).unwrap_or(&NONE)
     }
 
-    /// Every tree's object numbers as built.
-    pub(in crate::tree_actor) fn all_objects(&self) -> BTreeMap<TreeId, Objects> {
+    /// Every tree's object numbers as built, as a checkpoint holds them.
+    pub(in crate::tree_actor) fn all_objects(&self) -> BTreeMap<TreeId, BTreeMap<u64, u64>> {
         self.objects
             .iter()
-            .map(|(tree, objects)| (*tree, (**objects).clone()))
+            .map(|(tree, objects)| {
+                let objects = objects.iter().map(|(id, object)| (*id, *object)).collect();
+                (*tree, objects)
+            })
             .collect()
     }
 
@@ -244,7 +280,7 @@ impl History {
         repo: TreeGit,
         built: RecordNo,
         pointers: Pointers,
-        owners: BTreeMap<EventNumber, Oid>,
+        owners: Owners,
         objects: BuiltObjects,
     ) -> Self {
         Self {
@@ -253,13 +289,15 @@ impl History {
                 state: Mutex::new(State {
                     built,
                     pointers: Arc::new(pointers),
-                    owners: Arc::new(owners),
-                    objects: Arc::new(objects),
+                    owners,
+                    objects,
+                    trees: imbl::OrdMap::new(),
                     failed: None,
                     failed_at: 0,
                     wanted: built,
                     requests: 0,
                     epoch: 0,
+                    ends: Ends::default(),
                     oldest_unbuilt: None,
                     unbuilt: std::collections::VecDeque::new(),
                     stopping: false,
@@ -270,6 +308,8 @@ impl History {
                     gated: Vec::new(),
                 }),
                 changed: Condvar::new(),
+                #[cfg(test)]
+                batch_read: Mutex::new(None),
             }),
         }
     }
@@ -335,6 +375,56 @@ impl History {
         self.notify();
     }
 
+    /// Tests: `hook` runs at each batch's start (`None`), before it reads
+    /// anything, and once it has read the record it builds through, before
+    /// it builds anything.
+    #[cfg(test)]
+    pub(in crate::tree_actor) fn on_batch_read(
+        &self,
+        hook: impl FnMut(Option<RecordNo>) + Send + 'static,
+    ) {
+        *self
+            .inner
+            .batch_read
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(Box::new(hook));
+    }
+
+    /// Tests: the builder's batch starts (`None`) or has read `through`
+    /// ([`History::on_batch_read`]).
+    #[cfg(test)]
+    pub(in crate::tree_actor) fn batch_read(&self, through: Option<RecordNo>) {
+        let hook = self
+            .inner
+            .batch_read
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        if let Some(mut hook) = hook {
+            hook(through);
+            self.inner
+                .batch_read
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .get_or_insert(hook);
+        }
+    }
+
+    /// Asks the builder to build through record `through`, steps or not,
+    /// without waiting: the actor's overlay holds entries sealed at a record
+    /// after the last step (a call, an open), which only a build through it
+    /// lets go ([`TreeActor::rebuild`](crate::tree_actor::TreeActor)).
+    pub(in crate::tree_actor) fn want_through(&self, through: RecordNo) {
+        let mut state = self.state();
+        if state.wanted >= through {
+            return;
+        }
+        state.wanted = through;
+        state.requests += 1;
+        drop(state);
+        self.notify();
+    }
+
     /// The builder's wait for work: the record to build through, once one is
     /// wanted past the built point and, after a failure, asked again since
     /// `seen` requests. `None` when it should stop.
@@ -375,21 +465,23 @@ impl History {
         }
     }
 
-    /// A batch is built and its built-log entry durable: the built point moves.
+    /// A batch is built and its built-log entry durable: the built point
+    /// moves. `owners`, `objects` and `trees` are the builder's own persistent
+    /// maps, shared: O(1).
     pub(in crate::tree_actor) fn built_event(
         &self,
         through: RecordNo,
         pointers: Pointers,
-        owners: BTreeMap<EventNumber, Oid>,
-        objects: Arc<BuiltObjects>,
+        (owners, objects, trees): (Owners, BuiltObjects, imbl::OrdMap<TreeId, Tree>),
         elapsed: Duration,
     ) {
         let mut state = self.state();
         state.gate.built(through, elapsed);
         state.built = state.built.max(through);
         state.pointers = Arc::new(pointers);
-        state.owners = Arc::new(owners);
+        state.owners = owners;
         state.objects = objects;
+        state.trees = trees;
         state.failed = None;
         while state
             .unbuilt
@@ -400,6 +492,8 @@ impl History {
         }
         state.oldest_unbuilt = state.unbuilt.front().map(|(_, at)| *at);
         state.epoch += 1;
+        state.ends.built += 1;
+        state.ends.ended += 1;
         drop(state);
         self.notify();
     }
@@ -428,6 +522,7 @@ impl History {
         }
         state.failed = Some(error);
         state.epoch += 1;
+        state.ends.ended += 1;
         drop(state);
         self.notify();
     }
@@ -452,6 +547,23 @@ impl History {
         state.stopping = true;
         drop(state);
         self.notify();
+    }
+
+    /// The batches ended so far, built and failed.
+    pub(in crate::tree_actor) fn ends(&self) -> Ends {
+        self.state().ends
+    }
+
+    /// Returns once more than `after` batches have ended, built or failed,
+    /// with the counts then; `None` once the volume is stopping. Only a
+    /// batch's end moves it, never [`History::wake_waiters`]: what the
+    /// repack task runs on ([`super::repack::Repacker`]).
+    pub(in crate::tree_actor) fn wait_batch_end(&self, after: u64) -> Option<Ends> {
+        let mut state = self.state();
+        while state.ends.ended <= after && !state.stopping && !state.stopped {
+            state = self.wait(state);
+        }
+        (!state.stopping && !state.stopped).then_some(state.ends)
     }
 
     /// Wakes every [`History::wait_epoch`] caller with a new epoch.
@@ -557,6 +669,40 @@ impl History {
         }
     }
 
+    /// The overlay limit of the lag gate (`agentfs.overlayLimit`): over it,
+    /// a tree's new work waits for the builder.
+    pub fn set_overlay_limit(&self, bytes: u64) {
+        self.state().gate.set_overlay_limit(bytes);
+        self.notify();
+    }
+
+    /// The actor's overlay of each tree, as it left them at a release of
+    /// its lock: the gate's memory term. Wakes the gate thread when a tree's
+    /// admission changed. Lock order: the actor, then History.
+    pub(in crate::tree_actor) fn overlays(
+        &self,
+        overlays: impl IntoIterator<Item = (TreeId, u64)>,
+    ) {
+        let mut state = self.state();
+        let mut changed = false;
+        let mut reported = std::collections::BTreeSet::new();
+        for (tree, bytes) in overlays {
+            reported.insert(tree);
+            changed |= state.gate.overlay(tree, bytes);
+        }
+        changed |= state.gate.retain_overlays(|tree| reported.contains(&tree));
+        drop(state);
+        if changed {
+            self.notify();
+        }
+    }
+
+    /// `tree`'s overlay as the actor last reported it to the gate, in
+    /// estimated bytes: 0 before any report. For tests and metrics.
+    pub fn overlay_bytes(&self, tree: TreeId) -> u64 {
+        self.state().gate.overlay_of(tree)
+    }
+
     /// The lag gate with these levels: a test's limit, so a call waits.
     #[cfg(all(test, feature = "failpoints"))]
     pub(in crate::tree_actor) fn set_lag_limits(&self, alarm: Duration, limit: Duration) {
@@ -613,9 +759,19 @@ impl History {
             inner: Arc::clone(&self.inner),
             at: state.built,
             pointers: Arc::clone(&state.pointers),
-            owners: Arc::clone(&state.owners),
-            objects: Arc::clone(&state.objects),
+            owners: state.owners.clone(),
+            objects: state.objects.clone(),
         }
+    }
+
+    /// The builder's trees at the built point, with the point, once the
+    /// built point is past `since`: shared, O(1).
+    pub(in crate::tree_actor) fn built_trees(
+        &self,
+        since: RecordNo,
+    ) -> Option<(RecordNo, imbl::OrdMap<TreeId, Tree>)> {
+        let state = self.state();
+        (state.built > since && !state.trees.is_empty()).then(|| (state.built, state.trees.clone()))
     }
 
     /// Each tree's lag, the oldest unbuilt step's age and the builder's health.
@@ -629,5 +785,72 @@ impl History {
                 None => state.gate.health(),
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tree_actor::test_support::new_actor;
+
+    /// A tree left out of a report (a fork the actor dropped) no longer
+    /// holds the gate.
+    #[test]
+    fn a_tree_absent_from_a_report_is_dropped_from_the_gate() {
+        let tmp = tempfile::tempdir().unwrap();
+        let actor = new_actor(&tmp.path().join("state"));
+        let history = actor.history();
+        history.set_overlay_limit(1_000);
+        history.overlays([(TreeId::Root, 10), (TreeId::Fork(1), 5_000)]);
+        assert_eq!(history.overlay_bytes(TreeId::Fork(1)), 5_000);
+        assert_eq!(history.lag().health, Health::Stalled);
+        history.overlays([(TreeId::Root, 10)]);
+        assert_eq!(history.overlay_bytes(TreeId::Fork(1)), 0);
+        assert_eq!(history.overlay_bytes(TreeId::Root), 10);
+        assert_eq!(history.lag().health, Health::Current);
+    }
+
+    /// A built event moves both counts, a failed one only `ended`, and a
+    /// wake neither: the repack task runs on built events alone.
+    #[test]
+    fn only_built_events_count_as_built() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut actor = new_actor(&tmp.path().join("state"));
+        let w = crate::tree_actor::test_support::writer("w");
+        let h = actor
+            .write_open(
+                TreeId::Root,
+                "f",
+                &w,
+                Some(crate::tree_actor::test_support::ATTRS),
+            )
+            .unwrap();
+        actor.write(h, 0, b"one\n", false).unwrap();
+        actor.close(h).unwrap();
+        actor.settle().unwrap();
+        let history = actor.history().clone();
+        let start = history.ends();
+        assert!(start.built >= 1 && start.ended >= start.built, "{start:?}");
+        history.wake_waiters();
+        assert_eq!(history.ends(), start, "a wake is no batch end");
+        history.failed_event(BuildError::NoSpace, 0);
+        let failed = history.ends();
+        assert_eq!(
+            failed,
+            Ends {
+                built: start.built,
+                ended: start.ended + 1
+            }
+        );
+        assert_eq!(history.wait_batch_end(start.ended), Some(failed));
+        let h = actor.write_open(TreeId::Root, "f", &w, None).unwrap();
+        actor.write(h, 0, b"two\n", false).unwrap();
+        actor.close(h).unwrap();
+        actor.settle().unwrap();
+        let built = history.ends();
+        assert!(
+            built.built > failed.built && built.ended > failed.ended,
+            "{built:?}"
+        );
     }
 }

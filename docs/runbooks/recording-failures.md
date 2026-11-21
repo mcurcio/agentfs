@@ -8,7 +8,7 @@ usual cause is a state area that is full or cannot be written.
 
 Sections 1 to 4 are the recording engine's, on recording state areas, which no launcher runs any more ([moving.md](moving.md) moves the CSI volumes
 an older driver made); their `kubectl` lines apply to no volume today.
-Sections 5 to 7 are the tree views', which the sidecar, the Docker
+Sections 5 to 8 are the tree views', which the sidecar, the Docker
 examples, `agentfs mount` and the CSI driver run ([trees](../trees.md)); there `$STATE` is the volume's state area (the
 sidecar's and Docker's `/data/state`).
 
@@ -34,6 +34,7 @@ kubectl -n agentfs-csi exec "$NODE_POD" -c agentfs-csi -- agentfs --state "$STAT
 | `the operator's rules refuse the volume: info/attributes line <n>: <attribute> ...` | `mount`'s error at start (exit 1) | [5](#5-a-tree-state-area-that-refuses-to-open) |
 | `tree HistoryBuildFailed: <error>`, or a tree view's metrics with `history.health` `failed` or an `oldest_unbuilt_ns` that keeps growing | a tree actor's stderr; `--metrics-output` | [6](#6-a-tree-volumes-history-is-not-built) |
 | `agentfs mount` exits 75 or 1 at start, or does not exit after SIGTERM | the mount's stderr | [7](#7-a-tree-mount-that-will-not-start-or-stop) |
+| `tree HistoryUnverified: step=<n> ...`, `tree HistoryEvidenceNotWritten`, `tree HistoryNotesUnreadable` or `tree HistoryVerifyFailed`; gauge `agentfs.history.unverified` above 0; alert `AgentfsHistoryUnverified` | a tree actor's stderr; telemetry | [8](#8-a-save-history-could-not-check) |
 
 The `<error>` says what failed: `No space left on device` (`ENOSPC`),
 `Disk quota exceeded`, `Read-only file system` (`EROFS`), `Permission
@@ -162,7 +163,8 @@ anything. Its start shows the result:
 ## 5. A tree state area that refuses to open
 
 This section is for the tree actor ([trees](../trees.md)),
-whose journal is the segment files in `journal/` and whose refs are a copy of it.
+whose journal is the segment files in `journal/` and whose pointer refs are a copy
+of it; `refs/notes/` is not a copy, and the ref rebuild leaves it alone.
 Recovery is manual:
 agentfs repairs neither case itself.
 
@@ -185,7 +187,8 @@ cp -a "$STATE" "$STATE.saved"
 git --git-dir="$STATE/history.git" for-each-ref > "$STATE.saved.refs"
 ```
 
-Those refs are the last copy the actor made, and they show what the journal said.
+Those pointer refs are the last copy the actor made, and they show what the journal
+said; `refs/notes/` is not a copy, and the rebuild leaves it alone.
 Truncating the segment that holds the offset there, and removing every later
 segment, loses every later record: those saves stop existing, and the same refs
 show what they were. Recovery rebuilds the refs from the
@@ -238,11 +241,16 @@ never as a volume that will not mount.
   container the memory (about twice the file), or replace the file with a new
   one, which aligns with no `git diff`. Its two files are in `align/` in the
   state area while it runs and are removed after.
-- **`disagrees with step <n>`.** The builder's replay of step `n` does not give what
-  the actor recorded (a length, a digest of the file's pieces, or a name). Every
-  retry fails the same way. Preserve the state area (`cp -a "$STATE" "$STATE.saved"`)
-  and report it with `journal/` and `built.log`: it is a bug, and no history is built past step `n`
-  until a release fixes it.
+- **`disagrees with step <n>`.** The builder cannot lay what step `n` recorded: a
+  save's layout names a journal record no linked segment holds, its chunk records
+  are malformed, or it keeps bytes "as before" past the end of the file the
+  builder holds (the builder's state diverged before this save), or another step
+  names a file or open the builder lacks. A save the builder can lay but not
+  reproduce is no such failure: it is built and flagged
+  ([8](#8-a-save-history-could-not-check)). Every retry fails the same way.
+  Preserve the state area (`cp -a "$STATE" "$STATE.saved"`) and report it with
+  `journal/` and `built.log`: it is a bug or damage, and no history is built past
+  step `n` until a release fixes it.
 - **A wedged builder**: `oldest_unbuilt_ns` grows while `health` stays `current`.
   Waiters wait without a timeout. Find the `git fast-import` child of the agentfs
   process (`pgrep -P <pid> -a git`) and kill it: the batch fails, waiters get the
@@ -299,6 +307,65 @@ Log lines that change nothing: `tree UnstageFailed` (the volume stays staged;
 the next stop asks again), `tree DetachFailed: client=<id>` (the next mount's
 reconcile ends that client), `tree SettleFailed` (a fork's end or drop waits for
 the next judgement, at the latest the next mount's) and `tree EventFailed`.
+
+## 8. A save history could not check
+
+The builder replays every save and compares the replay with the layout the save
+recorded ([trees](../trees.md#when-history-cannot-check-a-save)). A
+`tree HistoryUnverified` line means they differed: the commit holds the bytes the
+workload saved, read from the record, and carries an `Agentfs-Unverified` trailer.
+Nothing was lost and recording goes on; what is in doubt is the builder's own
+replay, a bug to report.
+
+Find the flags, with their verdicts:
+
+```sh
+git --git-dir="$STATE/history.git" log --all --notes=agentfs-verify \
+  --grep=Agentfs-Unverified
+```
+
+Each flagged commit's evidence, the replay's inputs, is its note under
+`refs/notes/agentfs-verify-evidence`:
+
+```sh
+git --git-dir="$STATE/history.git" notes --ref=agentfs-verify-evidence show <commit>
+```
+
+**Check it with another release.** Every new build of agentfs checks each standing
+flag once: at the start of a volume, or with `agentfs verify`, which takes the
+volume's lock and opens only `history.git` (a release of another state format can
+run it). It prints one line a flag, `<step> <tree> <commit> <verdict> <path>`, and
+exits 0 when no flag stands, 2 while one does, 75 while the volume is in use
+([configuration](../configuration.md#commands)).
+
+- Under a sidecar or a CSI volume, either deploy the new image (its start checks),
+  or scale the workload to 0 and run `agentfs --state "$STATE" verify` from the new
+  image.
+- `verified`: the new release's replay of the evidence equals the recorded layout;
+  the flag clears. The cause was in the old release's replay code.
+- `mismatch-confirmed`: the new release's replay still differs. That says only
+  that this release's replay of the builder's inputs disagrees, not that the save
+  disagrees with the journal: if the cause was in what the builder tracked, or on
+  the view's side, every release reports this. Keep the evidence and report it.
+- `same-release`: this release flagged or judged it already, and the same code
+  gives the same answer; nothing is written.
+- `no-evidence`: the commit has no evidence note that parses (the evidence write
+  failed, logged as `tree HistoryEvidenceNotWritten` with its text, or the ref
+  was lost). Nothing can be replayed.
+- `- - <commit> unreadable -`: the commit's verdict note holds a line that is no
+  verdict (`tree HistoryNotesUnreadable`). The flag stands; fix or remove the line
+  with `git notes --ref=agentfs-verify edit <commit>`.
+
+**Acknowledge it.** Once you have looked and accept the commit as it is, clear the
+flag by hand:
+
+```sh
+git --git-dir="$STATE/history.git" -c user.name=<you> -c user.email=<you@example.com> \
+  notes --ref=agentfs-verify append -m "Agentfs-Verdict: acknowledged by <you>" <commit>
+```
+
+The counts are read from history at the next start. Never rewrite the flagged
+commit: the flag is history, and both notes refs only gain commits.
 
 ## Verify
 

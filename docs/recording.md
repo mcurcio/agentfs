@@ -221,6 +221,15 @@ is never sent twice.
 
 Operator steps: [runbooks/recording-failures.md](runbooks/recording-failures.md).
 
+Tree views record a save before the call returns and build its commit later.
+A save whose commit the builder cannot check against the save's record is no
+recording failure: the commit holds the bytes the workload saved and carries
+an `Agentfs-Unverified` trailer, the evidence and verdicts are git notes
+(`refs/notes/agentfs-verify-evidence`, `refs/notes/agentfs-verify`), a later
+release checks it at start or with `agentfs verify`, and a person may
+acknowledge it by hand ([trees](trees.md#when-history-cannot-check-a-save);
+runbook [section 8](runbooks/recording-failures.md#8-a-save-history-could-not-check)).
+
 ## Which paths are recorded
 
 agentfs follows git's model: **ignore rules decide only whether new

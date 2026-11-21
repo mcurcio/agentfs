@@ -557,3 +557,8 @@ base it applies to and the commands that recorded the fixture.
 The fixture of finding 51 is the library without the shows-the-same guard of a sync's fast-forward (introduced in
 `6049b1b`, fixed in `e9ab747`), on `finding_51_a_sync_that_cannot_show_the_upstreams_commit_merges`: the model
 fails it at call 15, the fork's sync, where the engine's fork lost its saved line.
+
+The fixtures `pieces-shorter-run-306` and `-414` are the library before a take placed each line from a source whose
+run holds it, on seeds 306 and 414 of `random_interleavings_rounds_phase1_scope` (found by the full sweep, outside
+the regression seeds): the model makes the take at call 38 and call 127, where the engine failed it with EIO because
+a shorter run of the same versions in the taken tree hid the head's whole run.

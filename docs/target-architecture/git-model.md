@@ -209,6 +209,9 @@ Agentfs-Tree: fork/3          # root | fork/<id>: the tree it was made for, by i
 The engine's commits carry these three and more: the event, the volume's name and id, and the pod context the writer
 ran in (`Agentfs-Event`, `Agentfs-Volume`, `Agentfs-Volume-Id`, `Agentfs-Namespace`, `Agentfs-Pod`, `Agentfs-Pod-Uid`,
 `Agentfs-Node`; their order is in docs/trees.md), and a landing's writer and pod trailers are its second parent's.
+A direct save may end with one optional trailer, `Agentfs-Unverified`, when the builder's replay of the save did not
+match its recorded layout: the commit holds the recorded bytes all the same, and the trailer flags it for a later
+check (docs/trees.md, "When history cannot check a save"). The model never flags.
 
 A take that decides a collision (R5.1, R9.9) records it in its own result commit, a landing or transaction commit, with
 one more trailer per record: its tree, file, cause, losing change, collision ref, lines, lost and won versions. So a
@@ -245,6 +248,7 @@ Ref names are a design choice; the model uses the first five (with `refs/collisi
 | `refs/collisions/<loser>` | one per losing change, named by its losing commit (the model numbers them, one per losing change, with a record for each file and cause it lost by) | past the fork's drop | yes, by Replication, under `refs/agentfs/<volume>/collisions/` ("i want to know who changed what when", 2026-11-03) |
 | `refs/queue/<tree>/<n>` | one queue entry (§5) | until taken | never |
 | `refs/agentfs/trees/fork/<n>`, `refs/agentfs/clients/<tree>`, `refs/agentfs/volume` | the volume's rows: one chain of event commits per row, beside the tree it concerns, each commit's tree one `row.json` and its message the event ([trees](../trees.md#rows-and-event-commits)) | always, a fork's past its drop | yes, by Replication, from M4 (design choice) |
+| `refs/notes/agentfs-verify`, `refs/notes/agentfs-verify-evidence` | git notes on flagged saves: their verdicts, and the builder's evidence ([trees](../trees.md#when-history-cannot-check-a-save)). Not pointers: no journal record names them, and the ref rebuild leaves them alone | always | by Replication under per-volume names, once tree push is built ([replication](domains/replication.md)) |
 
 A commit's tree (a design choice, the owner's pick Q1-A of 2026-11-14, hashed sub-folders) keeps each file at
 `files/<aa>/<bb>/<name>`, its line map (runs of line identities and versions, never bytes) at `lines/<aa>/<bb>/<name>` and each file identity's name history at
@@ -820,14 +824,15 @@ not; the rest is a design choice.
 appends one journal record: the change itself, and every pointer its build moves (the branch, queue entries, collision
 refs), each value an oid or "what step `n`'s build gives". That record is the commit point. The
 commits are built behind it by a builder (the owner, 2026-11-13: "only the diff/patch needs to be syncrhonosly
-collected and queued, while the git history persistence could be an asynchronous trailing process"). Git's refs are a
-copy of the built pointers, in the files format, and nothing decides from the copy. Reftable's one atomic swap is no
+collected and queued, while the git history persistence could be an asynchronous trailing process"). Git's pointer
+refs are a copy of the built pointers, in the files format, and nothing decides from the copy; `refs/notes/` is not a
+copy (§4), and the rebuild leaves it alone. Reftable's one atomic swap is no
 longer needed, and git's reftable writer could not survive a cut anyway (`reftable/writer.c` writes a table's footer
 after its last sync).
 
 The order of a step, on the call path:
 
-1. Decide it on the saved state: the outcome of a close (its length and checksum), the names it moves.
+1. Decide it on the saved state: the outcome of a close (its length and layout), the names it moves.
 2. Check the pointers it moves against their current values.
 3. Append the record, with no flush: **the commit point**. It survives power loss once a flush covers it (§3).
 4. Apply it to the saved state the views serve.
@@ -853,7 +858,7 @@ copy after the built-log entry is logged, and the next batch rebuilds the refs w
 | fork create | the branch and its upstream, and the fork's row (its event commit on `refs/agentfs/trees/fork/<n>`) | `config` is rewritten from the journal before any git command; a dropped fork is not built; the branch and the row are one record, or neither happened |
 | rows alone | each row's chain and its event commit | each chain's row is read from its built tip's `row.json`, then the records after the built point replayed; the event commits not built are built |
 | journal | each call appended before it returns, durable once a flush covers it (§3) | every frame is read, durable or not; a hole a later frame's mark shows was durable, or valid records that end before the built log's point, refuse to serve; any other bad tail is saved aside and discarded. Before any view serves the tree, each open with no record closing it is saved as its close would be, exactly once, and every record is flushed |
-| refs, `config`, `HEAD` | a copy of the records | `config` and `HEAD` are rewritten, then `refs/` and `packed-refs` are removed and every pointer is created in one `update-ref --stdin`, on every open, so this path always runs. A live `git` reader may see a step half copied |
+| refs, `config`, `HEAD` | a copy of the records | `config` and `HEAD` are rewritten, then every pointer ref (all of `refs/` and `packed-refs` but `refs/notes/`, which is no copy) is removed and every pointer is created in one locked transaction, on every open, so this path always runs. A live `git` reader may see a step half copied |
 | locks | none: held in memory by the actor | none survive: open files ended with their clients and are saved from the journal (row above); an unfinished take has no record, so its entry is still there and is taken again. In the model a take is one step, so none is unfinished at a crash |
 | object table | each tree's object per file identity, in the checkpoint as of its built point; the steps after it move them | rebuilt from the checkpoint and the steps' own transitions, never by file identity; an open whose object no path names is replayed as an orphan (saves nothing, `OrphanDropped`) |
 | objects | none: durable before a record names them | every pointer's commit, tree and blobs are checked (`rev-list --objects --no-walk --missing=print`): anything lost refuses to serve. Unreferenced objects: git's garbage collection |

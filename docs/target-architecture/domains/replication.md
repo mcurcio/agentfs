@@ -9,6 +9,13 @@ publishes each move of a head with the collision refs its take recorded, and the
 due (`crates/agentfs-model/src/mirror.rs`). This page covers the rest: remotes, credentials, attempts, divergence
 and settlement.
 
+**Flagged saves.** A save history could not check is flagged in its own commit (`Agentfs-Unverified`, docs/trees.md,
+"When history cannot check a save"), so the flag travels with every push of the commit. The verdicts and the evidence
+are git notes, `refs/notes/agentfs-verify` and `refs/notes/agentfs-verify-evidence`: when tree push is built, they
+join the refspec under per-volume names, as collision refs do (`refs/notes/agentfs-verify:refs/notes/agentfs/<volume>/verify`
+and `refs/notes/agentfs-verify-evidence:refs/notes/agentfs/<volume>/verify-evidence`), so several volumes sharing a
+remote never overwrite each other's notes.
+
 ## 1. What Replication owns, and what it is not
 
 Replication copies refs the git model has already written to zero or more git remotes, and fetches from them. It is

@@ -72,3 +72,57 @@ fn todays_library_differs_from_the_regression_only_at_its_call() {
     assert_eq!(library[..library.len() - 1], fixture[..fixture.len() - 1]);
     assert_eq!(library.last(), models_record().last());
 }
+
+/// The library before `pieces` placed each line from a source that holds it
+/// (seeds 306 and 414 of `random_interleavings_rounds_phase1_scope`, found by
+/// the full sweep): the head and the taken tree held runs of the same versions
+/// with different extents, `pieces` looked only in the run that sorted last, a
+/// shorter one, and the take failed (EIO) with "a live line no source holds".
+/// Each fixture is the library's recording of one seed; `pieces-shorter-run.patch`
+/// removes the fix for both.
+const PIECES_SHORTER_RUN: [(&str, &str); 2] = [
+    (
+        include_str!("regressions/pieces-shorter-run-306.trace"),
+        "call 38 (take t0 taken): ",
+    ),
+    (
+        include_str!("regressions/pieces-shorter-run-414.trace"),
+        "call 127 (take t0 taken): ",
+    ),
+];
+
+/// The model makes the take the recording failed: it agrees with every record
+/// before it and differs there.
+#[test]
+fn a_take_that_could_not_place_a_line_fails_in_the_model_at_its_call() {
+    for (trace, at) in PIECES_SHORTER_RUN {
+        let fixture = parse(trace).unwrap();
+        let mut recorded = Recorder::default();
+        let e = against_model(&fixture, &mut recorded).unwrap_err();
+        assert!(e.starts_with(at), "{e}");
+        let model = recorded.into_trace();
+        assert_eq!(model.len(), fixture.len(), "every call made");
+        assert_eq!(model[..model.len() - 1], fixture[..fixture.len() - 1]);
+        let failed = fixture[fixture.len() - 1].failed;
+        assert_eq!(failed.and_then(|f| f.errno), Some(libc::EIO), "{at}");
+        assert_eq!(model[model.len() - 1].failed, None, "{at}");
+    }
+}
+
+/// Today's library makes each fixture's calls as recorded up to the take, and
+/// there makes the model's record.
+#[test]
+fn todays_library_places_every_line_of_the_take() {
+    for (trace, at) in PIECES_SHORTER_RUN {
+        let fixture = parse(trace).unwrap();
+        let mut recorded = Recorder::default();
+        let e = against_library(&fixture, &mut recorded).unwrap_err();
+        assert!(e.starts_with(at), "{e}");
+        let library = recorded.into_trace();
+        let mut model = Recorder::default();
+        against_model(&fixture, &mut model).unwrap_err();
+        assert_eq!(library.len(), fixture.len(), "every call made");
+        assert_eq!(library[..library.len() - 1], fixture[..fixture.len() - 1]);
+        assert_eq!(library.last(), model.into_trace().last(), "{at}");
+    }
+}

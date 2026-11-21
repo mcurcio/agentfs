@@ -1,8 +1,8 @@
 //! Git plumbing for tree actors (target architecture §§3, 12).
 //!
-//! The repository is in Git's files format, and its refs are a copy: the
-//! actor's journal is the commit point and `rebuild_refs` remakes them after a
-//! crash. Objects are durable before a record names them. agentfs writes
+//! The repository is in Git's files format, and its pointer refs are a copy:
+//! the actor's journal is the commit point and `rebuild_refs` remakes them
+//! after a crash. `refs/notes/` is not a copy, and the rebuild leaves it alone. Objects are durable before a record names them. agentfs writes
 //! `config` and `HEAD` itself, atomically, before any git command: git replaces
 //! `config` with no fsync, and an emptied one silently loses `core.fsync`.
 //!
@@ -12,7 +12,7 @@
 
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
-use std::io::{self, Write};
+use std::io::{self, BufRead, Read, Write};
 use std::os::fd::{AsRawFd, BorrowedFd};
 use std::os::unix::ffi::OsStringExt;
 use std::os::unix::fs::PermissionsExt;
@@ -189,21 +189,217 @@ impl TreeGit {
         Ok(())
     }
 
-    /// Removes `refs/` and `packed-refs`, makes `refs/`, and creates every
-    /// pointer in one [`TreeGit::ref_transaction`]. A copy, which needs no
-    /// fsync; libgit2's process-wide setting fsyncs each ref all the same.
+    /// Removes every child of `refs/` but `notes/`, keeps only the
+    /// `refs/notes/` lines of `packed-refs` (rewritten atomically, or removed
+    /// when none is left), and creates every pointer in one
+    /// [`TreeGit::ref_transaction`]. The pointer refs are a copy, which needs
+    /// no fsync; libgit2's process-wide setting fsyncs each ref all the same.
+    /// No note is read: a damaged notes ref cannot fail it, and a crash at any
+    /// point leaves the notes refs as they were.
     pub fn rebuild_refs(&self, pointers: &[RefUpdate]) -> Result<()> {
         let refs = self.path.join("refs");
-        match std::fs::remove_dir_all(&refs) {
-            Err(err) if err.kind() != io::ErrorKind::NotFound => return Err(err.into()),
-            _ => {}
+        std::fs::create_dir_all(&refs)?;
+        for entry in std::fs::read_dir(&refs)? {
+            let entry = entry?;
+            if entry.file_name() == "notes" {
+                continue;
+            }
+            let removed = if entry.file_type()?.is_dir() {
+                std::fs::remove_dir_all(entry.path())
+            } else {
+                std::fs::remove_file(entry.path())
+            };
+            match removed {
+                Err(err) if err.kind() != io::ErrorKind::NotFound => return Err(err.into()),
+                _ => {}
+            }
         }
-        match std::fs::remove_file(self.path.join("packed-refs")) {
-            Err(err) if err.kind() != io::ErrorKind::NotFound => return Err(err.into()),
-            _ => {}
+        match std::fs::read(self.path.join("packed-refs")) {
+            Ok(packed) => {
+                let kept = notes_lines(&packed);
+                if kept.iter().any(|line| !line.starts_with(b"#")) {
+                    replace_file(&self.path, "packed-refs", &kept.concat())?;
+                } else {
+                    std::fs::remove_file(self.path.join("packed-refs"))?;
+                    std::fs::File::open(&self.path)?.sync_all()?;
+                }
+            }
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+            Err(err) => return Err(err.into()),
         }
-        std::fs::create_dir(&refs)?;
+        crate::failpoints::hit("tree.ref_rebuild_after_remove")?;
         self.ref_transaction(pointers)
+    }
+
+    /// Every note under `notes_ref`: each annotated commit and its note's
+    /// text, in commit-id order; empty when the ref does not exist. Read
+    /// through libgit2, git's notes layout (fan-out included).
+    ///
+    /// # Errors
+    ///
+    /// A store read; [`Error::Invalid`] for a note that is not UTF-8.
+    pub fn notes(&self, notes_ref: &str) -> Result<Vec<(Oid, String)>> {
+        self.with_repo(|repo| {
+            let iter = match repo.notes(Some(notes_ref)) {
+                Ok(iter) => iter,
+                Err(err) if err.code() == ErrorCode::NotFound => return Ok(Vec::new()),
+                Err(err) => return Err(err.into()),
+            };
+            let mut notes = Vec::new();
+            for item in iter {
+                let (blob, commit) = item?;
+                let text = String::from_utf8(repo.find_blob(blob)?.content().to_vec())
+                    .map_err(|_| Error::Invalid(format!("the note of {commit} is not UTF-8")))?;
+                notes.push((commit, text));
+            }
+            notes.sort_by_key(|(commit, _)| *commit);
+            Ok(notes)
+        })
+    }
+
+    /// `commit`'s note under `notes_ref`; `None` when it has none or the ref
+    /// does not exist.
+    ///
+    /// # Errors
+    ///
+    /// A store read; [`Error::Invalid`] for a note that is not UTF-8.
+    pub fn note(&self, notes_ref: &str, commit: Oid) -> Result<Option<String>> {
+        self.with_repo(|repo| match repo.find_note(Some(notes_ref), commit) {
+            Ok(note) => Ok(Some(note.message().map(str::to_owned).map_err(|_| {
+                Error::Invalid(format!("the note of {commit} is not UTF-8"))
+            })?)),
+            Err(err) if err.code() == ErrorCode::NotFound => Ok(None),
+            Err(err) => Err(err.into()),
+        })
+    }
+
+    /// The tip of `notes_ref`; `None` when it does not exist.
+    ///
+    /// # Errors
+    ///
+    /// A store read.
+    pub fn note_tip(&self, notes_ref: &str) -> Result<Option<Oid>> {
+        self.with_repo(|repo| match repo.find_reference(notes_ref) {
+            Ok(reference) => Ok(reference.target()),
+            Err(err) if err.code() == ErrorCode::NotFound => Ok(None),
+            Err(err) => Err(err.into()),
+        })
+    }
+
+    /// Makes `text` the note of `commit` under `notes_ref`, in one new notes
+    /// commit whose parent is `expected` (the ref's tip, or `None` for a
+    /// ref not created yet), committed by `committer`; moves the ref from
+    /// `expected` only. The notes blob, tree and commit and the ref are
+    /// durable before it returns. Answers the new tip. Never rewrites: the
+    /// old tip stays the new commit's parent. A note goes where git's notes
+    /// layout already has it, or under the fan-out directory its id falls
+    /// in, else at the top.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Git`] when the ref is no longer at `expected`; a store write.
+    pub fn write_note(
+        &self,
+        notes_ref: &str,
+        commit: Oid,
+        text: &str,
+        committer: &git2::Signature<'_>,
+        expected: Option<Oid>,
+    ) -> Result<Oid> {
+        if !git2::Reference::is_valid_name(notes_ref) {
+            return Err(Error::Invalid(format!("reference name {notes_ref:?}")));
+        }
+        OBJECT_WRITES.fetch_add(1, Ordering::Relaxed);
+        let new = self.with_repo(|repo| {
+            let blob = repo.blob(text.as_bytes())?;
+            let parent = expected.map(|oid| repo.find_commit(oid)).transpose()?;
+            let base = parent.as_ref().map(git2::Commit::tree).transpose()?;
+            let tree = put_note(repo, base.as_ref(), &commit.to_string(), blob)?;
+            let tree = repo.find_tree(tree)?;
+            let parents: Vec<&git2::Commit<'_>> = parent.iter().collect();
+            Ok(repo.commit(
+                None,
+                committer,
+                committer,
+                &format!("Notes for {commit}\n"),
+                &tree,
+                &parents,
+            )?)
+        })?;
+        self.store.unsynced.store(true, Ordering::Release);
+        self.sync_objects()?;
+        self.ref_transaction(&[RefUpdate {
+            refname: notes_ref.to_owned(),
+            new: Some(new),
+            expected_old: expected,
+        }])?;
+        Ok(new)
+    }
+
+    /// Visits each commit reachable from `tips` with its raw message, as
+    /// `git log` streams it, in one Git child: no message is held after its
+    /// visit, and the child's output is never read whole.
+    ///
+    /// # Errors
+    ///
+    /// The child's failure; [`Error::Invalid`] for output that names no
+    /// commit.
+    pub fn for_each_commit_message(
+        &self,
+        tips: &[Oid],
+        mut visit: impl FnMut(Oid, &[u8]),
+    ) -> Result<()> {
+        if tips.is_empty() {
+            return Ok(());
+        }
+        let mut input = String::new();
+        for tip in tips {
+            input.push_str(&format!("{tip}\n"));
+        }
+        let mut cmd = self.command(true);
+        cmd.args(["log", "--stdin", "--no-color", "--format=%x01%H%n%B"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = crate::git_cli::counted(&mut cmd)?;
+        let piped = || io::Error::other("git log's pipes were not set up");
+        let stdin = child.stdin.take().ok_or_else(piped)?;
+        let stdout = child.stdout.take().ok_or_else(piped)?;
+        let mut stderr = child.stderr.take().ok_or_else(piped)?;
+        let mut record = Vec::new();
+        let (read, written, drained) = std::thread::scope(|scope| {
+            let writer = scope.spawn(move || {
+                let mut stdin = stdin;
+                stdin.write_all(input.as_bytes())
+            });
+            let drain = scope.spawn(move || {
+                let mut bytes = Vec::new();
+                stderr.read_to_end(&mut bytes).map(|_| bytes)
+            });
+            // `stdout` is dropped when this returns, so a child still writing
+            // after a bad record ends on a closed pipe instead of blocking.
+            let read = read_records(stdout, &mut record, &mut visit);
+            let join = |what| io::Error::other(format!("git log's {what} thread panicked"));
+            (
+                read,
+                writer.join().map_err(|_| join("stdin")),
+                drain.join().map_err(|_| join("stderr")),
+            )
+        });
+        let status = child.wait()?;
+        let stderr = drained??;
+        // A bad record first: its closed pipe is also why the child failed.
+        read?;
+        if !status.success() {
+            return Err(classify(&stderr));
+        }
+        written??;
+        // The last record ends at the end of the output: whole only once the
+        // child has succeeded.
+        if !record.is_empty() {
+            visit_record(&record, &mut visit)?;
+        }
+        Ok(())
     }
 
     /// What is lost of each tip's commit, tree and blobs, parents not walked.
@@ -249,32 +445,6 @@ impl TreeGit {
             missing.push(parse_oid(oid)?);
         }
         Ok(missing)
-    }
-
-    /// Each commit reachable from `tips` with its raw message, in one Git
-    /// child, not one per commit.
-    pub fn commit_messages(&self, tips: &[Oid]) -> Result<Vec<(Oid, Vec<u8>)>> {
-        if tips.is_empty() {
-            return Ok(Vec::new());
-        }
-        let mut input = String::new();
-        for tip in tips {
-            input.push_str(&format!("{tip}\n"));
-        }
-        let out = self.run(
-            &["log", "--stdin", "--no-color", "--format=%x01%H%n%B"],
-            Some(input.as_bytes()),
-            true,
-        )?;
-        let mut commits = Vec::new();
-        for record in out.stdout.split(|b| *b == 1).filter(|r| !r.is_empty()) {
-            let (oid, message) = match record.iter().position(|b| *b == b'\n') {
-                Some(end) => (&record[..end], &record[end + 1..]),
-                None => (record, &[][..]),
-            };
-            commits.push((parse_oid(oid)?, message.to_vec()));
-        }
-        Ok(commits)
     }
 
     fn command(&self, bare: bool) -> Command {
@@ -805,6 +975,52 @@ fn output(mut cmd: Command) -> io::Result<Output> {
     crate::git_cli::counted(&mut cmd)?.wait_with_output()
 }
 
+/// Where each record of `git log --format=%x01%H%n%B` starts.
+const RECORD_START: u8 = 1;
+
+/// Reads `git log --format=%x01%H%n%B` output, visiting each record as the
+/// next one's start ends it. `record`, one buffer reused for every record,
+/// holds the last one when this returns: only the end of the output ends it.
+fn read_records(
+    stdout: std::process::ChildStdout,
+    record: &mut Vec<u8>,
+    visit: &mut impl FnMut(Oid, &[u8]),
+) -> Result<()> {
+    let mut reader = io::BufReader::new(stdout);
+    let mut first = true;
+    loop {
+        record.clear();
+        if reader.read_until(RECORD_START, record)? == 0 {
+            return Ok(());
+        }
+        if record.last() != Some(&RECORD_START) {
+            // The end of the output: the last record, left in `record`.
+            return Ok(());
+        }
+        record.pop();
+        if first {
+            // Nothing comes before the first record's start.
+            if !record.is_empty() {
+                return Err(Error::Invalid("git log output before a commit".into()));
+            }
+            first = false;
+            continue;
+        }
+        visit_record(record, visit)?;
+    }
+}
+
+/// One record, `<id>\n<message>\n`: the message as stored, without the
+/// newline `--format` ends every record with.
+fn visit_record(record: &[u8], visit: &mut impl FnMut(Oid, &[u8])) -> Result<()> {
+    let (oid, message) = match record.iter().position(|b| *b == b'\n') {
+        Some(end) => (&record[..end], &record[end + 1..]),
+        None => (record, &[][..]),
+    };
+    visit(parse_oid(oid)?, trim(message));
+    Ok(())
+}
+
 // Spawn, feed stdin and wait. The exit status wins over a failed stdin write: a
 // git that died of a full disk also breaks the pipe, and stderr says why.
 fn run_command(mut cmd: Command, input: Option<&[u8]>) -> Result<Output> {
@@ -839,6 +1055,57 @@ fn run_command(mut cmd: Command, input: Option<&[u8]>) -> Result<Output> {
         result?;
     }
     Ok(output)
+}
+
+/// The lines of `packed-refs` a ref rebuild keeps: its header, and each
+/// `refs/notes/` ref with the peeled line after it.
+fn notes_lines(packed: &[u8]) -> Vec<&[u8]> {
+    let mut kept = Vec::new();
+    let mut keeping = false;
+    for line in packed.split_inclusive(|b| *b == b'\n') {
+        if line.starts_with(b"#") {
+            kept.push(line);
+        } else if line.starts_with(b"^") {
+            if keeping {
+                kept.push(line);
+            }
+        } else {
+            let name = line.splitn(2, |b| *b == b' ').nth(1).unwrap_or_default();
+            keeping = name.starts_with(b"refs/notes/");
+            if keeping {
+                kept.push(line);
+            }
+        }
+    }
+    kept
+}
+
+/// `tree` (a notes tree, `None` for none yet) with `blob` as the note at
+/// `hex`: in the fan-out directory whose name prefixes it, if there is one,
+/// else at this level, over any note there. Answers the new tree.
+fn put_note(
+    repo: &Repository,
+    tree: Option<&git2::Tree<'_>>,
+    hex: &str,
+    blob: Oid,
+) -> std::result::Result<Oid, git2::Error> {
+    let mut builder = repo.treebuilder(tree)?;
+    if let Some(tree) = tree {
+        for entry in tree.iter() {
+            let Ok(name) = entry.name() else { continue };
+            if entry.kind() == Some(ObjectType::Tree)
+                && name.len() < hex.len()
+                && hex.starts_with(name)
+            {
+                let sub = repo.find_tree(entry.id())?;
+                let id = put_note(repo, Some(&sub), &hex[name.len()..], blob)?;
+                builder.insert(name, id, 0o040_000)?;
+                return builder.write();
+            }
+        }
+    }
+    builder.insert(hex, blob, 0o100_644)?;
+    builder.write()
 }
 
 fn replace_file(dir: &Path, name: &str, bytes: &[u8]) -> io::Result<()> {
@@ -1071,6 +1338,54 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
     }
+    /// Each commit two tips reach (one a merge, the other reached from it
+    /// too) is visited once, with its message's exact bytes; a tip that is
+    /// no commit fails.
+    #[test]
+    fn each_commit_message_is_streamed_once_and_whole() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = TreeGit::init(temp.path().join("repo.git")).unwrap();
+        repo.write_config("refs/heads/root", &BTreeMap::new())
+            .unwrap();
+        let git = Repository::open(temp.path().join("repo.git")).unwrap();
+        let tree = git
+            .find_tree(git.treebuilder(None).unwrap().write().unwrap())
+            .unwrap();
+        let sig = git2::Signature::new("t", "t@example.com", &git2::Time::new(0, 0)).unwrap();
+        let commit = |message: &str, parents: &[Oid]| {
+            let parents: Vec<git2::Commit<'_>> = parents
+                .iter()
+                .map(|p| git.find_commit(*p).unwrap())
+                .collect();
+            let parents: Vec<&git2::Commit<'_>> = parents.iter().collect();
+            git.commit(None, &sig, &sig, message, &tree, &parents)
+                .unwrap()
+        };
+        let a = commit("one\n\nAgentfs-Event: 1\n", &[]);
+        let b = commit("two", &[a]);
+        let c = commit("three\n\n\n", &[a]);
+        let m = commit("merge\n", &[b, c]);
+        let mut seen: Vec<(Oid, Vec<u8>)> = Vec::new();
+        repo.for_each_commit_message(&[m, c], |oid, message| seen.push((oid, message.to_vec())))
+            .unwrap();
+        seen.sort();
+        let mut want: Vec<(Oid, Vec<u8>)> = [a, b, c, m]
+            .into_iter()
+            .map(|oid| (oid, git.find_commit(oid).unwrap().message_bytes().to_vec()))
+            .collect();
+        want.sort();
+        assert_eq!(seen, want);
+        let mut none = 0;
+        repo.for_each_commit_message(&[], |_, _| none += 1).unwrap();
+        assert_eq!(none, 0);
+        let bad = Oid::from_str("1234567890123456789012345678901234567890").unwrap();
+        assert!(
+            repo.for_each_commit_message(&[bad], |_, _| none += 1)
+                .is_err()
+        );
+        assert_eq!(none, 0);
+    }
+
     #[test]
     fn killed_parent_leaves_lease_until_git_exits() {
         // Stop on parent death to inspect the lease, then exercise the actual

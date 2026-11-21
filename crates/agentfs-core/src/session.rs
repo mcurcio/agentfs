@@ -9,6 +9,7 @@
 //! Lock order: the tree actor's lock, then the bindings'.
 
 use std::collections::BTreeMap;
+use std::ops::DerefMut;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
@@ -122,14 +123,35 @@ impl TreeSession {
     /// [`Error::Stopped`] when the actor stopped.
     pub fn lock(&self) -> Result<SessionGuard<'_>> {
         let actor = self.sessions.recording.actor()?;
-        let writes_as = match self.sessions.bindings().get(&self.id) {
-            Some(SessionAuthority::Write(cap)) => Some(cap.writes_as().clone()),
-            _ => None,
-        };
+        let writes_as = self.writes_as();
         Ok(SessionGuard {
-            actor,
+            actor: Box::new(actor),
             tree: self.tree,
             writes_as,
+        })
+    }
+
+    /// The session's writer, read from its binding: none once unbound or
+    /// for a read-only session.
+    fn writes_as(&self) -> Option<WriterAt> {
+        match self.sessions.bindings().get(&self.id) {
+            Some(SessionAuthority::Write(cap)) => Some(cap.writes_as().clone()),
+            _ => None,
+        }
+    }
+
+    /// RELEASE of this session's open `handle` ([`Recording::close_with`]):
+    /// checked as the session's own under the lock, decided with the lock
+    /// released, so the volume's other views go on meanwhile. Saved before
+    /// it returns.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NotFound`] for an open that is not this session's; as
+    /// [`TreeActor::close`].
+    pub fn close(&self, handle: u64) -> Result<Saved> {
+        self.sessions.recording.close_with(handle, |actor| {
+            own(actor, self.tree, self.writes_as().as_ref(), handle)
         })
     }
 
@@ -164,10 +186,21 @@ impl TreeSession {
     }
 }
 
+/// `handle` is an open of `tree` by the writer `writes_as`.
+fn own(actor: &TreeActor, tree: TreeId, writes_as: Option<&WriterAt>, handle: u64) -> Result<()> {
+    let (of, writer) = actor.open_by(handle)?;
+    match writes_as {
+        Some(by) if of == tree && *writer == by.writer => Ok(()),
+        _ => Err(Error::NotFound),
+    }
+}
+
 /// The actor locked for one session: [`TreeActor`]'s calls of the same name,
-/// with the session's tree and writer.
+/// with the session's tree and writer. The lock is [`Recording::actor`]'s
+/// guard, measured as every hold is; it is held boxed because the guard's
+/// type is not named outside the tree actor.
 pub struct SessionGuard<'a> {
-    actor: MutexGuard<'a, TreeActor>,
+    actor: Box<dyn DerefMut<Target = TreeActor> + 'a>,
     tree: TreeId,
     writes_as: Option<WriterAt>,
 }
@@ -180,11 +213,7 @@ impl SessionGuard<'_> {
 
     /// `handle` is an open of this session's tree and writer.
     fn own(&self, handle: u64) -> Result<()> {
-        let (tree, writer) = self.actor.open_by(handle)?;
-        match &self.writes_as {
-            Some(by) if tree == self.tree && *writer == by.writer => Ok(()),
-            _ => Err(Error::NotFound),
-        }
+        own(&self.actor, self.tree, self.writes_as.as_ref(), handle)
     }
 
     pub fn read(&self, path: &str) -> Result<Vec<u8>> {

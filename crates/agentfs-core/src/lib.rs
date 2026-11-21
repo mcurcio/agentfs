@@ -10,6 +10,7 @@
 //! [`events::Event`]s, and [`telemetry::Telemetry`] turns them, with the
 //! engine's own measurements and spans, into OpenTelemetry signals.
 
+pub mod allocator;
 pub mod checkpoint;
 pub mod checks;
 pub mod claims;

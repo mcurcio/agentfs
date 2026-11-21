@@ -76,6 +76,7 @@ exporter.
 | `agentfs.telemetry.export_failures` | counter, per signal | Telemetry exports (traces, metrics, logs) that failed; counted by the binary, exported once metrics get through |
 | `agentfs.front.round_trip` | histogram, by request | A front's round trip to the history service (`record`, `tracked`, `ping`), in seconds |
 | `agentfs.front.service_failures` | counter, by stage | A front's failed requests to the history service: `connect`, `timeout`, `request` (connection lost or malformed reply), `refused`, `service` |
+| `agentfs.history.unverified` | gauge, by `verdict` | A tree volume's saves history flagged because the builder's replay did not match the save's record: `unresolved` (no verdict yet, or a verdict note that does not parse) and `mismatch_confirmed` (a later release's check still differs), both always observed, zero included; read from history at each start ([trees](trees.md#when-history-cannot-check-a-save)). Alert `AgentfsHistoryUnverified` |
 | `agentfs.history_service.fronts` | gauge | Fronts connected to this history service |
 | `agentfs.history_service.superseded` | counter | Front writes the history service skipped because a newer state of the path was already journaled (freeze stamps) |
 | `agentfs.history_service.resyncs` | counter | Paths the history service recorded again as the backing tree has them, after a front's change it could not order (identical stamps from two slots, a late removal or symlink) |

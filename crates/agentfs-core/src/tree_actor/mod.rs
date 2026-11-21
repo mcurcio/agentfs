@@ -49,18 +49,23 @@ use history::builder::{BuildState, Builder, JournalReader, copy_all};
 pub use history::built::{BuildError, BuiltSnapshot, Health, History, Lag, TreeLag, WaitError};
 use history::built_log::{self, BuiltLog};
 use history::message::Message;
+use history::repack::Repacker;
 use history::upstreams::Upstreams;
-use history::{
-    check_objects, clean_packs, objects_of, read_trees, refs, remove_stale_locks, sync_marker,
+use history::verify;
+pub use history::verify::{
+    Checked, EVIDENCE_REF, Flag, Outcome, UnverifiedCounts, VERIFY_REF, Verdict, Verification,
+    VerifyReport, release, verify_flagged,
 };
+use history::{check_objects, clean_packs, read_trees, refs, remove_stale_locks, sync_marker};
 pub use journal::durable::{Durability, DurableError, RecordNo};
 use journal::{
-    Change, Entry, FoldedOpen, Journal, PointerChange, Record, Replay, RowRecord, Target,
+    Change, Entry, Journal, PointerChange, Record, Replay, RowRecord, SaveOutcome, Target,
     compact_at, fold,
 };
 pub use meta::{Attrs, Kind, Meta, Perm, SetTime, Times};
 use pointers::Pointers;
 pub use recording::file_map::FileMapReader;
+pub use recording::layout::Fingerprint;
 pub use recording::{DirEntry, FileMap, Node, RenameMode};
 use recording::{Handle, pages};
 use rows::SavedRows;
@@ -69,7 +74,7 @@ use stages::Stages;
 use tree::{EventNumber, SavedTree};
 pub use untracked::{AreaWrite, UntrackedArea};
 
-const FORMAT: &str = "agentfs-trees-11\n";
+const FORMAT: &str = "agentfs-trees-13\n";
 /// The volume identity file: [`VolumeIdentity`] as JSON, written once by
 /// [`TreeActor::create`], read before any write at every open.
 const IDENTITY: &str = "volume";
@@ -297,11 +302,15 @@ pub struct TreeActor {
     /// The one owner of the Git store; the builder runs behind it.
     history: History,
     builder: Option<JoinHandle<()>>,
+    /// The history's repack task, beside the builder; stopped after it.
+    repacker: Option<Repacker>,
     /// The pointers as the journal's records name them.
     pointers: Pointers<Target>,
     /// Each fork's upstream. The root has none.
     upstreams: Upstreams,
     trees: BTreeMap<TreeId, SavedTree>,
+    /// The built point the saved trees rest on ([`SavedTree::rebuilt`]).
+    rebuilt: RecordNo,
     /// Each row chain's row, as the journal's records leave them.
     rows: SavedRows,
     /// The tree each queue entry came from: the step's tree that queued it.
@@ -334,6 +343,8 @@ pub struct TreeActor {
     rules: Arc<agentfs_rules::RuleSet>,
     /// Each tree's untracked area and its hold.
     areas: untracked::Areas,
+    /// The flagged commits by state, which the alarm's gauge reads.
+    verification: Verification,
     _lock: Arc<FileLock>,
 }
 
@@ -351,6 +362,8 @@ struct Started {
     /// The rows and queue entries' sources as of the journal's last record.
     rows: SavedRows,
     sources: BTreeMap<String, TreeId>,
+    /// The flagged commits by state, as history holds them.
+    verification: Verification,
 }
 
 /// What a state area holds: reads `format` and `volume` only, takes no lock,
@@ -730,33 +743,16 @@ impl TreeActor {
         let pointers = resolve_pointers(&at_built.pointers, &values)?;
         check_objects(&repo, &pointers)?;
         // Object numbers, directory numbers and times as of the built point:
-        // the checkpoint's, moved by the steps built after it, on the trees as
-        // the checkpoint has them.
+        // the checkpoint's, moved by what each batch built after it moved, as
+        // its built-log entry says. No tree is read for them.
         let (objects, locals) = if built > folded_built {
             let checkpoint = fold(&frames[..1])?;
-            let at_checkpoint = resolve_pointers(&checkpoint.pointers, &values)?;
-            let mut trees = read_trees(&repo, &at_checkpoint, &checkpoint.objects, |_, _, _| {
-                Ok(Arc::default())
-            })?;
-            restore_locals(&mut trees, &checkpoint.locals)?;
-            let trees = trees
-                .iter()
-                .map(|(tree, t)| (*tree, SavedTree::of(t)))
-                .collect();
-            let mut replay = Replay::shapes(trees, &checkpoint.opens)?;
-            for (record, tail) in &frames[1..upto] {
-                replay.apply(record, tail)?;
+            let (mut objects, mut locals) = (checkpoint.objects, checkpoint.locals);
+            for entry in entries.iter().filter(|entry| entry.through > folded_built) {
+                for moved in &entry.moved {
+                    moved.apply(&mut objects, &mut locals)?;
+                }
             }
-            let objects = replay
-                .trees
-                .iter()
-                .map(|(tree, t)| Ok((*tree, objects_of(&t.shape)?)))
-                .collect::<Result<_>>()?;
-            let locals = replay
-                .trees
-                .iter()
-                .map(|(tree, t)| (*tree, t.shape.locals()))
-                .collect();
             (objects, locals)
         } else {
             (at_built.objects.clone(), at_built.locals.clone())
@@ -780,7 +776,8 @@ impl TreeActor {
         at_built
             .upstreams
             .check_recovered(|fork| trees.contains_key(&fork))?;
-        let owners = history::owners(&repo, &pointers)?;
+        let (owners, flagged) = history::owners(&repo, &pointers)?;
+        let verification = Self::check_flags_at_start(&repo, &flagged, service);
         // The saved state: the built trees with every record after the built
         // point replayed on them, as the actor applied it at the call. Open
         // never waits for the builder, which starts from the same trees.
@@ -816,10 +813,7 @@ impl TreeActor {
             &owners,
             heads,
         )?;
-        let objects = objects
-            .into_iter()
-            .map(|(tree, objects)| (tree, Arc::new(objects)))
-            .collect();
+        let objects = objects.into_iter().collect();
         let history = History::new(repo, built, pointers.clone(), owners, objects);
         history.checkpointed(folded_built);
         // The steps replayed past the built point are the builder's to build,
@@ -841,7 +835,7 @@ impl TreeActor {
             copied: pointers,
             checked_out,
             stale: false,
-            log: entries,
+            verification: verification.clone(),
         };
         let owner = crate::failpoints::owner();
         let handle = std::thread::Builder::new()
@@ -859,7 +853,38 @@ impl TreeActor {
             trees: replay.trees,
             rows,
             sources,
+            verification,
         })
+    }
+
+    /// The flagged commits' counts, from history: before the builder
+    /// starts, under the volume's lock, each standing flag this release has
+    /// not judged is checked again ([`verify::check_flags`]), its verdict
+    /// committed with the service's identity now. A failure of the check is
+    /// logged and never stops the start.
+    fn check_flags_at_start(
+        repo: &crate::tree_git::TreeGit,
+        flagged: &[verify::Unverified],
+        service: &PodContext,
+    ) -> Verification {
+        let verification = Verification::default();
+        if flagged.is_empty() {
+            return verification;
+        }
+        if let Some(release) = verify::release() {
+            let checked = verify::verdict_committer(service).and_then(|committer| {
+                verify::check_flags(repo, flagged, Some(release), &committer)
+            });
+            if let Err(e) = checked {
+                eprintln!(
+                    "tree HistoryVerifyFailed: the check of flagged saves at start: {e}; their \
+                     flags stand (docs/runbooks/recording-failures.md)"
+                );
+            }
+        }
+        let commits: Vec<Oid> = flagged.iter().map(|flag| flag.commit).collect();
+        verification.set(verify::Notes::read(repo).counts(&commits));
+        verification
     }
 
     /// The rows and the queue entries' sources as of the journal's last
@@ -925,6 +950,7 @@ impl TreeActor {
             trees,
             rows,
             sources,
+            verification,
         } = Self::start_history(
             &root,
             &lock,
@@ -943,10 +969,12 @@ impl TreeActor {
             journal,
             history,
             builder: Some(builder),
+            repacker: None,
             // As the records name them: a step not yet built by its number.
             pointers: folded.pointers,
             upstreams: folded.upstreams,
             trees,
+            rebuilt: built,
             rows,
             sources,
             handles: BTreeMap::new(),
@@ -966,23 +994,19 @@ impl TreeActor {
             compacted: (RecordNo::ZERO, BTreeMap::new()),
             rules,
             areas: untracked::Areas::new(&root),
+            verification,
             _lock: lock,
         };
+        // After the builder, and once the volume stops it on any error below.
+        volume.repacker = Some(Repacker::start(
+            volume.history.clone(),
+            root.join("history.git"),
+        )?);
         volume.areas.sweep(&volume.trees())?;
-        for (handle, FoldedOpen { open, calls }) in folded.opens {
-            volume.handles.insert(
-                handle,
-                Handle {
-                    tree: open.tree,
-                    by: open.by,
-                    object: open.object,
-                    // Nothing reads it: this handle closes before serving.
-                    bytes: FileMap::empty(),
-                    calls,
-                    replayed: None,
-                },
-            );
-            volume.pages_opened(open.tree, open.object);
+        for (handle, open) in folded.opens {
+            let (tree, object) = (open.open.tree, open.open.object);
+            volume.handles.insert(handle, Handle::recovered(open));
+            volume.pages_opened(tree, object);
         }
         let mut page_writes = folded.page_writes;
         let saved = folded.saved_through;
@@ -1490,9 +1514,13 @@ impl TreeActor {
         }
         let cost = change.build_cost()?;
         let rows: Vec<RowRecord> = rows.into_iter().map(RowWrite::record).collect();
-        // A take's step comes after its chunk records.
+        // A take's step, and a save's, comes after its chunk records.
         let ahead = match &change {
             Change::Take { take, .. } => take.chunks,
+            Change::Save {
+                outcome: SaveOutcome::Saved { chunks, .. },
+                ..
+            } => *chunks,
             _ => 0,
         };
         let mut pointers = pointers;
@@ -1570,17 +1598,19 @@ impl TreeActor {
     /// save takes it too.
     fn rebase_built(&mut self) {
         for (tree, object, map) in self.history.take_maps() {
-            let Some(saved) = self
-                .trees
-                .get_mut(&tree)
-                .and_then(|t| t.bytes.get_mut(&object))
-            else {
+            let Some(t) = self.trees.get_mut(&tree) else {
+                continue;
+            };
+            let Some(saved) = t.bytes.get(&object) else {
                 continue;
             };
             if map.step().is_none() || saved.step() != map.step() || saved.len() != map.len() {
                 continue;
             }
-            *saved = map.clone();
+            // A map the built layer gives is the builder's already.
+            if let Some(saved) = t.bytes.changed_mut(&object) {
+                *saved = map.clone();
+            }
             for handle in self.handles.values_mut() {
                 if handle.tree == tree
                     && handle.object == object
@@ -1592,8 +1622,48 @@ impl TreeActor {
         }
     }
 
-    /// After a step is applied: a compaction when one is due.
+    /// A built or failed event reached the view's worker (`Recording::progress`):
+    /// what the actor does at once, without waiting for its next step. Bounded:
+    /// O(1) plus the batch's maps and what changed since the last built point.
+    /// Lock order: the actor, then History.
+    pub(in crate::tree_actor) fn on_built(&mut self) {
+        self.rebuild();
+        self.rebase_built();
+    }
+
+    /// Moves every saved tree onto the builder's at the built point, when it
+    /// moved: what is built is held once, the builder's, and only what the
+    /// actor's steps changed since is the actor's own. Every step so far is
+    /// applied, so each change of no known step is at or before the last
+    /// record. That record may be no step (a call, an open), which the
+    /// builder is not asked to build: when entries are left past the built
+    /// point, the builder is asked to build through it, so the overlay is
+    /// let go at that build even if no step follows (docs/trees.md, "History
+    /// trails the files").
+    fn rebuild(&mut self) {
+        let Some((through, built)) = self.history.built_trees(self.rebuilt) else {
+            return;
+        };
+        let last = EventNumber::new(self.next.saturating_sub(1));
+        let through_step = EventNumber::new(through.get());
+        let mut left = false;
+        for (tree, saved) in &mut self.trees {
+            saved.seal(last);
+            if let Some(built) = built.get(tree) {
+                saved.rebuilt(built, through_step);
+            }
+            left |= saved.overlay_bytes() > 0;
+        }
+        self.rebuilt = through;
+        if left && last.get() > through.get() {
+            self.history.want_through(RecordNo::new(last.get()));
+        }
+    }
+
+    /// After a step is applied: the saved trees onto a new built point, and a
+    /// compaction when one is due.
     fn after_step(&mut self) {
+        self.rebuild();
         self.compact_if_due();
     }
 }
@@ -1607,6 +1677,10 @@ impl TreeActor {
         self.history.stop(appended);
         if let Some(builder) = self.builder.take() {
             let _ = builder.join();
+        }
+        // History has stopped: the task ends, killing a repack in progress.
+        if let Some(repacker) = self.repacker.take() {
+            repacker.join();
         }
     }
 }
@@ -1904,6 +1978,9 @@ mod tests {
             "agentfs-trees-7\n",
             "agentfs-trees-8\n",
             "agentfs-trees-9\n",
+            "agentfs-trees-10\n",
+            "agentfs-trees-11\n",
+            "agentfs-trees-12\n",
         ] {
             let tmp = tempfile::tempdir().unwrap();
             drop(new_actor(tmp.path()));
@@ -2040,6 +2117,121 @@ mod tests {
         unreachable!("killed");
     }
 
+    /// Every entry of every tree as a view presents it (number, metadata,
+    /// times, length, links), by tree and path.
+    fn every_node(v: &TreeActor) -> BTreeMap<(TreeId, String), Node> {
+        let mut nodes = BTreeMap::new();
+        for tree in v.trees() {
+            let mut dirs = vec![String::new()];
+            while let Some(dir) = dirs.pop() {
+                nodes.insert((tree, dir.clone()), v.node(tree, &dir).unwrap());
+                for entry in v.children(tree, &dir, 0, usize::MAX).unwrap() {
+                    let path = if dir.is_empty() {
+                        entry.name
+                    } else {
+                        format!("{dir}/{}", entry.name)
+                    };
+                    if entry.kind == Kind::Dir {
+                        dirs.push(path);
+                    } else {
+                        nodes.insert((tree, path.clone()), v.node(tree, &path).unwrap());
+                    }
+                }
+            }
+        }
+        nodes
+    }
+
+    /// A saved file at `path` of `tree`, its path its content.
+    fn put(v: &mut TreeActor, tree: TreeId, path: &str) {
+        let h = v.write_open(tree, path, &writer("w"), Some(ATTRS)).unwrap();
+        v.write(h, 0, path.as_bytes(), false).unwrap();
+        v.close(h).unwrap();
+    }
+
+    /// One of each step a restart must carry over: files, a mkdir, a
+    /// directory rename, a set of times, and a fork with a file whose landing
+    /// the root takes. Returns the fork.
+    fn one_of_each(v: &mut TreeActor, round: &str) -> TreeId {
+        let w = writer("w");
+        put(v, ROOT, &format!("{round}-a"));
+        put(v, ROOT, &format!("{round}-b"));
+        v.mkdir(ROOT, &format!("{round}-d"), ATTRS, &w).unwrap();
+        put(v, ROOT, &format!("{round}-d/f"));
+        v.rename(
+            ROOT,
+            &format!("{round}-d"),
+            &format!("{round}-moved"),
+            RenameMode::NoReplace,
+            &w,
+        )
+        .unwrap();
+        v.set_times(
+            ROOT,
+            &format!("{round}-a"),
+            Some(SetTime::At(7_000)),
+            Some(SetTime::At(9_000)),
+            &w,
+        )
+        .unwrap();
+        v.set_times(
+            ROOT,
+            &format!("{round}-moved"),
+            None,
+            Some(SetTime::At(11_000)),
+            &w,
+        )
+        .unwrap();
+        let fork = rowless_fork(v);
+        put(v, fork, &format!("{round}-forked"));
+        while v.take_next(ROOT).unwrap() == Took::Taken {}
+        fork
+    }
+
+    /// A start after a kill, its built point past its checkpoint, reads each
+    /// tree once: the checkpoint's object numbers and locals are carried to
+    /// the built point by the built log's moves, never by reading the trees
+    /// at the checkpoint. Every entry comes back with its number, times and
+    /// mode, a fork dropped after the checkpoint included.
+    #[test]
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "the engine's drop, below the store"
+    )]
+    fn a_restart_after_a_kill_reads_each_tree_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut v = new_actor(tmp.path());
+        let first = one_of_each(&mut v, "one");
+        v.settle().unwrap();
+        v.compact().unwrap();
+        let second = one_of_each(&mut v, "two");
+        put(&mut v, second, "kept-in-fork");
+        v.set_times(ROOT, "one-b", Some(SetTime::At(13_000)), None, &writer("w"))
+            .unwrap();
+        v.unlink(ROOT, "two-b", &writer("w")).unwrap();
+        v.settle().unwrap();
+        v.drop_fork(first, |_| Ok(Vec::new())).unwrap();
+        v.settle().unwrap();
+        let before = every_node(&v);
+        assert!(before.keys().any(|(tree, _)| *tree == second));
+        assert!(!before.keys().any(|(tree, _)| *tree == first));
+        // No compaction at the stop: the built point is past the checkpoint.
+        drop(v);
+        let Entry::Checkpoint { built, .. } = frames_of(tmp.path())[0].0.entry else {
+            panic!("the journal starts at the checkpoint");
+        };
+        let (_, entries) = BuiltLog::open(&tmp.path().join("built.log")).unwrap();
+        assert!(built_log::built_through(&entries) > built);
+        history::TREE_READS.with(|n| n.set(0));
+        let v = reopen(tmp.path());
+        assert_eq!(
+            history::TREE_READS.with(std::cell::Cell::get),
+            1,
+            "a start reads each tree once"
+        );
+        assert_eq!(every_node(&v), before);
+    }
+
     #[test]
     fn restart_replays_from_the_checkpoint() {
         use std::os::unix::process::ExitStatusExt;
@@ -2135,5 +2327,36 @@ mod tests {
         let v = reopen(tmp.path());
         assert_eq!(v.read(ROOT, "log").unwrap(), b"line\nline\nline\n");
         assert_eq!(v.read(ROOT, "big").unwrap().len(), 66 << 20);
+    }
+
+    /// The built event wakes the actor: once a close's save is built, one
+    /// `progress` (what a view's worker runs at each built event) takes the
+    /// builder's map read from the checkout, with no further step, and the
+    /// saved map lets go of its journal frames.
+    #[test]
+    fn a_built_event_lets_the_saved_map_go_of_its_frames_without_a_step() {
+        let tmp = tempfile::tempdir().unwrap();
+        let identity = VolumeIdentity {
+            name: agentfs_contracts::name::VolumeName::parse("test").unwrap(),
+            id: agentfs_contracts::volume::VolumeId(uuid::Uuid::from_u128(1)),
+        };
+        let rec = Recording::create(tmp.path(), &identity, None, &PodContext::default()).unwrap();
+        let h = rec
+            .actor()
+            .unwrap()
+            .write_open(ROOT, "a", &writer("w"), Some(ATTRS))
+            .unwrap();
+        rec.actor().unwrap().write(h, 0, b"bytes", false).unwrap();
+        rec.actor().unwrap().close(h).unwrap();
+        rec.settle().unwrap();
+        let on_frames = || {
+            let actor = rec.actor().unwrap();
+            let object = actor.object_at(ROOT, "a").unwrap();
+            actor.trees[&ROOT].bytes[&object].on_frames()
+        };
+        assert!(on_frames(), "no step has taken the built map yet");
+        rec.progress().unwrap();
+        assert!(!on_frames(), "the built event took the built map");
+        assert_eq!(rec.actor().unwrap().read(ROOT, "a").unwrap(), b"bytes");
     }
 }

@@ -15,6 +15,7 @@
 //! ancestors retained; a line's identity is independent of a filesystem object's
 //! identity.
 
+use std::cmp::Reverse;
 use std::collections::BTreeMap;
 use std::fmt;
 use std::fs::File;
@@ -504,6 +505,8 @@ fn canonical_overs<V: Id>(mut overs: Vec<Over<V>>) -> Result<Vec<Over<V>>, Error
         }
         out.push(o);
     }
+    // Exact: a built map is kept for as long as its file is.
+    out.shrink_to_fit();
     Ok(out)
 }
 
@@ -614,8 +617,10 @@ impl<V: Id> LineMap<V> {
             }
             runs.push(run);
         }
+        let mut lines = runs.0;
+        lines.shrink_to_fit();
         let map = Self {
-            lines: runs.0,
+            lines,
             ancestors: canonical_overs(ancestors)?,
         };
         map.validate()?;
@@ -989,8 +994,10 @@ impl<V: Id> LineMap<V> {
             }
         }
         cursor.copy_until_live(old_index.count, &mut out);
+        let mut lines = out.0;
+        lines.shrink_to_fit();
         let result = Self {
-            lines: out.0,
+            lines,
             ancestors: canonical_overs(ancestors)?,
         };
         result.validate()?;
@@ -1019,8 +1026,8 @@ fn read_byte(image: &dyn Image, at: u64) -> io::Result<Option<u8>> {
     Ok((image.read_at(&mut b, at)? == 1).then_some(b[0]))
 }
 
-/// Where a source's live runs are in its image: each with its first version,
-/// its line count and its first byte, sorted by version.
+/// Where a source's live run is in its image: its first version, its line
+/// count and its first byte.
 struct Placed<V> {
     version: V,
     count: u64,
@@ -1039,7 +1046,10 @@ pub struct Piece {
 /// Where each live line of `map` is in `sources` (each a map and the image it
 /// describes), as parts of their images in file order: how a file made of
 /// lines from other files (a take's) is written without holding its bytes. A
-/// version's bytes are the same in every file that holds it live.
+/// version's bytes are the same in every file that holds it live. Two sources
+/// can hold runs of the same versions with different extents (one rewrote a
+/// line the other kept); each line comes from a source whose run holds it, the
+/// one holding the most lines from it, the first such source on a tie.
 ///
 /// # Errors
 ///
@@ -1049,9 +1059,11 @@ pub fn pieces<V: Id>(
     map: &LineMap<V>,
     sources: &[(&LineMap<V>, &dyn Image)],
 ) -> Result<Vec<Piece>, Error> {
-    let mut placed: Vec<(usize, Placed<V>)> = Vec::new();
-    for (s, (source, image)) in sources.iter().enumerate() {
+    // Each source's live runs, sorted by version: disjoint within one source.
+    let mut placed: Vec<Vec<Placed<V>>> = Vec::with_capacity(sources.len());
+    for (source, image) in sources {
         let mut at = 0;
+        let mut runs = Vec::new();
         for run in source.runs().iter().filter(|r| !r.dead) {
             let finished = run.count - u64::from(run.open.is_some());
             let start = at;
@@ -1059,34 +1071,33 @@ pub fn pieces<V: Id>(
             if let Some(len) = run.open {
                 at += len;
             }
-            placed.push((
-                s,
-                Placed {
-                    version: run.version,
-                    count: run.count,
-                    start,
-                    open: run.open,
-                },
-            ));
+            runs.push(Placed {
+                version: run.version,
+                count: run.count,
+                start,
+                open: run.open,
+            });
         }
+        runs.sort_by_key(|p| key(&p.version));
+        placed.push(runs);
     }
-    placed.sort_by_key(|(_, p)| key(&p.version));
-    let missing = Error::InvalidMap("a live line no source holds");
     let mut out: Vec<Piece> = Vec::new();
     for run in map.runs().iter().filter(|r| !r.dead) {
         let (mut v, mut left) = (run.version, run.count);
         while left > 0 {
-            let i = placed.partition_point(|(_, p)| key(&p.version) <= key(&v));
-            let (s, p) = i
-                .checked_sub(1)
-                .and_then(|i| placed.get(i))
+            let (s, p, skip) = placed
+                .iter()
+                .enumerate()
+                .filter_map(|(s, runs)| {
+                    let i = runs.partition_point(|p| key(&p.version) <= key(&v));
+                    let p = runs.get(i.checked_sub(1)?)?;
+                    let skip = v.index().wrapping_sub(p.version.index());
+                    (p.version.writer() == v.writer() && skip < p.count).then_some((s, p, skip))
+                })
+                .max_by_key(|&(s, p, skip)| (p.count - skip, Reverse(s)))
                 .ok_or(Error::InvalidMap("a live line no source holds"))?;
-            let skip = v.index().wrapping_sub(p.version.index());
-            if p.version.writer() != v.writer() || skip >= p.count {
-                return Err(missing);
-            }
             let n = (p.count - skip).min(left);
-            let image = sources[*s].1;
+            let image = sources[s].1;
             let start = skip_lines(image, p.start, skip)?;
             let takes_last = skip + n == p.count;
             let wants_open = left == n && run.open.is_some();
@@ -1099,7 +1110,7 @@ pub fn pieces<V: Id>(
                 skip_lines(image, start, n)?
             };
             let piece = Piece {
-                source: *s,
+                source: s,
                 offset: start,
                 len: end - start,
             };
@@ -1336,6 +1347,36 @@ mod tests {
                 len: 2
             }]
         );
+    }
+
+    /// Two sources can hold runs of the same versions with different extents: a
+    /// line comes from a source whose run holds it, not from whichever run of
+    /// those versions sorts last.
+    #[test]
+    fn a_line_two_sources_hold_comes_from_one_that_holds_it() {
+        // The taken tree rewrote the 4th line, so its run of the save stops at 3.
+        let base = save(&LineMap::default(), b"", b"a\nb\nc\nd\n", 1);
+        let head: &[u8] = b"a\nb\nc\nd\n";
+        let taken_bytes: &[u8] = b"a\nb\nc\nX\n";
+        let taken = save(&base, head, taken_bytes, 2);
+        assert_eq!(taken.runs()[0].count, 3);
+        let parts = pieces(&base, &[(&base, &head), (&taken, &taken_bytes)]).unwrap();
+        assert_eq!(render(&[&head, &taken_bytes], &parts).unwrap(), head);
+    }
+
+    /// A rewritten middle line splits the taken tree's run of a save in two
+    /// around a gap; the head's whole run of it still serves the line.
+    #[test]
+    fn a_line_one_source_rewrote_comes_from_another() {
+        let base = save(&LineMap::default(), b"", b"a\nb\nc\n", 1);
+        let head: &[u8] = b"a\nb\nc\n";
+        let taken_bytes: &[u8] = b"a\nX\nc\n";
+        let taken = save(&base, head, taken_bytes, 2);
+        let parts = pieces(&base, &[(&base, &head), (&taken, &taken_bytes)]).unwrap();
+        assert_eq!(render(&[&head, &taken_bytes], &parts).unwrap(), head);
+        // The taken tree's own lines still come from it alone.
+        let parts = pieces(&taken, &[(&base, &head), (&taken, &taken_bytes)]).unwrap();
+        assert_eq!(render(&[&head, &taken_bytes], &parts).unwrap(), taken_bytes);
     }
 
     #[test]

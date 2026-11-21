@@ -37,7 +37,7 @@ impl TreeActor {
                 .names
                 .iter()
                 .filter(|(path, _)| self.rules.never_records(path))
-                .map(|(path, object)| (path.clone(), *object))
+                .map(|(path, object)| (path.to_string(), *object))
                 .collect();
             if marked.is_empty() {
                 continue;
@@ -45,7 +45,7 @@ impl TreeActor {
             let area = self.areas.open(tree)?;
             for (path, object) in marked {
                 let t = self.tree(tree)?;
-                let meta = *t.meta.get(&object).ok_or(Error::Format)?;
+                let meta = *t.meta_of(object).ok_or(Error::Format)?;
                 let bytes = t.bytes.get(&object).ok_or(Error::Format)?;
                 {
                     let writing = area.writing();

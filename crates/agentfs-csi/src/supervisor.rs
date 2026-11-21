@@ -11,32 +11,53 @@
 //!   records the target in `<node-state>/published/<handle>.json`.
 //! - **Unpublish** asks the host to close the view (or detaches the target
 //!   when no host runs), removes the record and the target directory, and
-//!   stops the host once its last view is closed.
+//!   stops the host once the volume is idle.
 //! - **Starting a host** installs the profile's rule files (rules are read
-//!   when a volume opens), spawns the host and reads its hello, then opens
-//!   every recorded view of the volume whose target is still there
-//!   (stacked over a stale mount a crashed host left) and asks the host to
-//!   reconcile, which ends what no view uses any more.
-//! - **Stopping a host** drops its control channel: the host sees EOF. With
-//!   no view open (every stop the supervisor asks for) it drains and exits 0
-//!   once Volume has released the volume; with views open (the plugin's
-//!   shutdown) it exits 3 at once and leaves them stale for the next host.
+//!   when a volume opens), spawns the host and reads its hello (another
+//!   protocol version is refused, and never retried), then opens every
+//!   recorded view of the volume whose target is still there (stacked over
+//!   a stale mount a crashed host left) and asks the host to reconcile,
+//!   which ends what no view uses any more. Only then do other calls see
+//!   the host.
+//! - **Stopping a host** closes its control channel, whatever clones of its
+//!   client other tasks hold: the host sees EOF. With no view open (every
+//!   stop the supervisor asks for) it drains and exits 0 once Volume has
+//!   released the volume; with views open (the plugin's shutdown) it exits
+//!   3 at once and leaves them stale for the next host.
 //! - **A host that exits unasked** is started again after a backoff while
-//!   records of the volume remain, with every view replayed. A start that
-//!   fails is tried again with backoff. These delays are the only timers,
-//!   beside the launcher's bounded wait for a child's last log lines.
+//!   the volume is not idle, with every view replayed. A start that fails
+//!   is tried again with backoff. These delays are the only timers, beside
+//!   the launcher's bounded wait for a child's last log lines.
 //! - **Release** (DeleteVolume) starts the volume's host with no view and
 //!   stops it: its exit 0 is Volume's release verdict.
 //! - **Forks** (a fork claim's CreateVolume and DeleteVolume) are created
 //!   and ended by key on the source volume's host, started for the call
-//!   when none runs and stopped after it when no view of the volume is
-//!   open. A fork claim's view is published on that same host.
+//!   when none runs and stopped after it when the volume is idle. A fork
+//!   claim's view is published on that same host.
 //! - **Reconcile**, at plugin start, drops the records whose target is
 //!   gone, starts a host per volume that still has views, and names the
 //!   recording-format volumes it never serves.
 //!
-//! Each volume's calls run one at a time, under a per-volume async lock;
-//! every on-demand start and stop happens under it.
+//! Locks, each named for what it orders:
+//!
+//! - **A claim's lock** is held by its publish or unpublish, from the
+//!   one-pod check to the record's write. A second NodePublish or
+//!   NodeUnpublish of a claim whose call still runs is answered `ABORTED`
+//!   at once (the CSI specification's "operation pending for volume"), and
+//!   the kubelet retries; calls of other claims go on. Each runs as a task
+//!   of its own to the end, so a kubelet that gives up drops only its wait.
+//! - **A volume's start lock** orders its host's start and stop, the
+//!   replay, every write of the volume's records and every detach of its
+//!   targets. It is held across a reply only while a host starts (replay
+//!   and reconcile, on a host no other call sees yet), while it stops, and
+//!   for a fork's create or end. An open or close of a running host's view
+//!   is never under it, so one close that waits on a held file stalls only
+//!   its own claim.
+//! - **`using`**, a short lock never held across an await on a host,
+//!   holds each volume's claims whose open is in flight. A volume is idle
+//!   when none is and it has no record; deciding that and taking the host
+//!   out of service are one step under it, as are joining it and taking
+//!   the host's client, so a publish never gets a host being stopped.
 
 use std::collections::{BTreeSet, HashMap};
 use std::fs::{self, DirBuilder};
@@ -58,7 +79,7 @@ use agentfs_core::tree_actor;
 use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard, watch};
 
 use crate::error::Error;
-use crate::host_client::{HostClient, HostGone};
+use crate::host_client::{HostClient, HostGone, StartError};
 use crate::launcher::{self, Exit, Launcher, PluginIdentity, RecentLog, Spawned};
 use crate::layout::{Layout, target_key, validate_handle};
 use crate::mounter::{Mounter, detach_agentfs};
@@ -142,7 +163,8 @@ pub struct ReconcileReport {
     pub unreadable: Vec<String>,
 }
 
-/// A running host.
+/// A running host. Its `client` is the one owner of the control channel:
+/// closing it stops the host.
 struct Host {
     client: HostClient,
     exited: watch::Receiver<Option<Exit>>,
@@ -153,21 +175,52 @@ struct Host {
     backoff: Option<Duration>,
 }
 
-/// A host just started.
+/// A host just started and in service.
 struct Started {
-    client: HostClient,
     views: usize,
     dropped: usize,
 }
+
+/// A host that did not start; nothing of it runs. `permanent`: trying
+/// again cannot help (another protocol version).
+struct NotStarted {
+    error: Error,
+    permanent: bool,
+}
+
+impl From<Error> for NotStarted {
+    fn from(error: Error) -> Self {
+        Self {
+            error,
+            permanent: false,
+        }
+    }
+}
+
+impl From<NotStarted> for Error {
+    fn from(not: NotStarted) -> Self {
+        not.error
+    }
+}
+
+/// Each volume's claims whose open is in flight.
+type Using = HashMap<String, BTreeSet<String>>;
+
+/// One async lock per name, made on first use.
+type Locks = Mutex<HashMap<String, Arc<AsyncMutex<()>>>>;
 
 pub struct Supervisor {
     cfg: NodeConfig,
     launcher: Arc<dyn Launcher>,
     mounter: Arc<dyn Mounter>,
-    /// The running hosts by volume. An entry removed is a host asked to
-    /// stop: its exit is no crash.
+    /// The hosts in service, by volume. An entry removed is a host asked
+    /// to stop: its exit is no crash.
     hosts: Mutex<HashMap<String, Host>>,
-    locks: Mutex<HashMap<String, Arc<AsyncMutex<()>>>>,
+    /// Each claim's lock, by handle.
+    claims: Locks,
+    /// Each volume's start lock.
+    starts: Locks,
+    using: Mutex<Using>,
     generation: AtomicU64,
     shutting_down: AtomicBool,
 }
@@ -236,6 +289,16 @@ fn optional(path: PathBuf) -> Option<PathBuf> {
     path.exists().then_some(path)
 }
 
+/// The lock of `name` in `locks`, made on first use.
+fn lock_of(locks: &Locks, name: &str) -> Arc<AsyncMutex<()>> {
+    locks
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .entry(name.to_owned())
+        .or_default()
+        .clone()
+}
+
 impl Supervisor {
     pub fn new(
         config: NodeConfig,
@@ -247,7 +310,9 @@ impl Supervisor {
             launcher,
             mounter,
             hosts: Mutex::new(HashMap::new()),
-            locks: Mutex::new(HashMap::new()),
+            claims: Mutex::new(HashMap::new()),
+            starts: Mutex::new(HashMap::new()),
+            using: Mutex::new(HashMap::new()),
             generation: AtomicU64::new(1),
             shutting_down: AtomicBool::new(false),
         })
@@ -268,24 +333,70 @@ impl Supervisor {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    async fn lock_volume(&self, volume: &str) -> OwnedMutexGuard<()> {
-        let lock = self
-            .locks
+    /// The claim's lock, for its publish or unpublish: `ABORTED` while
+    /// another call of the claim holds it.
+    fn lock_claim(&self, handle: &str) -> Result<OwnedMutexGuard<()>, Error> {
+        lock_of(&self.claims, handle).try_lock_owned().map_err(|_| {
+            Error::Aborted(format!(
+                "a publish or unpublish of claim {handle} is still running on this node; it is \
+                 finished first"
+            ))
+        })
+    }
+
+    /// The volume's start lock.
+    async fn lock_start(&self, volume: &str) -> OwnedMutexGuard<()> {
+        lock_of(&self.starts, volume).lock_owned().await
+    }
+
+    /// Each volume's claims whose open is in flight. Taken before `hosts`
+    /// when both are, and never held across an await.
+    fn using(&self) -> MutexGuard<'_, Using> {
+        self.using
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Whether `volume` is idle: no open of it in flight and no record of
+    /// it. Read under `using` (the caller's guard).
+    fn idle(&self, using: &Using, volume: &str) -> bool {
+        using.get(volume).is_none_or(BTreeSet::is_empty) && self.records_of(volume).is_empty()
+    }
+
+    /// Joins `using` with the claim's open of `volume`, and takes the
+    /// client of the host in service, if one is: one step, so the host is
+    /// not stopped while the open is in flight.
+    fn join(&self, volume: &str, handle: &str) -> Option<(HostClient, u64)> {
+        let mut using = self.using();
+        using
             .entry(volume.to_owned())
             .or_default()
-            .clone();
-        lock.lock_owned().await
+            .insert(handle.to_owned());
+        self.hosts()
+            .get(volume)
+            .map(|h| (h.client.clone(), h.generation))
+    }
+
+    /// The claim's open of `volume` is no longer in flight.
+    fn leave(&self, volume: &str, handle: &str) {
+        let mut using = self.using();
+        if let Some(claims) = using.get_mut(volume) {
+            claims.remove(handle);
+            if claims.is_empty() {
+                using.remove(volume);
+            }
+        }
     }
 
     fn shutting_down(&self) -> bool {
         self.shutting_down.load(Ordering::Relaxed)
     }
 
-    /// The running host's client.
-    fn client(&self, volume: &str) -> Option<HostClient> {
-        self.hosts().get(volume).map(|h| h.client.clone())
+    /// The client and generation of the host in service.
+    fn host_of(&self, volume: &str) -> Option<(HostClient, u64)> {
+        self.hosts()
+            .get(volume)
+            .map(|h| (h.client.clone(), h.generation))
     }
 
     fn recent(&self, volume: &str) -> String {
@@ -328,9 +439,9 @@ impl Supervisor {
     // ----- volumes --------------------------------------------------------
 
     /// `agentfs init` for the claim's volume, then install_rules from the
-    /// profile.
+    /// profile. Under the volume's start lock.
     pub async fn ensure(&self, handle: &str, params: &VolumeParams) -> Result<(), Error> {
-        let _lock = self.lock_volume(handle).await;
+        let _start = self.lock_start(handle).await;
         let layout = self.layout();
         volume::profile_config(layout, &params.profile)?;
         if self.hosts().contains_key(handle) {
@@ -400,19 +511,22 @@ impl Supervisor {
 
     /// Starts the volume's host: its rules installed, its hello read, then
     /// (`replay`) every recorded view of the volume opened again, then a
-    /// reconcile. The caller holds the volume's lock.
+    /// reconcile; only then is it in service (in `hosts`, watched). A host
+    /// that fails before is stopped, its exit awaited. The caller holds the
+    /// volume's start lock and has seen no host in service.
     async fn start_host(
         self: &Arc<Self>,
         volume: &str,
         replay: bool,
         backoff: Option<Duration>,
-    ) -> Result<Started, Error> {
+    ) -> Result<Started, NotStarted> {
         let layout = self.layout().clone();
         let Some((name, profile)) = records::load_volume_claim(&layout, volume)? else {
             return Err(Error::NotFound(format!(
                 "no claim of volume {volume} under {}",
                 layout.base.display()
-            )));
+            ))
+            .into());
         };
         self.install_rules(volume, &profile)?;
         let spec = launcher::host_spec(&layout, volume, &name, &self.cfg.plugin);
@@ -426,13 +540,25 @@ impl Supervisor {
             .spawn(spec)
             .map_err(|e| Error::io("starting agentfs host", e))?;
         let Some(control) = control else {
-            return Err(Error::Internal(
-                "the launcher gave the host no control channel".into(),
-            ));
+            return Err(
+                Error::Internal("the launcher gave the host no control channel".into()).into(),
+            );
         };
         let (client, hello) = match HostClient::start(control).await {
             Ok(started) => started,
-            Err(HostGone) => {
+            Err(StartError::Version { host, plugin }) => {
+                // Its stream is closed: with no view it drains.
+                wait_exit(&mut exited).await;
+                return Err(NotStarted {
+                    error: Error::FailedPrecondition(format!(
+                        "the host of volume {volume} speaks host protocol v{host}, this plugin \
+                         v{plugin}: the node plugin's image and its agentfs binary must be of \
+                         one release; not tried again"
+                    )),
+                    permanent: true,
+                });
+            }
+            Err(StartError::Gone(HostGone)) => {
                 let exit = wait_exit(&mut exited).await;
                 let log = launcher::recent(&recent_log);
                 return Err(match exit {
@@ -445,22 +571,31 @@ impl Supervisor {
                     _ => Error::Unavailable(format!(
                         "the host of volume {volume} exited before it served ({exit}):\n{log}"
                     )),
-                });
+                }
+                .into());
             }
         };
-        if hello.volume != name {
-            drop(client);
-            wait_exit(&mut exited).await;
-            return Err(Error::Internal(format!(
+        let served = if hello.volume == name {
+            self.serve(volume, &client, replay, &recent_log).await
+        } else {
+            Err(Error::Internal(format!(
                 "the host of volume {volume} serves agentfs volume {}, not {name}",
                 hello.volume
-            )));
-        }
+            )))
+        };
+        let (views, dropped) = match served {
+            Ok(counts) => counts,
+            Err(error) => {
+                client.close();
+                wait_exit(&mut exited).await;
+                return Err(error.into());
+            }
+        };
         let generation = self.generation.fetch_add(1, Ordering::Relaxed);
         self.hosts().insert(
             volume.to_owned(),
             Host {
-                client: client.clone(),
+                client,
                 exited: exited.clone(),
                 recent_log,
                 generation,
@@ -469,8 +604,29 @@ impl Supervisor {
             },
         );
         self.watch(volume.to_owned(), generation, exited);
-        let (views, dropped) = if replay {
-            self.replay(volume, &client).await?
+        Ok(Started { views, dropped })
+    }
+
+    /// A new host's first calls: (`replay`) the recorded views, then the
+    /// reconcile.
+    async fn serve(
+        &self,
+        volume: &str,
+        client: &HostClient,
+        replay: bool,
+        recent_log: &RecentLog,
+    ) -> Result<(usize, usize), Error> {
+        let gone = || {
+            Error::Unavailable(format!(
+                "the host of volume {volume} is gone; it is started again:\n{}",
+                launcher::recent(recent_log)
+            ))
+        };
+        let counts = if replay {
+            self.replay(volume, client).await.map_err(|e| match e {
+                Replay::Gone => gone(),
+                Replay::Record(e) => e,
+            })?
         } else {
             (0, 0)
         };
@@ -484,19 +640,16 @@ impl Supervisor {
                     "the host of volume {volume} answered a reconcile with {other:?}"
                 )));
             }
-            Err(HostGone) => return Err(self.gone(volume)),
+            Err(HostGone) => return Err(gone()),
         }
-        Ok(Started {
-            client,
-            views,
-            dropped,
-        })
+        Ok(counts)
     }
 
     /// Opens every recorded view of `volume` again: its target still there
     /// (a stale mount of it included), else its record dropped. A view the
-    /// host refuses is logged and its record dropped.
-    async fn replay(&self, volume: &str, client: &HostClient) -> Result<(usize, usize), Error> {
+    /// host refuses is logged and its record dropped. The caller holds the
+    /// volume's start lock.
+    async fn replay(&self, volume: &str, client: &HostClient) -> Result<(usize, usize), Replay> {
         let mut views = 0;
         let mut dropped = 0;
         for record in self.records_of(volume) {
@@ -508,7 +661,7 @@ impl Supervisor {
                     }
                     Ok(Reply::Refused(refusal)) => refusal.message,
                     Ok(other) => format!("the host answered {other:?}"),
-                    Err(HostGone) => return Err(self.gone(volume)),
+                    Err(HostGone) => return Err(Replay::Gone),
                 }
             } else {
                 "its target is gone".to_owned()
@@ -518,7 +671,7 @@ impl Supervisor {
                 record.handle,
                 record.target.display()
             );
-            records::remove_published(self.layout(), &record.handle)?;
+            records::remove_published(self.layout(), &record.handle).map_err(Replay::Record)?;
             dropped += 1;
         }
         Ok((views, dropped))
@@ -540,7 +693,7 @@ impl Supervisor {
 
     async fn exited(self: Arc<Self>, volume: String, generation: u64, exit: Exit) {
         let delay = {
-            let _lock = self.lock_volume(&volume).await;
+            let _start = self.lock_start(&volume).await;
             let host = {
                 let mut hosts = self.hosts();
                 if hosts
@@ -563,30 +716,36 @@ impl Supervisor {
         self.restart(volume, delay).await;
     }
 
-    /// Starts the volume's host again after `delay` while records of it
-    /// remain, and keeps trying with backoff while that fails.
+    /// Starts the volume's host again after `delay` while the volume is not
+    /// idle, and keeps trying with backoff while that fails, unless trying
+    /// again cannot help.
     async fn restart(self: Arc<Self>, volume: String, mut delay: Duration) {
         loop {
             tokio::time::sleep(delay).await;
-            let _lock = self.lock_volume(&volume).await;
-            if self.shutting_down()
-                || self.hosts().contains_key(&volume)
-                || self.records_of(&volume).is_empty()
-            {
+            let _start = self.lock_start(&volume).await;
+            let idle = {
+                let using = self.using();
+                self.idle(&using, &volume)
+            };
+            if self.shutting_down() || self.hosts().contains_key(&volume) || idle {
                 return;
             }
             match self.start_host(&volume, true, Some(delay)).await {
-                Ok(started) => {
-                    drop(started.client);
+                Ok(_) => {
                     self.stop_if_idle(&volume).await;
                     return;
                 }
-                // Started, then gone: its watcher restarts it.
-                Err(_) if self.hosts().contains_key(&volume) => return,
-                Err(e) => {
+                Err(NotStarted {
+                    error,
+                    permanent: true,
+                }) => {
+                    eprintln!("starting the host of volume {volume} again: {error}");
+                    return;
+                }
+                Err(NotStarted { error, .. }) => {
                     delay = next_backoff(Some(delay), Duration::ZERO, &self.cfg.backoff);
                     eprintln!(
-                        "starting the host of volume {volume} again: {e}; trying again in \
+                        "starting the host of volume {volume} again: {error}; trying again in \
                          {delay:?}"
                     );
                 }
@@ -594,35 +753,60 @@ impl Supervisor {
         }
     }
 
-    /// Stops the volume's host: removed (so its exit is no crash), its
-    /// client dropped (EOF: it drains), its exit awaited. The caller holds
-    /// the volume's lock and no clone of the client.
-    async fn stop_host(&self, volume: &str) -> Option<(Exit, RecentLog)> {
-        let host = self.hosts().remove(volume)?;
+    /// Stops a host out of service: its channel closed (EOF: with no view
+    /// open it drains), its exit awaited.
+    async fn stop(host: Host) -> (Exit, RecentLog) {
         let Host {
             client,
             mut exited,
             recent_log,
             ..
         } = host;
-        drop(client);
-        let exit = wait_exit(&mut exited).await;
-        Some((exit, recent_log))
+        client.close();
+        (wait_exit(&mut exited).await, recent_log)
     }
 
-    /// Stops the volume's host when no view of it remains.
+    /// Stops the volume's host. The caller holds the volume's start lock.
+    async fn stop_host(&self, volume: &str) -> Option<(Exit, RecentLog)> {
+        let host = self.hosts().remove(volume)?;
+        Some(Self::stop(host).await)
+    }
+
+    /// Stops the volume's host when the volume is idle: the decision and
+    /// taking the host out of service are one step under `using`. The
+    /// caller holds the volume's start lock.
     async fn stop_if_idle(&self, volume: &str) {
-        if self.hosts().contains_key(volume) && self.records_of(volume).is_empty() {
-            self.stop_host(volume).await;
+        let host = {
+            let using = self.using();
+            if !self.idle(&using, volume) {
+                return;
+            }
+            self.hosts().remove(volume)
+        };
+        if let Some(host) = host {
+            Self::stop(host).await;
         }
     }
 
     // ----- views ----------------------------------------------------------
 
     /// NodePublish: one pod per claim; the view opened at the target on the
-    /// volume's host, started when none runs.
+    /// volume's host, started when none runs. `ABORTED` while another call
+    /// of the claim runs. Runs to the end as a task of its own: a caller
+    /// that gives up drops only its wait.
     pub async fn publish(self: &Arc<Self>, view: ViewSpec) -> Result<(), Error> {
-        let _lock = self.lock_volume(&view.volume).await;
+        let claim = self.lock_claim(&view.handle)?;
+        let this = Arc::clone(self);
+        tokio::spawn(async move {
+            let _claim = claim;
+            this.publish_claimed(&view).await
+        })
+        .await
+        .map_err(|e| Error::Internal(format!("publishing: {e}")))?
+    }
+
+    /// Publish, under the claim's lock.
+    async fn publish_claimed(self: &Arc<Self>, view: &ViewSpec) -> Result<(), Error> {
         let handle = view.handle.as_str();
         let published = records::load_published(self.layout())
             .0
@@ -646,19 +830,33 @@ impl Supervisor {
                 view.read_only
             )));
         }
-        let result = self.open(&view).await;
+        let result = self.open(view).await;
         if result.is_err() {
+            let _start = self.lock_start(&view.volume).await;
+            self.leave(&view.volume, handle);
             self.stop_if_idle(&view.volume).await;
         }
         result
     }
 
-    /// Opens the view and records it. The caller holds the volume's lock.
+    /// The host in service for the claim's open, which joins `using`; one
+    /// is started when none is.
+    async fn attach(self: &Arc<Self>, view: &ViewSpec) -> Result<(HostClient, u64), Error> {
+        loop {
+            if let Some(host) = self.join(&view.volume, &view.handle) {
+                return Ok(host);
+            }
+            let _start = self.lock_start(&view.volume).await;
+            if !self.hosts().contains_key(&view.volume) {
+                self.start_host(&view.volume, true, None).await?;
+            }
+        }
+    }
+
+    /// Opens the view and records it; the claim leaves `using` once its
+    /// record is written. On an error the caller leaves.
     async fn open(self: &Arc<Self>, view: &ViewSpec) -> Result<(), Error> {
-        let client = match self.client(&view.volume) {
-            Some(client) => client,
-            None => self.start_host(&view.volume, true, None).await?.client,
-        };
+        let (client, generation) = self.attach(view).await?;
         let target = &view.target;
         fs::create_dir_all(target).or_else(|e| {
             // A stale mount there: `mkdir` fails with EEXIST, and
@@ -685,10 +883,7 @@ impl Supervisor {
         };
         match client.call(Request::Open(view_request(&record))).await {
             Ok(Reply::Opened { stacked, .. }) => {
-                if let Err(e) = records::store_published(self.layout(), &record) {
-                    let _ = client.call(Request::Close { at: target.clone() }).await;
-                    return Err(e);
-                }
+                self.record(&record, &client, generation).await?;
                 eprintln!(
                     "published volume {} at {}{}",
                     view.handle,
@@ -706,73 +901,160 @@ impl Supervisor {
         }
     }
 
+    /// Writes the record of a view the host of `generation` opened, under
+    /// the volume's start lock, and leaves `using`. A host started since
+    /// then replayed the records before this one was written: the view is
+    /// opened on it too. Any later start replays the record. Should that
+    /// host refuse it (its reconcile ended the client of the open in
+    /// flight, and a fork's writer outlives its client), the record goes
+    /// and the publish fails with the refusal: no host serves the view, and
+    /// a replay would be refused the same way.
+    async fn record(
+        &self,
+        record: &PublishedRecord,
+        client: &HostClient,
+        generation: u64,
+    ) -> Result<(), Error> {
+        let current = {
+            let start = self.lock_start(&record.volume).await;
+            if let Err(e) = records::store_published(self.layout(), record) {
+                drop(start);
+                let _ = client
+                    .call(Request::Close {
+                        at: record.target.clone(),
+                    })
+                    .await;
+                return Err(e);
+            }
+            self.leave(&record.volume, &record.handle);
+            self.host_of(&record.volume)
+        };
+        if let Some((current, newer)) = current
+            && newer != generation
+        {
+            match current.call(Request::Open(view_request(record))).await {
+                Ok(Reply::Opened { .. }) => {}
+                Ok(Reply::Refused(refusal)) => {
+                    let start = self.lock_start(&record.volume).await;
+                    let removed = records::remove_published(self.layout(), &record.handle);
+                    drop(start);
+                    removed?;
+                    return Err(refused(refusal));
+                }
+                other => eprintln!(
+                    "volume {}: opening the view of {} at {} on the restarted host: {other:?}; \
+                     the next start replays it",
+                    record.volume,
+                    record.handle,
+                    record.target.display()
+                ),
+            }
+        }
+        Ok(())
+    }
+
     /// NodeUnpublish: the view closed (or the target detached when no host
     /// runs), the record and the target directory removed, and the host
-    /// stopped once no view of its volume remains.
-    pub async fn unpublish(&self, handle: &str, target: &Path) -> Result<(), Error> {
-        let find = || {
-            records::load_published(self.layout())
-                .0
-                .into_iter()
-                .find(|r| r.handle == handle && r.target == target)
+    /// stopped once the volume is idle. `ABORTED` while another call of
+    /// the claim runs. Runs to the end as a task of its own: a caller that
+    /// gives up drops only its wait.
+    pub async fn unpublish(self: &Arc<Self>, handle: &str, target: &Path) -> Result<(), Error> {
+        let claim = self.lock_claim(handle)?;
+        let this = Arc::clone(self);
+        let (handle, target) = (handle.to_owned(), target.to_path_buf());
+        tokio::spawn(async move {
+            let _claim = claim;
+            this.unpublish_claimed(&handle, &target).await
+        })
+        .await
+        .map_err(|e| Error::Internal(format!("unpublishing: {e}")))?
+    }
+
+    /// Unpublish, under the claim's lock. The close is asked of the host in
+    /// service without the start lock; the record's removal, any detach
+    /// and the stop are under it. A host started since the close was asked
+    /// (its replay reopened the view) is asked again.
+    async fn unpublish_claimed(&self, handle: &str, target: &Path) -> Result<(), Error> {
+        let found = records::load_published(self.layout())
+            .0
+            .into_iter()
+            .find(|r| r.handle == handle && r.target == target);
+        let Some(record) = found else {
+            // Nothing of ours is published there: done already, but an
+            // agentfs mount left there goes, and so does the directory.
+            let _start = self.lock_start(handle).await;
+            self.detach(target).await?;
+            return remove_target(target);
         };
-        let volume = find().map_or_else(|| handle.to_owned(), |r| r.volume);
-        let _lock = self.lock_volume(&volume).await;
-        if let Some(record) = find() {
-            let closed = match self.client(&record.volume) {
-                Some(client) => match client.call(Request::Close { at: target.into() }).await {
-                    Ok(Reply::Closed) => true,
-                    Ok(Reply::Refused(refusal)) => return Err(refused(refusal)),
-                    Ok(other) => {
-                        return Err(Error::Internal(format!(
-                            "the host of volume {volume} answered a close with {other:?}"
-                        )));
+        let volume = record.volume;
+        loop {
+            let tried = self.host_of(&volume);
+            let closed = match &tried {
+                Some((client, _)) => {
+                    match client.call(Request::Close { at: target.into() }).await {
+                        Ok(Reply::Closed) => true,
+                        Ok(Reply::Refused(refusal)) => return Err(refused(refusal)),
+                        Ok(other) => {
+                            return Err(Error::Internal(format!(
+                                "the host of volume {volume} answered a close with {other:?}"
+                            )));
+                        }
+                        // The plugin stops: the view is left for the next.
+                        Err(HostGone) if self.shutting_down() => return Err(self.gone(&volume)),
+                        Err(HostGone) => false,
                     }
-                    Err(HostGone) => false,
-                },
+                }
                 None => false,
             };
+            let _start = self.lock_start(&volume).await;
+            let now = self.hosts().get(&volume).map(|h| h.generation);
+            if now.is_some() && now != tried.map(|(_, generation)| generation) {
+                continue;
+            }
             if !closed {
                 self.detach(target).await?;
             }
             records::remove_published(self.layout(), handle)?;
             remove_target(target)?;
             eprintln!("unpublished volume {handle} at {}", target.display());
-            self.stop_if_idle(&record.volume).await;
+            self.stop_if_idle(&volume).await;
             return Ok(());
         }
-        // Nothing of ours is published there: done already, but an agentfs
-        // mount left there goes, and so does the directory.
-        self.detach(target).await?;
-        remove_target(target)
     }
 
     /// The first published record using `volume`, if any.
     pub async fn in_use(&self, volume: &str) -> Option<PublishedRecord> {
-        let _lock = self.lock_volume(volume).await;
+        let _start = self.lock_start(volume).await;
         self.records_of(volume).into_iter().next()
     }
 
     /// The published record of the claim `handle`, whose view is on
     /// `volume`'s host, if any.
     pub async fn claim_in_use(&self, volume: &str, handle: &str) -> Option<PublishedRecord> {
-        let _lock = self.lock_volume(volume).await;
+        let _start = self.lock_start(volume).await;
         self.records_of(volume)
             .into_iter()
             .find(|r| r.handle == handle)
     }
 
     /// One call on the volume's host, started for it when none runs (its
-    /// recorded views replayed) and stopped after it when no view is open.
+    /// recorded views replayed) and stopped after it when the volume is
+    /// idle. The whole call is under the volume's start lock.
     async fn call_on_host(
         self: &Arc<Self>,
         volume: &str,
         request: Request,
     ) -> Result<Reply, Error> {
-        let _lock = self.lock_volume(volume).await;
-        let client = match self.client(volume) {
-            Some(client) => Ok(client),
-            None => self.start_host(volume, true, None).await.map(|s| s.client),
+        let _start = self.lock_start(volume).await;
+        let client = match self.host_of(volume) {
+            Some((client, _)) => Ok(client),
+            None => match self.start_host(volume, true, None).await {
+                Ok(_) => self
+                    .host_of(volume)
+                    .map(|(client, _)| client)
+                    .ok_or_else(|| self.gone(volume)),
+                Err(not) => Err(not.into()),
+            },
         };
         let reply = match client {
             Ok(client) => client
@@ -786,7 +1068,7 @@ impl Supervisor {
     }
 
     /// On the volume's host, started for the call if none runs and stopped
-    /// after it if no view is open: the open fork under `key`, or a new
+    /// after it if the volume is idle: the open fork under `key`, or a new
     /// fork of `upstream` under it.
     pub async fn create_fork(
         self: &Arc<Self>,
@@ -814,8 +1096,8 @@ impl Supervisor {
     }
 
     /// Ends the fork under `key` on the volume's host, started for the call
-    /// if none runs and stopped after it if no view is open. Ended, or no
-    /// fork under the key, are both Ok (idempotent DeleteVolume).
+    /// if none runs and stopped after it if the volume is idle. Ended, or
+    /// no fork under the key, are both Ok (idempotent DeleteVolume).
     pub async fn end_fork(self: &Arc<Self>, volume: &str, key: ForkKey) -> Result<(), Error> {
         match self.call_on_host(volume, Request::ForkEnd { key }).await? {
             Reply::Ended
@@ -831,21 +1113,20 @@ impl Supervisor {
     }
 
     /// Starts the volume's host and stops it: Ok once it exits 0 (Volume
-    /// released).
+    /// released). Refused while a host serves the volume or it is not
+    /// idle.
     pub async fn release(self: &Arc<Self>, volume: &str) -> Result<(), Error> {
-        let _lock = self.lock_volume(volume).await;
-        if self.hosts().contains_key(volume) || !self.records_of(volume).is_empty() {
+        let _start = self.lock_start(volume).await;
+        let busy = {
+            let using = self.using();
+            !self.idle(&using, volume)
+        };
+        if busy || self.hosts().contains_key(volume) {
             return Err(Error::FailedPrecondition(format!(
                 "volume {volume} is in use on this node"
             )));
         }
-        match self.start_host(volume, false, None).await {
-            Ok(started) => drop(started.client),
-            Err(e) => {
-                self.stop_host(volume).await;
-                return Err(e);
-            }
-        }
+        self.start_host(volume, false, None).await?;
         match self.stop_host(volume).await {
             Some((Exit::Code(0), _)) => Ok(()),
             Some((exit, log)) => Err(Error::Unavailable(format!(
@@ -877,6 +1158,7 @@ impl Supervisor {
                 volumes.insert(record.volume);
                 continue;
             }
+            let _start = self.lock_start(&record.volume).await;
             eprintln!(
                 "volume {}: dropped the view at {}: its target is gone",
                 record.handle,
@@ -888,7 +1170,7 @@ impl Supervisor {
             report.dropped += 1;
         }
         for volume in volumes {
-            let _lock = self.lock_volume(&volume).await;
+            let _start = self.lock_start(&volume).await;
             if self.hosts().contains_key(&volume) {
                 continue;
             }
@@ -897,14 +1179,18 @@ impl Supervisor {
                     report.hosts += 1;
                     report.views += started.views;
                     report.dropped += started.dropped;
-                    drop(started.client);
                     self.stop_if_idle(&volume).await;
                 }
-                Err(_) if self.hosts().contains_key(&volume) => {}
-                Err(e) => {
+                Err(NotStarted {
+                    error,
+                    permanent: true,
+                }) => {
+                    eprintln!("starting the host of volume {volume}: {error}");
+                }
+                Err(NotStarted { error, .. }) => {
                     let delay = self.cfg.backoff.initial;
                     eprintln!(
-                        "starting the host of volume {volume}: {e}; trying again in {delay:?}"
+                        "starting the host of volume {volume}: {error}; trying again in {delay:?}"
                     );
                     tokio::spawn(Arc::clone(self).restart(volume.clone(), delay));
                 }
@@ -920,14 +1206,16 @@ impl Supervisor {
         report
     }
 
-    /// Stops every host: each sees EOF, drains, and exits.
+    /// Stops every host: each one's channel is closed, whatever clones the
+    /// tasks still running hold (EOF: with views open it exits 3 at once),
+    /// and its exit awaited.
     pub async fn shutdown(&self) {
         self.shutting_down.store(true, Ordering::Relaxed);
         let hosts: Vec<(String, Host)> = self.hosts().drain().collect();
         let mut exits = Vec::new();
         for (volume, host) in hosts {
             let Host { client, exited, .. } = host;
-            drop(client);
+            client.close();
             exits.push((volume, exited));
         }
         for (volume, mut exited) in exits {
@@ -935,6 +1223,14 @@ impl Supervisor {
             eprintln!("[host {volume}] stopped: {exit}");
         }
     }
+}
+
+/// Why a replay stopped.
+enum Replay {
+    /// The host is gone.
+    Gone,
+    /// A record could not be removed.
+    Record(Error),
 }
 
 /// The open request of a recorded view.

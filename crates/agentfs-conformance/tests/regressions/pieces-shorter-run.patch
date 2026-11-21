@@ -1,0 +1,135 @@
+Removes the fix of pieces-shorter-run-306.trace and pieces-shorter-run-414.trace:
+`pieces` placing each line of a take from a source whose run holds it (in
+tree_reconcile.rs). Without it, `pieces` merged every source's runs into one
+list and looked only in the last run starting at or before a line, so a shorter
+run of the same versions from a later source hid the head's whole run.
+Base: the commit that adds this file; this hunk set is the reverse of its fix.
+git: the release in ci/git-release.
+Re-record (crates/agentfs-model/VERIFYING.md, "A regression found on the engine")
+in a scratch worktree with this applied. Give it fresh volumes, since --record
+refuses a non-empty OUT: export MODEL_TARGET_VOLUME=mt-fixture MODEL_WORK_VOLUME=mw-fixture
+  for s in 306 414; do ci/model-docker.sh -- sh -c "AGENTFS_MODEL_TRACE_DIR=/work/t \
+    AGENTFS_MODEL_SEED=$s cargo test --locked -p agentfs-model --test interleavings \
+    random_interleavings_rounds_phase1_scope -- --exact"; done
+  ci/model-docker.sh -- cargo run --locked -p agentfs-conformance --bin phase1-replay -- \
+    library /work/t --min-scenarios 0 --min-seeds 1 --record /work/out
+    # exits 1: MISMATCH at call 38 (seed 306) and call 127 (seed 414), as expected
+  for s in 306 414; do ci/model-docker.sh -- sh -c "cp \
+    /work/out/random_interleavings_rounds_phase1_scope.seed$s.trace \
+    crates/agentfs-conformance/tests/regressions/pieces-shorter-run-$s.trace"; done
+Recorded 2026-11-21 without Docker: the same two commands run directly, with git
+2.47.3 built from ci/git-release bind-mounted over /usr/local/bin in a private
+mount namespace (agentfs_align::GIT_PATH is fixed). The seed 306 recording equals
+one made independently on main 9045165 byte for byte (cmp).
+`git apply` skips these lines.
+
+--- a/crates/agentfs-core/src/tree_reconcile.rs
++++ b/crates/agentfs-core/src/tree_reconcile.rs
+@@ -15,7 +15,6 @@
+ //! ancestors retained; a line's identity is independent of a filesystem object's
+ //! identity.
+ 
+-use std::cmp::Reverse;
+ use std::collections::BTreeMap;
+ use std::fmt;
+ use std::fs::File;
+@@ -1026,8 +1025,8 @@
+     Ok((image.read_at(&mut b, at)? == 1).then_some(b[0]))
+ }
+ 
+-/// Where a source's live run is in its image: its first version, its line
+-/// count and its first byte.
++/// Where a source's live runs are in its image: each with its first version,
++/// its line count and its first byte, sorted by version.
+ struct Placed<V> {
+     version: V,
+     count: u64,
+@@ -1046,10 +1045,7 @@
+ /// Where each live line of `map` is in `sources` (each a map and the image it
+ /// describes), as parts of their images in file order: how a file made of
+ /// lines from other files (a take's) is written without holding its bytes. A
+-/// version's bytes are the same in every file that holds it live. Two sources
+-/// can hold runs of the same versions with different extents (one rewrote a
+-/// line the other kept); each line comes from a source whose run holds it, the
+-/// one holding the most lines from it, the first such source on a tie.
++/// version's bytes are the same in every file that holds it live.
+ ///
+ /// # Errors
+ ///
+@@ -1059,11 +1055,9 @@
+     map: &LineMap<V>,
+     sources: &[(&LineMap<V>, &dyn Image)],
+ ) -> Result<Vec<Piece>, Error> {
+-    // Each source's live runs, sorted by version: disjoint within one source.
+-    let mut placed: Vec<Vec<Placed<V>>> = Vec::with_capacity(sources.len());
+-    for (source, image) in sources {
++    let mut placed: Vec<(usize, Placed<V>)> = Vec::new();
++    for (s, (source, image)) in sources.iter().enumerate() {
+         let mut at = 0;
+-        let mut runs = Vec::new();
+         for run in source.runs().iter().filter(|r| !r.dead) {
+             let finished = run.count - u64::from(run.open.is_some());
+             let start = at;
+@@ -1071,33 +1065,34 @@
+             if let Some(len) = run.open {
+                 at += len;
+             }
+-            runs.push(Placed {
+-                version: run.version,
+-                count: run.count,
+-                start,
+-                open: run.open,
+-            });
++            placed.push((
++                s,
++                Placed {
++                    version: run.version,
++                    count: run.count,
++                    start,
++                    open: run.open,
++                },
++            ));
+         }
+-        runs.sort_by_key(|p| key(&p.version));
+-        placed.push(runs);
+     }
++    placed.sort_by_key(|(_, p)| key(&p.version));
++    let missing = Error::InvalidMap("a live line no source holds");
+     let mut out: Vec<Piece> = Vec::new();
+     for run in map.runs().iter().filter(|r| !r.dead) {
+         let (mut v, mut left) = (run.version, run.count);
+         while left > 0 {
+-            let (s, p, skip) = placed
+-                .iter()
+-                .enumerate()
+-                .filter_map(|(s, runs)| {
+-                    let i = runs.partition_point(|p| key(&p.version) <= key(&v));
+-                    let p = runs.get(i.checked_sub(1)?)?;
+-                    let skip = v.index().wrapping_sub(p.version.index());
+-                    (p.version.writer() == v.writer() && skip < p.count).then_some((s, p, skip))
+-                })
+-                .max_by_key(|&(s, p, skip)| (p.count - skip, Reverse(s)))
++            let i = placed.partition_point(|(_, p)| key(&p.version) <= key(&v));
++            let (s, p) = i
++                .checked_sub(1)
++                .and_then(|i| placed.get(i))
+                 .ok_or(Error::InvalidMap("a live line no source holds"))?;
++            let skip = v.index().wrapping_sub(p.version.index());
++            if p.version.writer() != v.writer() || skip >= p.count {
++                return Err(missing);
++            }
+             let n = (p.count - skip).min(left);
+-            let image = sources[s].1;
++            let image = sources[*s].1;
+             let start = skip_lines(image, p.start, skip)?;
+             let takes_last = skip + n == p.count;
+             let wants_open = left == n && run.open.is_some();
+@@ -1110,7 +1105,7 @@
+                 skip_lines(image, start, n)?
+             };
+             let piece = Piece {
+-                source: s,
++                source: *s,
+                 offset: start,
+                 len: end - start,
+             };

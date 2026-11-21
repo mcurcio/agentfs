@@ -6,6 +6,7 @@ use agentfs_contracts::name::{Label, WriterLabel};
 use agentfs_contracts::pod::{PodContext, WriterAt};
 use agentfs_contracts::volume::VolumeIdentity;
 
+use super::verify::Flag;
 use crate::tree_actor::journal::RowRecord;
 use crate::tree_actor::rows::Chain;
 use crate::tree_actor::tree::EventNumber;
@@ -23,6 +24,9 @@ const POD_UID: &str = "Agentfs-Pod-Uid: ";
 const NODE: &str = "Agentfs-Node: ";
 const OPEN: &str = "Agentfs-Open: ";
 const COLLISIONS: &str = "Agentfs-Collisions: ";
+/// A direct save history could not check (`super::verify`): its layout's
+/// and the builder's replay's fingerprints, and the builder.
+const UNVERIFIED: &str = "Agentfs-Unverified: ";
 /// The cause a direct save's commit carries, written by `render` and read by `direct_event`.
 const DIRECT: &str = "Direct";
 const ENVELOPE: &str = "Agentfs-Format: envelope-2";
@@ -67,13 +71,15 @@ pub(in crate::tree_actor) enum Message<'a> {
     /// `Agentfs-Format`: its absence marks the Root commit.
     Root { service: &'a PodContext },
     /// "{action} by {writer}"; `Agentfs-Cause: Direct`; `Agentfs-Open` when the save closed an
-    /// open.
+    /// open; `Agentfs-Unverified`, the last trailer, when the builder's replay of the save did
+    /// not match its record.
     Direct {
         action: Action,
         by: &'a WriterAt,
         tree: TreeId,
         event: EventNumber,
         open: Option<u64>,
+        unverified: Option<&'a Flag>,
     },
     /// "Landing by {writer}": `landed` is the queued commit's writer and pod context, read by
     /// [`writer_at`] (git-model §3). `Agentfs-Collisions` when any.
@@ -113,7 +119,8 @@ fn pod_fields(at: &PodContext) -> [(&'static str, Option<&Label>); 4] {
 
 impl Message<'_> {
     /// The message's bytes: subject, blank line, Writer, Cause, Tree, Event, Volume, Volume-Id,
-    /// each present pod field, Format, then Open or Collisions, each line ending in '\n'.
+    /// each present pod field, Format, then Open or Collisions, then Unverified, each line ending
+    /// in '\n'.
     ///
     /// # Errors
     ///
@@ -189,6 +196,19 @@ impl Message<'_> {
                 &format!("{COLLISIONS}{}\n", serde_json::to_string(collisions)?),
             ),
             _ => {}
+        }
+        if let Self::Direct {
+            unverified: Some(flag),
+            ..
+        } = self
+        {
+            let replayed = flag
+                .replayed
+                .map_or_else(|| "none".to_owned(), |f| f.to_string());
+            message.push_str(&format!(
+                "{UNVERIFIED}recorded {} replayed {replayed} by {}\n",
+                flag.recorded, flag.builder
+            ));
         }
         Ok(message)
     }
@@ -294,6 +314,30 @@ pub(in crate::tree_actor) fn direct_event(message: &[u8]) -> Option<EventNumber>
         .map(EventNumber::new)
 }
 
+/// The flag of a direct save history could not check: its `Agentfs-Unverified` trailer read back;
+/// `None` when it has none, or one that does not parse.
+pub(in crate::tree_actor) fn unverified(message: &[u8]) -> Option<Flag> {
+    let text = lines(message)?.find_map(|line| line.strip_prefix(UNVERIFIED))?;
+    let rest = text.strip_prefix("recorded ")?;
+    let (recorded, rest) = rest.split_once(" replayed ")?;
+    let (replayed, builder) = rest.split_once(" by ")?;
+    Some(Flag {
+        recorded: recorded.parse().ok()?,
+        replayed: match replayed {
+            "none" => None,
+            fingerprint => Some(fingerprint.parse().ok()?),
+        },
+        builder: builder.to_owned(),
+    })
+}
+
+/// The open a direct save closed (its `Agentfs-Open`); `None` for a save that closed none.
+pub(in crate::tree_actor) fn open_of(message: &[u8]) -> Option<u64> {
+    lines(message)?
+        .find_map(|line| line.strip_prefix(OPEN))
+        .and_then(|text| text.parse().ok())
+}
+
 /// Every `Agentfs-Collisions` line's entries, in order; empty if none or not UTF-8.
 ///
 /// # Errors
@@ -385,6 +429,7 @@ mod tests {
             tree: TreeId::Fork(7),
             event: EventNumber::new(42),
             open,
+            unverified: None,
         })
     }
 
@@ -423,6 +468,7 @@ mod tests {
                 tree: TreeId::Root,
                 event: EventNumber::new(3),
                 open: Some(2),
+                unverified: None,
             }),
             format!(
                 "Direct by w\n\nAgentfs-Writer: w\nAgentfs-Cause: Direct\nAgentfs-Tree: root\nAgentfs-Event: 3\n{VOLUME_TEXT}Agentfs-Pod: p-1\nAgentfs-Format: envelope-2\nAgentfs-Open: 2\n"
@@ -440,6 +486,7 @@ mod tests {
                 tree: TreeId::Root,
                 event: EventNumber::new(1),
                 open: None,
+                unverified: None,
             });
             assert!(text.starts_with(&format!("{word} by w\n\n")), "{text}");
         }
@@ -522,6 +569,42 @@ mod tests {
     }
 
     #[test]
+    fn an_unverified_trailer_is_the_last_and_reads_back() {
+        use crate::tree_actor::recording::layout::Fingerprint;
+        let recorded = Fingerprint {
+            len: 12,
+            digest: 0xab,
+        };
+        for replayed in [
+            None,
+            Some(Fingerprint {
+                len: 11,
+                digest: 0xcd,
+            }),
+        ] {
+            let flag = Flag {
+                recorded,
+                replayed,
+                builder: "agentfs 0.1.0 build 0123456789abcdef".to_owned(),
+            };
+            let text = render(&Message::Direct {
+                action: Action::Direct,
+                by: &by("w", PodContext::default()),
+                tree: TreeId::Root,
+                event: EventNumber::new(3),
+                open: Some(2),
+                unverified: Some(&flag),
+            });
+            let last = text.lines().last().unwrap();
+            assert!(last.starts_with("Agentfs-Unverified: recorded 12:00000000000000ab replayed "));
+            assert!(is_envelope(text.as_bytes()));
+            assert_eq!(unverified(text.as_bytes()), Some(flag));
+            assert_eq!(open_of(text.as_bytes()), Some(2));
+        }
+        assert_eq!(unverified(direct(Some(5)).as_bytes()), None);
+    }
+
+    #[test]
     fn writer_at_reads_back_what_render_writes() {
         let partial = PodContext {
             node: Some(Label::parse("n1").unwrap()),
@@ -535,6 +618,7 @@ mod tests {
                 tree: TreeId::Fork(1),
                 event: EventNumber::new(2),
                 open: None,
+                unverified: None,
             });
             assert_eq!(writer_at(text.as_bytes()).unwrap(), Some(writer.clone()));
             let landed = render(&Message::Landing {
