@@ -1175,6 +1175,7 @@ impl TreeActor {
     where
         F: FnOnce(TreeId, RecordNo) -> Result<Vec<RowWrite>>,
     {
+        let _kind = stages::section(stages::Hold::ForkCopy);
         self.tree(upstream)?;
         if !upstream.is_root() {
             return Err(Error::NotFound);
@@ -1644,6 +1645,7 @@ impl TreeActor {
         let Some((through, built)) = self.history.built_trees(self.rebuilt) else {
             return;
         };
+        let _kind = stages::section(stages::Hold::CatchUp);
         let last = EventNumber::new(self.next.saturating_sub(1));
         let through_step = EventNumber::new(through.get());
         let mut left = false;

@@ -411,6 +411,7 @@ pub fn mount(state: &Path, args: MountArgs, minter: Minter) -> Result<ExitCode> 
     let boot = settings::at_boot(state, &views)?;
     let otel = crate::otel::init(name.as_str(), &identity(name.as_str(), &args.pod));
     otel.telemetry().observe_not_built(&boot.not_built);
+    otel.telemetry().observe_latency();
     let expect: Vec<mountpoint::Expect> = std::iter::once(mountpoint::Expect::Source(
         agentfs_fuse::tree_view::view_source(name.as_str(), TreeId::Root),
     ))

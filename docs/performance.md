@@ -375,6 +375,31 @@ must exit 1, and the tracer runs it before the figures.
   `ci/trees-budget.json` (256 MiB, 2 KiB a file) are marks for regressions,
   not targets. The owner, 2026-11-20: "I dont have a number in mind. Im just
   looking to cut waste".
+- **Each workload reports the volume lock by kind.** `lock` holds, for
+  each kind of work under the volume's lock (compaction, catching up with
+  history, drops, closes, takes, fork copies, other:
+  [telemetry](telemetry.md#the-volume-lock)), the holds it ran in, its
+  time and its longest share of one hold, and the waits to take the lock,
+  between the metrics file before the workload and after its history is
+  built. One more save, `fig-nudge`, is made and built first: a
+  compaction the workload made due runs at the first call after history
+  caught up, and the nudge is that call. A longest share is given only
+  when the process-wide maximum grew in that workload, so run a workload
+  alone (`--only`) to read its own. These figures have no bar and never
+  warn or fail.
+- **And the other waits a request can meet.** In the same window,
+  `gate_wait` gives the lag gate's waits by cause, and `requests` the
+  view's FUSE requests by op, with each op's p50 and p99 to a power of two
+  ([telemetry](telemetry.md#the-volume-lock)).
+- **A probe times another file during a workload** (`--probe`, read
+  locally; the tracer does not pass it, because it adds requests beside
+  the gated `create`). Beside `create`, `close_1g`, `close_frag` and
+  `write_1m`, a thread per view stats, opens and reads a file no workload
+  touches every 10 ms, until the nudge is built: in the workload's own
+  view, and in another view of the volume (`--probe-view`, a fork's
+  mount). `probe` gives p50, p99 and the longest of each call in each
+  view. A stall in the workload's view alone is that view's one request
+  thread; one in both views is the volume's lock.
 - The report is the job's artifact `trees-figures-<fs>`.
 
 Figures from two runs on GitHub `ubuntu-24.04` runners, each one
@@ -566,13 +591,53 @@ On one 4-CPU container (ext4, release build; local observations, not CI):
 | `memory_create`, 50,000 files, persistent maps and overlay in place | 2.67 KiB a file (2.61 to 2.70 before the overlay) | 1.64 KiB a file with the arena cap |
 | `create`'s RssAnon peak, 50,000 files, default `agentfs.overlayLimit` | | about 81 MiB; with an 8 MiB limit 77.5 MiB, so the overlay is a small part of it |
 | Restart after a kill, 100,000 files, built point 400 records past the checkpoint: RssAnon peak (mount) | 370 to 386 MiB (46 to 49 s) | 328 to 333 MiB (38 to 39 s), each tree read once, at the built point |
-| `close_frag`: the close of 200,000 random writes | 110.4 s under the actor lock | 0.47 to 0.52 s (three runs); the longest lock hold, 68 to 89 ms, is the built event's rebuild dropping the save's 200,000-piece map under the lock (`Files::rebuilt`), not the close; the journal's compaction held it at most 1 to 9 ms |
+| `close_frag`: the close of 200,000 random writes | 110.4 s under the actor lock | 0.51 to 0.59 s (two runs); the longest lock hold is the journal's compaction, then the drop of the save's 200,000-piece map at its built event (below) |
 | `write_1m`: peak over memory before | 670 MiB | 774 MiB: a million appends leave the large map's leaves about half full |
 
 `close_frag` and `write_1m` miss their bars and warn. A close's work no
 longer runs under the actor lock (docs/trees.md, "File maps"), but the
 rebuild at the save's built event still drops its old map under it, in time
 proportional to the map's pieces, and sequential write pieces are not merged.
+
+The volume lock by kind and another file's stall, each workload run alone
+on a fresh volume (`trees-figures.py --only W --metrics --probe
+--probe-view FORK`, through `agentfs mount --fork-mount FORK -- COMMAND`
+on the release build; same container, ext4; one run each; local
+observations, not CI). Each lock cell is the kind's longest share of one
+hold, in ms; the kinds not shown held the lock under 0.4 ms or not at all.
+
+| Workload | compaction | drops | close | take | catch_up | other | Longest lock wait |
+|---|---|---|---|---|---|---|---|
+| `close_1g` | **1,244** | 0.03 | 0.28 | 0.37 | 0.37 | 7.8 | 1,241 |
+| `write_1m` | **1,166** | 60 | 72 | 0.27 | 0.08 | 45 | 1,166 |
+| `close_frag` | **233** | 41 | 55 | 123 | 0.08 | 6.9 | 233 |
+| `create` (50,000) | none | 37 | 11 | 36 | **120** | 43 | 147 |
+
+The probe's calls on another file, in ms (p50 / p99 / longest of its
+stats, and the longest of any call), with the longest request on each
+workload view's one thread and the longest wait at the lag gate:
+
+| Workload | Same view: stat | Same view: longest call | Other view: stat | Other view: longest call | Longest request on the view's thread | Longest gate wait |
+|---|---|---|---|---|---|---|
+| `close_1g` | 0.26 / 1.1 / 1,239 | 1,239 | 0.27 / 0.95 / 1,241 | 1,241 | `create` 1,244 (the nudge, behind compaction) | none |
+| `write_1m` | 0.14 / 0.48 / 962 | 1,183 | 0.28 / 0.71 / 68 | 1,167 | `create` 1,183 (the nudge); `release` 970 | none |
+| `close_frag` | 0.24 / 1.4 / 503 | 503 | 0.27 / 1.3 / 233 | 233 | `release` 509 (the close) | none |
+| `create` (50,000) | 0.13 / 12.4 / 116 | 116 | 0.09 / 12.8 / 119 | 153 | `flush` 147 | `lag` 3,983 (17 waits, 21 s in all) |
+
+- **Compaction causes the longest holds** in every workload that writes a
+  large journal: it runs at the first call after history has built the
+  workload's steps, and another view's file waits nearly all of it (1.24 s
+  for `close_1g`, 1.17 s for `write_1m`).
+- **The view's one thread stalls its own files as long as the lock does.**
+  The close of `close_frag` held its view's thread 509 ms (its `release`),
+  so a stat of another file in that view waited 503 ms, while another view
+  waited at most 233 ms, the compaction. `write_1m`'s close held its
+  thread 970 ms the same way.
+- **The lag gate holds only new work.** During `create` it held the
+  workload's own saves up to 4.0 s, but the probe, which never writes,
+  waited at most 153 ms, about the longest catch-up of the lock (120 ms).
+  A write to another file of the same tree would wait at the gate too; the
+  probe does not measure that.
 
 ## Performance budget
 

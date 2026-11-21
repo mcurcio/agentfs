@@ -33,6 +33,7 @@ use crate::stale::{self, MountState};
 use agentfs_contracts::clients::{Access, Binding, FileOwner};
 use agentfs_contracts::views::{MountOptions, MountPoint, ViewError, ViewId, Views};
 use agentfs_core::session::{SessionGuard, Sessions, TreeSession};
+use agentfs_core::tree_actor::stages as measured;
 use agentfs_core::tree_actor::{
     Attrs, Error, FileMap, Kind, Meta, Node, Perm, Progress, Recording, RenameMode, Saved, SetTime,
     TreeId,
@@ -1323,6 +1324,7 @@ impl Filesystem for View {
         Ok(())
     }
     fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
+        let _request = measured::request(measured::Op::Lookup);
         let result = (|| {
             let v = self.actor()?;
             let (dir, up) = self.dir_of(&v, parent)?;
@@ -1338,6 +1340,7 @@ impl Filesystem for View {
         }
     }
     fn getattr(&self, _req: &Request, ino: INodeNo, fh: Option<FileHandle>, reply: ReplyAttr) {
+        let _request = measured::request(measured::Op::Getattr);
         if is_untracked(ino) {
             let result = fh
                 .map(|fh| self.untracked_fd(fh))
@@ -1358,6 +1361,7 @@ impl Filesystem for View {
         }
     }
     fn open(&self, _req: &Request, ino: INodeNo, flags: OpenFlags, reply: ReplyOpen) {
+        let _request = measured::request(measured::Op::Open);
         if is_untracked(ino) {
             let changes =
                 flags.0 & libc::O_ACCMODE != libc::O_RDONLY || flags.0 & libc::O_TRUNC != 0;
@@ -1401,6 +1405,7 @@ impl Filesystem for View {
         flags: i32,
         reply: ReplyCreate,
     ) {
+        let _request = measured::request(measured::Op::Create);
         let owner = (req.uid(), req.gid());
         let untracked = self.untracked_new(parent, name, NewKind::File, |v, path| {
             let meta_of = &mut |dir: &str| v.node(dir).ok().map(|n| n.meta);
@@ -1454,6 +1459,7 @@ impl Filesystem for View {
         flags: i32,
         reply: ReplyCreate,
     ) {
+        let _request = measured::request(measured::Op::Create);
         // An anonymous file becomes tracked by its first link; one in an
         // untracked directory would have nowhere to go.
         if is_untracked(parent) {
@@ -1514,6 +1520,7 @@ impl Filesystem for View {
         owner: Option<LockOwner>,
         reply: ReplyData,
     ) {
+        let _request = measured::request(measured::Op::Read);
         let result = (|| {
             if let Some(open) = self.untracked_fd(fh)? {
                 return untracked::read(&open.fd, offset, size);
@@ -1567,6 +1574,7 @@ impl Filesystem for View {
         _owner: Option<LockOwner>,
         reply: ReplyWrite,
     ) {
+        let _request = measured::request(measured::Op::Write);
         match self.untracked_fd(fh) {
             Ok(Some(open)) => {
                 if open.moved {
@@ -1638,6 +1646,7 @@ impl Filesystem for View {
         _flags: Option<BsdFileFlags>,
         reply: ReplyAttr,
     ) {
+        let _request = measured::request(measured::Op::Other);
         let changes = AttrChanges {
             mode,
             uid,
@@ -1692,6 +1701,7 @@ impl Filesystem for View {
         _owner: LockOwner,
         reply: ReplyEmpty,
     ) {
+        let _request = measured::request(measured::Op::Flush);
         let handle = match self
             .handles()
             .map(|h| h.entries.get(&fh.0).map(open_handle))
@@ -1715,6 +1725,7 @@ impl Filesystem for View {
         datasync: bool,
         reply: ReplyEmpty,
     ) {
+        let _request = measured::request(measured::Op::Other);
         match self.untracked_fd(fh) {
             Ok(Some(open)) => {
                 let synced = if datasync {
@@ -1753,6 +1764,7 @@ impl Filesystem for View {
         _datasync: bool,
         reply: ReplyEmpty,
     ) {
+        let _request = measured::request(measured::Op::Other);
         // The area's directory at the same path holds the untracked names.
         let synced = self
             .actor()
@@ -1773,6 +1785,7 @@ impl Filesystem for View {
         _flush: bool,
         reply: ReplyEmpty,
     ) {
+        let _request = measured::request(measured::Op::Release);
         match self.finish(fh) {
             Ok(()) => reply.ok(),
             Err(e) => {
@@ -1788,6 +1801,7 @@ impl Filesystem for View {
     /// anonymous file, its first name; a named tracked file `EPERM`; across
     /// the halves `EXDEV`.
     fn link(&self, _req: &Request, ino: INodeNo, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
+        let _request = measured::request(measured::Op::Other);
         let untracked = (|| {
             let v = self.actor()?;
             if !v.writable() {
@@ -1845,6 +1859,7 @@ impl Filesystem for View {
         });
     }
     fn unlink(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
+        let _request = measured::request(measured::Op::Other);
         let untracked = (|| {
             let v = self.actor()?;
             let (dir, up) = self.dir_of(&v, parent)?;
@@ -1885,6 +1900,7 @@ impl Filesystem for View {
         target: &Path,
         reply: ReplyEntry,
     ) {
+        let _request = measured::request(measured::Op::Other);
         let untracked = self.untracked_new(parent, link_name, NewKind::Symlink, |v, path| {
             let meta_of = &mut |dir: &str| v.node(dir).ok().map(|n| n.meta);
             self.untracked
@@ -1914,6 +1930,7 @@ impl Filesystem for View {
         });
     }
     fn readlink(&self, _req: &Request, ino: INodeNo, reply: ReplyData) {
+        let _request = measured::request(measured::Op::Other);
         if is_untracked(ino) {
             return match self.untracked.readlink(ino) {
                 Ok(target) => reply.data(&target),
@@ -1943,6 +1960,7 @@ impl Filesystem for View {
         _rdev: u32,
         reply: ReplyEntry,
     ) {
+        let _request = measured::request(measured::Op::Other);
         let special = match mode & libc::S_IFMT {
             libc::S_IFREG => None,
             libc::S_IFIFO => Some(NewKind::Fifo),
@@ -2004,6 +2022,7 @@ impl Filesystem for View {
         _umask: u32,
         reply: ReplyEntry,
     ) {
+        let _request = measured::request(measured::Op::Other);
         let untracked = self.untracked_new(parent, name, NewKind::Dir, |v, path| {
             if v.node(path).is_ok() {
                 return Err(Errno::EEXIST);
@@ -2036,6 +2055,7 @@ impl Filesystem for View {
         });
     }
     fn rmdir(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
+        let _request = measured::request(measured::Op::Other);
         let untracked = (|| {
             let v = self.actor()?;
             let (dir, up) = self.dir_of(&v, parent)?;
@@ -2089,6 +2109,7 @@ impl Filesystem for View {
         flags: RenameFlags,
         reply: ReplyEmpty,
     ) {
+        let _request = measured::request(measured::Op::Other);
         // RENAME_EXCHANGE and RENAME_WHITEOUT are not supported.
         let mode = if flags.is_empty() {
             RenameMode::Replace
@@ -2129,6 +2150,7 @@ impl Filesystem for View {
         offset: u64,
         mut reply: ReplyDirectory,
     ) {
+        let _request = measured::request(measured::Op::Readdir);
         let result = self.listing(ino, offset);
         match result {
             Ok(entries) => {

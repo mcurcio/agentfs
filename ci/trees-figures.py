@@ -100,6 +100,43 @@ commit, not only the close.
                `ratio`, their mean ms over the first run's `create`
                `first_2000_ms`
 
+With --metrics, every workload also reports `lock`: the volume lock's holds
+by kind of work (`compaction`, `catch_up`, `drops`, `close`, `take`,
+`fork_copy`, `other`; docs/telemetry.md, "The volume lock") and the waits
+to take it, from the metrics file read before the workload and again once
+its history is built and one more save (`fig-nudge`, the first call after
+history caught up, which runs the compaction the workload made due) is
+built too. Per kind: `holds`, the holds it ran in; `total_ms`,
+its time; `longest_ms`, its longest share of one hold, given only when that
+maximum, kept process-wide, grew during this workload (else null: an
+earlier workload's was longer). `longest_kind` names the kind with the
+longest share among those. The figures carry no bar: they are read, and
+never warn or fail (owner, 2026-11-20). Run a workload alone (`--only`) to
+read its longest holds without an earlier workload's.
+
+Each such workload also reports `gate_wait`: the lag gate's waits by
+cause (`lag`, `overlay`, `overdue`), each `waits`, `total_ms` and
+`longest_ms` as above; and `requests`: the view's FUSE requests by op
+(`lookup`, `getattr`, `open`, `create`, `read`, `write`, `flush`,
+`release`, `readdir`, `other`), each op with any requests giving
+`requests`, `total_ms`, `longest_ms` as above, and `p50_under_ms` and
+`p99_under_ms`, the power-of-two bound in ms under which that quantile
+falls (null past 8.4 s): each the time the view's one thread spent on it, without
+a reply sent later for the lag gate or the disk. They count the probe's
+requests too.
+
+With --probe, `create`, `close_1g`, `close_frag` and `write_1m` also
+report `probe`: another file's stall while the workload runs, from its
+start until the nudge's build. A thread per view stats, opens and reads
+4 KiB of `fig-probe` (written before the first workload, and touched by
+no workload) every 10 ms: `same` in the workload's view, which answers its
+requests on one thread, and `other` in --probe-view, another view of the
+same volume (a fork's mount), which shares only the volume's lock. Per
+view and call: `count`, `p50_ms`, `p99_ms`, `max_ms`. A stall in `same`
+alone is the view's one thread; in both, the lock. The probe never writes,
+so the lag gate, which holds only new work, never holds it. It adds requests
+beside the workload, so the tracer does not pass it: it is read locally.
+
 Each workload runs on a worker thread. One the deadline catches inside a
 save gets `grace_s` more to come back; one still blocked then is stuck in
 the view, so the FUSE connection is aborted (/sys/fs/fuse/connections, as
@@ -682,6 +719,189 @@ PEAKS = ("create", "close_1g", "write_1m")
 
 
 
+LOCK_KINDS = ("compaction", "catch_up", "drops", "close", "take", "fork_copy", "other")
+GATE_CAUSES = ("lag", "overlay", "overdue")
+OPS = ("lookup", "getattr", "open", "create", "read", "write", "flush", "release", "readdir",
+       "other")
+# Workloads the probe runs beside (--probe).
+PROBED = ("create", "close_1g", "close_frag", "write_1m")
+PROBE_FILE = "fig-probe"
+
+
+def stages_of(metrics):
+    """The view's process-wide stage totals from its metrics file, or None."""
+    now = metrics_of(metrics)
+    try:
+        return now["stages"]
+    except (KeyError, TypeError):
+        return None
+
+
+def delta(now, then, runs):
+    """One stage's runs between two snapshots: `runs`, how many; `total_ms`;
+    `longest_ms`, the process-wide longest only when it grew in between."""
+    grew = now["max_nanos"] > then["max_nanos"]
+    return {runs: now["count"] - then["count"],
+            "total_ms": round((now["nanos"] - then["nanos"]) / 1e6, 3),
+            "longest_ms": round(now["max_nanos"] / 1e6, 3) if grew else None}
+
+
+def lock_figures(before, after):
+    """The volume lock's holds by kind and its waits between two stage
+    snapshots (see the module's docstring), or None without both."""
+    try:
+        hold = {kind: delta(after["lock_hold"][kind], before["lock_hold"][kind], "holds")
+                for kind in LOCK_KINDS}
+        wait = delta(after["lock_wait"], before["lock_wait"], "holds")
+    except (KeyError, TypeError):
+        return None
+    known = {kind: v["longest_ms"] for kind, v in hold.items() if v["longest_ms"] is not None}
+    return {"hold": hold, "wait": wait,
+            "longest_kind": max(known, key=known.get) if known else None}
+
+
+def gate_figures(before, after):
+    """The lag gate's waits by cause between two stage snapshots, or None."""
+    try:
+        return {cause: delta(after["gate_wait"][cause], before["gate_wait"][cause], "waits")
+                for cause in GATE_CAUSES}
+    except (KeyError, TypeError):
+        return None
+
+
+def bucket_ms(buckets, q):
+    """The bound in ms under which the q-quantile of a request histogram
+    falls (bucket i counts requests under 2^i us), None past the last
+    bound or with no requests."""
+    total = sum(buckets)
+    if not total:
+        return None
+    rank, seen = max(1, math.ceil(q * total)), 0
+    for i, n in enumerate(buckets):
+        seen += n
+        if seen >= rank:
+            return None if i == len(buckets) - 1 else (1 << i) / 1000
+    return None
+
+
+def request_figures(before, after):
+    """The views' FUSE requests by op between two stage snapshots: per op
+    with any, `delta`'s figures and `p50_under_ms` and `p99_under_ms` from
+    the histogram's power-of-two bounds; or None."""
+    try:
+        found = {}
+        for op in OPS:
+            now, then = after["requests"][op], before["requests"][op]
+            buckets = [a - b for a, b in zip(now["buckets"], then["buckets"])]
+            if sum(buckets):
+                found[op] = {**delta(now, then, "requests"),
+                             "p50_under_ms": bucket_ms(buckets, 0.5),
+                             "p99_under_ms": bucket_ms(buckets, 0.99)}
+        return found
+    except (KeyError, TypeError):
+        return None
+
+
+def spread(samples):
+    """count, p50, p99 and max of samples in seconds, as ms; None if empty."""
+    if not samples:
+        return None
+    return {"count": len(samples), "p50_ms": ms(statistics.median(samples)),
+            "p99_ms": ms(p99(samples)), "max_ms": ms(max(samples))}
+
+
+class Probe:
+    """Another file's requests while a workload runs: on a daemon thread
+    per view, every `interval_s`, a stat(2), an open(2) and a 4 KiB read(2)
+    of PROBE_FILE, a file no workload touches, each timed from the call to
+    its return. `same` is the workload's view, which answers its requests
+    on one thread; `other` another view of the same volume (--probe-view),
+    which shares only the volume's lock. Measurement only."""
+
+    def __init__(self, views, interval_s=0.01):
+        self.views, self.interval_s = views, interval_s
+        self.samples = {label: {"stat": [], "open": [], "read": []} for label in views}
+        self.errors = {}
+        self._stopped = threading.Event()
+        self._threads = []
+
+    def _run(self, label, path):
+        timed = self.samples[label]
+        while not self._stopped.wait(self.interval_s):
+            try:
+                start = time.monotonic()
+                os.stat(path)
+                opened = time.monotonic()
+                fd = os.open(path, os.O_RDONLY)
+                try:
+                    read = time.monotonic()
+                    os.read(fd, 4096)
+                    end = time.monotonic()
+                finally:
+                    os.close(fd)
+            except OSError as error:
+                self.errors[label] = str(error)
+                return
+            timed["stat"].append(opened - start)
+            timed["open"].append(read - opened)
+            timed["read"].append(end - read)
+
+    def start(self):
+        for label, view in self.views.items():
+            thread = threading.Thread(target=self._run, name=f"probe-{label}", daemon=True,
+                                      args=(label, os.path.join(view, PROBE_FILE)))
+            thread.start()
+            self._threads.append(thread)
+
+    def stop(self, grace):
+        """Stops probing; per view and call, `spread`'s figures, with
+        `error` for a view whose probe failed and `stuck` for one still in
+        a call `grace` s later."""
+        self._stopped.set()
+        found = {}
+        for (label, _), thread in zip(self.views.items(), self._threads):
+            thread.join(grace)
+            found[label] = {call: spread(list(samples))
+                            for call, samples in self.samples[label].items()}
+            if label in self.errors:
+                found[label]["error"] = self.errors[label]
+            if thread.is_alive():
+                found[label]["stuck"] = True
+        return found
+
+
+def probe_views(args):
+    """The views the probe reads, each with PROBE_FILE written, or {}."""
+    if not args.probe:
+        return {}
+    views = {"same": args.view}
+    if args.probe_view:
+        views["other"] = args.probe_view
+    for label, view in list(views.items()):
+        path = os.path.join(view, PROBE_FILE)
+        try:
+            write_file(path, page(0))
+            os.stat(path)
+        except OSError as error:
+            print(f"::warning title=tree views::no probe in the {label} view: {error}", flush=True)
+            del views[label]
+    return views
+
+
+def nudge(view, metrics, cap):
+    """One save of `fig-nudge` after a workload's history is built, then
+    waits for its build: the first call after history caught up runs the
+    compaction then due, which the workload's journal made due. Whether the
+    build was reached within `cap`."""
+    try:
+        write_file(os.path.join(view, "fig-nudge"), b"nudge\n")
+        os.stat(os.path.join(view, "fig-nudge"))
+    except OSError as error:
+        print(f"::warning title=tree views::the nudge after a workload failed: {error}", flush=True)
+        return False
+    return drain(metrics, cap) is not None
+
+
 def lock_hold_ms(metrics):
     """The longest hold of the actor's lock so far, process-wide, in ms, from
     the view's metrics file; None without one."""
@@ -730,6 +950,10 @@ def main():
                         help="how long to wait for history to be built after a workload")
     parser.add_argument("--view-pid", type=int,
                         help="the view's process: the memory figures then read it")
+    parser.add_argument("--probe", action="store_true",
+                        help="time another file's stat, open and read beside " + ", ".join(PROBED))
+    parser.add_argument("--probe-view",
+                        help="with --probe: another view of the volume (a fork's mount) to probe too")
     parser.add_argument("--only", action="append", choices=[n for n, _ in WORKLOADS],
                         help="run only this workload (repeatable; a probe's shortcut)")
     parser.add_argument("--baseline",
@@ -766,6 +990,7 @@ def main():
             baseline_report = json.load(file)
     # Read before any workload: a stat of the view blocks while it is stuck.
     dev = os.stat(args.view).st_dev
+    probed = probe_views(args)
 
     workloads, stopped, aborted = [], False, False
     if baseline_report is not None:
@@ -795,6 +1020,10 @@ def main():
         # history is built (after drain), so the build is inside it.
         sampler = PeakSampler(args.view_pid) if args.view_pid and name in PEAKS else None
         before = sampler.start() if sampler else None
+        stages_before = stages_of(args.metrics)
+        probe = Probe(probed) if probed and name in PROBED else None
+        if probe:
+            probe.start()
 
         def worker(work=work, run=run, target=budget.get("count")):
             try:
@@ -834,6 +1063,28 @@ def main():
             mine = figure.get("ms_per_create")
             figure.update(create_first_2000_ms=first,
                           ratio=round(mine / first, 3) if mine and first else None)
+        if figure.get("drain_s") is not None:
+            # A compaction due once history caught up runs at the next call:
+            # the nudge is that call, so it lands in this workload's window.
+            nudged = nudge(args.view, args.metrics, args.drain_cap)
+            figure["lock"] = lock_figures(stages_before, stages_of(args.metrics)) if nudged else None
+            stages_after = stages_of(args.metrics) if nudged else None
+            figure["gate_wait"] = gate_figures(stages_before, stages_after)
+            figure["requests"] = request_figures(stages_before, stages_after)
+            lock = figure["lock"] or {}
+            kind = lock.get("longest_kind")
+            if kind:
+                print(f"{name} on {args.filesystem}: longest lock hold {kind} "
+                      f"{lock['hold'][kind]['longest_ms']} ms, longest wait "
+                      f"{lock['wait']['longest_ms']} ms", flush=True)
+        if probe:
+            # Stopped once the nudge's compaction ran, so its stall is inside.
+            figure["probe"] = probe.stop(grace)
+            for label, calls in figure["probe"].items():
+                worst = {call: (v or {}).get("max_ms") for call, v in calls.items()
+                         if call in ("stat", "open", "read")}
+                print(f"{name} on {args.filesystem}: probe in the {label} view, longest ms "
+                      f"{json.dumps(worst)}", flush=True)
         found = [(name, budget, figure)]
         if name == "create":
             # memory_create: the peak through its history's build, so the

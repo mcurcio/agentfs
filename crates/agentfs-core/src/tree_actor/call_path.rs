@@ -3,8 +3,8 @@
 //! place. Under the lock a call decides, appends (no fsync) and applies;
 //! durability waits, lag-gate waits and a close's decision run outside it
 //! (docs/trees.md, "Recording and durability"). Each hold is measured
-//! (`Stages::actor_lock`): its longest is the longest any other view of the
-//! volume waited.
+//! (`Stages::actor_lock`, and by kind of work in `Stages::lock_hold`), and
+//! so is each wait to take the lock (`Stages::lock_wait`).
 //!
 
 use std::ops::{Deref, DerefMut};
@@ -18,17 +18,18 @@ use agentfs_contracts::volume::VolumeIdentity;
 use super::history::built::History;
 use super::journal::durable::{Durability, RecordNo};
 use super::recording::CloseStart;
-use super::stages::{Timer, Which};
+use super::stages::{self, Held};
 use super::takes::{self, Lands};
 use super::{Error, Saved, Took, TreeActor, TreeId};
 
 /// The actor, locked through the call path: [`TreeActor`] by `Deref`. Each
 /// guard adds one run of `Stages::actor_lock` when it is dropped, from the
-/// lock taken to its release, and reports each tree's overlay to the lag
+/// lock taken to its release, with each kind of work's share of it in
+/// `Stages::lock_hold`, and reports each tree's overlay to the lag
 /// gate before the lock is released.
 pub struct ActorGuard<'a> {
     guard: MutexGuard<'a, TreeActor>,
-    _held: Timer,
+    _held: Held,
 }
 
 impl Drop for ActorGuard<'_> {
@@ -197,8 +198,10 @@ impl Recording {
     ///
     /// [`Error::Stopped`] when the actor stopped or its lock is poisoned.
     pub fn actor(&self) -> Result<ActorGuard<'_>, Error> {
+        let waiting = std::time::Instant::now();
         let actor = self.actor.lock().map_err(|_| Error::Stopped)?;
-        let held = Timer::start(Which::ActorLock);
+        stages::waited(waiting);
+        let held = Held::start();
         if actor.is_stopped() {
             return Err(Error::Stopped);
         }

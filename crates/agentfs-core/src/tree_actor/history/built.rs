@@ -185,7 +185,15 @@ struct State {
     maps: Vec<(TreeId, u64, FileMap)>,
     /// Gated calls waiting for their tree's lag to fall, in arrival order:
     /// the one gate thread answers them ([`History::serve_gate`]).
-    gated: Vec<(TreeId, Then)>,
+    gated: Vec<Gated>,
+}
+
+/// A gated call: its tree, its reply, and why and since when it waits.
+struct Gated {
+    tree: TreeId,
+    then: Then,
+    cause: super::lag::GateCause,
+    since: Instant,
 }
 
 /// How many batches have ended since History started: `built` counts the
@@ -609,13 +617,18 @@ impl History {
     /// [`WaitError::Stopped`] at shutdown.
     pub(in crate::tree_actor) fn admit(&self, tree: TreeId) -> Result<(), WaitError> {
         let mut state = self.state();
+        let mut waited: Option<(super::lag::GateCause, Instant)> = None;
         loop {
-            if state.gate.admits(tree) {
+            let Some(cause) = state.gate.refusal(tree) else {
+                if let Some((cause, since)) = waited {
+                    crate::tree_actor::stages::gate_waited(cause, since);
+                }
                 return Ok(());
-            }
+            };
             if state.stopped || state.stopping {
                 return Err(WaitError::Stopped);
             }
+            waited.get_or_insert((cause, Instant::now()));
             state = self.wait(state);
         }
     }
@@ -626,16 +639,25 @@ impl History {
     /// waiting call ([`History::serve_gate`]).
     pub(in crate::tree_actor) fn admit_then(&self, tree: TreeId, then: Then) {
         let mut state = self.state();
-        if state.gate.admits(tree) {
-            drop(state);
-            then(Ok(()));
-        } else if state.stopped || state.stopping {
-            drop(state);
-            then(Err(WaitError::Stopped.into()));
-        } else {
-            state.gated.push((tree, then));
-            drop(state);
-            self.notify();
+        match state.gate.refusal(tree) {
+            None => {
+                drop(state);
+                then(Ok(()));
+            }
+            Some(_) if state.stopped || state.stopping => {
+                drop(state);
+                then(Err(WaitError::Stopped.into()));
+            }
+            Some(cause) => {
+                state.gated.push(Gated {
+                    tree,
+                    then,
+                    cause,
+                    since: Instant::now(),
+                });
+                drop(state);
+                self.notify();
+            }
         }
     }
 
@@ -648,12 +670,15 @@ impl History {
             let shutting = state.stopped || state.stopping;
             let (ready, waiting): (Vec<_>, Vec<_>) = std::mem::take(&mut state.gated)
                 .into_iter()
-                .partition(|(tree, _)| shutting || state.gate.admits(*tree));
+                .partition(|gated| shutting || state.gate.admits(gated.tree));
             state.gated = waiting;
             if !ready.is_empty() {
                 drop(state);
-                for (_, then) in ready {
-                    then(if shutting {
+                for gated in ready {
+                    if !shutting {
+                        crate::tree_actor::stages::gate_waited(gated.cause, gated.since);
+                    }
+                    (gated.then)(if shutting {
                         Err(WaitError::Stopped.into())
                     } else {
                         Ok(())

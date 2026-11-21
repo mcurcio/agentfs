@@ -33,6 +33,7 @@ use super::journal::{
 };
 use super::meta::{Attrs, Kind, Meta, Perm, SetTime, Times};
 use super::queue::Key;
+use super::stages::{Hold, section};
 use super::tree::{DirState, EventNumber, SavedTree};
 use super::{Error, Result, Saved, TreeActor, TreeId};
 use crate::paths::RepoPath;
@@ -964,6 +965,7 @@ impl TreeActor {
     /// [`CloseWork::decide`] and [`TreeActor::close_finish`] in one hold of
     /// the lock: `Recording::close_with` releases it for the decision.
     pub fn close(&mut self, handle: u64) -> Result<Saved> {
+        let _kind = section(Hold::Close);
         match self.close_begin(handle)? {
             CloseStart::Done(saved) => Ok(saved),
             CloseStart::Decide(work) => match work.decide() {
@@ -986,6 +988,7 @@ impl TreeActor {
     /// [`Error::Stopped`], [`Error::NotFound`] (no such open, or one being
     /// closed); a failed save, which stays pending.
     pub(in crate::tree_actor) fn close_begin(&mut self, handle: u64) -> Result<CloseStart> {
+        let _kind = section(Hold::Close);
         if self.is_stopped() {
             return Err(Error::Stopped);
         }
@@ -1059,6 +1062,7 @@ impl TreeActor {
     /// [`Error::Stopped`]; [`Error::NotFound`] for an open not being
     /// closed; a failed save, which stays pending.
     pub(in crate::tree_actor) fn close_finish(&mut self, decision: CloseDecision) -> Result<Saved> {
+        let _kind = section(Hold::Close);
         let CloseDecision {
             work,
             outcome,
@@ -1328,6 +1332,7 @@ impl TreeActor {
             .collect();
         let mut saved = Vec::with_capacity(due.len());
         for handle in due {
+            let _kind = section(Hold::Close);
             saved.push((handle, self.close_step(handle)?));
         }
         Ok(saved)

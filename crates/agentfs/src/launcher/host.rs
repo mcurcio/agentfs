@@ -115,6 +115,7 @@ pub fn host(state: &Path, args: HostArgs, minter: Minter) -> Result<ExitCode> {
         &identity(volume.name.as_str(), &args.pod),
     );
     otel.telemetry().observe_not_built(&boot.not_built);
+    otel.telemetry().observe_latency();
     let cap = LaunchCap::mint(&minter, launcher, LaunchScope::Root);
     let staged = match serving::stage::<Line>(state, &at, cap, minter, boot.overlay_limit)? {
         Ok(staged) => staged,
