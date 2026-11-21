@@ -27,7 +27,7 @@ use super::feed::{BuildRef, CommitSpec, Feed, Parent};
 use super::format::{self, BlobRef};
 use super::message::{self, Action, Message};
 use super::upstreams::Upstreams;
-use super::{checkout, objects_after, objects_of, refs};
+use super::{Objects, TreeMoved, checkout, objects_after, objects_of, refs};
 use crate::tree_actor::journal::durable::{Durability, RecordNo};
 use crate::tree_actor::journal::segment::{FramePos, Relocations, Segment};
 use crate::tree_actor::journal::{
@@ -420,6 +420,68 @@ impl BuildState {
 
     fn tree(&self, tree: TreeId) -> Result<&Tree> {
         self.trees.get(&tree).ok_or(Error::Format)
+    }
+
+    /// Each tree's objects as built: the published map, else (a tree no
+    /// batch has moved yet) its shape's.
+    fn objects_of_tree(&self, tree: TreeId, t: &Tree) -> Result<Objects> {
+        match self.objects.get(&tree) {
+            Some(objects) => Ok(objects.clone()),
+            None => objects_of(&t.shape),
+        }
+    }
+
+    /// What `next`, this state after a batch, moved of each tree's object
+    /// numbers and locals: the built-log entry's `moved`. Visits the diffs of
+    /// the persistent maps only (O(trees) plus what moved).
+    fn moved_to(&self, next: &Self) -> Result<Vec<TreeMoved>> {
+        let trees: BTreeSet<TreeId> = self
+            .trees
+            .keys()
+            .chain(next.trees.keys())
+            .copied()
+            .collect();
+        let mut moved = Vec::new();
+        for tree in trees {
+            let before = match self.trees.get(&tree) {
+                Some(t) => Some((t, self.objects_of_tree(tree, t)?)),
+                None => None,
+            };
+            let after = match next.trees.get(&tree) {
+                Some(t) => Some((t, next.objects_of_tree(tree, t)?)),
+                None => None,
+            };
+            let change = TreeMoved::between(
+                tree,
+                before.as_ref().map(|(t, o)| (&t.shape, o)),
+                after.as_ref().map(|(t, o)| (&t.shape, o)),
+            )?;
+            // The unit tests' check, at every batch: the moves carry the
+            // before-state's objects and locals to the after-state's.
+            #[cfg(test)]
+            {
+                let (mut objects, mut locals) = (BTreeMap::new(), BTreeMap::new());
+                if let Some((t, _)) = &before {
+                    objects.insert(tree, objects_of(&t.shape)?);
+                    locals.insert(tree, t.shape.locals());
+                }
+                if let Some(change) = &change {
+                    change.apply(&mut objects, &mut locals)?;
+                }
+                let (mut want_objects, mut want_locals) = (BTreeMap::new(), BTreeMap::new());
+                if let Some((t, _)) = &after {
+                    want_objects.insert(tree, objects_of(&t.shape)?);
+                    want_locals.insert(tree, t.shape.locals());
+                }
+                assert_eq!(
+                    (objects, locals),
+                    (want_objects, want_locals),
+                    "{tree}: a batch's moves disagree with its trees"
+                );
+            }
+            moved.extend(change);
+        }
+        Ok(moved)
     }
 
     fn head(&self, tree: TreeId) -> Result<Parent> {
@@ -1442,8 +1504,13 @@ impl Builder {
                 oid,
             });
         }
+        let moved = self.state.moved_to(&next).map_err(to_build_error)?;
         crate::failpoints::hit("tree.build_after_pack")?;
-        let entry = BuiltEntry { through, values };
+        let entry = BuiltEntry {
+            through,
+            values,
+            moved,
+        };
         self.built_log.append(&entry)?;
         self.reader.advance(offset, through);
         let built = next.built_pointers().map_err(to_build_error)?;

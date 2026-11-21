@@ -592,8 +592,13 @@ at any size, so a map costs its saves' edits, not its file's bytes.
 Object numbers (which file an open handle writes to), directory numbers and
 times are not in history. They are the journal's: a checkpoint holds each tree's
 objects as of its built point, and each tree's directory numbers and times and
-its files' times (`locals`), and the steps after it move them. A checkout of
-history shows checkout times, as git's does.
+its files' times (`locals`), and the steps after it move them. Each built-log
+entry also records what its batch moved of them, tree by tree: the objects set
+or unnamed, the directories set or removed, the files' times set or dropped, a
+tree the batch made (all of it) or dropped. A start after a kill, whose built
+point is past its checkpoint, carries the checkpoint's objects and locals to the
+built point with those records and reads each tree once, at the built point. A
+checkout of history shows checkout times, as git's does.
 
 ## The journal
 
@@ -672,8 +677,9 @@ appends it and applies it to the saved state the views serve; it runs no git.
 - The state area is `volume`, `history.git`, `journal/`, `built.log`, `align/`,
   `bases/`, `actor.lock`, `format` and rebuilt private checkout caches, which the workload
   never sees. A create writes an `initializing` marker first and removes it last;
-  the next `init` starts a cut-short create over. **Earlier state formats
-  (format 8 included) do not open**, and are never converted.
+  the next `init` starts a cut-short create over. The state format is
+  `agentfs-trees-12`. **Earlier state formats (11 included) do not open**, and
+  are never converted ([upgrading](runbooks/upgrading-the-sidecar.md)).
 
 ## History trails the files
 

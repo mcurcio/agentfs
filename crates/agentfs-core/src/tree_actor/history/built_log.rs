@@ -24,17 +24,21 @@ use std::path::{Path, PathBuf};
 use git2::Oid;
 use serde::{Deserialize, Serialize};
 
+use super::TreeMoved;
 use crate::tree_actor::journal::durable::RecordNo;
 
 const MAGIC: &[u8; 4] = b"AFB1";
 const HEADER: usize = 12;
 
-/// One batch: every record through `through` is built, and each pointer a
-/// step's record named as `Target::Step(step)` got `oid`.
+/// One batch: every record through `through` is built, each pointer a
+/// step's record named as `Target::Step(step)` got `oid`, and `moved` is what
+/// the batch moved of each tree's object numbers and locals, so a start after
+/// a kill folds a checkpoint's forward without reading any tree.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(in crate::tree_actor) struct BuiltEntry {
     pub through: RecordNo,
     pub values: Vec<BuiltValue>,
+    pub moved: Vec<TreeMoved>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -241,17 +245,55 @@ mod tests {
                 name: "refs/heads/root".into(),
                 oid: Oid::from_str("0123456789012345678901234567890123456789").unwrap(),
             }],
+            moved: Vec::new(),
         }
     }
 
     #[test]
     fn an_entry_is_stored_as_its_pinned_line() {
-        // The bytes every built.log already on disk holds: an object id as
-        // its hex text.
-        let line = r#"{"through":3,"values":[{"step":3,"name":"refs/heads/root","oid":"0123456789012345678901234567890123456789"}]}"#;
+        // An object id as its hex text; `moved` is required.
+        let line = r#"{"through":3,"values":[{"step":3,"name":"refs/heads/root","oid":"0123456789012345678901234567890123456789"}],"moved":[]}"#;
         assert_eq!(serde_json::to_string(&entry(3)).unwrap(), line);
         assert_eq!(serde_json::from_str::<BuiltEntry>(line).unwrap(), entry(3));
         assert!(serde_json::from_str::<BuiltEntry>(&line.replace("0123", "zz23")).is_err());
+        // An entry of an older format, with no `moved`, does not parse.
+        let older = line.replace(r#","moved":[]"#, "");
+        assert!(serde_json::from_str::<BuiltEntry>(&older).is_err());
+    }
+
+    /// An entry's moves (a set object, an unnamed identity, a directory set
+    /// and one removed, a file's times set and one dropped, a dropped tree)
+    /// come back from the file as written.
+    #[test]
+    fn an_entry_with_moves_round_trips() {
+        let times = crate::tree_actor::Times {
+            atime_ns: 1,
+            mtime_ns: 2,
+            ctime_ns: 3,
+        };
+        let mut moving = entry(5);
+        moving.moved = vec![
+            TreeMoved {
+                tree: "root".into(),
+                dropped: false,
+                objects: vec![(4, 9)],
+                unnamed: vec![7],
+                dirs: vec![("a".into(), Some((12, times))), ("b".into(), None)],
+                files: vec![(4, Some(times)), (7, None)],
+            },
+            TreeMoved {
+                tree: "fork/3".into(),
+                dropped: true,
+                ..TreeMoved::default()
+            },
+        ];
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("built.log");
+        let (mut log, _) = BuiltLog::open(&path).unwrap();
+        log.append(&moving).unwrap();
+        drop(log);
+        let (_, entries) = BuiltLog::open(&path).unwrap();
+        assert_eq!(entries, vec![moving]);
     }
 
     #[test]

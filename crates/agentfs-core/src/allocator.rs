@@ -11,5 +11,10 @@ pub const ARENAS: i32 = 2;
 /// arenas made before it stay. A no-op where the C library is not glibc. A
 /// refusal by `mallopt` is ignored: the process runs on with glibc's default.
 pub fn limit_arenas() {
-    todo!("agentfs-ln6.12")
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    // SAFETY: `mallopt` only sets a malloc parameter, and the caller runs it
+    // before any thread starts, so nothing allocates beside it.
+    unsafe {
+        libc::mallopt(libc::M_ARENA_MAX, ARENAS);
+    }
 }

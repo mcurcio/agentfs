@@ -52,9 +52,7 @@ use history::message::Message;
 use history::repack::Repacker;
 use history::upstreams::Upstreams;
 pub use history::verify::{Checked, UnverifiedCounts, Verdict, Verification};
-use history::{
-    check_objects, clean_packs, objects_of, read_trees, refs, remove_stale_locks, sync_marker,
-};
+use history::{check_objects, clean_packs, read_trees, refs, remove_stale_locks, sync_marker};
 pub use journal::durable::{Durability, DurableError, RecordNo};
 use journal::{
     Change, Entry, Journal, PointerChange, Record, Replay, RowRecord, Target, compact_at, fold,
@@ -70,7 +68,7 @@ use stages::Stages;
 use tree::{EventNumber, SavedTree};
 pub use untracked::{AreaWrite, UntrackedArea};
 
-const FORMAT: &str = "agentfs-trees-11\n";
+const FORMAT: &str = "agentfs-trees-12\n";
 /// The volume identity file: [`VolumeIdentity`] as JSON, written once by
 /// [`TreeActor::create`], read before any write at every open.
 const IDENTITY: &str = "volume";
@@ -735,33 +733,16 @@ impl TreeActor {
         let pointers = resolve_pointers(&at_built.pointers, &values)?;
         check_objects(&repo, &pointers)?;
         // Object numbers, directory numbers and times as of the built point:
-        // the checkpoint's, moved by the steps built after it, on the trees as
-        // the checkpoint has them.
+        // the checkpoint's, moved by what each batch built after it moved, as
+        // its built-log entry says. No tree is read for them.
         let (objects, locals) = if built > folded_built {
             let checkpoint = fold(&frames[..1])?;
-            let at_checkpoint = resolve_pointers(&checkpoint.pointers, &values)?;
-            let mut trees = read_trees(&repo, &at_checkpoint, &checkpoint.objects, |_, _, _| {
-                Ok(Arc::default())
-            })?;
-            restore_locals(&mut trees, &checkpoint.locals)?;
-            let trees = trees
-                .iter()
-                .map(|(tree, t)| (*tree, SavedTree::of(t)))
-                .collect();
-            let mut replay = Replay::shapes(trees, &checkpoint.opens)?;
-            for (record, tail) in &frames[1..upto] {
-                replay.apply(record, tail)?;
+            let (mut objects, mut locals) = (checkpoint.objects, checkpoint.locals);
+            for entry in entries.iter().filter(|entry| entry.through > folded_built) {
+                for moved in &entry.moved {
+                    moved.apply(&mut objects, &mut locals)?;
+                }
             }
-            let objects = replay
-                .trees
-                .iter()
-                .map(|(tree, t)| Ok((*tree, objects_of(&t.shape)?)))
-                .collect::<Result<_>>()?;
-            let locals = replay
-                .trees
-                .iter()
-                .map(|(tree, t)| (*tree, t.shape.locals()))
-                .collect();
             (objects, locals)
         } else {
             (at_built.objects.clone(), at_built.locals.clone())
@@ -1939,6 +1920,8 @@ mod tests {
             "agentfs-trees-7\n",
             "agentfs-trees-8\n",
             "agentfs-trees-9\n",
+            "agentfs-trees-10\n",
+            "agentfs-trees-11\n",
         ] {
             let tmp = tempfile::tempdir().unwrap();
             drop(new_actor(tmp.path()));
@@ -2073,6 +2056,121 @@ mod tests {
         // SAFETY: signals this process; nothing after it runs.
         unsafe { libc::kill(libc::getpid(), libc::SIGKILL) };
         unreachable!("killed");
+    }
+
+    /// Every entry of every tree as a view presents it (number, metadata,
+    /// times, length, links), by tree and path.
+    fn every_node(v: &TreeActor) -> BTreeMap<(TreeId, String), Node> {
+        let mut nodes = BTreeMap::new();
+        for tree in v.trees() {
+            let mut dirs = vec![String::new()];
+            while let Some(dir) = dirs.pop() {
+                nodes.insert((tree, dir.clone()), v.node(tree, &dir).unwrap());
+                for entry in v.children(tree, &dir, 0, usize::MAX).unwrap() {
+                    let path = if dir.is_empty() {
+                        entry.name
+                    } else {
+                        format!("{dir}/{}", entry.name)
+                    };
+                    if entry.kind == Kind::Dir {
+                        dirs.push(path);
+                    } else {
+                        nodes.insert((tree, path.clone()), v.node(tree, &path).unwrap());
+                    }
+                }
+            }
+        }
+        nodes
+    }
+
+    /// A saved file at `path` of `tree`, its path its content.
+    fn put(v: &mut TreeActor, tree: TreeId, path: &str) {
+        let h = v.write_open(tree, path, &writer("w"), Some(ATTRS)).unwrap();
+        v.write(h, 0, path.as_bytes(), false).unwrap();
+        v.close(h).unwrap();
+    }
+
+    /// One of each step a restart must carry over: files, a mkdir, a
+    /// directory rename, a set of times, and a fork with a file whose landing
+    /// the root takes. Returns the fork.
+    fn one_of_each(v: &mut TreeActor, round: &str) -> TreeId {
+        let w = writer("w");
+        put(v, ROOT, &format!("{round}-a"));
+        put(v, ROOT, &format!("{round}-b"));
+        v.mkdir(ROOT, &format!("{round}-d"), ATTRS, &w).unwrap();
+        put(v, ROOT, &format!("{round}-d/f"));
+        v.rename(
+            ROOT,
+            &format!("{round}-d"),
+            &format!("{round}-moved"),
+            RenameMode::NoReplace,
+            &w,
+        )
+        .unwrap();
+        v.set_times(
+            ROOT,
+            &format!("{round}-a"),
+            Some(SetTime::At(7_000)),
+            Some(SetTime::At(9_000)),
+            &w,
+        )
+        .unwrap();
+        v.set_times(
+            ROOT,
+            &format!("{round}-moved"),
+            None,
+            Some(SetTime::At(11_000)),
+            &w,
+        )
+        .unwrap();
+        let fork = rowless_fork(v);
+        put(v, fork, &format!("{round}-forked"));
+        while v.take_next(ROOT).unwrap() == Took::Taken {}
+        fork
+    }
+
+    /// A start after a kill, its built point past its checkpoint, reads each
+    /// tree once: the checkpoint's object numbers and locals are carried to
+    /// the built point by the built log's moves, never by reading the trees
+    /// at the checkpoint. Every entry comes back with its number, times and
+    /// mode, a fork dropped after the checkpoint included.
+    #[test]
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "the engine's drop, below the store"
+    )]
+    fn a_restart_after_a_kill_reads_each_tree_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut v = new_actor(tmp.path());
+        let first = one_of_each(&mut v, "one");
+        v.settle().unwrap();
+        v.compact().unwrap();
+        let second = one_of_each(&mut v, "two");
+        put(&mut v, second, "kept-in-fork");
+        v.set_times(ROOT, "one-b", Some(SetTime::At(13_000)), None, &writer("w"))
+            .unwrap();
+        v.unlink(ROOT, "two-b", &writer("w")).unwrap();
+        v.settle().unwrap();
+        v.drop_fork(first, |_| Ok(Vec::new())).unwrap();
+        v.settle().unwrap();
+        let before = every_node(&v);
+        assert!(before.keys().any(|(tree, _)| *tree == second));
+        assert!(!before.keys().any(|(tree, _)| *tree == first));
+        // No compaction at the stop: the built point is past the checkpoint.
+        drop(v);
+        let Entry::Checkpoint { built, .. } = frames_of(tmp.path())[0].0.entry else {
+            panic!("the journal starts at the checkpoint");
+        };
+        let (_, entries) = BuiltLog::open(&tmp.path().join("built.log")).unwrap();
+        assert!(built_log::built_through(&entries) > built);
+        history::TREE_READS.with(|n| n.set(0));
+        let v = reopen(tmp.path());
+        assert_eq!(
+            history::TREE_READS.with(std::cell::Cell::get),
+            1,
+            "a start reads each tree once"
+        );
+        assert_eq!(every_node(&v), before);
     }
 
     #[test]

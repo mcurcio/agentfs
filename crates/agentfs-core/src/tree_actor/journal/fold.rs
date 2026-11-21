@@ -200,20 +200,6 @@ impl Replay {
         })
     }
 
-    /// [`Replay::new`] of shapes only: what object numbers need.
-    ///
-    /// # Errors
-    ///
-    /// As [`Replay::new`].
-    pub(in crate::tree_actor) fn shapes(
-        trees: BTreeMap<TreeId, SavedTree>,
-        opens: &BTreeMap<u64, FoldedOpen>,
-    ) -> Result<Self> {
-        let mut replay = Self::new(trees, opens, BTreeMap::new(), Vec::new())?;
-        replay.maps = false;
-        Ok(replay)
-    }
-
     fn tree(&mut self, tree: &str) -> Result<(TreeId, &mut SavedTree)> {
         let id = tree.parse::<TreeId>()?;
         Ok((id, self.trees.get_mut(&id).ok_or(Error::Format)?))
