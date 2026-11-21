@@ -43,7 +43,9 @@ impl Retired {
 ///
 /// Contract (once built): [`DeferredDrops::defer`] is O(1) and never waits
 /// for a drop; a deferred value is dropped on a thread that answers no FUSE
-/// request and takes no lock the call path takes; [`DeferredDrops::finish`]
+/// request and holds no lock the call path takes across a drop's I/O (a
+/// base file's drop takes the open-bases cache's lock for O(256) and unlinks
+/// outside it); [`DeferredDrops::finish`]
 /// returns once every value deferred before it is dropped and that thread
 /// has ended, so a base file's link is gone before the state area's lease is
 /// released. The same path serves the actor behind [`Recording`] and a
@@ -55,9 +57,14 @@ pub(in crate::tree_actor) struct DeferredDrops {
 }
 
 impl DeferredDrops {
-    /// Deferred drops for one volume's History.
-    pub(in crate::tree_actor) fn new() -> Self {
-        Self { _private: () }
+    /// Deferred drops for one volume's History, with the thread that drops
+    /// them (named `tree-drops`). Until the slice lands: no thread.
+    ///
+    /// # Errors
+    ///
+    /// The thread could not be spawned.
+    pub(in crate::tree_actor) fn start() -> std::io::Result<Self> {
+        Ok(Self { _private: () })
     }
 
     /// Takes `values` to drop them after the actor's lock is released.

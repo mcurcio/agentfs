@@ -287,14 +287,18 @@ pub struct History {
 
 impl History {
     /// History over `repo`, built through `built` with these pointers.
+    ///
+    /// # Errors
+    ///
+    /// The deferred drops' thread could not be spawned ([`DeferredDrops::start`]).
     pub(in crate::tree_actor) fn new(
         repo: TreeGit,
         built: RecordNo,
         pointers: Pointers,
         owners: Owners,
         objects: BuiltObjects,
-    ) -> Self {
-        Self {
+    ) -> std::io::Result<Self> {
+        Ok(Self {
             inner: Arc::new(Inner {
                 repo,
                 state: Mutex::new(State {
@@ -319,11 +323,11 @@ impl History {
                     gated: Vec::new(),
                 }),
                 changed: Condvar::new(),
-                drops: DeferredDrops::new(),
+                drops: DeferredDrops::start()?,
                 #[cfg(test)]
                 batch_read: Mutex::new(None),
             }),
-        }
+        })
     }
 
     fn state(&self) -> MutexGuard<'_, State> {
@@ -515,6 +519,54 @@ impl History {
         if !maps.is_empty() {
             self.state().maps.extend(maps);
         }
+    }
+
+    /// The compactor's view of History at its built point, read in one hold
+    /// (C8, C9): O(1), every field shared.
+    #[expect(
+        dead_code,
+        reason = "interfaces of the compaction slice (latency-upkeep.md, slice 2), wired by it"
+    )]
+    pub(in crate::tree_actor) fn at_built(&self) -> super::compactor::AtBuilt {
+        todo!()
+    }
+
+    /// The actor rolled its journal to a new segment whose first record is
+    /// `first`, under its lock: every segment that starts before it is
+    /// rolled past and may be unlinked once covered (C2a). O(1).
+    #[expect(
+        dead_code,
+        reason = "interfaces of the compaction slice (latency-upkeep.md, slice 2), wired by it"
+    )]
+    pub(in crate::tree_actor) fn rolled(&self, first: RecordNo) {
+        todo!("{first:?}")
+    }
+
+    /// The actor switched `pointer` from a step to the oid it was built as,
+    /// under its lock, before appending record `at`: no record from `at` on
+    /// names that step, so History lets go of the pointer's step head once
+    /// its built point reaches `at` (C3, C4). O(log pointers).
+    #[expect(
+        dead_code,
+        reason = "interfaces of the compaction slice (latency-upkeep.md, slice 2), wired by it"
+    )]
+    pub(in crate::tree_actor) fn switched(&self, pointer: &str, at: RecordNo) {
+        todo!("{pointer} {at:?}")
+    }
+
+    /// A checkpoint at `published.built()` is in place: only now may History
+    /// forget the built-log entries it covers (C3), which
+    /// [`History::checkpointed_through`] then reports, never past a step
+    /// head still kept. Replaces `checkpointed`.
+    #[expect(
+        dead_code,
+        reason = "interfaces of the compaction slice (latency-upkeep.md, slice 2), wired by it"
+    )]
+    pub(in crate::tree_actor) fn published(
+        &self,
+        published: &crate::tree_actor::journal::compaction::Published,
+    ) {
+        todo!("{published:?}")
     }
 
     /// Values the actor let go under its lock (replaced saved maps and
