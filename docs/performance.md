@@ -324,8 +324,14 @@ must exit 1, and the tracer runs it before the figures.
 | `close_64m` | Writes a 64 MiB file in 1 MiB blocks and closes it | 120 s | The engine's close of a dirty 1 GiB file (12 s on ext4, 8 s on XFS), unscaled |
 | `close_1g` | Writes a 1 GiB file in 1 MiB blocks; times the close and `stat` alone | 300 s | The engine's close of a dirty 1 GiB file: 12 s on ext4, 8 s on XFS |
 | `write_1g` | The same run's last 64 writes, against 32 files of 1 MiB written in one write each | 300 s | Median within 1.5 times a 1 MiB file's write |
+| `close_frag` | Writes a 64 MiB file, then 200,000 64-byte writes at random offsets in one open, and closes it | 300 s | The longest hold of the volume's actor lock at most 50 ms (read alone, `--only close_frag`) |
+| `write_1m` | 1,000,000 sequential 64-byte appends in one open, then the close | 300 s | The view's peak through the save and its build at most 256 MiB over its memory before |
+| `restart` | Stops the view and mounts it again on the state the run left (about 50,000 files) | | Mounted within 15 s, peak from start to mount under 256 MiB |
+| `long_history` | 2,000 more creates on the restarted view | 120 s | Mean ms a create within 1.2 times `create`'s first 2,000 |
 
-`close_1g` also reports its total.
+`close_1g` also reports its total. `history_1g`, `memory_1g` and
+`memory_create` read the 1 GiB save's build and the view's memory per file
+(below). Every bar but `create`'s warns and never fails.
 
 - **Each save is timed to its record.** Every timed save ends with a
   `stat` of the file. The view saves a file on the kernel's release, which
@@ -531,20 +537,42 @@ save took 13.8 s with the children at 752 MiB.
 
 The view's memory per file is held by `memory_create`: its sampled RssAnon
 peak through the `create` workload and its build, over its RssAnon before,
-per file created, at most 2 KiB. The local figures below are resident memory
-read once the history was built, not that peak. About 20 KiB a file came from libgit2: the
-builder packs each batch with `git fast-import`, and one handle kept open
+per file created, at most 2 KiB. About 20 KiB a file once came from libgit2:
+the builder packs each batch with `git fast-import`, and one handle kept open
 held a cache of delta bases (up to 16 MiB) for every pack it had read. The
-handle is now let go after each batch. Small maps (a file's name versions,
-its byte pieces, the paths of each object) are vectors, not B-tree maps,
-whose node costs hundreds of bytes for the one entry most files have. On one
-4-CPU container (ext4, release build, one-line files created one after
-another, each step's history built before reading; a local observation, not
-CI), the resident memory grows by about 3.4 to 3.8 KiB a file between 5,000
-and 20,000 files: about 400 MiB for a 100,000-file tree. Two things hold most
-of what is left: each builder batch applies to a copy of the builder's trees
-(about 0.7 KiB a file while it runs), and each path is held about four times
-in each of the actor's and the builder's trees.
+handle is now let go after each batch.
+
+What the view holds for a tree, one copy of each fact:
+
+- **The builder's state is a persistent map** (`imbl`, [architecture](architecture.md#technology-choices)).
+  A batch applies to a clone that costs O(1) and shares every node the batch
+  did not change, so a batch allocates for its own steps, not the volume's,
+  and History and the actor take the builder's maps at each built event as
+  a snapshot, never a copy.
+- **The actor keeps an overlay**, not a second shape: only the names,
+  directories, objects and file maps changed since the built point, over the
+  builder's shared shape (docs/trees.md, "History trails the files"). The
+  `agentfs.overlayLimit` setting bounds it.
+- **One record per object and one path string**, shared by every index; the
+  built log lives on disk only; line maps have exact capacity.
+- **glibc's malloc is capped at two arenas** in each binary
+  ([architecture](architecture.md#technology-choices)): memory one thread
+  freed no longer stays resident in that thread's own arena.
+
+On one 4-CPU container (ext4, release build; local observations, not CI):
+
+| Figure | Before | After |
+|---|---|---|
+| `memory_create`, 50,000 files, persistent maps and overlay in place | 2.67 KiB a file (2.61 to 2.70 before the overlay) | 1.64 KiB a file with the arena cap |
+| `create`'s RssAnon peak, 50,000 files, default `agentfs.overlayLimit` | | about 81 MiB; with an 8 MiB limit 77.5 MiB, so the overlay is a small part of it |
+| Restart after a kill, 100,000 files, built point 400 records past the checkpoint: RssAnon peak (mount) | 370 to 386 MiB (46 to 49 s) | 328 to 333 MiB (38 to 39 s), each tree read once, at the built point |
+| `close_frag`: the close of 200,000 random writes | 110.4 s under the actor lock | 0.086 s; the longest lock hold, 136 ms, is the journal's compaction, not the close |
+| `write_1m`: peak over memory before | 670 MiB | 774 MiB: a million appends leave the large map's leaves about half full |
+
+`close_frag` and `write_1m` miss their bars and warn. A close's work no
+longer runs under the actor lock (docs/trees.md, "File maps"), but the
+journal's compaction still copies live frames forward under it, and
+sequential write pieces are not merged.
 
 ## Performance budget
 

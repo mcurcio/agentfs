@@ -2086,3 +2086,23 @@ agentfs-ln6.12 engine (run 4 resume), implementer findings:
 ### agentfs-ln6.13
 
 None appended: nothing in the page stopped the slice. Non-blocking findings for the main loop to record if it wants: (1) the page's `LagGate::overlay`, written as admits-before vs admits-after, costs O(unbuilt steps) on every release of the actor's lock and made the release create figure about 25% slower (63 s to 78-84 s on ext4); the slice recomputes admission only when a report crosses the limit. (2) The page's burst test needs a take worker calling `progress` at built events (as the view's take_worker does), or `admit` never returns once the tree is held, because only lock releases report the overlay. (3) With the default 32 MiB the create workload's overlay never reaches the limit and the RssAnon peak is unchanged (about 81 MiB); at 8m the peak falls only to 77.5 MiB, so the overlay is a small share of RSS. (4) docs/library/core.md's classify table calls `includeIf.<c>.path` "none: structure", but `classify` answers `Other` (left as is).
+
+## 2026-11-21, agentfs-ln6.7 (memory-and-stalls docs): residuals closed, and where the docs were behind
+
+1. **M8 residual 2 (B-F6) is done**, landed in 683bb83 (host protocol v2): a request waits only while a pending close
+   holds a resource it names, and the plugin locks per claim. csi_trees `a_held_close_stalls_only_its_claim` is the
+   done condition. M8 residual 1 (A-F6) is covered by launcher_host (o) in the same commit. Documented in
+   docs/library/filesystem.md ("The view host command"), docs/library/kubernetes.md ("The supervisor") and
+   docs/runbooks/csi-recovery.md ("A pod that will not mount").
+2. **Docs the slices left behind, now current:** docs/library/filesystem.md still described protocol v1 ("exactly
+   one reply per request, in order"); docs/library/kubernetes.md still said each volume's calls run one at a time;
+   docs/runbooks/csi-recovery.md said one held close stalls every claim; docs/trees.md's "File maps" described the
+   close applying every call under the lock and the actor taking rebased maps at its next call; docs/architecture.md
+   said the repack runs in the state area's git directory; docs/trees.md's limits named one gauge.
+3. **Design page deleted** (docs/target-architecture/future/memory-and-stalls.md). Its deferrals that are not
+   documented behaviour stay open, for a bead if wanted: untracked fsync on the view's FUSE thread (never measured);
+   trimming `owners` and `heads` at a checkpoint; merging sequential write pieces (now a stated limit in
+   docs/trees.md); compaction under the actor lock (a stated limit); the restart checkout marker of the page's
+   restart section (not built: the failpoint `tree.checkout_before_marker` is registered with no marker after it);
+   `clean_packs` failing a reopen on `ENOENT`; a waiting host request has no cancel (stated in
+   docs/library/filesystem.md).

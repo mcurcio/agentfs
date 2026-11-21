@@ -190,7 +190,8 @@ agentfs --state STATE host --launcher ID --volume NAME   # stdin: the parent's s
 It boots as `mount` does, under the launcher `ID`: the volume checked against
 `--volume`, the operator settings read and each key not built logged, the
 volume staged and its domains restored, the view host started. It then writes
-a hello line and answers each request in order: `open` a view of the root or
+a hello line and answers each request by its id, at once unless a pending
+`close` holds the mount point, client or fork it names: `open` a view of the root or
 of the open fork under a key at a mount point, with a client label, an access
 and the pod context of its saves; `close` it; `reconcile` (end the launcher's
 clients no open view uses); `fork_create` and `fork_end` under
@@ -476,17 +477,37 @@ actor: its waiters get its error and every later call `EIO` (see
 No file's bytes are held in memory, by the views or by the builder. A file is a map: pieces of journal frames
 and of the private checkout's file as built, by file offset. A write adds one
 piece that points at its frame, so it costs its own bytes at any file size: a
-4 KiB write into a 1 GiB file copies 4 KiB, into its frame. An open starts from
-the saved map, shared until it writes (copy on write). A close applies the
-open's calls to the saved map with the same function the builder replays, and
-tells a close that changes nothing by comparing only the bytes the open's calls
-touched. A view reads a map with the actor unlocked: the lock is held only to
-clone it.
+4 KiB write into a 1 GiB file copies 4 KiB, into its frame. A map of a few
+pieces is a shared array; a large one is a persistent map ordered by offset,
+so a write costs the log of its pieces and the pieces it covers. An open starts
+from the saved map, shared until it writes (copy on write). An open handle
+keeps no list of its calls: each call is checked against the file's length
+with a rule composed per call, and a close reads the open's calls back from
+the journal when it needs them.
+
+A close does bounded work under the actor's lock:
+
+- An open that made no call saves nothing. When no other save of the file
+  landed during the open (the saved map did not move), the file has no page
+  writes, the length changed and the open's map has at most 32 pieces, the
+  open's own map is the save: the close takes it and records its step.
+- Otherwise the close takes a snapshot of the saved map and the open's map
+  under the lock, then decides with the lock released. When the saved map did
+  not move and there are no page writes, it compares the open's map with the
+  saved map only where their pieces differ. Else it replays the open's calls,
+  read back from the journal, and the file's page writes onto the saved map
+  with the same function the builder replays, and compares only the bytes the
+  calls touched. Either way it makes the save's layout. The decision lands
+  under the lock if the saved step it read is still the current one, else the
+  close is redone once under the lock.
+
+Either way the step is recorded before the release is answered. A view reads
+a map with the actor unlocked: the lock is held only to clone it.
 
 - After a batch is built and checked out, the builder reads each changed file
   from its checkout instead of the frames, through a hard link in the state
-  area's `bases/` (cleared at each start), and the actor takes that map at its
-  next call where it saved the same step. A checkout writes each file to a
+  area's `bases/` (cleared at each start), and the actor takes that map at the
+  built event, where it saved the same step. A checkout writes each file to a
   temporary name and renames it over the old one, so a reader that opened the
   old version keeps reading it through its link; the link goes when the last
   map lets go of it.
@@ -716,6 +737,25 @@ the private checkouts copied, the checked-out files' maps rebased onto them
 - Dropping the volume builds every record appended, so a clean shutdown leaves
   history built through its last record. After a kill the builder builds what
   was left unbuilt, behind the reopened views.
+- **The repack.** Each batch is one pack, and a read's cost grows with the pack
+  count, so at each built event a task of its own runs `git repack
+  --geometric=2 -d`, one at a time, beside `git fast-import` and never stopping
+  the builder; events that come while one runs make one more run after it.
+  Geometric repack packs whole packs: it keeps every object, reachable or not,
+  prunes nothing and touches no ref. A run never works in the store's own
+  `objects/pack`, because git and libgit2 find a pack by listing that directory
+  and opening the index later, so a pack deleted between the two would read as
+  a missing object. Each run works in a scratch object directory under
+  `history.git/repack/`, on hard links to the store's packs with the store as
+  an alternate; the task links each new pack into `objects/pack`, its index
+  last, and fsyncs the directory. The packs a run rolled up are set aside,
+  named in `repack/rolled-up`, and deleted only at a run that starts on a
+  later built event, as git's incremental repack defers its `expire`: at most
+  the last two runs' packs are set aside. A start deletes the packs a stop set
+  aside, and any scratch directory a killed daemon left, before the volume is
+  served. A stop kills a repack in progress with every process it started. A
+  failed run is logged (`tree RepackFailed: <error>`) and tried again at the
+  next built event; its git child is not counted with the actor's.
 - No record after a checkpoint names a step the checkpoint covers: a step whose
   pointers were read before a compaction names those values as the oids they
   were built as, so a restart, which builds from the checkpoint, builds every
@@ -738,9 +778,10 @@ the private checkouts copied, the checked-out files' maps rebased onto them
   `tree HistoryLagging` is logged once; over the limit, `tree HistoryStalled`.
   The levels are constants, not settings.
 - **The overlay limit.** The actor holds, per tree, each name, directory, object
-  and file map its steps changed since the built point (its overlay); a built
-  event drops what that build covers, so after each rebuild a tree's overlay is
-  its unbuilt steps' entries. The gate estimates it at 256 bytes an entry and
+  and file map its steps changed since the built point (its overlay), over the
+  builder's shape and maps at the built point, which it shares and never
+  copies; a built event drops what that build covers, so after each rebuild a
+  tree's overlay is its unbuilt steps' entries. The gate estimates it at 256 bytes an entry and
   counts entries, not a changed map's pieces (the lag's byte term covers a save's
   bytes). The actor reports every tree's overlay as it releases its lock, so the
   gate sees it grow at each step and shrink at each rebuild, without a timer.
@@ -1101,8 +1142,8 @@ What the tree views do not support:
 - **Nested forks, transactions, `Client::Outside`, view profiles, CSI, several
   view hosts, upgrades and snapshot opens** are not built. The designs for them
   are in [target-architecture](target-architecture/README.md).
-- **Telemetry export** carries one gauge, `agentfs.not_built`, and the binary's
-  own export failures, over OTLP when the `OTEL_*` variables name a collector
+- **Telemetry export** carries two gauges, `agentfs.not_built` and
+  `agentfs.history.unverified`, and the binary's own export failures, over OTLP when the `OTEL_*` variables name a collector
   ([telemetry](telemetry.md)). `--metrics-output` is the only other measurement.
 - **Large files.** A save costs its own file: the builder's memory does not
   grow with the file (17 MiB for a 1 GiB save in one local run, its history
@@ -1114,11 +1155,21 @@ What the tree views do not support:
   any over 8 MiB; and a line map keeps every deleted line, so maps of files
   edited often grow with their edits.
 - **A call can wait.** A call that starts new work in a tree waits while that
-  tree's lag is over the limit, or while an overdue compaction waits for the
+  tree's lag or overlay is over its limit, or while an overdue compaction waits for the
   builder (see [History trails the files](#history-trails-the-files)); every call
   waits while a take lands under the actor's lock. A take waits for its entry's
   write-opens to close, so a file held open holds the takes that write it. The
   model replays do not cover the waits; the mounted cases do.
+- **Work still under the actor's lock.** A close's work is bounded
+  ([File maps](#file-maps)), but the journal's compaction copies live frames
+  forward under the lock, and every call of the volume waits meanwhile (136 ms
+  after 200,000 random writes to one open file, in one local run;
+  [performance.md](performance.md#tree-views-release-build)). Sequential writes
+  are not merged into one piece, so an open of a million small appends holds a
+  million pieces (a 774 MiB peak in one local run).
+- **A restart copies every checkout.** Each start writes the private checkouts
+  of the built point whole, so its time grows with the tree (38 to 39 s for
+  100,000 files in one local run).
 - **Shared mappings have a gap.** A write through an `mmap` is saved as a page. A
   mapped store that writes the bytes its page last held records nothing, so a
   descriptor write made meanwhile stands where Linux would keep the store: with a

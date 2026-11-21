@@ -55,7 +55,6 @@ Smaller slices, one page each:
 | Where the line map lives; two renames to one path | [Line map and renames](future/line-map-and-renames.md) |
 | Refusing shared mappings | [Shared mappings](future/shared-mappings.md) |
 | Faster saves and landings with large files or many saves | [Save and take speed](future/save-and-take-speed.md) |
-| Memory per file and stalls from a slow close | [Memory and stalls](future/memory-and-stalls.md) |
 | Landing patches while a workload runs | [Live landing](future/live-landing.md) |
 | Recovery tooling beyond restore and revert | [Recovery tooling](future/recovery-tooling.md) |
 | Sandbox overlay: shared locks, inode gaps, hosting on a front | [Overlay gaps](future/sandbox-overlay-gaps.md) |

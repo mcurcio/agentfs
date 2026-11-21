@@ -115,13 +115,19 @@ event:
 - `the host of volume <pv> refused to start` or `exited before it served`,
   with its last lines: fix what they name (a full disk, a profile setting
   refused at boot).
-- The call times out (`DeadlineExceeded`) for every claim of one volume, a
-  fork claim's too: a host answers its requests in order, and a `close`
-  answers only once the closed view's files are released. A process on the
-  node, outside the pod, that still holds a file of a view being unpublished
-  holds every later call on that volume. Find it with
+- `the host of volume <pv> speaks host protocol v<n>, this plugin v<m>`:
+  the node plugin's image and its `agentfs` binary are of different
+  releases. Deploy one image for both; the plugin never starts that host
+  again until it is replaced.
+- A claim's NodeUnpublish times out (`DeadlineExceeded`), and its retries,
+  and the next NodePublish of the same claim, answer `operation pending`
+  (`ABORTED`): the host answers a `close` only once the closed view's files
+  are released ([host protocol](../library/filesystem.md#the-view-host-command)).
+  A process on the node, outside the pod, still holds a file of that view.
+  Only requests about the same mount point, client or fork wait; other
+  claims of the volume publish and unpublish as usual. Find the holder with
   `in_plugin sh -c 'ls -l /proc/[0-9]*/fd 2>/dev/null | grep <target>'`
-  and stop it; the calls then complete.
+  and stop it; the call then completes.
 
 ## A claim that will not delete
 
