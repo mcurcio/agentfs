@@ -400,6 +400,7 @@ impl Pod {
 const EXIT_LOCKED: u8 = 75;
 
 fn main() -> ExitCode {
+    agentfs_core::allocator::limit_arenas();
     if cfg!(feature = "failpoints") && std::env::var_os(agentfs_core::failpoints::ENV_VAR).is_some()
     {
         eprintln!(

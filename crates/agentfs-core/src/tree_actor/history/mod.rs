@@ -15,7 +15,7 @@ pub(super) mod take;
 pub(super) mod upstreams;
 pub(super) mod verify;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
 use std::io;
 use std::path::{Path, PathBuf};
@@ -103,14 +103,109 @@ impl TreeMoved {
     /// # Errors
     ///
     /// [`Error::Format`] for an object with no identity.
-    #[allow(dead_code, reason = "frozen interface of agentfs-ln6.12")]
     pub(in crate::tree_actor) fn between(
         tree: TreeId,
         before: Option<(&Shape, &Objects)>,
         after: Option<(&Shape, &Objects)>,
     ) -> Result<Option<Self>> {
-        let _ = (tree, before, after);
-        todo!("agentfs-ln6.12")
+        let mut moved = Self {
+            tree: tree.to_string(),
+            ..Self::default()
+        };
+        match (before, after) {
+            (None, None) => return Ok(None),
+            (Some(_), None) => moved.dropped = true,
+            (None, Some((shape, objects))) => {
+                moved.objects = objects.iter().map(|(id, object)| (*id, *object)).collect();
+                let locals = shape.locals();
+                moved.dirs = locals
+                    .dirs
+                    .into_iter()
+                    .map(|(path, local)| (path, Some(local)))
+                    .collect();
+                moved.files = locals
+                    .files
+                    .into_iter()
+                    .map(|(id, times)| (id, Some(times)))
+                    .collect();
+            }
+            (Some((was, was_objects)), Some((shape, objects))) => {
+                moved.diff(was, was_objects, shape, objects)?;
+            }
+        }
+        let empty = Self {
+            tree: moved.tree.clone(),
+            ..Self::default()
+        };
+        Ok((moved != empty).then_some(moved))
+    }
+
+    /// What moved from `was` to `shape`, two shapes that share what neither
+    /// changed: only the diffs of their persistent maps are visited.
+    fn diff(
+        &mut self,
+        was: &Shape,
+        was_objects: &Objects,
+        shape: &Shape,
+        objects: &Objects,
+    ) -> Result<()> {
+        use imbl::ordmap::DiffItem;
+        for item in was_objects.diff(objects) {
+            match item {
+                DiffItem::Add(id, object)
+                | DiffItem::Update {
+                    new: (id, object), ..
+                } => {
+                    self.objects.push((*id, *object));
+                }
+                DiffItem::Remove(id, _) => self.unnamed.push(*id),
+            }
+        }
+        for item in was.dirs.diff(&shape.dirs) {
+            match item {
+                DiffItem::Add(path, dir) => {
+                    self.dirs
+                        .push((path.to_string(), Some((dir.number, dir.times))));
+                }
+                DiffItem::Update {
+                    old,
+                    new: (path, dir),
+                } => {
+                    if (old.1.number, old.1.times) != (dir.number, dir.times) {
+                        self.dirs
+                            .push((path.to_string(), Some((dir.number, dir.times))));
+                    }
+                }
+                DiffItem::Remove(path, _) => self.dirs.push((path.to_string(), None)),
+            }
+        }
+        // A file's times are kept by identity: each identity an object that
+        // moved had, before or after, is read again on both sides.
+        let mut touched: BTreeSet<u64> = shape.objects_changed_since(was);
+        for item in was.anonymous.diff(&shape.anonymous) {
+            match item {
+                imbl::ordset::DiffItem::Add(object) | imbl::ordset::DiffItem::Remove(object) => {
+                    touched.insert(*object);
+                }
+            }
+        }
+        let mut ids: BTreeSet<u64> = touched
+            .iter()
+            .flat_map(|object| [was.identity_of(*object), shape.identity_of(*object)])
+            .flatten()
+            .map(|id| id.0)
+            .collect();
+        ids.extend(self.objects.iter().map(|(id, _)| *id));
+        ids.extend(self.unnamed.iter().copied());
+        let (was_anonymous, anonymous) = (anonymous_times(was), anonymous_times(shape));
+        for id in ids {
+            let old = file_times(was, was_objects, &was_anonymous, id);
+            let new = file_times(shape, objects, &anonymous, id);
+            if old != new {
+                self.files.push((id, new));
+            }
+        }
+        Ok(())
     }
 
     /// Moves `objects` and `locals` (every tree's, as a checkpoint holds
@@ -123,15 +218,73 @@ impl TreeMoved {
     ///
     /// [`Error::Format`] for a tree text that is no [`TreeId`], or a move of a
     /// tree `objects` lacks that the batch did not make.
-    #[allow(dead_code, reason = "frozen interface of agentfs-ln6.12")]
     pub(in crate::tree_actor) fn apply(
         &self,
         objects: &mut BTreeMap<TreeId, Objects>,
         locals: &mut BTreeMap<TreeId, super::journal::TreeLocals>,
     ) -> Result<()> {
-        let _ = (objects, locals);
-        todo!("agentfs-ln6.12")
+        let tree: TreeId = self.tree.parse().map_err(|_| Error::Format)?;
+        if self.dropped {
+            objects.remove(&tree);
+            locals.remove(&tree);
+            return Ok(());
+        }
+        // A tree the batch made lists every directory, its root among them.
+        let made = self
+            .dirs
+            .iter()
+            .any(|(path, dir)| path.is_empty() && dir.is_some());
+        if !locals.contains_key(&tree) && !made {
+            return Err(Error::Format);
+        }
+        let tree_objects = objects.entry(tree).or_default();
+        for id in &self.unnamed {
+            tree_objects.remove(id);
+        }
+        for (id, object) in &self.objects {
+            tree_objects.insert(*id, *object);
+        }
+        let tree_locals = locals.entry(tree).or_default();
+        for (path, dir) in &self.dirs {
+            match dir {
+                Some(dir) => tree_locals.dirs.insert(path.clone(), *dir),
+                None => tree_locals.dirs.remove(path),
+            };
+        }
+        for (id, times) in &self.files {
+            match times {
+                Some(times) => tree_locals.files.insert(*id, *times),
+                None => tree_locals.files.remove(id),
+            };
+        }
+        Ok(())
     }
+}
+
+/// Each anonymous object's times by identity, as [`Shape::locals`] keeps
+/// them: a later object wins. O(anonymous objects), which are open files
+/// with no name.
+fn anonymous_times(shape: &Shape) -> BTreeMap<u64, super::Times> {
+    shape
+        .anonymous
+        .iter()
+        .filter_map(|object| Some((shape.identity_of(*object)?.0, *shape.times_of(*object)?)))
+        .collect()
+}
+
+/// The times [`Shape::locals`] keeps for identity `id`: an anonymous object's
+/// (those come after the names), else the named file's `objects` gives it,
+/// the last by path as there.
+fn file_times(
+    shape: &Shape,
+    objects: &Objects,
+    anonymous: &BTreeMap<u64, super::Times>,
+    id: u64,
+) -> Option<super::Times> {
+    anonymous
+        .get(&id)
+        .copied()
+        .or_else(|| shape.times_of(*objects.get(&id)?).copied())
 }
 
 // What is lost of any pointer's commit, tree and blobs refuses to serve. The
@@ -208,6 +361,13 @@ pub(in crate::tree_actor) fn tree_snapshot(
     Ok(snapshot)
 }
 
+#[cfg(test)]
+thread_local! {
+    /// The [`read_trees`] calls this thread made, for tests: a start after a
+    /// kill reads every tree once.
+    pub(in crate::tree_actor) static TREE_READS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
 /// Every tree as built: each branch's snapshot installed, each file's map
 /// from `map` (given its tree, object and path).
 pub(in crate::tree_actor) fn read_trees(
@@ -216,6 +376,8 @@ pub(in crate::tree_actor) fn read_trees(
     objects: &BTreeMap<TreeId, Objects>,
     mut map: impl FnMut(TreeId, u64, &str) -> Result<Arc<FileBytes>>,
 ) -> Result<BTreeMap<TreeId, Tree>> {
+    #[cfg(test)]
+    TREE_READS.with(|n| n.set(n.get() + 1));
     let mut trees = BTreeMap::new();
     let none = Objects::new();
     for id in refs::branches(pointers)?.into_keys() {
@@ -234,14 +396,16 @@ pub(in crate::tree_actor) fn read_trees(
 }
 
 /// The commit of every direct save the pointers reach, by its event number:
-/// one Git child.
+/// one Git child, its messages folded in as they stream, none held.
 pub(in crate::tree_actor) fn owners(repo: &TreeGit, pointers: &Pointers) -> Result<built::Owners> {
     let _timer = Timer::start(Which::EventOwners);
-    Ok(repo
-        .commit_messages(&refs::owner_tips(pointers))?
-        .into_iter()
-        .filter_map(|(oid, message)| Some((message::direct_event(&message)?, oid)))
-        .collect())
+    let mut owners = built::Owners::new();
+    repo.for_each_commit_message(&refs::owner_tips(pointers), |oid, message| {
+        if let Some(event) = message::direct_event(message) {
+            owners.insert(event, oid);
+        }
+    })?;
+    Ok(owners)
 }
 
 /// Where `tree`'s checkout holds the file named `name`: its `files/` path

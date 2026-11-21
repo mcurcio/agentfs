@@ -28,6 +28,7 @@ recorded; [guarantees](../guarantees.md) says what the engine promises.
 | Alarms and events | `events` | `Event`, `EventSink`, `MemorySink`, `NullSink` |
 | OpenTelemetry signals | `telemetry` | `Telemetry`, `Telemetry::sink` |
 | Exclusive use of a state area | `lock`, `file_lock` | `StateLock`, `FileLock` |
+| A binary's malloc arenas | `allocator` | `limit_arenas` (glibc's `M_ARENA_MAX` to `ARENAS`, 2): a binary calls it first in `main`, before any thread; the library never does |
 | Settings from the git config | `config` | `Settings`, `Settings::load`, `KEYS` |
 | Path rules and checks | `rules`, `checks`, `paths` | `Rules`, `Checks`, `RepoPath` |
 | Restore and revert | `restore`, `operations` | `plan`, `check`, `apply`, `record_applied` |

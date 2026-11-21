@@ -12,7 +12,7 @@
 
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
-use std::io::{self, Write};
+use std::io::{self, BufRead, Read, Write};
 use std::os::fd::{AsRawFd, BorrowedFd};
 use std::os::unix::ffi::OsStringExt;
 use std::os::unix::fs::PermissionsExt;
@@ -242,8 +242,7 @@ impl TreeGit {
 
     /// Visits each commit reachable from `tips` with its raw message, as
     /// `git log` streams it, in one Git child: no message is held after its
-    /// visit, and the child's output is never read whole. Replaces
-    /// [`TreeGit::commit_messages`].
+    /// visit, and the child's output is never read whole.
     ///
     /// # Errors
     ///
@@ -252,10 +251,59 @@ impl TreeGit {
     pub fn for_each_commit_message(
         &self,
         tips: &[Oid],
-        visit: impl FnMut(Oid, &[u8]),
+        mut visit: impl FnMut(Oid, &[u8]),
     ) -> Result<()> {
-        let _ = (tips, visit);
-        todo!("agentfs-ln6.12")
+        if tips.is_empty() {
+            return Ok(());
+        }
+        let mut input = String::new();
+        for tip in tips {
+            input.push_str(&format!("{tip}\n"));
+        }
+        let mut cmd = self.command(true);
+        cmd.args(["log", "--stdin", "--no-color", "--format=%x01%H%n%B"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = crate::git_cli::counted(&mut cmd)?;
+        let piped = || io::Error::other("git log's pipes were not set up");
+        let stdin = child.stdin.take().ok_or_else(piped)?;
+        let stdout = child.stdout.take().ok_or_else(piped)?;
+        let mut stderr = child.stderr.take().ok_or_else(piped)?;
+        let mut record = Vec::new();
+        let (read, written, drained) = std::thread::scope(|scope| {
+            let writer = scope.spawn(move || {
+                let mut stdin = stdin;
+                stdin.write_all(input.as_bytes())
+            });
+            let drain = scope.spawn(move || {
+                let mut bytes = Vec::new();
+                stderr.read_to_end(&mut bytes).map(|_| bytes)
+            });
+            // `stdout` is dropped when this returns, so a child still writing
+            // after a bad record ends on a closed pipe instead of blocking.
+            let read = read_records(stdout, &mut record, &mut visit);
+            let join = |what| io::Error::other(format!("git log's {what} thread panicked"));
+            (
+                read,
+                writer.join().map_err(|_| join("stdin")),
+                drain.join().map_err(|_| join("stderr")),
+            )
+        });
+        let status = child.wait()?;
+        let stderr = drained??;
+        // A bad record first: its closed pipe is also why the child failed.
+        read?;
+        if !status.success() {
+            return Err(classify(&stderr));
+        }
+        written??;
+        // The last record ends at the end of the output: whole only once the
+        // child has succeeded.
+        if !record.is_empty() {
+            visit_record(&record, &mut visit)?;
+        }
+        Ok(())
     }
 
     /// What is lost of each tip's commit, tree and blobs, parents not walked.
@@ -301,32 +349,6 @@ impl TreeGit {
             missing.push(parse_oid(oid)?);
         }
         Ok(missing)
-    }
-
-    /// Each commit reachable from `tips` with its raw message, in one Git
-    /// child, not one per commit.
-    pub fn commit_messages(&self, tips: &[Oid]) -> Result<Vec<(Oid, Vec<u8>)>> {
-        if tips.is_empty() {
-            return Ok(Vec::new());
-        }
-        let mut input = String::new();
-        for tip in tips {
-            input.push_str(&format!("{tip}\n"));
-        }
-        let out = self.run(
-            &["log", "--stdin", "--no-color", "--format=%x01%H%n%B"],
-            Some(input.as_bytes()),
-            true,
-        )?;
-        let mut commits = Vec::new();
-        for record in out.stdout.split(|b| *b == 1).filter(|r| !r.is_empty()) {
-            let (oid, message) = match record.iter().position(|b| *b == b'\n') {
-                Some(end) => (&record[..end], &record[end + 1..]),
-                None => (record, &[][..]),
-            };
-            commits.push((parse_oid(oid)?, message.to_vec()));
-        }
-        Ok(commits)
     }
 
     fn command(&self, bare: bool) -> Command {
@@ -857,6 +879,52 @@ fn output(mut cmd: Command) -> io::Result<Output> {
     crate::git_cli::counted(&mut cmd)?.wait_with_output()
 }
 
+/// Where each record of `git log --format=%x01%H%n%B` starts.
+const RECORD_START: u8 = 1;
+
+/// Reads `git log --format=%x01%H%n%B` output, visiting each record as the
+/// next one's start ends it. `record`, one buffer reused for every record,
+/// holds the last one when this returns: only the end of the output ends it.
+fn read_records(
+    stdout: std::process::ChildStdout,
+    record: &mut Vec<u8>,
+    visit: &mut impl FnMut(Oid, &[u8]),
+) -> Result<()> {
+    let mut reader = io::BufReader::new(stdout);
+    let mut first = true;
+    loop {
+        record.clear();
+        if reader.read_until(RECORD_START, record)? == 0 {
+            return Ok(());
+        }
+        if record.last() != Some(&RECORD_START) {
+            // The end of the output: the last record, left in `record`.
+            return Ok(());
+        }
+        record.pop();
+        if first {
+            // Nothing comes before the first record's start.
+            if !record.is_empty() {
+                return Err(Error::Invalid("git log output before a commit".into()));
+            }
+            first = false;
+            continue;
+        }
+        visit_record(record, visit)?;
+    }
+}
+
+/// One record, `<id>\n<message>\n`: the message as stored, without the
+/// newline `--format` ends every record with.
+fn visit_record(record: &[u8], visit: &mut impl FnMut(Oid, &[u8])) -> Result<()> {
+    let (oid, message) = match record.iter().position(|b| *b == b'\n') {
+        Some(end) => (&record[..end], &record[end + 1..]),
+        None => (record, &[][..]),
+    };
+    visit(parse_oid(oid)?, trim(message));
+    Ok(())
+}
+
 // Spawn, feed stdin and wait. The exit status wins over a failed stdin write: a
 // git that died of a full disk also breaks the pipe, and stderr says why.
 fn run_command(mut cmd: Command, input: Option<&[u8]>) -> Result<Output> {
@@ -1123,6 +1191,54 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
     }
+    /// Each commit two tips reach (one a merge, the other reached from it
+    /// too) is visited once, with its message's exact bytes; a tip that is
+    /// no commit fails.
+    #[test]
+    fn each_commit_message_is_streamed_once_and_whole() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = TreeGit::init(temp.path().join("repo.git")).unwrap();
+        repo.write_config("refs/heads/root", &BTreeMap::new())
+            .unwrap();
+        let git = Repository::open(temp.path().join("repo.git")).unwrap();
+        let tree = git
+            .find_tree(git.treebuilder(None).unwrap().write().unwrap())
+            .unwrap();
+        let sig = git2::Signature::new("t", "t@example.com", &git2::Time::new(0, 0)).unwrap();
+        let commit = |message: &str, parents: &[Oid]| {
+            let parents: Vec<git2::Commit<'_>> = parents
+                .iter()
+                .map(|p| git.find_commit(*p).unwrap())
+                .collect();
+            let parents: Vec<&git2::Commit<'_>> = parents.iter().collect();
+            git.commit(None, &sig, &sig, message, &tree, &parents)
+                .unwrap()
+        };
+        let a = commit("one\n\nAgentfs-Event: 1\n", &[]);
+        let b = commit("two", &[a]);
+        let c = commit("three\n\n\n", &[a]);
+        let m = commit("merge\n", &[b, c]);
+        let mut seen: Vec<(Oid, Vec<u8>)> = Vec::new();
+        repo.for_each_commit_message(&[m, c], |oid, message| seen.push((oid, message.to_vec())))
+            .unwrap();
+        seen.sort();
+        let mut want: Vec<(Oid, Vec<u8>)> = [a, b, c, m]
+            .into_iter()
+            .map(|oid| (oid, git.find_commit(oid).unwrap().message_bytes().to_vec()))
+            .collect();
+        want.sort();
+        assert_eq!(seen, want);
+        let mut none = 0;
+        repo.for_each_commit_message(&[], |_, _| none += 1).unwrap();
+        assert_eq!(none, 0);
+        let bad = Oid::from_str("1234567890123456789012345678901234567890").unwrap();
+        assert!(
+            repo.for_each_commit_message(&[bad], |_, _| none += 1)
+                .is_err()
+        );
+        assert_eq!(none, 0);
+    }
+
     #[test]
     fn killed_parent_leaves_lease_until_git_exits() {
         // Stop on parent death to inspect the lease, then exercise the actual
