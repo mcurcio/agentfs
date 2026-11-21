@@ -100,6 +100,20 @@ commit, not only the close.
                `ratio`, their mean ms over the first run's `create`
                `first_2000_ms`
 
+With --metrics, every workload also reports `lock`: the volume lock's holds
+by kind of work (`compaction`, `catch_up`, `drops`, `close`, `take`,
+`fork_copy`, `other`; docs/telemetry.md, "The volume lock") and the waits
+to take it, from the metrics file read before the workload and again once
+its history is built and one more save (`fig-nudge`, the first call after
+history caught up, which runs the compaction the workload made due) is
+built too. Per kind: `holds`, the holds it ran in; `total_ms`,
+its time; `longest_ms`, its longest share of one hold, given only when that
+maximum, kept process-wide, grew during this workload (else null: an
+earlier workload's was longer). `longest_kind` names the kind with the
+longest share among those. The figures carry no bar: they are read, and
+never warn or fail (owner, 2026-11-20). Run a workload alone (`--only`) to
+read its longest holds without an earlier workload's.
+
 Each workload runs on a worker thread. One the deadline catches inside a
 save gets `grace_s` more to come back; one still blocked then is stuck in
 the view, so the FUSE connection is aborted (/sys/fs/fuse/connections, as
@@ -682,6 +696,51 @@ PEAKS = ("create", "close_1g", "write_1m")
 
 
 
+LOCK_KINDS = ("compaction", "catch_up", "drops", "close", "take", "fork_copy", "other")
+
+
+def stages_of(metrics):
+    """The view's process-wide stage totals from its metrics file, or None."""
+    now = metrics_of(metrics)
+    try:
+        return now["stages"]
+    except (KeyError, TypeError):
+        return None
+
+
+def lock_figures(before, after):
+    """The volume lock's holds by kind and its waits between two stage
+    snapshots (see the module's docstring), or None without both."""
+    def one(now, then):
+        grew = now["max_nanos"] > then["max_nanos"]
+        return {"holds": now["count"] - then["count"],
+                "total_ms": round((now["nanos"] - then["nanos"]) / 1e6, 3),
+                "longest_ms": round(now["max_nanos"] / 1e6, 3) if grew else None}
+    try:
+        hold = {kind: one(after["lock_hold"][kind], before["lock_hold"][kind])
+                for kind in LOCK_KINDS}
+        wait = one(after["lock_wait"], before["lock_wait"])
+    except (KeyError, TypeError):
+        return None
+    known = {kind: v["longest_ms"] for kind, v in hold.items() if v["longest_ms"] is not None}
+    return {"hold": hold, "wait": wait,
+            "longest_kind": max(known, key=known.get) if known else None}
+
+
+def nudge(view, metrics, cap):
+    """One save of `fig-nudge` after a workload's history is built, then
+    waits for its build: the first call after history caught up runs the
+    compaction then due, which the workload's journal made due. Whether the
+    build was reached within `cap`."""
+    try:
+        write_file(os.path.join(view, "fig-nudge"), b"nudge\n")
+        os.stat(os.path.join(view, "fig-nudge"))
+    except OSError as error:
+        print(f"::warning title=tree views::the nudge after a workload failed: {error}", flush=True)
+        return False
+    return drain(metrics, cap) is not None
+
+
 def lock_hold_ms(metrics):
     """The longest hold of the actor's lock so far, process-wide, in ms, from
     the view's metrics file; None without one."""
@@ -795,6 +854,7 @@ def main():
         # history is built (after drain), so the build is inside it.
         sampler = PeakSampler(args.view_pid) if args.view_pid and name in PEAKS else None
         before = sampler.start() if sampler else None
+        stages_before = stages_of(args.metrics)
 
         def worker(work=work, run=run, target=budget.get("count")):
             try:
@@ -834,6 +894,17 @@ def main():
             mine = figure.get("ms_per_create")
             figure.update(create_first_2000_ms=first,
                           ratio=round(mine / first, 3) if mine and first else None)
+        if figure.get("drain_s") is not None:
+            # A compaction due once history caught up runs at the next call:
+            # the nudge is that call, so it lands in this workload's window.
+            nudged = nudge(args.view, args.metrics, args.drain_cap)
+            figure["lock"] = lock_figures(stages_before, stages_of(args.metrics)) if nudged else None
+            lock = figure["lock"] or {}
+            kind = lock.get("longest_kind")
+            if kind:
+                print(f"{name} on {args.filesystem}: longest lock hold {kind} "
+                      f"{lock['hold'][kind]['longest_ms']} ms, longest wait "
+                      f"{lock['wait']['longest_ms']} ms", flush=True)
         found = [(name, budget, figure)]
         if name == "create":
             # memory_create: the peak through its history's build, so the

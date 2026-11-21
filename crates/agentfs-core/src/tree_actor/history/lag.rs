@@ -10,6 +10,7 @@ use std::time::Duration;
 use super::super::TreeId;
 use super::super::journal::durable::RecordNo;
 use super::built::{Health, TreeLag};
+pub(in crate::tree_actor) use crate::tree_actor::stages::GateCause;
 
 /// Over this, `tree HistoryLagging` is logged once (a placeholder, one home).
 pub(in crate::tree_actor) const LAG_ALARM: Duration = Duration::from_secs(30);
@@ -189,6 +190,20 @@ impl LagGate {
                 && !(self.overdue && !self.unbuilt.is_empty()))
     }
 
+    /// Why `tree`'s new work waits now, or None when it may start: the
+    /// overdue stop first, then the overlay limit, then the lag limit.
+    pub(in crate::tree_actor) fn refusal(&self, tree: TreeId) -> Option<GateCause> {
+        if self.admits(tree) {
+            None
+        } else if self.overdue && !self.unbuilt.is_empty() {
+            Some(GateCause::Overdue)
+        } else if self.overlay_of(tree) > self.overlay_limit {
+            Some(GateCause::Overlay)
+        } else {
+            Some(GateCause::Lag)
+        }
+    }
+
     /// Every tree's lag, worst first.
     pub(in crate::tree_actor) fn trees(&self) -> Vec<TreeLag> {
         let mut trees: Vec<TreeLag> = self
@@ -340,6 +355,26 @@ mod tests {
         assert!(!gate.overlay(A, 2_000), "still held: no change");
         assert!(gate.overlay(A, 1_000), "at the limit: admitted");
         assert!(gate.admits(A));
+    }
+
+    /// A held tree's cause: the overdue stop over the overlay limit over
+    /// the lag limit; none once admitted.
+    #[test]
+    fn a_refusal_names_its_cause() {
+        let mut gate = LagGate::with_limits(Duration::from_secs(1), Duration::from_secs(2));
+        gate.set_overlay_limit(1_000);
+        assert_eq!(gate.refusal(A), None);
+        for n in 1..=1_000 {
+            gate.appended(A, step(n), 0);
+        }
+        assert_eq!(gate.refusal(A), Some(GateCause::Lag));
+        gate.overlay(A, 5_000);
+        assert_eq!(gate.refusal(A), Some(GateCause::Overlay));
+        gate.compaction_overdue(true);
+        assert_eq!(gate.refusal(A), Some(GateCause::Overdue));
+        assert_eq!(gate.refusal(B), Some(GateCause::Overdue), "it holds every tree");
+        gate.failed();
+        assert_eq!(gate.refusal(A), None);
     }
 
     #[test]

@@ -125,6 +125,12 @@ pub mod names {
     pub const RECONCILE_FAILURES: &str = "agentfs.reconcile.failures";
     pub const NESTED_GITDIR_HEURISTIC: &str = "agentfs.nested.gitdir_heuristic";
     pub const FORK_PUBLISH_DURATION: &str = "agentfs.fork.publish.duration";
+    pub const LOCK_HOLD: &str = "agentfs.lock.hold";
+    pub const LOCK_HOLDS: &str = "agentfs.lock.holds";
+    pub const LOCK_HOLD_LONGEST: &str = "agentfs.lock.hold.longest";
+    pub const LOCK_WAIT: &str = "agentfs.lock.wait";
+    pub const LOCK_WAITS: &str = "agentfs.lock.waits";
+    pub const LOCK_WAIT_LONGEST: &str = "agentfs.lock.wait.longest";
     /// Recorded by the binary, which owns the exporters.
     pub const TELEMETRY_EXPORT_FAILURES: &str = "agentfs.telemetry.export_failures";
 }
@@ -653,6 +659,89 @@ impl Telemetry {
                 }
             })
             .build();
+    }
+
+    /// Registers the tree volume lock's figures, read from the process's
+    /// [`Stages`](crate::tree_actor::stages::Stages) at each collection:
+    /// `agentfs.lock.hold` (seconds), `agentfs.lock.holds` (holds) and
+    /// `agentfs.lock.hold.longest` (seconds, the longest share of one hold),
+    /// each by `kind` of work, every kind observed, zero included; and
+    /// `agentfs.lock.wait`, `agentfs.lock.waits` and
+    /// `agentfs.lock.wait.longest`, the waits to take the lock. Call once per
+    /// process; a noop telemetry registers nothing.
+    pub fn observe_lock(&self) {
+        use crate::tree_actor::stages::{Stage, Stages};
+        let Some(inner) = &self.inner else {
+            return;
+        };
+        let seconds = |nanos: u64| nanos as f64 / 1e9;
+        type Read = fn(&Stages) -> Vec<(Option<&'static str>, Stage)>;
+        let holds: Read = |stages| {
+            stages
+                .lock_hold
+                .by_kind()
+                .into_iter()
+                .map(|(kind, stage)| (Some(kind), stage))
+                .collect()
+        };
+        let waits: Read = |stages| vec![(None, stages.lock_wait)];
+        let attrs = |kind: Option<&'static str>| -> Vec<KeyValue> {
+            kind.map(|kind| KeyValue::new("kind", kind))
+                .into_iter()
+                .collect()
+        };
+        for (read, time, count, unit, longest, what) in [
+            (
+                holds,
+                names::LOCK_HOLD,
+                names::LOCK_HOLDS,
+                "{hold}",
+                names::LOCK_HOLD_LONGEST,
+                "the tree volume's lock held",
+            ),
+            (
+                waits,
+                names::LOCK_WAIT,
+                names::LOCK_WAITS,
+                "{wait}",
+                names::LOCK_WAIT_LONGEST,
+                "waits to take the tree volume's lock",
+            ),
+        ] {
+            inner
+                .meter
+                .f64_observable_counter(time)
+                .with_unit("s")
+                .with_description(format!("Seconds of {what}"))
+                .with_callback(move |observer| {
+                    for (kind, stage) in read(&Stages::current()) {
+                        observer.observe(seconds(stage.nanos), &attrs(kind));
+                    }
+                })
+                .build();
+            inner
+                .meter
+                .u64_observable_counter(count)
+                .with_unit(unit)
+                .with_description(format!("Runs of {what}"))
+                .with_callback(move |observer| {
+                    for (kind, stage) in read(&Stages::current()) {
+                        observer.observe(stage.count, &attrs(kind));
+                    }
+                })
+                .build();
+            inner
+                .meter
+                .f64_observable_gauge(longest)
+                .with_unit("s")
+                .with_description(format!("The longest run of {what}"))
+                .with_callback(move |observer| {
+                    for (kind, stage) in read(&Stages::current()) {
+                        observer.observe(seconds(stage.max_nanos), &attrs(kind));
+                    }
+                })
+                .build();
+        }
     }
 
     /// Registers `agentfs.history.unverified` (unit `{step}`): a tree
@@ -1742,6 +1831,55 @@ mod tests {
         assert_eq!(gauge("patches"), Some(1));
         assert_eq!(gauge("lfs"), None);
         assert_eq!(gauge("other"), None);
+    }
+
+    /// The volume lock's figures: every kind of hold observed, zeros
+    /// included, and a hold and a wait through a real volume counted.
+    #[test]
+    fn the_volume_lock_is_observed_by_kind() {
+        use crate::tree_actor::Recording;
+        let h = Harness::new();
+        h.telemetry.observe_lock();
+        let holds = |kind| h.sum(names::LOCK_HOLDS, &[("kind", kind)]);
+        let kinds = [
+            "compaction",
+            "catch_up",
+            "drops",
+            "close",
+            "take",
+            "fork_copy",
+            "other",
+        ];
+        for kind in kinds {
+            assert!(holds(kind).is_some(), "{kind} observed");
+            assert!(
+                h.gauge_f64(names::LOCK_HOLD_LONGEST, &[("kind", kind)])
+                    .is_some()
+            );
+        }
+        let (other, waits) = (
+            holds("other").unwrap(),
+            h.sum(names::LOCK_WAITS, &[]).unwrap(),
+        );
+        let tmp = tempfile::tempdir().unwrap();
+        let identity = agentfs_contracts::volume::VolumeIdentity {
+            name: agentfs_contracts::name::VolumeName::parse("test").unwrap(),
+            id: agentfs_contracts::volume::VolumeId(uuid::Uuid::from_u128(1)),
+        };
+        let rec = Recording::create(
+            &tmp.path().join("state"),
+            &identity,
+            None,
+            &agentfs_contracts::pod::PodContext::default(),
+        )
+        .unwrap();
+        drop(rec.actor().unwrap());
+        assert!(holds("other").unwrap() > other);
+        assert!(h.sum(names::LOCK_WAITS, &[]).unwrap() > waits);
+        assert!(
+            h.point(names::LOCK_HOLD, &[("kind", "other")]).is_some()
+                && h.point(names::LOCK_WAIT, &[]).is_some()
+        );
     }
 
     /// A11: both verdicts are observed at every collection, zeros included,

@@ -6,7 +6,7 @@ use super::segment::FramePos;
 use super::{CompactError, Entry, OpenRecord, PointerChange, Record, Target};
 use crate::tree_actor::history::refs;
 use crate::tree_actor::recording::pages;
-use crate::tree_actor::stages::{Timer, Which};
+use crate::tree_actor::stages::{Hold, Timer, Which, section};
 use crate::tree_actor::{Error, Result, TreeActor, now_ns};
 
 /// When a journal this long after its last compaction compacts again.
@@ -103,6 +103,7 @@ impl TreeActor {
     /// compaction back.
     pub(in crate::tree_actor) fn compact(&mut self) -> std::result::Result<(), CompactError> {
         let _timer = Timer::start(Which::Compaction);
+        let _kind = section(Hold::Compaction);
         if !self.history.steps_built() {
             return Err(CompactError::Before(std::io::Error::other(
                 "history is not built through the journal's last step",

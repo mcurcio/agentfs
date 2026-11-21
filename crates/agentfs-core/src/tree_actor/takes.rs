@@ -17,7 +17,7 @@ use super::history::{self, refs};
 use super::journal::durable::RecordNo;
 use super::journal::{Change, TakeHead, TakeRecord, Target};
 use super::queue::{self, Key};
-use super::stages::{Timer, Which};
+use super::stages::{Hold, Timer, Which, section};
 use super::tree::EventNumber;
 use super::{Error, Result, Took, TreeActor, TreeId, referee};
 
@@ -273,6 +273,7 @@ impl TreeActor {
     ///
     /// [`Error::NotFound`] for no such tree; [`Error::Stopped`].
     pub(in crate::tree_actor) fn take_inputs(&self, tree: TreeId) -> Result<TakeInputs> {
+        let _kind = section(Hold::Take);
         let t = self.tree(tree)?;
         let held = queue::held(
             t,
@@ -292,6 +293,7 @@ impl TreeActor {
 
     /// Notes when each waiting entry started waiting (the wait metrics).
     pub(in crate::tree_actor) fn note_waiting(&mut self, waiting: &[String]) {
+        let _kind = section(Hold::Take);
         for reference in waiting {
             if !self.waiting_since.contains_key(reference) {
                 self.waiting_since.insert(reference.clone(), Instant::now());
@@ -336,6 +338,7 @@ impl TreeActor {
         &mut self,
         decision: Decision,
     ) -> Result<std::result::Result<EventNumber, Refused>> {
+        let _kind = section(Hold::Take);
         let tree = decision.tree;
         // A fork dropped after the decision: its entry went with it.
         if !self.is_stopped() && !self.trees.contains_key(&tree) {

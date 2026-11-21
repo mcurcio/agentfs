@@ -9,7 +9,8 @@ record and alarm event, with its attributes, and how to turn export on.
 `fork finish`, `fork abandon`, and `restore` and `revert` without a mount
 export telemetry; a front (`mount` or `record` with `--history-service`)
 exports its own. `host`, the CSI driver's per-volume process, exports
-the `agentfs.not_built` gauge and the export-failure counter through the
+the `agentfs.not_built` gauge, the volume lock's figures and the
+export-failure counter through the
 `OTEL_*` variables the node plugin passes on ([csi.md](csi.md#9-operations));
 the plugin itself exports nothing.
 
@@ -87,8 +88,14 @@ exporter.
 | `agentfs.nested.gitdir_heuristic` | counter | Absolute `gitdir:` or `.git` symlink targets under no known view of the tree, found by trying their suffixes; set `--workload-mount` |
 | `agentfs.sandbox_overlay.refusals` | counter, by `reason` | Changes the sandbox overlay refused, each counted once: `not_recordable` (a name the rules skip for that kind: a directory they could record nothing beneath, a recorded file moved to a skipped name), `kind` (a symlink, hard link or special file), `cross_device` (a directory move, `EXDEV`), `hidden` (the source, or an entry at the target, is hidden), `rules_error` (the rules could not decide: `EIO`), `ownership` (an owner, group, set-id or sticky-bit change), `xattr` (an extended-attribute change). Reads of hidden names are not counted |
 | `agentfs.fork.publish.duration` | histogram, per remote | Seconds from a fork's finish commit to its fork remote holding the change and finish refs: one point per fork, when the published mark is written |
+| `agentfs.lock.hold` | counter, by `kind` | Seconds a tree volume's lock was held, by kind of work ([below](#the-volume-lock)) |
+| `agentfs.lock.holds` | counter, by `kind` | Holds of the volume's lock each kind of work ran in |
+| `agentfs.lock.hold.longest` | gauge, by `kind` | Seconds of the longest share of one hold each kind of work took, since the process started |
+| `agentfs.lock.wait` | counter | Seconds callers waited to take the volume's lock |
+| `agentfs.lock.waits` | counter | Waits to take the volume's lock, one per hold |
+| `agentfs.lock.wait.longest` | gauge | Seconds of the longest wait to take the volume's lock, since the process started |
 
-Metric attributes are short and low-cardinality: `trigger`, `remote`,
+Metric attributes are short and low-cardinality: `trigger`, `remote`, `kind`,
 `reason` (a refusal label, a push failure kind or a sandbox overlay
 refusal), `stage` (`record` or
 `commit` for refused paths, `git`, `lfs` or `queue` for push failures) and `part`
@@ -121,6 +128,36 @@ Reads of hidden names are not counted: a hidden name answers like a
 missing one. A steady count usually means a sandbox's tool works in a
 way the overlay does not offer
 ([guarantees](guarantees.md#the-sandbox-overlay)).
+
+### The volume lock
+
+A tree volume has one lock: every recorded call and every lookup in every
+view of the volume takes it ([trees](trees.md#recording-and-durability)).
+`mount` and `host` export how long it is held, by kind of work, and how
+long callers wait to take it. The same figures are in the
+`--metrics-output` file, under `stages`: `lock_hold.<kind>` and
+`lock_wait`, each with its `count`, `nanos` and `max_nanos`
+([configuration](configuration.md)).
+
+A hold's time is split between the kinds of work that ran in it. A kind's
+time is its own: work of one kind run inside another (catching up with
+history inside a close) counts to the inner kind only. Every hold is one
+`other` hold, whose time is what no other kind claimed. The kinds:
+
+| `kind` | The work |
+|---|---|
+| `compaction` | The journal's compaction: a checkpoint, its fsyncs, and dropping the segments behind it |
+| `catch_up` | Moving the saved trees onto history's built point, at a step or a built event |
+| `drops` | Dropping the maps and shapes catching up let go: the last drop of a large file map |
+| `close` | A close's first half and its land, a close decided under the lock, and pending closes saved again |
+| `take` | A take's inputs, the entries it leaves waiting, and its land |
+| `fork_copy` | A fork's step, its untracked area's copy included |
+| `other` | Everything else: the call's own work |
+
+The longest values are kept since the process started, so a longest
+share or wait belongs to the whole run; compare two collections of the
+counters for an interval. `ci/trees-figures.py` reports these per workload
+([performance](performance.md#tree-views-release-build)).
 
 ## Spans
 

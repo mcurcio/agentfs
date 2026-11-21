@@ -375,6 +375,18 @@ must exit 1, and the tracer runs it before the figures.
   `ci/trees-budget.json` (256 MiB, 2 KiB a file) are marks for regressions,
   not targets. The owner, 2026-11-20: "I dont have a number in mind. Im just
   looking to cut waste".
+- **Each workload reports the volume lock by kind.** `lock` holds, for
+  each kind of work under the volume's lock (compaction, catching up with
+  history, drops, closes, takes, fork copies, other:
+  [telemetry](telemetry.md#the-volume-lock)), the holds it ran in, its
+  time and its longest share of one hold, and the waits to take the lock,
+  between the metrics file before the workload and after its history is
+  built. One more save, `fig-nudge`, is made and built first: a
+  compaction the workload made due runs at the first call after history
+  caught up, and the nudge is that call. A longest share is given only
+  when the process-wide maximum grew in that workload, so run a workload
+  alone (`--only`) to read its own. These figures have no bar and never
+  warn or fail.
 - The report is the job's artifact `trees-figures-<fs>`.
 
 Figures from two runs on GitHub `ubuntu-24.04` runners, each one
@@ -566,13 +578,34 @@ On one 4-CPU container (ext4, release build; local observations, not CI):
 | `memory_create`, 50,000 files, persistent maps and overlay in place | 2.67 KiB a file (2.61 to 2.70 before the overlay) | 1.64 KiB a file with the arena cap |
 | `create`'s RssAnon peak, 50,000 files, default `agentfs.overlayLimit` | | about 81 MiB; with an 8 MiB limit 77.5 MiB, so the overlay is a small part of it |
 | Restart after a kill, 100,000 files, built point 400 records past the checkpoint: RssAnon peak (mount) | 370 to 386 MiB (46 to 49 s) | 328 to 333 MiB (38 to 39 s), each tree read once, at the built point |
-| `close_frag`: the close of 200,000 random writes | 110.4 s under the actor lock | 0.47 to 0.52 s (three runs); the longest lock hold, 68 to 89 ms, is the built event's rebuild dropping the save's 200,000-piece map under the lock (`Files::rebuilt`), not the close; the journal's compaction held it at most 1 to 9 ms |
+| `close_frag`: the close of 200,000 random writes | 110.4 s under the actor lock | 0.51 to 0.59 s (two runs); the longest lock hold is the journal's compaction, then the drop of the save's 200,000-piece map at its built event (below) |
 | `write_1m`: peak over memory before | 670 MiB | 774 MiB: a million appends leave the large map's leaves about half full |
 
 `close_frag` and `write_1m` miss their bars and warn. A close's work no
 longer runs under the actor lock (docs/trees.md, "File maps"), but the
 rebuild at the save's built event still drops its old map under it, in time
 proportional to the map's pieces, and sequential write pieces are not merged.
+
+The volume lock by kind, each workload run alone on a fresh volume
+(`trees-figures.py --only W --metrics`, through `agentfs mount -- COMMAND`
+on the release build; same container, ext4; one run each; local
+observations, not CI). Each cell is the kind's longest share of one hold,
+in ms; the kinds not shown held the lock under 0.3 ms or not at all.
+
+| Workload | compaction | drops | close | catch_up | other | Longest wait |
+|---|---|---|---|---|---|---|
+| `close_1g` | **1,151** | 0.15 | 0.24 | 0.09 | 2.4 | 1,047 |
+| `write_1m` | **1,038** | 112 | 49 | 0.08 | 15 | 940 |
+| `close_frag` | **167** | 99 | 54 | 0.06 | 1.8 | 166 |
+| `create` (50,000) | none | 15 | 3.7 | **57** | 4.9 | 67 |
+
+- **Compaction causes the longest holds** in every workload that writes a
+  large journal: it runs at the first call after history has built the
+  workload's steps, and another caller waited nearly all of it.
+- **`create`'s longest holds are catching up with history** (the rebuild's
+  walk of the overlay), at most 57 ms. Its slowest create, 219 ms at
+  50,000 files, is longer than any wait for the lock (67 ms), so that cost
+  is not the lock.
 
 ## Performance budget
 
