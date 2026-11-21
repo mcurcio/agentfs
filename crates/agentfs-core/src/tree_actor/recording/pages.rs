@@ -29,7 +29,6 @@ use std::collections::BTreeMap;
 use super::layout::Located;
 use super::{Call, FileMap, Handle};
 use crate::tree_actor::journal::PagePiece;
-use crate::tree_actor::journal::durable::RecordNo;
 use crate::tree_actor::journal::segment::{FramePos, Relocations};
 use crate::tree_actor::{Error, Result, TreeActor, TreeId};
 
@@ -96,9 +95,9 @@ pub(in crate::tree_actor) struct ObjectPages {
     /// Page number to the bytes last filled or written back. Memory only.
     bases: BTreeMap<u64, Vec<u8>>,
     /// The file's page writes with journal numbers, until the state drops.
-    writes: Vec<(u64, Run)>,
+    pub(in crate::tree_actor) writes: Vec<(u64, Run)>,
     /// The number of the last step closing a write-open of this file.
-    saved_through: u64,
+    pub(in crate::tree_actor) saved_through: u64,
 }
 
 /// The runs of `page`, which starts at file offset `at`, that differ from
@@ -628,29 +627,6 @@ impl TreeActor {
         }
     }
 
-    /// The files with a live write-open whose earlier close moved `saved_through`,
-    /// for a checkpoint. This is the only home of that number while serving.
-    pub(in crate::tree_actor) fn pages_saved_through(&self) -> Vec<(String, u64, u64)> {
-        self.pages
-            .iter()
-            .filter(|(_, state)| state.saved_through > 0)
-            .map(|((tree, object), state)| (tree.to_string(), *object, state.saved_through))
-            .collect()
-    }
-
-    /// Every page write memory holds, in record order: what a checkpoint
-    /// names for recovery to read from the segments before it.
-    pub(in crate::tree_actor) fn pages_held(&self) -> Vec<RecordNo> {
-        let mut held: Vec<RecordNo> = self
-            .pages
-            .values()
-            .flat_map(|state| state.writes.iter().map(|(seq, _)| RecordNo::new(*seq)))
-            .collect();
-        held.sort_unstable();
-        held.dedup();
-        held
-    }
-
     /// Hook: recovery found these page writes and this `saved_through` for a
     /// file with a live write-open, before its closes run. No I/O.
     pub(in crate::tree_actor) fn pages_restore(
@@ -685,22 +661,6 @@ pub(in crate::tree_actor) fn relocate_runs(runs: &mut [(u64, Run)], moved: &Relo
     for (_, run) in runs {
         run.at.relocate(moved);
     }
-}
-
-/// Whether memory holds the page write numbered `seq` of `object` in `tree`: what
-/// a compaction keeps. `writes` is in journal order.
-pub(in crate::tree_actor) fn holds(
-    pages: &BTreeMap<(TreeId, u64), ObjectPages>,
-    tree: TreeId,
-    object: u64,
-    seq: u64,
-) -> bool {
-    pages.get(&(tree, object)).is_some_and(|state| {
-        state
-            .writes
-            .binary_search_by_key(&seq, |(number, _)| *number)
-            .is_ok()
-    })
 }
 
 /// Up to `size` bytes of `map` from `offset`, short at the end.

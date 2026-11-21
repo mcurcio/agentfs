@@ -1,13 +1,15 @@
 //! The journal's commit point: appending a step's record, and compacting the journal behind it
 //! (target git-model §3).
 
+use std::collections::BTreeMap;
+
 use super::durable::RecordNo;
 use super::segment::FramePos;
 use super::{CompactError, Entry, OpenRecord, PointerChange, Record, Target};
 use crate::tree_actor::history::refs;
 use crate::tree_actor::recording::pages;
 use crate::tree_actor::stages::{Hold, Timer, Which, section};
-use crate::tree_actor::{Error, Result, TreeActor, now_ns};
+use crate::tree_actor::{Error, Result, TreeActor, TreeId, now_ns};
 
 /// When a journal this long after its last compaction compacts again.
 /// Constants, not a setting: restart memory is at most this plus live calls.
@@ -204,9 +206,9 @@ impl TreeActor {
         let live = |record: &Record| match &record.entry {
             Entry::Call { handle, .. } => handles.contains_key(handle),
             // A page write that names no tree is kept, never dropped.
-            Entry::PageWrite { tree, object, .. } => tree.parse().map_or(true, |tree| {
-                pages::holds(pages, tree, *object, record.seq.get())
-            }),
+            Entry::PageWrite { tree, object, .. } => tree
+                .parse()
+                .map_or(true, |tree| holds(pages, tree, *object, record.seq.get())),
             _ => false,
         };
         // The builder reads the records after its built point from the
@@ -273,4 +275,45 @@ impl TreeActor {
             }
         }
     }
+}
+
+impl TreeActor {
+    /// The files with a live write-open whose earlier close moved `saved_through`,
+    /// for a checkpoint. This is the only home of that number while serving.
+    pub(in crate::tree_actor) fn pages_saved_through(&self) -> Vec<(String, u64, u64)> {
+        self.pages
+            .iter()
+            .filter(|(_, state)| state.saved_through > 0)
+            .map(|((tree, object), state)| (tree.to_string(), *object, state.saved_through))
+            .collect()
+    }
+
+    /// Every page write memory holds, in record order: what a checkpoint
+    /// names for recovery to read from the segments before it.
+    pub(in crate::tree_actor) fn pages_held(&self) -> Vec<RecordNo> {
+        let mut held: Vec<RecordNo> = self
+            .pages
+            .values()
+            .flat_map(|state| state.writes.iter().map(|(seq, _)| RecordNo::new(*seq)))
+            .collect();
+        held.sort_unstable();
+        held.dedup();
+        held
+    }
+}
+
+/// Whether memory holds the page write numbered `seq` of `object` in `tree`: what
+/// a compaction keeps. `writes` is in journal order.
+pub(in crate::tree_actor) fn holds(
+    pages: &BTreeMap<(TreeId, u64), pages::ObjectPages>,
+    tree: TreeId,
+    object: u64,
+    seq: u64,
+) -> bool {
+    pages.get(&(tree, object)).is_some_and(|state| {
+        state
+            .writes
+            .binary_search_by_key(&seq, |(number, _)| *number)
+            .is_ok()
+    })
 }
