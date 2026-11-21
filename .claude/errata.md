@@ -2072,3 +2072,17 @@ Amendments 2-10 of the same review are also open:
 - the exit-code contract differs between main.rs's doc and invariant 10.
 
 The page needs a revision and a re-cut before this bead can be built.
+
+## 2026-11-21, memory-and-stalls run 5: errata
+
+### agentfs-ln6.12
+
+agentfs-ln6.12 engine (run 4 resume), implementer findings:
+1. OWNED omits crates/agentfs-core/src/tree_actor/journal/fold.rs. Plan item B removes the only caller of `Replay::shapes`, so leaving the function in place fails `clippy -D warnings` (dead_code). Commit 018cd1d deletes `Replay::shapes` there, 14 lines and nothing else. A sibling lane editing fold.rs may need to rebase over that.
+2. Mutation probe P3 is wrong about what catches it. `git log` lists newest first, so the record at EOF is the oldest reachable commit, not the newest direct save. With P3 applied, tests/tree_actor.rs stays green (51/51). Only the unit test (c), `each_commit_message_is_streamed_once_and_whole`, fails.
+3. The page's figure of "+189 MB anon at 100k" for the double read is not what I measured. On release builds after a SIGKILL with built 400 records past the checkpoint, the sampled peak RssAnon fell from 370-386 MiB to 328-333 MiB (about 40-55 MiB), and mount_s from 46-49 s to 38-39 s.
+4. The page's arena figure "2.52 to 1.95 KiB/file" does not match this session's measurement of 2.67 to 1.64 at 50,000 files. docs/architecture.md now records the measured figures.
+
+### agentfs-ln6.13
+
+None appended: nothing in the page stopped the slice. Non-blocking findings for the main loop to record if it wants: (1) the page's `LagGate::overlay`, written as admits-before vs admits-after, costs O(unbuilt steps) on every release of the actor's lock and made the release create figure about 25% slower (63 s to 78-84 s on ext4); the slice recomputes admission only when a report crosses the limit. (2) The page's burst test needs a take worker calling `progress` at built events (as the view's take_worker does), or `admit` never returns once the tree is held, because only lock releases report the overlay. (3) With the default 32 MiB the create workload's overlay never reaches the limit and the RssAnon peak is unchanged (about 81 MiB); at 8m the peak falls only to 77.5 MiB, so the overlay is a small share of RSS. (4) docs/library/core.md's classify table calls `includeIf.<c>.path` "none: structure", but `classify` answers `Other` (left as is).
