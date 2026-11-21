@@ -327,7 +327,7 @@ The interfaces are committed as compiling code with `todo!()` bodies and no beha
 
 | Lane | Owns (repo-relative) |
 |---|---|
-| A | `crates/agentfs-core/src/tree_actor/journal/`; `crates/agentfs-core/src/tree_actor/history/{compactor.rs,built.rs,lag.rs,built_log.rs}`; `crates/agentfs-core/src/tree_actor/{mod.rs,call_path.rs,stages.rs}`; `crates/agentfs-core/src/{session.rs,store.rs,telemetry.rs,failpoints.rs}`; `crates/agentfs-core/tests/{tree_actor.rs,tree_stages.rs,crash_points.rs}` and new `crates/agentfs-core/tests/tree_compaction.rs`, `crates/agentfs-core/tests/tree_flush.rs`; `crates/agentfs-fuse/src/tree_view.rs`, `crates/agentfs-fuse/src/tree_view/untracked.rs`; `crates/agentfs-conformance/`; `ci/power-loss-trees.sh`, `ci/power-loss-trees-check.sh`, `ci/trees-figures.py`; `docs/target-architecture/git-model.md`, `docs/trees.md`, `docs/guarantees.md`, `docs/telemetry.md`, `docs/architecture.md`, `docs/configuration.md`, `docs/runbooks/upgrading-the-sidecar.md` |
+| A | `crates/agentfs-core/src/tree_actor/journal/`; `crates/agentfs-core/src/tree_actor/history/{compactor.rs,built.rs,lag.rs,built_log.rs}`; `crates/agentfs-core/src/tree_actor/{mod.rs,call_path.rs,stages.rs}`; `crates/agentfs-core/src/{session.rs,store.rs,telemetry.rs,failpoints.rs}`; `crates/agentfs-core/tests/{tree_actor.rs,tree_stages.rs,crash_points.rs}`; `crates/agentfs-fuse/src/tree_view.rs`, `crates/agentfs-fuse/src/tree_view/untracked.rs`; `crates/agentfs-conformance/`; `ci/power-loss-trees.sh`, `ci/power-loss-trees-check.sh`, `ci/trees-figures.py`; `docs/target-architecture/git-model.md`, `docs/trees.md`, `docs/guarantees.md`, `docs/telemetry.md`, `docs/architecture.md`, `docs/configuration.md`, `docs/runbooks/upgrading-the-sidecar.md` |
 | B | `crates/agentfs-core/src/tree_actor/history/retired.rs` |
 | C | `crates/agentfs-core/src/tree_actor/recording/{pages.rs,layout.rs,mod.rs}`; `crates/agentfs-core/src/tree_actor/history/{builder.rs,verify.rs}` |
 
@@ -466,16 +466,23 @@ Called at `Segment::sync`, at every unlink of a segment or carry file, and at `C
 
 | # | Criterion (from "Proven by" and the corrections) | Test that proves it | Mutation probe |
 |---|---|---|---|
-| 2.1 | A kill at any gap of a compaction loses nothing returned and the volume opens with the same reads (C1 to C5) | `tree_compaction.rs::a_kill_at_each_gap_keeps_every_returned_call`: for each `Gap`, park the compactor (below), copy the state area as it stands, release, then open the copy and compare every read with the uninterrupted volume | **P2.1** call `History::published` before `JournalCompaction::publish`: the copy taken at `Written` fails to open or reads differently |
-| 2.2 | A segment is unlinked only after the actor rolled past it (C2a) | `tree_compaction.rs::an_append_during_the_coverage_gap_survives_a_kill`: park at `Covered` while the actor's newest segment is covered by B, append one call and return it, release, kill, reopen, read the call | **P2.2** drop the `rolled` check in `unlink_covered`: the returned call is gone after the reopen |
-| 2.3 | The journal always opens (C7) | power-loss marks "covered segments unlinked, next segment's first frame not durable" and "no segment left" (2.6), and `tree_compaction.rs::a_checkpoint_with_no_segment_after_it_opens` | **P2.3** treat a missing segment after `built` as corruption in `Journal::open`: the "no segment left" case refuses to open |
-| 2.4 | A record after B that names a step at or below B folds the same on the old and the new checkpoint (C3, C4) | `tree_compaction.rs::a_step_named_after_the_checkpoint_folds_on_both`: a pointer set at step s, built through B ≥ s, compacted before the actor's built event switches it, one more step naming Step(s), reopen at each of the two checkpoints | **P2.4** leave the head out of `step_heads` once the fold gives `Target::Step` (only switched pointers kept): the reopen fails with `Format` |
-| 2.5 | No lock the actor takes is held across I/O or a wait (C9) | `tree_compaction.rs::calls_run_while_the_compactor_is_parked`: parked at each `Gap`, another thread appends a call, runs `durable_all` and catches up, each finishing (a 10-second bound fails the test rather than hanging it) | **P2.5** hold Durability's state lock across `unlink_covered`'s unlink: the append blocks at `BeforeUnlink` |
+| 2.1 | A kill at any gap of a compaction loses nothing returned and the volume opens with the same reads (C1 to C5) | `compactor.rs::tests::a_kill_at_each_gap_keeps_every_returned_call`: for each `Gap`, park the compactor (below), copy the state area as it stands, release, then open the copy and compare every read with the uninterrupted volume | **P2.1** call `History::published` before `JournalCompaction::publish`: the copy taken at `Written` fails to open or reads differently |
+| 2.2 | A segment is unlinked only after the actor rolled past it (C2a) | `compactor.rs::tests::an_append_during_the_coverage_gap_survives_a_kill`: park at `Covered` while the actor's newest segment is covered by B, append one call and return it, release, kill, reopen, read the call | **P2.2** drop the `rolled` check in `unlink_covered`: the returned call is gone after the reopen |
+| 2.3 | The journal always opens (C7) | power-loss marks "covered segments unlinked, next segment's first frame not durable" and "no segment left" (2.6), and `compactor.rs::tests::a_checkpoint_with_no_segment_after_it_opens` | **P2.3** treat a missing segment after `built` as corruption in `Journal::open`: the "no segment left" case refuses to open |
+| 2.4 | A record after B that names a step at or below B folds the same on the old and the new checkpoint (C3, C4) | `compactor.rs::tests::a_step_named_after_the_checkpoint_folds_on_both`: a pointer set at step s, built through B ≥ s, compacted before the actor's built event switches it, one more step naming Step(s), reopen at each of the two checkpoints | **P2.4** leave the head out of `step_heads` once the fold gives `Target::Step` (only switched pointers kept): the reopen fails with `Format` |
+| 2.5 | No lock the actor takes is held across I/O or a wait (C9) | `compactor.rs::tests::calls_run_while_the_compactor_is_parked`: parked at each `Gap`, another thread appends a call, runs `durable_all` and catches up, each finishing (a 10-second bound fails the test rather than hanging it) | **P2.5** hold Durability's state lock across `unlink_covered`'s unlink: the append blocks at `BeforeUnlink` |
 | 2.6 | Power loss at each step of a compaction, with records after B not yet durable, keeps the journal a prefix of what was appended and every record up to the last returned fsync | `ci/power-loss-trees.sh`: new marks at `Written`, `Renamed`, `DirSynced`, `BeforeUnlink` and after the unlink, plus the two C7 marks, driven through the compaction gate; each replayed from an empty device and checked by `power-loss-trees-check.sh` | **P2.6** skip the directory fsync in `publish`: the mark after `Renamed` replays with no checkpoint (run locally under root with dm-log-writes, or on CI) |
 | 2.7 | Phase-1 coverage of compaction across model steps | the conformance leg: `phase1-replay library` and the mounted replay at the regression seeds with `AGENTFS_COMPACT_GATE` set, compacting at every built event and parking at each gap in turn while the replay goes on | **P2.7** the same plant as P2.4: the leg reports the seed and call where the library left the model |
-| 2.8 | New work is admitted while history trails past twice the due length (the overdue stop is gone) | `lag.rs` unit test `a_long_journal_holds_no_tree`, and `tree_compaction.rs::creates_go_on_while_history_trails` with the builder held at its batch start (`History::batch_read` hook) and the journal past `2 × compact_at(0)` | **P2.8** restore the overdue term in `LagGate::admits`: both tests fail |
+| 2.8 | New work is admitted while history trails past twice the due length (the overdue stop is gone) | `lag.rs` unit test `a_long_journal_holds_no_tree`, and `compactor.rs::tests::creates_go_on_while_history_trails` with the builder held at its batch start (`History::batch_read` hook) and the journal past `2 × compact_at(0)` | **P2.8** restore the overdue term in `LagGate::admits`: both tests fail |
 | 2.9 | A call never waits for compaction (the purpose) | figures (warn only): `close_1g` and `write_1m` with `--metrics --probe --probe-view`, local release build on ext4: `lock_hold.compaction` longest under 1 ms and the other view's longest probe call under 50 ms (slice 0: 1,244 and 1,166 ms) | none: a figure. Read in the report. |
-| 2.10 | The guard holds | the whole workspace test run in debug: `assert_unlocked` panics on any unexempted fsync, journal read or unlink under the lock | **P2.10** add a `Segment::sync` call inside `relocate_if_moved`: `tree_compaction.rs` panics in the guard |
+| 2.10 | The guard holds | the whole workspace test run in debug: `assert_unlocked` panics on any unexempted fsync, journal read or unlink under the lock | **P2.10** add a `Segment::sync` call inside `relocate_if_moved`: `compactor.rs`'s tests panic in the guard |
+
+**The test hook, unit tests only.** The tests of 2.1 to 2.5 and 2.8 are unit tests in `history/compactor.rs` (they open a `TreeActor` and copy its state area, which integration tests cannot reach). They park the compactor through a hook on History, stored beside today's `batch_read` hook in `history/built.rs` and run at each `Gap` before the compactor's next step:
+
+```rust
+#[cfg(test)]
+pub(in crate::tree_actor) fn hold_compactor_with(&self, hook: impl Fn(Gap) + Send + Sync + 'static);
+```
 
 **The compaction gate, failpoints builds only.** `AGENTFS_COMPACT_GATE=<dir>` holds FIFOs `at` and `go`, the way `AGENTFS_TAKE_GATE` does. With it set, the compactor compacts at every built event, ignoring `compact_at`. At each `Gap` it writes the gap's name to `at` and waits for a line on `go`. The test, the conformance leg and the power-loss driver each use this one mechanism, which is event-driven with no sleeps. `docs/configuration.md` gets its row.
 
@@ -531,9 +538,9 @@ impl TreeSession {
 
 | # | Criterion | Test that proves it | Mutation probe |
 |---|---|---|---|
-| 6.1 | FLUSH never waits for an fsync | `tree_flush.rs::a_close_answers_while_the_fsync_is_held`: `Durability::hold_fsync_with` blocks the fsync leader; `Recording::flush` returns, and `durable_all` from another thread is still waiting | **P6.1** make `flush` call `make_durable`: the test's flush blocks (10-second bound) |
-| 6.2 | A failed journal fsync is never FLUSH's error before the actor stops, and it is `Stopped` (EIO) after | `tree_flush.rs::flush_reports_only_a_stopped_actor`: a failed fsync, then `flush` gives `Error::Stopped`; before any failure, `flush` is `Ok` | **P6.2** return `Ok` after `has_failed()`: the second assertion fails |
-| 6.3 | fsync, FSYNCDIR and an O_SYNC write still wait | `tree_flush.rs::fsync_still_waits`: with the fsync held, `durable_then` has not answered until it is released. `ci/power-loss-trees.sh` marks F, SF and HC keep "loses nothing" | **P6.3** route `fsync` through `session.flush`: the power-loss F marks fail (CI), and the unit test fails locally |
+| 6.1 | FLUSH never waits for an fsync | `call_path.rs::tests::a_close_answers_while_the_fsync_is_held`: `Durability::hold_fsync_with` blocks the fsync leader; `Recording::flush` returns, and `durable_all` from another thread is still waiting | **P6.1** make `flush` call `make_durable`: the test's flush blocks (10-second bound) |
+| 6.2 | A failed journal fsync is never FLUSH's error before the actor stops, and it is `Stopped` (EIO) after | `call_path.rs::tests::flush_reports_only_a_stopped_actor`: a failed fsync, then `flush` gives `Error::Stopped`; before any failure, `flush` is `Ok` | **P6.2** return `Ok` after `has_failed()`: the second assertion fails |
+| 6.3 | fsync, FSYNCDIR and an O_SYNC write still wait | `call_path.rs::tests::fsync_still_waits`: with the fsync held, `durable_then` has not answered until it is released. `ci/power-loss-trees.sh` marks F, SF and HC keep "loses nothing" | **P6.3** route `fsync` through `session.flush`: the power-loss F marks fail (CI), and the unit test fails locally |
 | 6.4 | After a power cut, the journal is a prefix of what was appended and holds every record up to the last returned fsync, FSYNCDIR or O_SYNC write; the volume opens; recovery saves what survived (D1) | `ci/power-loss-trees-check.sh` rewritten to check exactly those four. The XW marks become may-lose. New legs: close A, rename A over B, close C, create D with no fsync; and the editor pattern, an untracked temp file, with and without fsync, renamed into the tree | **P6.4** append records out of order in the oracle's fixture (or skip the prefix check): the checker must fail on a planted non-prefix image |
 | 6.5 | A rename from the untracked area into the tree never loses bytes a program fsynced (D2) | the editor leg of 6.4 with fsync: after any cut the bytes are in the area or in the tree. `tree_view.rs` unit test: the area file is still present when `durable_all` has not returned | **P6.5** unlink the area file before `durable_all`: the editor leg loses the bytes at the mark between them |
 | 6.6 | `close_4k` is faster and the cost moved elsewhere is measured | figures (warn only): `close_4k` p50 and p99 before and after; fsync p99 while another open writes 1 GiB with no fsync; the append's lock hold (`lock_hold.other`) during that write, which shows whether writeback throttling stalls the write under the lock | none: figures. Read in the report. If throttling shows, it is a follow-up (RocksDB's `wal_bytes_per_sync`), not this slice. |
@@ -547,3 +554,127 @@ impl TreeSession {
 - `sync(1)` and `syncfs(2)` send a FUSE mount no request, so they do not make closed saves durable.
 - A failed journal fsync first shows as a later call's EIO, once the actor has stopped.
 - One program's fsync pays for every view's unsynced bytes, because group commit fsyncs the whole journal.
+
+### Slice 1: deferred drops leave the request threads
+
+**Bead:** to be created, "latency slice 1: deferred drops off request threads". **Lane B.** **Delivers:** the maps and shapes a catch-up or a rebase lets go are dropped on a thread that serves no requests, not under the lock and not on a view's FUSE thread or the gate thread. Slice 0 measured the `drops` share of one hold at 60 ms (`write_1m`), 41 ms (`close_frag`) and 37 ms (`create`).
+
+**Already in place (5a80783, e1eee36):** `SavedTree::rebuilt` returns a `Retired`. `TreeActor::rebuild` and `TreeActor::rebase_built` hand theirs to `History::defer_drops`, and shutdown calls `History::finish_drops` after the builder and the repacker have stopped and before the lease is released. `History::new` returns `io::Result` for the thread's start. So this slice changes `retired.rs` only.
+
+**Signatures (committed; bodies are this slice's work), `history/retired.rs`:**
+
+```rust
+#[derive(Default)]
+#[must_use]
+pub(in crate::tree_actor) struct Retired { values: Vec<Box<dyn Send>> }
+impl Retired {
+    pub(in crate::tree_actor) fn push<T: Send + 'static>(&mut self, value: T);
+    pub(in crate::tree_actor) fn append(&mut self, other: Retired);
+    pub(in crate::tree_actor) fn is_empty(&self) -> bool;
+}
+
+pub(in crate::tree_actor) struct DeferredDrops { /* private: the queue and the thread */ }
+impl DeferredDrops {
+    pub(in crate::tree_actor) fn start() -> std::io::Result<Self>;  // spawns `tree-drops`
+    pub(in crate::tree_actor) fn defer(&self, values: Retired);    // O(1), never waits for a drop
+    pub(in crate::tree_actor) fn finish(&self);                    // every value deferred before it dropped, thread joined
+}
+impl Drop for DeferredDrops { fn drop(&mut self); }               // new: finish() if it has not run
+```
+
+**Contract:**
+- `defer` takes the queue's lock for one push and a notify. It never drops a value and never waits on the drop thread.
+- The thread takes the whole queue under the lock, releases the lock, then drops each value. No lock the call path takes is held across a drop. A base file's drop takes the open-bases cache's lock for its O(256) retain and unlinks outside it, as `BaseFile::drop` does today.
+- `finish` and `Drop` mark the queue finishing, wake the thread and join it. The thread drops what is left and ends. A join error is logged as `tree DropsFailed` and never panics. Calling `finish` twice is a no-op.
+- The drop thread holds no `Arc` of History's `Inner`, so no cycle keeps it alive.
+- The `Hold::Drops` section leaves `defer`. After this slice the `drops` kind of `lock_hold` reads zero, because no drop runs under the lock.
+- The same path serves `Recording` and a `TreeActor` used directly, the conformance library replay included. There is no second mode.
+
+**Departure from the review's fix, with its cost:** the review asked for a histogram of the time drops take off the lock. It is not added, because the drop thread serves no request, so no caller feels that time. Adding it would grow the stage vocabulary across `stages.rs`, `telemetry.rs`, `ci/trees-figures.py` and `docs/telemetry.md`, which lane A owns. **Cost:** if drops ever fall behind, the memory queued for them is not measured. That is a `residual:` bead if a figure ever points at it.
+
+**Acceptance criteria and mutation probes:**
+
+| # | Criterion | Test that proves it (unit tests in `retired.rs`) | Mutation probe |
+|---|---|---|---|
+| 1.1 | A deferred value is dropped on `tree-drops`, never on the caller's thread | `a_deferred_value_drops_on_the_drop_thread`: a sentinel whose `Drop` sends `thread::current().name()` over a channel | **P1.1** drop inline in `defer`: the name is the test thread's |
+| 1.2 | `defer` never waits for a drop | `defer_returns_while_a_drop_runs`: the first sentinel's `Drop` signals that it has started, then blocks on a channel; a second `defer` from the test thread returns while the first is still blocked; then the first is released | **P1.2** drop while holding the queue's lock: the second `defer` blocks (a 10-second bound fails the test rather than hanging it) |
+| 1.3 | `finish` returns only after every value deferred before it is dropped, a base file's link included | `finish_waits_for_every_drop`: a blocked sentinel and a real `BaseFile` (`BaseFile::new` over a temporary file). `finish` runs on another thread and has not returned while the sentinel is blocked; after the release, `finish` returns and the base link is gone | **P1.3** return from `finish` without joining: `finish` returns while the sentinel is blocked |
+| 1.4 | No drop under the lock or on a request thread in a real catch-up (the purpose) | figures (warn only), local release build on ext4, `trees-figures.py --only W --metrics --probe --probe-view FORK` for `close_frag`, `write_1m` and `create`: the `drops` share reads 0. Report the same-view and other-view probe latencies and the longest gate wait beside slice 0's | none: figures, read in the report |
+
+**Finding to report, not to fix here:** the page's "close_frag longest hold under 10 ms" cannot follow from this slice. Slice 0 shows `close_frag`'s other kinds holding the lock 233 ms (compaction, gone after slice 2), 123 ms (take) and 55 ms (close). Slice 1's bar is the `drops` share, not the longest hold.
+
+**Gates:** fmt, clippy `-D warnings`, `cargo test --workspace` (the regression tier runs within it), CI `ci` and `image` green. This slice changes no durability.
+
+### Slice 5: one copy of each open's calls
+
+**Bead:** agentfs-ln6.10. **Lane C.** **Delivers:** a close no longer copies an open's calls into new vectors. Today a 1M-call close copies them up to four times beyond the one copy each part keeps:
+- In the actor: `CallReader::calls` builds one `Vec`, then `pages::close_calls` copies it into a second.
+- In the builder: `open.calls`, its persistent copy, is collected into `own`, then `recorded_close_calls` copies that into a third.
+
+After this slice each part keeps one copy: the actor the `Vec` it reads back from the journal, the builder its `BuildOpen.calls`. Every pass reads a lazy merge over them.
+
+**Measure first.** Before changing code, run `ci/trees-figures.py --only write_1m --metrics` on the release build and record its peak over memory before (slice 0's figure: 774 MiB, against a bar of 256 MiB). If removing the copies does not move the figure by at least the copies' size (about 1M × `size_of::<(u64, Call, FramePos)>()` each), the report says so and names the next candidates: the large map's leaves left half full by a million appends, and sequential write pieces that are never merged. Both live in `recording/file_map.rs`, which no lane owns, so each becomes a `residual:` bead, not part of this slice.
+
+**Signatures.** Committed in `recording/pages.rs` (e4beefd):
+
+```rust
+pub(in crate::tree_actor) enum CloseCall<'a, L: Located> { Own(&'a Call, &'a L), Piece(Call, L) }
+impl<L: Located> CloseCall<'_, L> {
+    pub(in crate::tree_actor) fn call(&self) -> &Call;
+    pub(in crate::tree_actor) fn at(&self) -> &L;
+}
+#[derive(Clone)]
+pub(in crate::tree_actor) struct CloseCalls<'a, L: Located + 'a, O>
+where O: Iterator<Item = &'a (u64, Call, L)> + Clone
+{ own: Peekable<O>, pieces: Peekable<std::vec::IntoIter<(u64, Run<L>)>> }
+impl<'a, L: Located + 'a, O: Iterator<Item = &'a (u64, Call, L)> + Clone> Iterator for CloseCalls<'a, L, O> {
+    type Item = CloseCall<'a, L>;
+}
+```
+
+Changed by this slice. Each replaces the function of the same name, and every caller and test moves with it:
+
+```rust
+// recording/pages.rs
+pub(in crate::tree_actor) fn close_calls<'a, L: Located + 'a, O>(own: O, pieces: Vec<(u64, Run<L>)>) -> CloseCalls<'a, L, O>
+where O: Iterator<Item = &'a (u64, Call, L)> + Clone;
+pub(in crate::tree_actor) fn calls_for_close<'a>(
+    saved_len: u64, own: &'a [(u64, Call, FramePos)], writes: &[(u64, Run)], saved_through: u64,
+) -> CloseCalls<'a, FramePos, std::slice::Iter<'a, (u64, Call, FramePos)>>;
+pub(in crate::tree_actor) fn recorded_close_calls<'a, L: Located + 'a, O>(
+    own: O, writes: &[(u64, Run<L>)], pieces: &[PagePiece],
+) -> Option<CloseCalls<'a, L, O>>
+where O: Iterator<Item = &'a (u64, Call, L)> + Clone;
+
+// recording/layout.rs
+impl Layout {
+    pub fn of_close<'a, L: Located + 'a>(saved_len: u64, calls: impl IntoIterator<Item = CloseCall<'a, L>>) -> Result<Self>;
+    pub fn replay<'a, L: Located + 'a, O>(saved_len: u64, own: O, writes: &[(u64, Run<L>)], pieces: &[PagePiece]) -> Result<Option<Self>>
+    where O: ExactSizeIterator<Item = &'a (u64, Call, L)> + Clone;   // ExactSize: the skew failpoint drops the last own call
+}
+
+// recording/mod.rs (private)
+fn replay_judge<'a, O>(saved: &FileMap, calls: CloseCalls<'a, FramePos, O>) -> Result<(SaveOutcome, Option<Decided>)>
+where O: Iterator<Item = &'a (u64, Call, FramePos)> + Clone;   // clones the merge once, for Layout::of_close
+```
+
+In `history/builder.rs`, the save's replay passes `open.calls.iter()` to `Layout::replay` and builds `known` from the same iterator. The `own` vector is deleted. `history/verify.rs` follows `Layout::replay`'s new signature.
+
+**Contract:** the merge yields exactly what the old `close_calls` vector held, in the same order. Own calls and page-write pieces are ordered by journal number, and the two never share one. No function on a close's path collects an open's calls into a new vector. The types now carry that, so a later caller cannot make a copy without writing `collect` by hand.
+
+**Acceptance criteria and mutation probes:**
+
+| # | Criterion | Test that proves it | Mutation probe |
+|---|---|---|---|
+| 5.1 | The lazy merge yields what the old vector did | `pages.rs` tests: `calls_for_close_table` and the seeded property test at `pages.rs` (today about line 869) unchanged in what they assert, plus `the_lazy_merge_matches_the_vector`: random own calls and pieces, the old merge kept in the test module as the oracle, compared call by call, and compared again after a `clone` taken midway | **P5.1** in `CloseCalls::next`, take the piece whenever both are present: the table test and the property test fail |
+| 5.2 | The builder's replay and `agentfs verify` are unchanged | `cargo test --workspace`: the builder's replays, `tree_verify.rs`, the skew failpoint test, phase-1 conformance at the regression seeds | **P5.2** drop the last own call always (not only under `tree.build_replay_skew`): every save flags as unverified and the verify tests fail |
+| 5.3 | `write_1m`'s peak falls by the copies removed | figure (warn only): peak-over-before, before and after, release build, local ext4, with the measured size of one copy | none: a figure. Report it beside 774 MiB and the 256 MiB bar. |
+
+**Gates:** fmt, clippy `-D warnings`, `cargo test --workspace` (the regression tier runs within it), CI `ci` and `image` green. This slice changes no durability and no rule.
+
+### What this cut leaves open
+
+- **Slices 3 and 4** stay gated on a figure (above).
+- **The view's single FUSE thread** held by a large close's own decision, 509 ms in `close_frag` and 970 ms in `write_1m`, is unchanged by every slice here. The question to the owner about it is asked separately and does not gate these slices.
+- **The lag gate's waits** for writes to other files of a busy tree were not measured by slice 0, and nothing here changes them.
+- **Docs bead:** after lanes A, B and C land, as listed under "Lanes and order".
