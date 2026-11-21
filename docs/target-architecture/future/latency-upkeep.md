@@ -7,13 +7,13 @@
 
 **What you are asked:** to agree the shape and the order of the slices, and to answer three questions. The order is: measure first, then the one measured cause, then compaction as the tracer bullet. All other work waits for a figure that justifies it.
 
-**Before this page goes to you:** your 2026-11-21 latency quotes must be recorded in OWNER-GUIDANCE.md. They are not there today.
+**Answers (owner, 2026-11-21; OWNER-GUIDANCE.md, Performance):**
 
-| Open question | Kind | Section |
-|---|---|---|
-| Q1. Which wait did you mean by "the queue flush"? | general guidance | §2 |
-| Q2. Must a close or fsync wait until the change is power-cut safe? | **absolute requirement** | §2 |
-| Q3. How much of the work should be committed now? | general guidance | §8 |
+| Question | Answer |
+|---|---|
+| Q1. Which wait did "the queue flush" mean? | "Interruption to the host program due to the held locks which prevent it from opening/reading/writing new files": the volume lock held for upkeep, which this design removes |
+| Q2. Must a close or fsync wait until the change is power-cut safe? | "No. If we want to take a durability approach, then I would suggest an oolong system where the queue is persisted. But it's not a requirement, just a nice-to-have". Not a requirement. Whether fsync keeps its POSIX promise while close stops waiting is the one open follow-up |
+| Q3. How much should be committed now? | "Agreed": slices 0–2 and 5 committed; 3 and 4 only if slice 0 shows they matter |
 
 **What changed since the review.** Four reviewers found two crash-order holes in the compaction plan, and a close plan that changed the order closes save in. They also found that the slices were committed before the 4-second hold had a known cause. The revision makes three changes:
 - Compaction moves to history, which writes the checkpoint at its own built point into a file of its own.
