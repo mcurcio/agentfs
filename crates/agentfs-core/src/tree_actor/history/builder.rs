@@ -8,8 +8,10 @@
 //! order: pack, then index (git's own), the pack files and directory fsynced,
 //! then the built-log entry fsynced. Only then are refs, `config` and the
 //! checkouts copied and the built event sent. It decides nothing: outcomes,
-//! dates and take decisions are in the records, and a replay that disagrees
-//! with its record (`Disagrees`) stops building with the alarm.
+//! dates and take decisions are in the records. A save is built from its
+//! recorded layout: when the builder's own replay of it does not match, the
+//! commit is flagged and building goes on ([`super::verify`]); only a layout
+//! that cannot be laid (`Disagrees`) stops building with the alarm.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ops::Bound;
@@ -27,8 +29,10 @@ use super::feed::{BuildRef, CommitSpec, Feed, Parent};
 use super::format::{self, BlobRef};
 use super::message::{self, Action, Message};
 use super::upstreams::Upstreams;
+use super::verify::{self, Evidence, Flag, Inputs, Verification};
 use super::{Objects, TreeMoved, checkout, objects_after, objects_of, refs};
 use crate::tree_actor::journal::durable::{Durability, RecordNo};
+use crate::tree_actor::journal::readback::CallReader;
 use crate::tree_actor::journal::segment::{FramePos, Relocations, Segment};
 use crate::tree_actor::journal::{
     At, Change, Entry, Frame, Record, RowRecord, SaveOutcome, Tail, TakeHead, TakeRecord, Target,
@@ -37,6 +41,7 @@ use crate::tree_actor::journal::{
 use crate::tree_actor::pointers::Pointers;
 use crate::tree_actor::queue::Key;
 use crate::tree_actor::recording::file_map::BaseFile;
+use crate::tree_actor::recording::layout::{Layout, Positions};
 use crate::tree_actor::recording::{Call, FileMap, pages};
 use crate::tree_actor::stages::{Timer, Which};
 use crate::tree_actor::tree::{
@@ -220,6 +225,20 @@ struct Batch<'a> {
     moved: BTreeSet<TreeId>,
     /// Files whose map a step replaced: History hands the new maps to the actor.
     files: BTreeSet<(TreeId, u64)>,
+    /// This batch's flagged saves, by their commit's mark.
+    flags: Vec<Flagged>,
+}
+
+/// A save the batch flagged: its commit's mark, what its log line and its
+/// evidence say, and when it was recorded.
+struct Flagged {
+    mark: u64,
+    step: RecordNo,
+    tree: TreeId,
+    path: String,
+    flag: Flag,
+    evidence: Evidence,
+    at_ns: u64,
 }
 
 impl Batch<'_> {
@@ -278,6 +297,15 @@ fn to_build_error(e: Error) -> BuildError {
 
 fn disagrees(step: u64) -> Error {
     build_error(BuildError::Disagrees(RecordNo::new(step)))
+}
+
+/// A recorded layout that could not be read or laid: [`disagrees`]; any
+/// other failure as it is.
+fn unlaid(e: Error, step: u64) -> Error {
+    match e {
+        Error::Format => disagrees(step),
+        e => e,
+    }
 }
 
 impl BuildState {
@@ -665,6 +693,7 @@ impl BuildState {
                 tree,
                 event,
                 open,
+                unverified: None,
             }
             .render(ctx.identity)
         };
@@ -769,38 +798,103 @@ impl BuildState {
                         self.framed.remove(&(id, open.object));
                     }
                     SaveOutcome::Unchanged | SaveOutcome::OrphanDropped => {}
-                    SaveOutcome::Saved {
-                        len,
-                        pieces: digest,
-                    } => {
+                    SaveOutcome::Saved { len, chunks } => {
+                        let chunks = self.take_chunks(seq, *chunks)?;
+                        // The record wins: a layout that cannot be read or
+                        // laid is the only disagreement that stops building.
+                        let recorded = Layout::read(*len, &chunks).map_err(|e| unlaid(e, seq))?;
                         let writes: Vec<(u64, pages::Run)> = self
                             .pages
                             .get(&(id, open.object))
                             .map(|runs| runs.iter().cloned().collect())
                             .unwrap_or_default();
                         let own: Vec<(u64, Call, FramePos)> = open.calls.iter().cloned().collect();
+                        let t = self.trees.get_mut(&id).ok_or(Error::Format)?;
                         let saved = t.bytes.get(&open.object).ok_or_else(|| disagrees(seq))?;
-                        let (map, calls) = pages::replay_close(saved, &own, &writes, pieces)?
-                            .ok_or_else(|| disagrees(seq))?;
-                        // What the save wrote, by place, never how each side
-                        // sources the bytes from before.
-                        if map.len() != *len
-                            || FileMap::close_digest(saved.len(), &calls)? != *digest
-                        {
-                            return Err(disagrees(seq));
+                        let replayed = Layout::replay(saved.len(), &own, &writes, pieces)?;
+                        // Each place from the calls and runs tracked here,
+                        // else from the journal by its record.
+                        let mut known = Positions::default();
+                        for (_, _, pos) in &own {
+                            known.add(pos);
                         }
+                        for (_, run) in &writes {
+                            known.add(&run.at);
+                        }
+                        let mut journal: Option<CallReader> = None;
+                        let map = recorded
+                            .lay(saved, &mut |place| {
+                                if let Some(pos) = known.find(place) {
+                                    return Ok(Some(pos));
+                                }
+                                let reader = match &mut journal {
+                                    Some(reader) => reader,
+                                    empty => empty.insert(CallReader::of_segments(
+                                        ctx.durability.segments(),
+                                        ctx.salt,
+                                    )?),
+                                };
+                                Ok(reader
+                                    .record(place.record)?
+                                    .map(|(_, tail)| tail.pos.at(place.at)))
+                            })
+                            .map_err(|e| unlaid(e, seq))?;
                         let base = t.bytes.get(&open.object).ok_or_else(|| disagrees(seq))?;
                         let old = t.lines.get(&open.object).ok_or_else(|| disagrees(seq))?;
-                        let appended = calls
-                            .iter()
-                            .all(|(call, _)| matches!(call, Call::Append { .. }));
+                        let appended = recorded.only_extends(base.len());
+                        let before_len = base.len();
                         let lines = saved_lines(ctx.root, old, base, &map, appended, event)?;
                         t.lines.insert(open.object, Arc::new(lines));
                         t.bytes.insert(open.object, saved_map(map, seq));
                         batch.files.insert((id, open.object));
-                        let message = direct(Action::Direct, id, Some(*handle))?;
-                        head =
-                            Some(self.commit_direct(id, &keys, &message, record.at_ns, batch)?);
+                        let flag = (replayed.as_ref() != Some(&recorded)).then(|| Flag {
+                            recorded: recorded.fingerprint(),
+                            replayed: replayed.as_ref().map(Layout::fingerprint),
+                            builder: verify::release_or_unknown(),
+                        });
+                        let message = Message::Direct {
+                            action: Action::Direct,
+                            by,
+                            tree: id,
+                            event,
+                            open: Some(*handle),
+                            unverified: flag.as_ref(),
+                        }
+                        .render(ctx.identity)?;
+                        let commit =
+                            self.commit_direct(id, &keys, &message, record.at_ns, batch)?;
+                        if let (Some(flag), Parent::Mark(mark)) = (flag, &commit) {
+                            let path = self
+                                .tree(id)?
+                                .names
+                                .of(open.object)
+                                .next()
+                                .unwrap_or_default()
+                                .to_owned();
+                            let evidence = Evidence::of(&Inputs {
+                                step: record.seq,
+                                handle: *handle,
+                                tree: id,
+                                object: open.object,
+                                path: &path,
+                                before_len,
+                                own: &own,
+                                writes: &writes,
+                                pieces,
+                                recorded: &recorded,
+                                replayed: replayed.as_ref(),
+                            });
+                            batch.flags.push(Flagged {
+                                mark: *mark,
+                                step: record.seq,
+                                tree: id,
+                                path,
+                                flag,
+                                evidence,
+                                at_ns: record.at_ns,
+                            });
+                        }
+                        head = Some(commit);
                         owner = true;
                     }
                 }
@@ -1300,6 +1394,10 @@ pub(in crate::tree_actor) struct Context<'a> {
     pub repo: &'a TreeGit,
     /// The state area: where an alignment writes the files `git diff` reads.
     pub root: &'a Path,
+    /// The journal's segments and salt: where a save's bytes the builder
+    /// does not track are read by record.
+    pub durability: &'a Arc<Durability>,
+    pub salt: u32,
 }
 
 /// The line map of `after`'s bytes over `old`, the map of `before`'s: one
@@ -1368,6 +1466,9 @@ pub(in crate::tree_actor) struct Builder {
     pub checked_out: BTreeMap<TreeId, Oid>,
     /// A copy failed: the next batch rebuilds refs, config and checkouts whole.
     pub stale: bool,
+    /// The volume's flagged commits by state: each flag counted once its
+    /// batch is built.
+    pub verification: Verification,
 }
 
 impl Builder {
@@ -1437,6 +1538,8 @@ impl Builder {
             service: &self.service,
             repo: &repo,
             root: &self.root,
+            durability: &self.durability,
+            salt: self.reader.salt,
         };
         let mut batch = Batch {
             repo: &repo,
@@ -1449,6 +1552,7 @@ impl Builder {
             forked: false,
             moved: BTreeSet::new(),
             files: BTreeSet::new(),
+            flags: Vec::new(),
         };
         for (record, tail) in &frames {
             next.apply(record, tail, &ctx, &mut batch)
@@ -1505,6 +1609,16 @@ impl Builder {
             });
         }
         let moved = self.state.moved_to(&next).map_err(to_build_error)?;
+        // Each flag's commit is in the pack: its evidence, best effort. The
+        // flag itself is the commit's trailer, already durable.
+        let mut flagged = Vec::with_capacity(batch.flags.len());
+        for pending in std::mem::take(&mut batch.flags) {
+            let commit = *marks
+                .get(&pending.mark)
+                .ok_or_else(|| BuildError::Packer("an unknown mark".into()))?;
+            write_evidence(&repo, commit, &pending);
+            flagged.push((commit, pending));
+        }
         crate::failpoints::hit("tree.build_after_pack")?;
         let entry = BuiltEntry {
             through,
@@ -1512,6 +1626,24 @@ impl Builder {
             moved,
         };
         self.built_log.append(&entry)?;
+        // Built: each flag counts once, whatever builds the batch again.
+        self.verification.add_unresolved(flagged.len() as u64);
+        for (commit, pending) in &flagged {
+            let replayed = pending
+                .flag
+                .replayed
+                .map_or_else(|| "none".to_owned(), |f| f.to_string());
+            eprintln!(
+                "tree HistoryUnverified: step={} tree={} commit={commit} path={}: the builder's \
+                 replay of this save does not match its recorded layout (recorded {}, replayed \
+                 {replayed}); history holds the bytes the workload saved \
+                 (docs/runbooks/recording-failures.md)",
+                pending.step.get(),
+                pending.tree,
+                serde_json::to_string(&pending.path).unwrap_or_default(),
+                pending.flag.recorded,
+            );
+        }
         self.reader.advance(offset, through);
         let built = next.built_pointers().map_err(to_build_error)?;
         let owners = next.owners.clone();
@@ -1674,6 +1806,25 @@ impl Builder {
         }
         self.stale = false;
         Ok(rewritten)
+    }
+}
+
+/// A flagged save's evidence, under the notes ref, committed by the builder's
+/// commit identity at the step's record time. Any failure is logged with the
+/// evidence's text and never fails the batch: the flag is in the commit.
+fn write_evidence(repo: &TreeGit, commit: Oid, pending: &Flagged) {
+    let written = (|| -> Result<()> {
+        let seconds = i64::try_from(pending.at_ns / 1_000_000_000).unwrap_or(i64::MAX);
+        let committer =
+            git2::Signature::new("agentfs", "agentfs@localhost", &git2::Time::new(seconds, 0))?;
+        verify::write_evidence(repo, commit, &pending.evidence, &committer)
+    })();
+    if let Err(e) = written {
+        let text = verify::render_evidence(&pending.evidence).unwrap_or_default();
+        eprintln!(
+            "tree HistoryEvidenceNotWritten: commit={commit}: {e}; the evidence was: {}",
+            text.trim_end()
+        );
     }
 }
 

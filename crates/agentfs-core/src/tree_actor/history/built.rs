@@ -35,9 +35,13 @@ pub enum BuildError {
     /// A read or write of the store or the built log failed with this errno.
     #[error("history build: errno {0}")]
     Io(i32),
-    /// The builder's replay of this step disagrees with its record (outcome,
-    /// length or checksum): building stops with the alarm until an operator
-    /// acts (docs/runbooks/recording-failures.md).
+    /// The builder cannot build this step as recorded: a save's recorded
+    /// layout cannot be laid (a place no linked journal record holds,
+    /// malformed chunks, or bytes kept "as before" past the end of the file
+    /// the builder holds), or the step names a file or open the builder
+    /// lacks. Building stops with the alarm until an operator acts
+    /// (docs/runbooks/recording-failures.md). A save the builder can lay but
+    /// not reproduce is built and flagged instead (`super::verify`).
     #[error("history build disagrees with step {}", .0.get())]
     Disagrees(RecordNo),
     /// A commit the built log or a checkpoint names is not in the store.

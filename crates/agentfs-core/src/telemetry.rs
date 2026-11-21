@@ -656,17 +656,35 @@ impl Telemetry {
     }
 
     /// Registers `agentfs.history.unverified` (unit `{step}`): a tree
-    /// volume's saves history could not check, read from `counts` at each
-    /// collection, one point per `verdict`: `unresolved` (flagged, not
-    /// checked again) and `mismatch_confirmed` (checked again and still
+    /// volume's saves history flagged because the builder could not check
+    /// them (docs/trees.md, "When history cannot check a save"), read from
+    /// `counts` at each collection, one point per `verdict`: `unresolved`
+    /// (no verdict yet) and `mismatch_confirmed` (checked again and still
     /// disagreeing), both always observed, zero included. Call once per
     /// process; a noop telemetry registers nothing.
     pub fn observe_unverified(
         &self,
         counts: Weak<dyn Fn() -> crate::tree_actor::UnverifiedCounts + Send + Sync>,
     ) {
-        let _ = counts;
-        todo!("agentfs-ln6.11")
+        let Some(inner) = &self.inner else {
+            return;
+        };
+        inner
+            .meter
+            .u64_observable_gauge(names::HISTORY_UNVERIFIED)
+            .with_unit("{step}")
+            .with_description("Saves history flagged because the builder could not check them")
+            .with_callback(move |observer| {
+                if let Some(counts) = counts.upgrade() {
+                    let counts = counts();
+                    observer.observe(counts.unresolved, &[KeyValue::new("verdict", "unresolved")]);
+                    observer.observe(
+                        counts.mismatch_confirmed,
+                        &[KeyValue::new("verdict", "mismatch_confirmed")],
+                    );
+                }
+            })
+            .build();
     }
 
     /// Registers `agentfs.history_service.fronts`, the number of distinct
@@ -1724,6 +1742,28 @@ mod tests {
         assert_eq!(gauge("patches"), Some(1));
         assert_eq!(gauge("lfs"), None);
         assert_eq!(gauge("other"), None);
+    }
+
+    /// A11: both verdicts are observed at every collection, zeros included,
+    /// read from the counts as they are then.
+    #[test]
+    fn unverified_saves_are_observed_by_verdict_zeros_included() {
+        use crate::tree_actor::UnverifiedCounts;
+        let h = Harness::new();
+        let counts = Arc::new(std::sync::Mutex::new(UnverifiedCounts::default()));
+        let read = Arc::clone(&counts);
+        let gauge: Arc<dyn Fn() -> UnverifiedCounts + Send + Sync> =
+            Arc::new(move || *read.lock().unwrap());
+        h.telemetry.observe_unverified(Arc::downgrade(&gauge));
+        let point = |verdict| h.gauge_u64(names::HISTORY_UNVERIFIED, &[("verdict", verdict)]);
+        assert_eq!(point("unresolved"), Some(0));
+        assert_eq!(point("mismatch_confirmed"), Some(0));
+        *counts.lock().unwrap() = UnverifiedCounts {
+            unresolved: 2,
+            mismatch_confirmed: 1,
+        };
+        assert_eq!(point("unresolved"), Some(2));
+        assert_eq!(point("mismatch_confirmed"), Some(1));
     }
 
     #[test]

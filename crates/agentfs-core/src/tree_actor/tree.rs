@@ -2119,7 +2119,7 @@ mod tests {
                 }
             }
             Op::Save(object) => {
-                let outcome = SaveOutcome::Saved { len: 0, pieces: 0 };
+                let outcome = SaveOutcome::Saved { len: 0, chunks: 0 };
                 shape.save(*object, outcome, at_ns);
                 bytes(*object, Some(map_at(seq)));
             }

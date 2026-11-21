@@ -37,6 +37,7 @@ pub const ENV_VAR: &str = "AGENTFS_FAILPOINTS";
 pub const POINTS: &[&str] = &[
     // Tree actor recording and publication (target git-model §3, §12).
     "tree.init_before_format",
+    "tree.ref_rebuild_after_remove",
     "tree.after_ref_rebuild",
     "tree.wal_before_header",
     "tree.wal_after_payload",
@@ -53,6 +54,7 @@ pub const POINTS: &[&str] = &[
     "tree.compact_before_drop",
     // The tree builder, behind the call path (docs/trees.md).
     "tree.build_before_batch",
+    "tree.build_replay_skew",
     "tree.build_after_pack",
     "tree.build_after_built_log",
     "tree.build_after_ref_copy",

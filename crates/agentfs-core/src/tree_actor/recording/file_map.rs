@@ -23,6 +23,11 @@ use std::sync::{Arc, Mutex, PoisonError, Weak};
 use git2::Oid;
 
 use super::Call;
+#[cfg(doc)]
+use super::layout::Layout;
+use super::layout::Located;
+#[cfg(doc)]
+use super::layout::Place;
 use crate::tree_actor::journal::durable::RecordNo;
 use crate::tree_actor::journal::segment::{FramePos, Relocations};
 use crate::tree_actor::stages;
@@ -150,19 +155,31 @@ impl std::fmt::Debug for BaseFile {
 }
 
 /// Where a piece's bytes are. `at` is the offset into the source where the
-/// piece starts.
+/// piece starts. A map of journal positions ([`FramePos`]) reads its bytes; a
+/// map of [`Place`]s, a layout's replay, only names them.
 #[derive(Clone, Debug)]
-pub(in crate::tree_actor) enum Source {
-    Zero,
-    Base { file: Arc<BaseFile>, at: u64 },
-    Frame { pos: FramePos, at: u64 },
+pub(in crate::tree_actor) enum Source<L = FramePos> {
+    /// Zeros, and the record that made them: a call's gap or extension, or
+    /// [`RecordNo::ZERO`] for zeros from before (a layout's own included).
+    /// [`Layout::of_view`] tells a close's zeros from earlier ones by it.
+    Zero {
+        by: RecordNo,
+    },
+    Base {
+        file: Arc<BaseFile>,
+        at: u64,
+    },
+    Frame {
+        pos: L,
+        at: u64,
+    },
 }
 
-impl Source {
+impl<L: Located> Source<L> {
     /// The same source `by` bytes further on.
     fn advanced(&self, by: u64) -> Self {
         match self {
-            Self::Zero => Self::Zero,
+            Self::Zero { by: made } => Self::Zero { by: *made },
             Self::Base { file, at } => Self::Base {
                 file: Arc::clone(file),
                 at: at + by,
@@ -174,9 +191,29 @@ impl Source {
         }
     }
 
+    /// Whether this source `mine` bytes in and `other` `theirs` bytes in
+    /// name the same bytes: zeros, the same base file at the same offset, or
+    /// the same frame bytes by [`Located::place`] (wherever compaction
+    /// carried them).
+    fn same_place(&self, mine: u64, other: &Self, theirs: u64) -> bool {
+        match (self, other) {
+            (Self::Zero { .. }, Self::Zero { .. }) => true,
+            (Self::Base { file: a, at: x }, Self::Base { file: b, at: y }) => {
+                Arc::ptr_eq(a, b) && x + mine == y + theirs
+            }
+            (Self::Frame { pos: a, at: x }, Self::Frame { pos: b, at: y }) => {
+                let (a, b) = (a.place(), b.place());
+                a.record == b.record && a.at + x + mine == b.at + y + theirs
+            }
+            _ => false,
+        }
+    }
+}
+
+impl Source {
     fn read(&self, buf: &mut [u8]) -> io::Result<()> {
         match self {
-            Self::Zero => {
+            Self::Zero { .. } => {
                 buf.fill(0);
                 Ok(())
             }
@@ -184,31 +221,13 @@ impl Source {
             Self::Frame { pos, at } => pos.read(*at, buf),
         }
     }
-
-    /// Whether this source `mine` bytes in and `other` `theirs` bytes in
-    /// name the same bytes: zeros, the same base file at the same offset, or
-    /// the same frame bytes by [`FramePos::key`] (wherever compaction carried
-    /// them).
-    fn same_place(&self, mine: u64, other: &Self, theirs: u64) -> bool {
-        match (self, other) {
-            (Self::Zero, Self::Zero) => true,
-            (Self::Base { file: a, at: x }, Self::Base { file: b, at: y }) => {
-                Arc::ptr_eq(a, b) && x + mine == y + theirs
-            }
-            (Self::Frame { pos: a, at: x }, Self::Frame { pos: b, at: y }) => {
-                let ((ra, oa), (rb, ob)) = (a.key(), b.key());
-                ra == rb && oa + x + mine == ob + y + theirs
-            }
-            _ => false,
-        }
-    }
 }
 
 /// One run of a file: `len` bytes from `source`.
 #[derive(Clone, Debug)]
-pub(in crate::tree_actor) struct Piece {
+pub(in crate::tree_actor) struct Piece<L = FramePos> {
     pub len: u64,
-    pub source: Source,
+    pub source: Source<L>,
 }
 
 /// Up to this many pieces a map holds them in one exact-size slice; above, in
@@ -222,21 +241,22 @@ pub(in crate::tree_actor) const SMALL_PIECES: usize = 32;
 /// large one only the nodes on the path. Small becomes large when a change
 /// passes [`SMALL_PIECES`], never back.
 #[derive(Clone, Debug)]
-enum Pieces {
-    Small(Arc<[(u64, Piece)]>),
-    Large(imbl::OrdMap<u64, Piece>),
+enum Pieces<L: Located = FramePos> {
+    Small(Arc<[(u64, Piece<L>)]>),
+    Large(imbl::OrdMap<u64, Piece<L>>),
 }
 
-impl Default for Pieces {
+impl<L: Located> Default for Pieces<L> {
     fn default() -> Self {
-        Self::Small(Arc::default())
+        Self::Small(Arc::from(Vec::new()))
     }
 }
 
 /// The pieces in order from some offset.
-type PieceIter<'a> = Box<dyn Iterator<Item = (u64, &'a Piece)> + 'a>;
+pub(in crate::tree_actor) type PieceIter<'a, L = FramePos> =
+    Box<dyn Iterator<Item = (u64, &'a Piece<L>)> + 'a>;
 
-impl Pieces {
+impl<L: Located> Pieces<L> {
     fn count(&self) -> usize {
         match self {
             Self::Small(pieces) => pieces.len(),
@@ -244,13 +264,13 @@ impl Pieces {
         }
     }
 
-    fn iter(&self) -> PieceIter<'_> {
+    fn iter(&self) -> PieceIter<'_, L> {
         self.from(0)
     }
 
     /// The pieces in order from the one holding `offset` (the first one
     /// when none starts at or before it).
-    fn from(&self, offset: u64) -> PieceIter<'_> {
+    fn from(&self, offset: u64) -> PieceIter<'_, L> {
         match self {
             Self::Small(pieces) => {
                 let first = first_at(pieces, offset.saturating_add(1)).saturating_sub(1);
@@ -265,7 +285,7 @@ impl Pieces {
 
     /// A small map's pieces after an edit: kept small, or made large once
     /// they pass [`SMALL_PIECES`].
-    fn set_small(&mut self, pieces: Vec<(u64, Piece)>) {
+    fn set_small(&mut self, pieces: Vec<(u64, Piece<L>)>) {
         *self = if pieces.len() > SMALL_PIECES {
             Self::Large(pieces.into_iter().collect())
         } else {
@@ -274,7 +294,7 @@ impl Pieces {
     }
 
     /// `piece` laid at `start`, over whatever was there.
-    fn put(&mut self, start: u64, piece: Piece) {
+    fn put(&mut self, start: u64, piece: Piece<L>) {
         let end = start + piece.len;
         match self {
             Self::Small(pieces) => {
@@ -298,7 +318,7 @@ impl Pieces {
     }
 
     /// `piece` added at `start`, the end of the pieces.
-    fn push(&mut self, start: u64, piece: Piece) {
+    fn push(&mut self, start: u64, piece: Piece<L>) {
         match self {
             Self::Small(pieces) => {
                 let mut pieces = pieces.to_vec();
@@ -337,7 +357,9 @@ impl Pieces {
             }
         }
     }
+}
 
+impl Pieces {
     /// Each piece `moved` names a new place for, moved there. Returns
     /// whether any moved.
     fn relocate(&mut self, moved: &dyn Fn(&Piece) -> Option<FramePos>) -> bool {
@@ -383,9 +405,9 @@ fn move_piece(piece: &mut Piece, moved: &dyn Fn(&Piece) -> Option<FramePos>) {
 /// Clones share the pieces until one changes (copy on write), so an open's
 /// view starts as the saved map at O(1).
 #[derive(Clone, Debug)]
-pub struct FileMap {
+pub struct FileMap<L: Located = FramePos> {
     len: u64,
-    pieces: Pieces,
+    pieces: Pieces<L>,
     /// The step whose save the map is, while it holds nothing unsaved: what
     /// [`FileMap::rebase`] compares with a base's built point.
     step: Option<RecordNo>,
@@ -403,7 +425,7 @@ impl crate::tree_reconcile::Image for FileMap {
     }
 }
 
-impl Default for FileMap {
+impl<L: Located> Default for FileMap<L> {
     fn default() -> Self {
         Self::empty()
     }
@@ -412,7 +434,7 @@ impl Default for FileMap {
 /// How much one comparison or copy reads at a time.
 const CHUNK: usize = 64 << 10;
 
-impl FileMap {
+impl<L: Located> FileMap<L> {
     pub(in crate::tree_actor) fn empty() -> Self {
         Self {
             len: 0,
@@ -421,6 +443,49 @@ impl FileMap {
         }
     }
 
+    /// `len` bytes all "as before": zeros by no record. What
+    /// [`Layout::of_close`] lays a close's calls on.
+    pub(in crate::tree_actor) fn as_before(len: u64) -> Self {
+        let mut map = Self::empty();
+        if len > 0 {
+            map.pieces.push(
+                0,
+                Piece {
+                    len,
+                    source: Source::Zero { by: RecordNo::ZERO },
+                },
+            );
+        }
+        map.len = len;
+        map.step = None;
+        map
+    }
+
+    /// The pieces in order, with their file offsets: what a layout reads.
+    pub(in crate::tree_actor) fn pieces(&self) -> PieceIter<'_, L> {
+        self.pieces.iter()
+    }
+
+    /// Every byte from `len` on dropped, when the map is longer.
+    pub(in crate::tree_actor) fn cut(&mut self, len: u64) {
+        if len < self.len {
+            self.step = None;
+            self.pieces.cut(len);
+            self.len = len;
+        }
+    }
+
+    /// `len` bytes of `source` laid at `start`, which is at most the map's
+    /// length: a layout's range.
+    pub(in crate::tree_actor) fn lay(&mut self, start: u64, len: u64, source: Source<L>) {
+        if len > 0 {
+            self.step = None;
+            self.put(start, len, source, RecordNo::ZERO);
+        }
+    }
+}
+
+impl FileMap {
     /// The first `len` bytes of `base`, as saved at its built point.
     pub(in crate::tree_actor) fn of_base(base: Arc<BaseFile>, len: u64) -> Self {
         let step = Some(base.step);
@@ -437,7 +502,9 @@ impl FileMap {
         };
         Self { len, pieces, step }
     }
+}
 
+impl<L: Located> FileMap<L> {
     pub fn len(&self) -> u64 {
         self.len
     }
@@ -470,39 +537,41 @@ impl FileMap {
     ///
     /// [`Error::TooLarge`] where the call would end past `u64`; the map is
     /// unchanged then.
-    pub(in crate::tree_actor) fn apply(&mut self, call: &Call, at: &FramePos) -> Result<()> {
+    pub(in crate::tree_actor) fn apply(&mut self, call: &Call, at: &L) -> Result<()> {
         let source = || Source::Frame {
             pos: at.clone(),
             at: 0,
         };
+        let by = at.place().record;
         match *call {
             Call::Write { len: 0, .. } | Call::Append { len: 0 } => return Ok(()),
             Call::Write { offset, len } => {
                 offset.checked_add(len).ok_or(Error::TooLarge)?;
                 self.step = None;
-                self.put(offset, len, source());
+                self.put(offset, len, source(), by);
             }
             Call::Append { len } => {
                 self.len.checked_add(len).ok_or(Error::TooLarge)?;
                 self.step = None;
-                self.put(self.len, len, source());
+                self.put(self.len, len, source(), by);
             }
             Call::Truncate(size) => {
                 self.step = None;
-                self.truncate(size);
+                self.truncate(size, by);
             }
         }
         Ok(())
     }
 
-    /// Lays `len` bytes of `source` at `start`; a gap before it reads as zeros.
-    fn put(&mut self, start: u64, len: u64, source: Source) {
+    /// Lays `len` bytes of `source` at `start`; a gap before it reads as
+    /// zeros record `by` made.
+    fn put(&mut self, start: u64, len: u64, source: Source<L>, by: RecordNo) {
         if start > self.len {
             self.pieces.push(
                 self.len,
                 Piece {
                     len: start - self.len,
-                    source: Source::Zero,
+                    source: Source::Zero { by },
                 },
             );
             self.len = start;
@@ -516,13 +585,13 @@ impl FileMap {
         self.len = self.len.max(start + len);
     }
 
-    fn truncate(&mut self, size: u64) {
+    fn truncate(&mut self, size: u64, by: RecordNo) {
         if size > self.len {
             self.pieces.push(
                 self.len,
                 Piece {
                     len: size - self.len,
-                    source: Source::Zero,
+                    source: Source::Zero { by },
                 },
             );
         } else if size < self.len {
@@ -530,7 +599,9 @@ impl FileMap {
         }
         self.len = size;
     }
+}
 
+impl FileMap {
     /// Up to `buf.len()` bytes from `offset`, short at the end: one `pread`
     /// per piece.
     pub fn read(&self, offset: u64, buf: &mut [u8]) -> io::Result<usize> {
@@ -684,90 +755,19 @@ impl FileMap {
     pub(in crate::tree_actor) fn is_on(&self, base: &Arc<BaseFile>) -> bool {
         self.pieces.iter().all(|(_, piece)| match &piece.source {
             Source::Base { file, .. } => Arc::ptr_eq(file, base),
-            Source::Zero => true,
+            Source::Zero { .. } => true,
             Source::Frame { .. } => false,
         })
-    }
-
-    /// The save record's digest of a close (FNV-1a, 64 bits): what the close
-    /// wrote, by place, from the saved length and the close's calls alone.
-    /// The calls are laid on a map of `saved_len` bytes that are all "as
-    /// before"; the digest is the resulting length, then each piece a call
-    /// left visible (its file offset, its length, and its bytes' place in the
-    /// journal: record and offset in the frame), with each run of bytes kept
-    /// from before as one gap. It reads no map, so how either side sources
-    /// the bytes from before (journal frames, the checkout's file, a page
-    /// write an earlier close saved) cannot change it: the actor and the
-    /// builder rebase at different built points. The bytes from before are
-    /// the previous save's, which the builder checked at that save. The
-    /// builder's replay must reach the same digest (`Disagrees`).
-    ///
-    /// # Errors
-    ///
-    /// [`Error::TooLarge`] where a call would end past `u64`, as
-    /// [`FileMap::apply`].
-    pub(in crate::tree_actor) fn close_digest(
-        saved_len: u64,
-        calls: &[(Call, FramePos)],
-    ) -> Result<u64> {
-        let mut written = Self::empty();
-        written.truncate(saved_len);
-        for (call, pos) in calls {
-            written.apply(call, pos)?;
-        }
-        Ok(written.digest_by(|_| true))
-    }
-
-    /// [`FileMap::close_digest`] read off an open's view: every frame whose
-    /// record is `first` or later is a piece the close wrote. Equal to
-    /// `close_digest(saved.len(), own calls)` for an open whose saved map
-    /// did not move and whose file has no page writes: its own calls are
-    /// then the only frames from its open (record `first`) on, laid on the
-    /// saved map in the same order, so they leave the same pieces.
-    pub(in crate::tree_actor) fn digest_since(&self, first: u64) -> u64 {
-        self.digest_by(|pos| pos.record.get() >= first)
-    }
-
-    /// The length, then each piece read from a frame `own` names, and one
-    /// gap for each run of every other piece.
-    fn digest_by(&self, own: impl Fn(&FramePos) -> bool) -> u64 {
-        let mut hash = Fnv::new();
-        hash.u64(self.len);
-        let mut kept: Option<(u64, u64)> = None;
-        for (start, piece) in self.pieces.iter() {
-            if let Source::Frame { pos, at } = &piece.source
-                && own(pos)
-            {
-                if let Some((from, len)) = kept.take() {
-                    hash.u64(0).u64(from).u64(len);
-                }
-                let (record, offset) = pos.key();
-                hash.u64(1)
-                    .u64(start)
-                    .u64(piece.len)
-                    .u64(record)
-                    .u64(offset + at);
-                continue;
-            }
-            kept = Some(match kept {
-                Some((from, len)) => (from, len + piece.len),
-                None => (start, piece.len),
-            });
-        }
-        if let Some((from, len)) = kept {
-            hash.u64(0).u64(from).u64(len);
-        }
-        hash.0
     }
 }
 
 /// The index of the first piece starting at or after `at`.
-fn first_at(pieces: &[(u64, Piece)], at: u64) -> usize {
+fn first_at<L>(pieces: &[(u64, Piece<L>)], at: u64) -> usize {
     pieces.partition_point(|(start, _)| *start < at)
 }
 
 /// `pieces` with a piece boundary at `at`.
-fn split(pieces: &mut Vec<(u64, Piece)>, at: u64) {
+fn split<L: Located>(pieces: &mut Vec<(u64, Piece<L>)>, at: u64) {
     let index = first_at(pieces, at);
     let Some((start, piece)) = index.checked_sub(1).and_then(|i| pieces.get_mut(i)) else {
         return;
@@ -786,7 +786,7 @@ fn split(pieces: &mut Vec<(u64, Piece)>, at: u64) {
 }
 
 /// [`split`] for a large map: O(log pieces).
-fn split_large(pieces: &mut imbl::OrdMap<u64, Piece>, at: u64) {
+fn split_large<L: Located>(pieces: &mut imbl::OrdMap<u64, Piece<L>>, at: u64) {
     let Some((start, piece)) = pieces.get_prev_mut(&at) else {
         return;
     };
@@ -801,24 +801,6 @@ fn split_large(pieces: &mut imbl::OrdMap<u64, Piece>, at: u64) {
     };
     piece.len = at - start;
     pieces.insert(at, right);
-}
-
-/// FNV-1a, 64 bits: a digest stable across builds and releases, which a
-/// journal record outlives.
-struct Fnv(u64);
-
-impl Fnv {
-    fn new() -> Self {
-        Self(0xcbf2_9ce4_8422_2325)
-    }
-
-    fn u64(&mut self, value: u64) -> &mut Self {
-        for byte in value.to_le_bytes() {
-            self.0 ^= u64::from(byte);
-            self.0 = self.0.wrapping_mul(0x0000_0100_0000_01b3);
-        }
-        self
-    }
 }
 
 /// A file map's bytes in order.
@@ -954,14 +936,14 @@ mod tests {
         (call, pos, data)
     }
 
-    /// Every frame of the scratch segment, as a digest counts a close's own.
-    fn all_frames(map: &FileMap) -> u64 {
-        map.digest_since(0)
+    /// Every piece of the map, as a layout names it.
+    fn all_frames(map: &FileMap) -> super::super::layout::Layout {
+        super::super::layout::Layout::of_view(map, RecordNo::ZERO)
     }
 
     /// A map that starts in the persistent map and one that starts small and
     /// moves to it past [`SMALL_PIECES`] hold the same bytes and pieces (by
-    /// the digest, which names each piece) after every call, and match a
+    /// the layout, which names each piece) after every call, and match a
     /// byte oracle; clones keep their bytes.
     #[test]
     fn small_and_large_pieces_agree_with_a_byte_oracle() {
@@ -1118,76 +1100,5 @@ mod tests {
         open.rebase(base);
         assert_eq!(open.step(), None);
         assert_eq!(open.to_vec().unwrap(), b"Saved!");
-    }
-
-    /// A close that writes part of a page write whose rest an earlier close
-    /// saved: the earlier save's piece and this close's piece read one frame
-    /// from one place, and the saved map holds the rest on that frame on one
-    /// side and on the checkout's file on the other. The bytes agree, and so
-    /// does the digest, which names only what the close wrote.
-    #[test]
-    fn a_close_digest_names_what_the_close_wrote_not_where_earlier_bytes_are() {
-        let mut frames = Scratch::new();
-        let dir = tempfile::tempdir().unwrap();
-        let mut framed = FileMap::empty();
-        framed
-            .apply(
-                &Call::Append { len: 20 },
-                &frames.add(b"0123456789abcdefghij"),
-            )
-            .unwrap();
-        let run = frames.add(b"PAGEWRITE!");
-        framed
-            .apply(&Call::Write { offset: 4, len: 10 }, &run)
-            .unwrap();
-        framed.saved_at(RecordNo::new(3));
-        let path = dir.path().join("checkout");
-        std::fs::write(&path, framed.to_vec().unwrap()).unwrap();
-        let mut based = framed.clone();
-        based.rebase(BaseFile::open(dir.path(), &path, RecordNo::new(3), None).unwrap());
-        assert!(!based.on_frames());
-        // The close applies the run's first three bytes again: the same frame
-        // position as the earlier save's piece.
-        let calls = [(Call::Write { offset: 4, len: 3 }, run.clone())];
-        for (call, pos) in &calls {
-            framed.apply(call, pos).unwrap();
-            based.apply(call, pos).unwrap();
-        }
-        assert_eq!(framed.to_vec().unwrap(), based.to_vec().unwrap());
-        let digest = FileMap::close_digest(20, &calls).unwrap();
-        // What the close wrote is in it: the whole run is another close.
-        let whole = [(Call::Write { offset: 4, len: 10 }, run.clone())];
-        assert_ne!(digest, FileMap::close_digest(20, &whole).unwrap());
-        // As is where its bytes are in the journal, and the length before.
-        let moved = [(Call::Write { offset: 4, len: 3 }, run.at(1))];
-        assert_ne!(digest, FileMap::close_digest(20, &moved).unwrap());
-        assert_ne!(digest, FileMap::close_digest(21, &calls).unwrap());
-    }
-
-    /// The quick close's digest, read off the view, equals the digest of the
-    /// open's calls: random calls on a saved map read from the checkout.
-    #[test]
-    fn digest_since_equals_the_close_digest_of_the_calls() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("checkout");
-        std::fs::write(&path, [7_u8; 64]).unwrap();
-        let base = BaseFile::open(dir.path(), &path, RecordNo::new(1), None).unwrap();
-        for seed in 1..24_u64 {
-            let mut rng = Rng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15));
-            let mut frames = Scratch::new();
-            let saved = FileMap::of_base(Arc::clone(&base), rng.next(65));
-            let mut view = saved.clone();
-            let mut calls = Vec::new();
-            for step in 0..120 {
-                let (call, pos, _) = random_call(&mut rng, &mut frames, view.len());
-                view.apply(&call, &pos).unwrap();
-                calls.push((call, pos));
-                assert_eq!(
-                    view.digest_since(0),
-                    FileMap::close_digest(saved.len(), &calls).unwrap(),
-                    "seed {seed} step {step}"
-                );
-            }
-        }
     }
 }

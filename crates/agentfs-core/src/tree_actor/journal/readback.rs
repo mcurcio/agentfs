@@ -115,35 +115,57 @@ impl CallReader {
         Ok(calls)
     }
 
-    /// The frame of record `seq`, carried or not: what `agentfs verify`
-    /// reads a kept `Save` step from. `None` when no linked segment holds it.
+    /// The frame of record `seq`, carried or not: where the builder finds
+    /// a save's bytes its own tracking lacks. `None` when no linked segment
+    /// holds it. A frame that does not check ends its segment's walk, as a
+    /// torn tail.
     ///
     /// # Errors
     ///
-    /// As [`CallReader::for_each_call`].
-    #[allow(dead_code, reason = "frozen interface of agentfs-ln6.11")]
+    /// A failed read.
     pub(in crate::tree_actor) fn record(&self, seq: RecordNo) -> Result<Option<super::Frame>> {
-        let _ = seq;
-        todo!("agentfs-ln6.11")
+        for (segment, length) in &self.segments {
+            let mut window = Window::new(segment, *length);
+            let mut at = 0;
+            while at + HEADER as u64 <= *length {
+                let bytes = window.at(at)?;
+                let Some(header) = read_header(bytes, self.salt) else {
+                    break;
+                };
+                let frame = header.frame_len();
+                if at + frame > *length {
+                    break;
+                }
+                if header.record == seq {
+                    return match super::frame_at(segment, at, self.salt, seq)? {
+                        super::At::Frame(frame, _) => Ok(Some(*frame)),
+                        super::At::Later | super::At::End => Ok(None),
+                    };
+                }
+                at += frame;
+            }
+        }
+        Ok(None)
     }
 
-    /// The runs of each `PageWrite` record in `records` of `tree`'s
-    /// `object`, by record, as the builder holds them (`runs_from_frame`):
-    /// the page writes a kept save's pieces name.
+    /// A reader of `segments` as long as their files are now: the builder's,
+    /// which holds the segments but not the journal.
     ///
     /// # Errors
     ///
-    /// As [`CallReader::for_each_call`]; [`crate::tree_actor::Error::Format`]
-    /// for a record in `records` that is not such a page write.
-    #[allow(dead_code, reason = "frozen interface of agentfs-ln6.11")]
-    pub(in crate::tree_actor) fn page_writes(
-        &self,
-        tree: crate::tree_actor::TreeId,
-        object: u64,
-        records: &std::collections::BTreeSet<RecordNo>,
-    ) -> Result<Vec<(u64, crate::tree_actor::recording::pages::Run)>> {
-        let _ = (tree, object, records);
-        todo!("agentfs-ln6.11")
+    /// A failed `stat` of a segment.
+    pub(in crate::tree_actor) fn of_segments(
+        segments: Vec<Arc<Segment>>,
+        salt: u32,
+    ) -> Result<Self> {
+        let segments = segments
+            .into_iter()
+            .map(|segment| {
+                let length = segment.file().metadata()?.len();
+                Ok((segment, length))
+            })
+            .collect::<Result<_>>()?;
+        Ok(Self { segments, salt })
     }
 }
 
