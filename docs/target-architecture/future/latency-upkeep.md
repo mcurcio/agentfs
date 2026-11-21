@@ -12,7 +12,7 @@
 | Question | Answer |
 |---|---|
 | Q1. Which wait did "the queue flush" mean? | "Interruption to the host program due to the held locks which prevent it from opening/reading/writing new files": the volume lock held for upkeep, which this design removes |
-| Q2. Must a close or fsync wait until the change is power-cut safe? | "No. If we want to take a durability approach, then I would suggest an oolong system where the queue is persisted. But it's not a requirement, just a nice-to-have". Not a requirement. Whether fsync keeps its POSIX promise while close stops waiting is the one open follow-up |
+| Q2. Must a close or fsync wait until the change is power-cut safe? | "No. If we want to take a durability approach, then I would suggest an oolong system where the queue is persisted. But it's not a requirement, just a nice-to-have". Not a requirement. Follow-up, answered "A": a close returns once its change is in the journal; fsync and FSYNCDIR keep waiting for the disk (slice 6) |
 | Q3. How much should be committed now? | "Agreed": slices 0–2 and 5 committed; 3 and 4 only if slice 0 shows they matter |
 
 **What changed since the review.** Four reviewers found two crash-order holes in the compaction plan, and a close plan that changed the order closes save in. They also found that the slices were committed before the 4-second hold had a known cause. The revision makes three changes:
@@ -198,6 +198,7 @@ Two whole-system alternatives were set aside:
 | 3 | *Gated on slice 0:* the catch-up's overlay walk, using layers frozen at a record and dropped whole once built, never before history's check of that save (R1) | `create`'s slowest call flat across tree sizes; reads identical before and after |
 | 4 | *Gated on slice 0:* client-death closes, one handle at a time on the unbind thread; the fork copy, made durable before its record | the other view's `lockWait` p99 during a 1M-call client death |
 | 5 | One copy of each open's calls (ln6.10, cutting waste) | `write_1m` extra peak memory (warns) |
+| 6 | **A close returns once its change is in the journal; fsync and FSYNCDIR still wait for the disk** (owner, 2026-11-21, option A). The power-cut wait leaves close and stays on fsync, FSYNCDIR and O_SYNC writes. | `close_4k` p50 and p99 before and after (warns); a power-loss run that cuts power after a close with no fsync shows the volume opens and loses at most that unsynced save; one that cuts after fsync loses nothing |
 
 - **Tracer non-goals:** relocation mechanics beyond C6, closes, layers, memory, views.
 - **Per your 2026-11-20 answer, the new bars warn.** Each slice reports its figure.
