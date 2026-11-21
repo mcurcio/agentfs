@@ -38,14 +38,19 @@
 //! go.
 //!
 //! **A stop.** A stop kills a run in progress, with every process it
-//! started (its own process group). git writes a pack under a temporary
-//! name and renames it in, index last, so a killed run leaves at most a
-//! temporary file, which the next start removes (history/mod.rs,
-//! `clean_packs`), or a whole new pack the index does not prefer, whose
-//! packs a later run rolls up again. A stale `multi-pack-index.lock` goes
-//! at the next start with the other locks (`remove_stale_locks`). The start
-//! expires what the last roll-up superseded before the volume is served,
-//! so a stop leaves no copy behind. git fsyncs what it writes
+//! started (its own process group), but lets an expiry finish. git writes
+//! a pack under a temporary name and renames it in, index last, so a killed
+//! run leaves at most a temporary file, which the next start removes
+//! (history/mod.rs, `clean_packs`), or a whole new pack the index does not
+//! prefer, whose packs a later run rolls up again. A stale
+//! `multi-pack-index.lock` goes at the next start with the other locks
+//! (`remove_stale_locks`). An expiry deletes its packs before it writes the
+//! index that leaves them out, so a power cut or a kill of the daemon
+//! between the two leaves an index naming packs that are gone, which `git
+//! fsck` and every later index write fail on: the next start removes such
+//! an index ([`repair`]). The start then expires what the last roll-up
+//! superseded before the volume is served, so a stop leaves no copy
+//! behind. git fsyncs what it writes
 //! (`core.fsync=pack,pack-metadata`), so a batch whose pack is rolled up is
 //! as durable as one that is not (history/feed.rs).
 //!
@@ -78,6 +83,8 @@ use crate::tree_actor::stages::{Timer, Which};
 #[derive(Default)]
 struct Slot {
     child: Option<Child>,
+    /// The child is an expiry, which a stop lets finish rather than kill.
+    finishing: bool,
     stopped: bool,
 }
 
@@ -156,10 +163,12 @@ impl Repacker {
     /// The thread could not be started.
     pub(in crate::tree_actor) fn start(history: History, git_dir: PathBuf) -> io::Result<Self> {
         let child = Arc::new(Mutex::new(Slot::default()));
-        // Before the volume is served, what the last process's last roll-up
+        // Before the volume is served: an index left naming a pack an
+        // expiry deleted goes, then what the last process's last roll-up
         // superseded goes. A failure is said and the volume served (keep
         // operating).
-        if let Err(error) = expire(&program(&git_dir), &git_dir, &child) {
+        let started = repair(&git_dir).and_then(|()| expire(&program(&git_dir), &git_dir, &child));
+        if let Err(error) = started {
             eprintln!("tree RepackFailed: {error}");
         }
         let slot = Arc::clone(&child);
@@ -170,13 +179,15 @@ impl Repacker {
     }
 
     /// Waits for the task to end: History has stopped, and a git command in
-    /// progress was killed. Called after History stops
-    /// (`TreeActor::shut_down`).
+    /// progress was killed, or finished if it is an expiry (see the module
+    /// docs). Called after History stops (`TreeActor::shut_down`).
     pub(in crate::tree_actor) fn join(self) {
         {
             let mut slot = lock(&self.child);
             slot.stopped = true;
-            if let Some(child) = &slot.child {
+            if let Some(child) = &slot.child
+                && !slot.finishing
+            {
                 kill_group(child);
             }
         }
@@ -265,11 +276,88 @@ fn program(git_dir: &Path) -> PathBuf {
 /// Nothing when there is no index.
 fn expire(git: &Path, git_dir: &Path, slot: &Mutex<Slot>) -> Result<Ran<()>, TaskError> {
     Ok(
-        match command(git, git_dir, slot, &["multi-pack-index", "expire"], None)? {
+        match command(
+            git,
+            git_dir,
+            slot,
+            &["multi-pack-index", "expire"],
+            None,
+            true,
+        )? {
             Ran::Done(_) => Ran::Done(()),
             Ran::Stopped => Ran::Stopped,
         },
     )
+}
+
+/// The multi-pack index of `git_dir`'s store.
+fn index_path(git_dir: &Path) -> PathBuf {
+    git_dir
+        .join("objects")
+        .join("pack")
+        .join("multi-pack-index")
+}
+
+/// The packs the multi-pack index names (`pack-<hash>`), from its `PNAM`
+/// chunk (git's `gitformat-pack`, "multi-pack-index files"): `None` when
+/// there is no index or it does not read as one.
+fn indexed(git_dir: &Path) -> Option<Vec<String>> {
+    let bytes = std::fs::read(index_path(git_dir)).ok()?;
+    let be32 = |at: usize| -> Option<u32> {
+        Some(u32::from_be_bytes(bytes.get(at..at + 4)?.try_into().ok()?))
+    };
+    let be64 = |at: usize| -> Option<usize> {
+        usize::try_from(u64::from_be_bytes(bytes.get(at..at + 8)?.try_into().ok()?)).ok()
+    };
+    if bytes.get(..4)? != b"MIDX" {
+        return None;
+    }
+    let chunks = usize::from(*bytes.get(6)?);
+    let packs = usize::try_from(be32(8)?).ok()?;
+    let (mut start, mut end) = (None, None);
+    for i in 0..chunks {
+        let entry = 12 + 12 * i;
+        if bytes.get(entry..entry + 4)? == b"PNAM" {
+            start = Some(be64(entry + 4)?);
+            end = Some(be64(entry + 16)?);
+        }
+    }
+    let names = bytes.get(start?..end?)?;
+    let names: Vec<String> = names
+        .split(|b| *b == 0)
+        .filter(|name| !name.is_empty())
+        .map(|name| {
+            let name = std::str::from_utf8(name).ok()?;
+            Some(name.strip_suffix(".idx").unwrap_or(name).to_owned())
+        })
+        .collect::<Option<_>>()?;
+    (names.len() == packs).then_some(names)
+}
+
+/// Removes the multi-pack index when it names a pack whose files are gone:
+/// `git multi-pack-index expire` deletes the packs before it writes the
+/// index that leaves them out, so a power cut or a kill between the two
+/// leaves an index `git fsck` and every later index write fail on. Readers
+/// find every object without it, by listing `objects/pack`. What that
+/// expiry had yet to delete is rolled up again by a later run, once.
+fn repair(git_dir: &Path) -> Result<(), TaskError> {
+    let Some(names) = indexed(git_dir) else {
+        return Ok(());
+    };
+    let store = git_dir.join("objects").join("pack");
+    let whole = |name: &String| {
+        ["idx", "pack"]
+            .iter()
+            .all(|ext| store.join(format!("{name}.{ext}")).exists())
+    };
+    if names.iter().all(whole) {
+        return Ok(());
+    }
+    let index = index_path(git_dir);
+    std::fs::remove_file(&index).map_err(io_error("removing", &index))?;
+    File::open(&store)
+        .and_then(|dir| dir.sync_all())
+        .map_err(io_error("syncing", &store))
 }
 
 /// How many of `sizes`, sorted smallest first, `git repack --geometric=2`
@@ -324,7 +412,14 @@ fn roll(
         input.push_str(name);
         input.push_str(".pack\n");
     }
-    let out = match command(git, git_dir, slot, &PACK_OBJECTS, Some(input.as_bytes()))? {
+    let out = match command(
+        git,
+        git_dir,
+        slot,
+        &PACK_OBJECTS,
+        Some(input.as_bytes()),
+        false,
+    )? {
         Ran::Done(out) => out,
         Ran::Stopped => return Ok(Ran::Stopped),
     };
@@ -334,7 +429,7 @@ fn roll(
     }
     let preferred = format!("--preferred-pack=pack-{hash}.pack");
     let write = ["multi-pack-index", "write", preferred.as_str()];
-    if command(git, git_dir, slot, &write, None)? == Ran::Stopped {
+    if command(git, git_dir, slot, &write, None, false)? == Ran::Stopped {
         return Ok(Ran::Stopped);
     }
     // The new pack's name is durable before any pack it rolled up can go.
@@ -368,7 +463,8 @@ fn packs(dir: &Path) -> Result<Packs, TaskError> {
 
 /// Runs one `git <FSYNC> <PACK_CONFIG> <args>` on `git_dir`, `input` on its
 /// stdin, and returns its stdout. git runs in a process group of its own so
-/// a stop kills every process it started. The child is reaped only after
+/// a stop kills every process it started, unless it is `finishing` (an
+/// expiry), which a stop waits for. The child is reaped only after
 /// the slot lets go of it, so a stop never signals a process id reused
 /// since.
 fn command(
@@ -377,6 +473,7 @@ fn command(
     slot: &Mutex<Slot>,
     args: &[&str],
     input: Option<&[u8]>,
+    finishing: bool,
 ) -> Result<Ran<Vec<u8>>, TaskError> {
     let mut held = lock(slot);
     if held.stopped {
@@ -415,6 +512,7 @@ fn command(
     let stderr = child.stderr.take();
     let pid = child.id();
     held.child = Some(child);
+    held.finishing = finishing;
     drop(held);
     // Until every process of the group has let go of the pipes: they have
     // exited or were killed. stderr is read beside stdout so neither fills.
@@ -670,6 +768,22 @@ exec git "$@""#;
         );
     }
 
+    /// `git fsck --full --strict` passes, the multi-pack index's own check
+    /// included: what the power-loss replay asks of each checkpoint. Only
+    /// on a stopped volume, where no run moves a pack meanwhile.
+    fn fsck(git_dir: &Path, when: &str) {
+        let out = std::process::Command::new("git")
+            .env("GIT_DIR", git_dir)
+            .args(["fsck", "--full", "--strict", "--no-progress"])
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{when}: git fsck failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
     /// Reads every commit, tree and blob a snapshot reaches, through its own
     /// handle on the store.
     fn read_snapshot(snapshot: &BuiltSnapshot) -> usize {
@@ -767,6 +881,7 @@ exec git "$@""#;
         git_reads_everything(&git_dir, "after the expiry");
         assert!(all_objects(&git_dir).is_superset(&objects));
         drop(v);
+        fsck(&git_dir, "after the stop");
     }
 
     /// A pack a reader listed is still there after the roll-up that
@@ -793,6 +908,7 @@ exec git "$@""#;
             }
         }
         drop(v);
+        fsck(&git_dir, "after the stop");
     }
 
     /// The defect this design replaced: a roll-up that writes a pack the
@@ -825,6 +941,7 @@ exec git "$@""#;
         git_reads_everything(&git_dir, "after the expiry");
         assert!(all_objects(&git_dir).is_superset(&objects));
         drop(v);
+        fsck(&git_dir, "after the stop");
     }
 
     /// E2: while git writes a roll-up's pack, the store's `objects/pack` is
@@ -863,6 +980,7 @@ exec git "$@""#;
         assert_eq!(read_snapshot(&snapshot), reached);
         assert_eq!(read_snapshot(&v.history().snapshot()), reached);
         drop(v);
+        fsck(&git_dir, "after the stop");
     }
 
     /// E3: an unreachable blob in a pack of its own is in the store after a
@@ -906,6 +1024,7 @@ exec git "$@""#;
         );
         assert!(all_objects(&git_dir).is_superset(&objects));
         drop(v);
+        fsck(&git_dir, "after the stop");
     }
 
     /// E4: the task rolls up at a built event; a shutdown with that roll-up
@@ -927,6 +1046,7 @@ exec git "$@""#;
         batches(&mut v, 8, 1);
         wait_written(&wrapper);
         guarded("the shutdown", move || drop(v));
+        fsck(&git_dir, "after the killed run");
 
         std::fs::remove_file(&wrapper).unwrap();
         let v = reopen(tmp.path());
@@ -941,6 +1061,7 @@ exec git "$@""#;
             );
         }
         drop(v);
+        fsck(&git_dir, "after the stop");
     }
 
     /// What a roll-up superseded when the volume stopped is gone once it
@@ -971,6 +1092,7 @@ exec git "$@""#;
             repack_once(Path::new("git"), &git_dir, &slot).unwrap()
         ));
         drop(v);
+        fsck(&git_dir, "after the stop");
         assert!(
             listed(&git_dir).is_superset(&before),
             "a stop deletes nothing"
@@ -984,6 +1106,50 @@ exec git "$@""#;
         git_reads_everything(&git_dir, "after the reopen");
         assert!(all_objects(&git_dir).is_superset(&objects));
         drop(v);
+        fsck(&git_dir, "after the stop");
+    }
+
+    /// An expiry cut short between its deletes and its index write (a power
+    /// cut: git deletes the packs first) leaves an index naming a pack that
+    /// is gone, which `git fsck` fails on. The next open removes that index,
+    /// and the store passes `git fsck` and reads whole.
+    #[test]
+    fn an_index_naming_a_deleted_pack_goes_at_the_next_open() {
+        let tmp = tempfile::tempdir().unwrap();
+        let git_dir = tmp.path().join("history.git");
+        let mut v = new_actor(tmp.path());
+        script(&git_dir.join(WRAPPER), SKIP);
+        batches(&mut v, 0, 8);
+        let reachable = read_reachable(&git_dir);
+        let before = listed(&git_dir);
+        let slot = Mutex::new(Slot::default());
+        assert!(rolled(
+            repack_once(Path::new("git"), &git_dir, &slot).unwrap()
+        ));
+        drop(v);
+        let named = indexed(&git_dir).expect("the index reads");
+        assert_eq!(
+            named.iter().cloned().collect::<BTreeSet<_>>(),
+            listed(&git_dir),
+            "the index names every pack"
+        );
+        // Half an expiry: one superseded pack deleted, the index as it was.
+        let gone = before.iter().next().unwrap();
+        for ext in ["idx", "pack", "rev"] {
+            let _ = std::fs::remove_file(git_dir.join(format!("objects/pack/{gone}.{ext}")));
+        }
+        let broken = std::process::Command::new("git")
+            .env("GIT_DIR", &git_dir)
+            .args(["fsck", "--full", "--strict", "--no-progress"])
+            .output()
+            .unwrap();
+        assert!(!broken.status.success(), "git fsck fails on such an index");
+
+        std::fs::remove_file(git_dir.join(WRAPPER)).unwrap();
+        let v = reopen(tmp.path());
+        assert_eq!(read_reachable(&git_dir), reachable);
+        drop(v);
+        fsck(&git_dir, "after the reopen");
     }
 
     /// A stale `multi-pack-index.lock` (a stop killed a write) goes at the
@@ -996,6 +1162,7 @@ exec git "$@""#;
         script(&git_dir.join(WRAPPER), SKIP);
         batches(&mut v, 0, 4);
         drop(v);
+        fsck(&git_dir, "after the stop");
         let lock = git_dir.join("objects/pack/multi-pack-index.lock");
         std::fs::write(&lock, b"").unwrap();
         let v = reopen(tmp.path());
@@ -1005,6 +1172,7 @@ exec git "$@""#;
             repack_once(Path::new("git"), &git_dir, &slot).unwrap()
         ));
         drop(v);
+        fsck(&git_dir, "after the stop");
     }
 
     /// Batches built while the task rolls up beside them: none fails,
@@ -1018,10 +1186,12 @@ exec git "$@""#;
         batches(&mut v, 0, 100);
         let reachable = read_reachable(&git_dir);
         drop(v);
+        fsck(&git_dir, "after the stop");
         let v = reopen(tmp.path());
         assert_eq!(read_reachable(&git_dir), reachable);
         git_reads_everything(&git_dir, "after the reopen");
         drop(v);
+        fsck(&git_dir, "after the stop");
     }
 
     /// Forks landing and dropped beside the task, with epoch moves that are
@@ -1070,9 +1240,11 @@ exec git "$@""#;
             git_reads_everything(&git_dir, &format!("iteration {i} after the drop"));
         }
         drop(v);
+        fsck(&git_dir, "after the stop");
         let v = reopen(tmp.path());
         git_reads_everything(&git_dir, "after the reopen");
         drop(v);
+        fsck(&git_dir, "after the stop");
     }
 
     /// A killed run's temporary files go at the next open.

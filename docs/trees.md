@@ -766,8 +766,12 @@ the private checkouts copied, the checked-out files' maps rebased onto them
   index, so a roll-up that writes a pack the store already holds keeps it.
   While a roll-up waits for its expiry no run rolls up again. Nothing prunes
   and no ref is touched. A start expires what the last roll-up superseded
-  before the volume is served, and removes a stale `multi-pack-index.lock`. A
-  stop kills a run in progress with every process it started. A failed run is
+  before the volume is served, and removes a stale `multi-pack-index.lock`
+  and an index that names a pack that is gone (git's expiry deletes packs
+  before it writes the index without them, so a power cut between the two
+  leaves one; what that expiry had yet to delete is rolled up again once). A
+  stop kills a run in progress with every process it started, but waits for
+  an expiry to finish. A failed run is
   logged (`tree RepackFailed: <error>`) and tried again at the next built
   event; its git children are not counted with the actor's. Costs: an idle
   volume keeps the packs its last roll-up superseded until its next save or
