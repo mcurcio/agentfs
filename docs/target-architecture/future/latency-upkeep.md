@@ -487,3 +487,63 @@ Called at `Segment::sync`, at every unlink of a segment or carry file, and at `C
 **Docs in the same commit:** `docs/trees.md` (the journal, compaction, the lag gate without the overdue stop, state format 14), `docs/telemetry.md` (no `overdue` cause; what `lock_hold.compaction` now measures), `docs/architecture.md` (the `commit_point.rs`, `compactor.rs`, `compaction.rs`, `journal/mod.rs` and `lag.rs` rows), `docs/configuration.md` (`AGENTFS_COMPACT_GATE`), `docs/runbooks/upgrading-the-sidecar.md` (format 14), git-model §3 and §12.
 
 **Costs this slice states in trees.md:** restarts replay from B, so they take longer while history trails. Nothing bounds the journal's length except the tree's space limit (C6): the overdue stop used to bound it, and nothing replaces it. A long-lived open whose frames were carried pins the old segment until the actor's next built event. A failed compaction is reported at the next built event, not at a call.
+
+### Slice 6: a close returns once its change is in the journal
+
+**Bead:** to be created, "latency slice 6: close stops waiting for the disk". **Lane A, after slice 2 has landed.** **Delivers:** the owner's 2026-11-21 answer "A" to Q2. close(2) no longer waits for an fsync. fsync, FSYNCDIR and O_SYNC/O_DSYNC writes still wait for the disk. O_SYNC is this design's reading of the owner's "fsync and FSYNCDIR", not his words.
+
+**Every place that decides whether a close waits for the disk, settled one by one:**
+
+| Place | Today | After |
+|---|---|---|
+| FLUSH, `tree_view.rs` `flush` | `session.durable_then(handle, …)` | `session.flush(handle)` answered at once |
+| A client's death, `session.rs` `unbind` | `close_writer`, then `recording.durable_all()` | `close_writer` only. No program waits on it, and its records are durable at the next fsync, builder batch or shutdown. |
+| `Drop for Recording`, `call_path.rs` | `make_all_durable` | unchanged: a clean shutdown makes every record durable before the lease goes |
+| fsync, FSYNCDIR, O_SYNC/O_DSYNC write | wait for the disk | unchanged |
+
+**Signatures (committed; bodies are this slice's work):**
+
+```rust
+// crates/agentfs-core/src/tree_actor/call_path.rs
+impl Recording {
+    /// FLUSH of write-open `open`: answers at once. Takes neither the actor's
+    /// lock nor Durability's fsync; never returns a journal fsync's error.
+    pub fn flush(&self, open: u64) -> Result<(), Error>;   // Err(Error::Stopped) once Durability::has_failed()
+}
+// crates/agentfs-core/src/session.rs
+impl TreeSession {
+    pub fn flush(&self, handle: u64) -> Result<()>;
+    /// Every record so far durable, blocking the caller, never under the
+    /// actor's lock: what a move out of the untracked area waits for (D2).
+    pub fn durable_all(&self) -> Result<()>;
+}
+```
+
+`tree_view.rs`'s `flush` answers `reply.ok()` on `Ok`, and `EIO` (from `errno`) on `Err`. Its doc comment states the new contract.
+
+**D2: a change outside the journal that destroys data waits for the record that carries the data.** Both directions are in `tree_view.rs`'s rename and `tree_view/untracked.rs`:
+- **Into the tree** (`Move::Import`, `Move::ImportLink`): after the step (`replace_file` or `symlink`) and `drop(v)`, call `self.session.durable_all()?`, then `self.untracked.unlink(&from)`. The wait runs on the view's thread, outside the actor's lock.
+- **Out of the tree** (the move that `place`s an area copy, then `unlink`s the tracked name): `place` fsyncs the area file and its directory before the actor's `unlink` is recorded. Today it does neither.
+
+**D1, the invariant.** A power cut loses a suffix of the journal. After it, the volume equals an uninterrupted run cut after some record r, and r is at or after the last record covered by a returned fsync, FSYNCDIR or O_SYNC write.
+
+**Acceptance criteria and mutation probes:**
+
+| # | Criterion | Test that proves it | Mutation probe |
+|---|---|---|---|
+| 6.1 | FLUSH never waits for an fsync | `tree_flush.rs::a_close_answers_while_the_fsync_is_held`: `Durability::hold_fsync_with` blocks the fsync leader; `Recording::flush` returns, and `durable_all` from another thread is still waiting | **P6.1** make `flush` call `make_durable`: the test's flush blocks (10-second bound) |
+| 6.2 | A failed journal fsync is never FLUSH's error before the actor stops, and it is `Stopped` (EIO) after | `tree_flush.rs::flush_reports_only_a_stopped_actor`: a failed fsync, then `flush` gives `Error::Stopped`; before any failure, `flush` is `Ok` | **P6.2** return `Ok` after `has_failed()`: the second assertion fails |
+| 6.3 | fsync, FSYNCDIR and an O_SYNC write still wait | `tree_flush.rs::fsync_still_waits`: with the fsync held, `durable_then` has not answered until it is released. `ci/power-loss-trees.sh` marks F, SF and HC keep "loses nothing" | **P6.3** route `fsync` through `session.flush`: the power-loss F marks fail (CI), and the unit test fails locally |
+| 6.4 | After a power cut, the journal is a prefix of what was appended and holds every record up to the last returned fsync, FSYNCDIR or O_SYNC write; the volume opens; recovery saves what survived (D1) | `ci/power-loss-trees-check.sh` rewritten to check exactly those four. The XW marks become may-lose. New legs: close A, rename A over B, close C, create D with no fsync; and the editor pattern, an untracked temp file, with and without fsync, renamed into the tree | **P6.4** append records out of order in the oracle's fixture (or skip the prefix check): the checker must fail on a planted non-prefix image |
+| 6.5 | A rename from the untracked area into the tree never loses bytes a program fsynced (D2) | the editor leg of 6.4 with fsync: after any cut the bytes are in the area or in the tree. `tree_view.rs` unit test: the area file is still present when `durable_all` has not returned | **P6.5** unlink the area file before `durable_all`: the editor leg loses the bytes at the mark between them |
+| 6.6 | `close_4k` is faster and the cost moved elsewhere is measured | figures (warn only): `close_4k` p50 and p99 before and after; fsync p99 while another open writes 1 GiB with no fsync; the append's lock hold (`lock_hold.other`) during that write, which shows whether writeback throttling stalls the write under the lock | none: figures. Read in the report. If throttling shows, it is a follow-up (RocksDB's `wal_bytes_per_sync`), not this slice. |
+
+**Gates (durability changes):** the model-verification regression tier (`cargo test --workspace`, `phase-1.yml` on the PR) with git-model §3 rows 142 and 179 and §18 row 1058 amended through `VERIFYING.md` "The procedure". The power-loss runs (`ci/power-loss-trees.sh` with the legs of 6.4 and 6.5). fmt, clippy `-D warnings`, CI `ci` and `image` green.
+
+**Docs in the same commit:** `docs/guarantees.md` (what a close promises and what a power cut can lose), `docs/trees.md` ("Recording and durability"), git-model §3 and §18, and `tree_view.rs`'s FLUSH comment.
+
+**Costs this slice states in guarantees.md and trees.md:**
+- A power cut can lose every change since the last fsync, FSYNCDIR or O_SYNC write, or since the last builder batch. That can be many saves.
+- `sync(1)` and `syncfs(2)` send a FUSE mount no request, so they do not make closed saves durable.
+- A failed journal fsync first shows as a later call's EIO, once the actor has stopped.
+- One program's fsync pays for every view's unsynced bytes, because group commit fsyncs the whole journal.
