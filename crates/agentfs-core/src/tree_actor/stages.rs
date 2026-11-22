@@ -73,27 +73,29 @@ pub struct Stages {
     pub bytes_copied: u64,
     /// File bytes compared to tell a close that changes nothing.
     pub bytes_compared: u64,
+    /// Journal checkpoints history's compactors published, process-wide.
+    pub checkpoints: u64,
 }
 
 /// Why a call that starts new work waited at the lag gate (docs/trees.md,
-/// "History trails the files"), the first that holds of: the overdue stop
-/// (compaction waits for every step to be built), the overlay limit, the
-/// lag limit.
+/// "History trails the files"), the first that holds of: the overlay limit,
+/// the lag limit.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GateCause {
-    Overdue,
     Overlay,
     Lag,
 }
 
+/// How many causes [`GateCause`] has.
+const CAUSE_COUNT: usize = 2;
+
 impl GateCause {
-    const ALL: [Self; 3] = [Self::Lag, Self::Overlay, Self::Overdue];
+    const ALL: [Self; CAUSE_COUNT] = [Self::Lag, Self::Overlay];
 
     fn as_str(self) -> &'static str {
         match self {
             Self::Lag => "lag",
             Self::Overlay => "overlay",
-            Self::Overdue => "overdue",
         }
     }
 }
@@ -103,18 +105,16 @@ impl GateCause {
 pub struct GateWaits {
     pub lag: Stage,
     pub overlay: Stage,
-    pub overdue: Stage,
 }
 
 impl GateWaits {
     /// Each cause with its name, as the metrics file and OpenTelemetry's
     /// `cause` attribute spell it.
-    pub fn by_cause(&self) -> [(&'static str, Stage); 3] {
+    pub fn by_cause(&self) -> [(&'static str, Stage); CAUSE_COUNT] {
         GateCause::ALL.map(|cause| {
             let stage = match cause {
                 GateCause::Lag => self.lag,
                 GateCause::Overlay => self.overlay,
-                GateCause::Overdue => self.overdue,
             };
             (cause.as_str(), stage)
         })
@@ -236,7 +236,9 @@ impl Requests {
 /// are the holds it ran in, its time is its exclusive share of them.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
 pub struct LockHolds {
-    /// Journal compaction (`TreeActor::compact`).
+    /// The one piece of journal compaction left under the lock: moving the
+    /// actor's positions to frames the compactor carried
+    /// (`TreeActor::relocate_if_moved`), only when it carried some.
     pub compaction: Stage,
     /// Catching up with history at a built point (`TreeActor::rebuild`),
     /// without its drops.
@@ -249,6 +251,9 @@ pub struct LockHolds {
     pub take: Stage,
     /// A fork's step, its untracked area's copy included.
     pub fork_copy: Stage,
+    /// A page fill or writeback building a file's image from every live
+    /// open's calls, read back from the journal.
+    pub page_image: Stage,
     /// Everything else under the lock: the call's own work.
     pub other: Stage,
 }
@@ -268,6 +273,7 @@ impl LockHolds {
             Hold::Close => self.close,
             Hold::Take => self.take,
             Hold::ForkCopy => self.fork_copy,
+            Hold::PageImage => self.page_image,
             Hold::Other => self.other,
         }
     }
@@ -283,11 +289,12 @@ pub(in crate::tree_actor) enum Hold {
     Close,
     Take,
     ForkCopy,
+    PageImage,
     Other,
 }
 
 /// How many kinds [`Hold`] has.
-pub const HOLD_COUNT: usize = 7;
+pub const HOLD_COUNT: usize = 8;
 
 impl Hold {
     const ALL: [Self; HOLD_COUNT] = [
@@ -297,6 +304,7 @@ impl Hold {
         Self::Close,
         Self::Take,
         Self::ForkCopy,
+        Self::PageImage,
         Self::Other,
     ];
 
@@ -308,6 +316,7 @@ impl Hold {
             Self::Close => "close",
             Self::Take => "take",
             Self::ForkCopy => "fork_copy",
+            Self::PageImage => "page_image",
             Self::Other => "other",
         }
     }
@@ -370,7 +379,7 @@ impl Total {
 static TOTALS: [Total; STAGE_COUNT] = [const { Total::new() }; STAGE_COUNT];
 static HOLDS: [Total; HOLD_COUNT] = [const { Total::new() }; HOLD_COUNT];
 static WAITS: Total = Total::new();
-static GATE: [Total; 3] = [const { Total::new() }; 3];
+static GATE: [Total; CAUSE_COUNT] = [const { Total::new() }; CAUSE_COUNT];
 
 struct Histogram {
     total: Total,
@@ -434,6 +443,12 @@ impl Drop for Request {
 }
 static COPIED: AtomicU64 = AtomicU64::new(0);
 static COMPARED: AtomicU64 = AtomicU64::new(0);
+static CHECKPOINTS: AtomicU64 = AtomicU64::new(0);
+
+/// Counts one published journal checkpoint: `History::published`'s alone.
+pub(in crate::tree_actor) fn checkpointed() {
+    CHECKPOINTS.fetch_add(1, Ordering::Relaxed);
+}
 
 /// Counts `n` file bytes copied.
 pub(super) fn copied(n: u64) {
@@ -475,13 +490,13 @@ impl Stages {
                     close: held(Hold::Close),
                     take: held(Hold::Take),
                     fork_copy: held(Hold::ForkCopy),
+                    page_image: held(Hold::PageImage),
                     other: held(Hold::Other),
                 }
             },
             gate_wait: GateWaits {
                 lag: GATE[GateCause::Lag as usize].read(),
                 overlay: GATE[GateCause::Overlay as usize].read(),
-                overdue: GATE[GateCause::Overdue as usize].read(),
             },
             requests: {
                 let op = |op: Op| REQUESTS[op as usize].read();
@@ -504,6 +519,7 @@ impl Stages {
                 + super::history::feed::pack_syncs(),
             bytes_copied: COPIED.load(Ordering::Relaxed),
             bytes_compared: COMPARED.load(Ordering::Relaxed),
+            checkpoints: CHECKPOINTS.load(Ordering::Relaxed),
         }
     }
 }
@@ -632,4 +648,37 @@ impl Drop for Section {
             });
         }
     }
+}
+
+/// Work that never runs while this thread holds the actor's lock, except in
+/// a hold of a named exemption, each measured as its own `lock_hold` kind:
+/// `Hold::Close` (a close decided or redone under the lock, a client death's
+/// closes), `Hold::ForkCopy`, and `Hold::PageImage` (a page fill or writeback
+/// building a file's image from every live open's calls). Design rule 1 of
+/// docs/trees.md, "Recording and durability".
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::tree_actor) enum Unlocked {
+    Fsync,
+    JournalRead,
+    Unlink,
+}
+
+/// Debug builds: panics when this thread holds the actor's lock in a hold
+/// that is not a named exemption. Release builds: nothing.
+pub(in crate::tree_actor) fn assert_unlocked(work: Unlocked) {
+    #[cfg(debug_assertions)]
+    HELD.with(|held| {
+        if let Some(attribution) = held.borrow().as_ref() {
+            assert!(
+                matches!(
+                    attribution.current,
+                    Hold::Close | Hold::ForkCopy | Hold::PageImage
+                ),
+                "{work:?} under the actor's lock in a {} hold",
+                attribution.current.as_str()
+            );
+        }
+    });
+    #[cfg(not(debug_assertions))]
+    let _ = work;
 }

@@ -693,6 +693,38 @@ passes `OperatorSettings::overlay_limit()`); `History::overlay_bytes(tree)`
 gives a tree's overlay as last reported, in estimated bytes (0 before any
 report), and `History::lag()` the lags and the builder's health.
 
+How an open volume keeps its journal is an option of its open, `Upkeep`,
+fixed for the life of the open and stored nowhere:
+`TreeActor::{create_with, open_with}`, `Recording::{create_with, open_with}`
+and `TreeStateArea::with_upkeep` take one, and `create`, `open` and
+`TreeStateArea::at` use `Upkeep::default()`.
+
+| Field | Default | Meaning |
+|---|---|---|
+| `segment_bytes` | 64 MiB | The next frame starts a new segment once the current one has a record and the frame would take it past this |
+| `compact_from` | 64 MiB | The floor of compaction's due length. Unread with a gate |
+| `gate` | none | A `CompactGate`: the compactor then compacts at every built event, and calls `at(gap)` at each of a compaction's five gaps (`Gap`), with no lock held. `Err` fails the compaction there |
+
+`Upkeep::gated(gate)` is one frame per segment with that gate, for a test
+that wants every built event to compact a small volume. `ChannelGate::pair()`
+is a gate in a test's hands: it gives the gate, a receiver of each gap the
+compactor reaches, where it stays parked, and a sender of verdicts. Dropping
+both ends leaves a gate that never parks. The library reads no environment
+variable for any of it.
+
+Compaction runs on history's compactor, behind the call path
+([trees](../trees.md#the-journal)), so a caller waits on its events:
+
+| Call | Returns |
+|---|---|
+| `History::checkpointed()` | The last checkpoint counted (`Checkpointed`): its `generation`, 0 for the one the volume opened at and one more for each this open published, and its `built` point |
+| `History::wait_checkpointed(after)` | Once a checkpoint of a generation after `after` is published. `WaitError::Stopped` at shutdown or once a compaction stopped the actor |
+| `History::wait_compacted(generation)` | Once the compaction that published that generation has ended: the segments it covers are unlinked, or its unlink failed and was logged. The publish comes before the unlink |
+| `History::compactor_through()` | The built point of the last built event the compactor is done with, compacted or not due |
+
+Read the generation, act, then wait past it. Nothing waits on a length or a
+timer.
+
 Saves history could not check ([trees](../trees.md#when-history-cannot-check-a-save))
 are flagged in their commits' `Agentfs-Unverified` trailer.
 `TreeActor::verification()` gives the volume's `Verification` handle, whose

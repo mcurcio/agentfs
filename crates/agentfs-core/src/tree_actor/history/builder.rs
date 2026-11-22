@@ -559,6 +559,8 @@ impl BuildState {
                 pointers,
                 rows,
             } => self.step(record, tail, by, (change, rows), pointers, ctx, batch)?,
+            // The builder's pointers are built values already.
+            Entry::Switch { .. } => {}
         }
         Ok(())
     }
@@ -1524,8 +1526,9 @@ impl Builder {
             }
             _ => through,
         };
-        // No record after the checkpoint names a step it covers
-        // (`TreeActor::resolve_compacted`): those heads are never read again.
+        // `checkpointed` never passes the record before the checkpoint's
+        // oldest step head, so every head a record after it may still name
+        // (a fork's target, a save's `old`, a switch record's step) stays.
         if self
             .state
             .heads

@@ -295,10 +295,12 @@ fn of(kinds: &[(&'static str, u64)], kind: &str) -> u64 {
 /// Each kind of work under the actor's lock is recorded in the hold it
 /// runs in (docs/telemetry.md, "The volume lock"): a plain call is
 /// `other` only, a close is `close`, a built point reached is `catch_up`,
-/// a fork is `fork_copy`, a take is `take`, and a compaction is
-/// `compaction`. Every hold is also one wait to take the lock. No drop runs
-/// under the lock: what a catch-up lets go drops on the volume's
-/// `tree-drops` thread, so `drops` stays zero.
+/// a fork is `fork_copy`, and a take is `take`. Every hold is also one wait
+/// to take the lock. No drop runs under the lock: what a catch-up lets go
+/// drops on the volume's `tree-drops` thread, so `drops` stays zero.
+/// Compaction runs off the lock, on history's compactor: `compaction` counts
+/// only the actor's walk onto carried frames, which a volume with nothing
+/// carried never makes.
 #[test]
 fn each_kind_of_hold_is_recorded_when_its_work_runs() {
     let _one = ONE_AT_A_TIME.lock().unwrap_or_else(PoisonError::into_inner);
@@ -323,6 +325,7 @@ fn each_kind_of_hold_is_recorded_when_its_work_runs() {
             ("close", 0),
             ("take", 0),
             ("fork_copy", 0),
+            ("page_image", 0),
             ("other", 1),
         ]
     );
@@ -370,8 +373,10 @@ fn each_kind_of_hold_is_recorded_when_its_work_runs() {
     });
     assert!(of(&kinds, "take") >= 1, "{kinds:?}");
 
-    // Past the compaction threshold: the first call after history built
-    // every step compacts.
+    // Past the compaction threshold: the close's built event compacts, on
+    // history's thread, and no hold of the lock is a compaction's.
+    let generation = rec.history().checkpointed().generation;
+    let before = Stages::current().checkpoints;
     let h = rec
         .actor()
         .unwrap()
@@ -382,16 +387,50 @@ fn each_kind_of_hold_is_recorded_when_its_work_runs() {
         rec.actor().unwrap().write(h, 0, &chunk, true).unwrap();
     }
     rec.actor().unwrap().truncate(h, 1).unwrap();
-    rec.close_with(h, |_| Ok(())).unwrap();
-    rec.settle().unwrap();
-    let before = Stages::current().compaction.count;
     let (kinds, _) = holds_during(|| {
-        let mut actor = rec.actor().unwrap();
-        let h = actor.write_open(TreeId::Root, "big", &w, None).unwrap();
-        actor.close(h).unwrap();
+        rec.close_with(h, |_| Ok(())).unwrap();
+        rec.settle().unwrap();
+        let published = rec.history().wait_checkpointed(generation).unwrap();
+        rec.history().wait_compacted(published.generation).unwrap();
+        rec.progress().unwrap();
     });
-    assert!(Stages::current().compaction.count > before, "it compacted");
-    assert_eq!(of(&kinds, "compaction"), 1, "{kinds:?}");
+    assert!(Stages::current().checkpoints > before, "it compacted");
+    assert_eq!(of(&kinds, "compaction"), 0, "{kinds:?}");
+}
+
+/// A page fill that builds a file's image from a live open's calls reads the
+/// journal under the actor's lock: a named hold of its own, `page_image`,
+/// and so one the lock's guard lets read (a debug build panics on a journal
+/// read under the lock in any hold that is not named for it).
+#[test]
+fn a_page_fill_under_the_lock_is_a_page_image_hold() {
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(PoisonError::into_inner);
+    let tmp = tempfile::tempdir().unwrap();
+    let rec = Recording::create(
+        &tmp.path().join("state"),
+        &identity(),
+        None,
+        &PodContext::default(),
+    )
+    .unwrap();
+    let w = writer("test-writer");
+    let h = rec
+        .actor()
+        .unwrap()
+        .write_open(TreeId::Root, "a", &w, Some(ATTRS))
+        .unwrap();
+    rec.actor().unwrap().write(h, 0, b"calls", false).unwrap();
+    let object = rec.actor().unwrap().open_object(h).unwrap();
+    let (kinds, _) = holds_during(|| {
+        let filled = rec
+            .actor()
+            .unwrap()
+            .page_fill(TreeId::Root, object, 0, 4096)
+            .unwrap();
+        assert_eq!(filled, b"calls");
+    });
+    assert_eq!(of(&kinds, "page_image"), 1, "{kinds:?}");
+    rec.close_with(h, |_| Ok(())).unwrap();
 }
 
 /// A call held at the lag gate is counted under the cause that held it,
@@ -430,7 +469,6 @@ fn a_gate_wait_is_recorded_by_its_cause() {
     let after = Stages::current().gate_wait;
     assert_eq!(after.overlay.count - before.overlay.count, 1);
     assert_eq!(after.lag.count - before.lag.count, 0);
-    assert_eq!(after.overdue.count - before.overdue.count, 0);
     assert!(after.overlay.nanos > before.overlay.nanos);
 }
 

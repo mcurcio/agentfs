@@ -530,6 +530,7 @@ mod tests {
     use agentfs_contracts::volume::{VolumeId, VolumeIdentity};
 
     use super::*;
+    use crate::tree_actor::test_support::{compacted_through, compacting};
 
     fn identity() -> VolumeIdentity {
         VolumeIdentity {
@@ -547,8 +548,14 @@ mod tests {
     #[test]
     fn created_survives_a_change_and_a_compaction() {
         let tmp = tempfile::tempdir().unwrap();
-        let recording =
-            Recording::create(tmp.path(), &identity(), None, &PodContext::default()).unwrap();
+        let recording = Recording::create_with(
+            tmp.path(),
+            &identity(),
+            None,
+            &PodContext::default(),
+            compacting(),
+        )
+        .unwrap();
         let store = TreeStore::new(Arc::clone(&recording));
         let at = PodContext::default();
         let first = store
@@ -571,23 +578,14 @@ mod tests {
             .unwrap();
         assert_eq!(second.created, first.created);
         assert_eq!(second.changed.by, launcher("second"));
-        recording.settle().unwrap();
+        // The change built and compacted: the reopen starts from a
+        // checkpoint at or past its step.
+        let settled = recording.settle().unwrap();
+        let checkpoint = compacted_through(&recording.actor().unwrap(), settled);
+        assert!(checkpoint.built >= settled);
         drop(store);
         drop(recording);
-        // Every step built: the reopen compacts to one checkpoint.
         let recording = Recording::open(tmp.path(), &PodContext::default()).unwrap();
-        let segments = std::fs::read_dir(tmp.path().join("journal"))
-            .unwrap()
-            .filter(|entry| {
-                entry
-                    .as_ref()
-                    .unwrap()
-                    .path()
-                    .extension()
-                    .is_some_and(|e| e == "seg")
-            })
-            .count();
-        assert_eq!(segments, 1, "compacted to its checkpoint's segment");
         let rows: Vec<Audited<String>> = TreeStore::new(recording).load(RowDomain::Volume).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].value, "draining");

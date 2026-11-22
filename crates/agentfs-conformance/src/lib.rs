@@ -16,6 +16,7 @@
 //! (the recording-faults and power-loss jobs), `ENOSPC` and `EIO` (the enospc
 //! job).
 
+pub mod compact_turns;
 pub mod engine_names;
 pub mod git_history;
 pub mod invariants;

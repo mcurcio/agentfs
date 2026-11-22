@@ -31,6 +31,11 @@ use std::io;
 /// Release builds have no failpoints and ignore it.
 pub const ENV_VAR: &str = "AGENTFS_FAILPOINTS";
 
+/// The environment variable naming the compaction gate's directory
+/// ([`FifoGate`]): read only by the `agentfs` binary, and only in a
+/// `failpoints` build. Release builds ignore it.
+pub const COMPACT_GATE_VAR: &str = "AGENTFS_COMPACT_GATE";
+
 /// Every failpoint, in the order a change passes them. A test
 /// (`every_hit_is_listed`) keeps this list equal to the `hit` calls in
 /// the source.
@@ -49,9 +54,6 @@ pub const POINTS: &[&str] = &[
     "tree.untrack_after_place",
     "tree.fork_copy_file",
     "tree.fork_after_copy",
-    "tree.compact_before_checkpoint",
-    "tree.compact_before_fsync",
-    "tree.compact_before_drop",
     // The tree builder, behind the call path (docs/trees.md).
     "tree.build_before_batch",
     "tree.build_replay_skew",
@@ -121,6 +123,80 @@ pub fn adopt(_owner: Option<std::thread::ThreadId>) {}
 
 #[cfg(feature = "failpoints")]
 pub use take_gate::{TakeGate, take_gate};
+
+#[cfg(feature = "failpoints")]
+pub use compact_gate::FifoGate;
+
+/// A tree volume's compactor parked at each gap by a test script.
+#[cfg(feature = "failpoints")]
+mod compact_gate {
+    use std::fs::{File, OpenOptions};
+    use std::io::{self, BufRead, BufReader, Write};
+    use std::path::Path;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Mutex, PoisonError};
+
+    use crate::tree_actor::{CompactGate, Gap};
+
+    /// `AGENTFS_COMPACT_GATE=<dir>`'s gate: FIFOs `at` and `go` in `dir`,
+    /// both opened read and write so neither end blocks or sees end of file.
+    /// At each gap it writes the gap's name ([`Gap::name`]) and a newline to
+    /// `at`, then reads one line from `go`: `go` goes on, `fail` returns an
+    /// EIO error (the gap's fault), and an empty line or end of file ends the
+    /// gate, after which every gap passes without a line.
+    pub struct FifoGate {
+        at: Mutex<File>,
+        go: Mutex<BufReader<File>>,
+        ended: AtomicBool,
+    }
+
+    impl FifoGate {
+        /// The gate on the FIFOs in `dir`.
+        ///
+        /// # Errors
+        ///
+        /// Either FIFO could not be opened.
+        pub fn open(dir: &Path) -> io::Result<Self> {
+            let open = |name: &str| {
+                OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(dir.join(name))
+            };
+            Ok(Self {
+                at: Mutex::new(open("at")?),
+                go: Mutex::new(BufReader::new(open("go")?)),
+                ended: AtomicBool::new(false),
+            })
+        }
+    }
+
+    impl CompactGate for FifoGate {
+        fn at(&self, gap: Gap) -> io::Result<()> {
+            if self.ended.load(Ordering::Acquire) {
+                return Ok(());
+            }
+            writeln!(
+                self.at.lock().unwrap_or_else(PoisonError::into_inner),
+                "{}",
+                gap.name()
+            )?;
+            let mut line = String::new();
+            self.go
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .read_line(&mut line)?;
+            match line.trim_end() {
+                "go" => Ok(()),
+                "fail" => Err(io::Error::from_raw_os_error(libc::EIO)),
+                _ => {
+                    self.ended.store(true, Ordering::Release);
+                    Ok(())
+                }
+            }
+        }
+    }
+}
 
 /// Takes at a test's points, not the queue worker's (git-model §18's replay).
 #[cfg(feature = "failpoints")]

@@ -289,6 +289,12 @@ fn three_clients_killed_all_end_at_boot() {
         two.clients.attached_any(),
         ClientSet::from([a.clone(), b.clone(), c.clone()])
     );
+    // The reopened actor's first built event switches the pointers the
+    // clean shutdown built, by a record of its own, and its batch ends
+    // before the count is read: the reconcile's step is then the one
+    // record, with the builder idle at it.
+    recording.progress().unwrap();
+    recording.settle().unwrap();
     let appended = recording.actor().unwrap().durability().appended();
     let mut ended = two
         .clients

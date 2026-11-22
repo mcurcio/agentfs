@@ -46,7 +46,7 @@ use agentfs_contracts::volume::{
 use agentfs_core::identity::Context as Identity;
 use agentfs_core::operator_settings;
 use agentfs_core::state_area::TreeStateArea;
-use agentfs_core::tree_actor::{self, Recording, TreeId};
+use agentfs_core::tree_actor::{self, Recording, TreeId, Upkeep};
 use agentfs_volume::VolumeService;
 use anyhow::{Context, Result, bail};
 
@@ -343,8 +343,11 @@ pub fn init(state: &Path, args: InitArgs, minter: Minter) -> Result<ExitCode> {
         root_owner: args.owner,
     };
     let cap = root_cap(&minter)?;
-    let mut volume =
-        VolumeService::new(TreeStateArea::at(state), NoClients, DomainEvents::default());
+    let mut volume = VolumeService::new(
+        TreeStateArea::at(state).with_upkeep(upkeep()),
+        NoClients,
+        DomainEvents::default(),
+    );
     let ensured = match volume.ensure(spec.clone(), &at, &cap) {
         Ok(ensured) => ensured,
         Err(VolumeError::Busy) => return Ok(busy()),
@@ -354,7 +357,7 @@ pub fn init(state: &Path, args: InitArgs, minter: Minter) -> Result<ExitCode> {
             return Ok(ExitCode::FAILURE);
         }
     };
-    let mut area = TreeStateArea::at(state);
+    let mut area = TreeStateArea::at(state).with_upkeep(upkeep());
     match area.open(&at) {
         Ok(_) => {}
         Err(VolumeError::Busy) => return Ok(busy()),
@@ -472,6 +475,31 @@ fn identity(volume: &str, pod: &PodArgs) -> Identity {
     }
 }
 
+/// How every tree volume this binary opens keeps its journal: `mount` and
+/// `host` (through `serving`), `init` and `fork end`. A failpoints build
+/// with `AGENTFS_COMPACT_GATE` set gives each a compaction gate on the FIFOs
+/// in that directory: one frame per segment, a compaction at every built
+/// event, parked at each gap until the gate's holder answers
+/// (docs/configuration.md, "Test builds only"). A gate that cannot open
+/// aborts, as the take gate's does: a test must not pass with the compactor
+/// running by itself. Any other build, or no variable: the defaults.
+pub(crate) fn upkeep() -> Upkeep {
+    #[cfg(feature = "failpoints")]
+    {
+        use agentfs_core::failpoints::{COMPACT_GATE_VAR, FifoGate};
+        if let Some(dir) = std::env::var_os(COMPACT_GATE_VAR) {
+            match FifoGate::open(Path::new(&dir)) {
+                Ok(gate) => return Upkeep::gated(std::sync::Arc::new(gate)),
+                Err(e) => {
+                    eprintln!("{COMPACT_GATE_VAR}: {e}");
+                    std::process::abort();
+                }
+            }
+        }
+    }
+    Upkeep::default()
+}
+
 /// `agentfs fork end`: the keyed fork ends, and drops at once when nothing
 /// holds it (else at a later mount's settle).
 ///
@@ -481,7 +509,7 @@ fn identity(volume: &str, pod: &PodArgs) -> Identity {
 pub fn end_fork(state: &Path, args: EndArgs, minter: Minter) -> Result<ExitCode> {
     let at = context(&args.pod)?;
     let key = ForkKey::parse(&args.fork_key)?;
-    let recording = match Recording::open(state, &at) {
+    let recording = match Recording::open_with(state, &at, upkeep()) {
         Ok(recording) => recording,
         Err(tree_actor::Error::Busy) => return Ok(busy()),
         Err(e) => return Err(e).context("opening tree state"),

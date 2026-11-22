@@ -20,7 +20,7 @@ use super::journal::durable::{Durability, RecordNo};
 use super::recording::CloseStart;
 use super::stages::{self, Held};
 use super::takes::{self, Lands};
-use super::{Error, Saved, Took, TreeActor, TreeId};
+use super::{Error, Saved, Took, TreeActor, TreeId, Upkeep};
 
 /// The actor, locked through the call path: [`TreeActor`] by `Deref`. Each
 /// guard adds one run of `Stages::actor_lock` when it is dropped, from the
@@ -163,7 +163,25 @@ impl Recording {
         root_owner: Option<FileOwner>,
         service: &PodContext,
     ) -> Result<Arc<Self>, Error> {
-        Self::serve(TreeActor::create(root, identity, root_owner, service)?)
+        Self::create_with(root, identity, root_owner, service, Upkeep::default())
+    }
+
+    /// [`Recording::create`] with the volume's `upkeep`
+    /// ([`TreeActor::create_with`]).
+    ///
+    /// # Errors
+    ///
+    /// As [`TreeActor::create`].
+    pub fn create_with(
+        root: &Path,
+        identity: &VolumeIdentity,
+        root_owner: Option<FileOwner>,
+        service: &PodContext,
+        upkeep: Upkeep,
+    ) -> Result<Arc<Self>, Error> {
+        Self::serve(TreeActor::create_with(
+            root, identity, root_owner, service, upkeep,
+        )?)
     }
 
     /// Recovers a volume as [`TreeActor::open`] does, then serves it.
@@ -172,7 +190,21 @@ impl Recording {
     ///
     /// As [`TreeActor::open`].
     pub fn open(root: &Path, service: &PodContext) -> Result<Arc<Self>, Error> {
-        Self::serve(TreeActor::open(root, service)?)
+        Self::open_with(root, service, Upkeep::default())
+    }
+
+    /// [`Recording::open`] with the volume's `upkeep`
+    /// ([`TreeActor::open_with`]).
+    ///
+    /// # Errors
+    ///
+    /// As [`TreeActor::open`].
+    pub fn open_with(
+        root: &Path,
+        service: &PodContext,
+        upkeep: Upkeep,
+    ) -> Result<Arc<Self>, Error> {
+        Self::serve(TreeActor::open_with(root, service, upkeep)?)
     }
 
     /// The operator's rules, read when the volume opened: where each new

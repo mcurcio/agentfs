@@ -134,6 +134,7 @@ pub mod names {
     pub const GATE_WAIT: &str = "agentfs.gate.wait";
     pub const GATE_WAITS: &str = "agentfs.gate.waits";
     pub const GATE_WAIT_LONGEST: &str = "agentfs.gate.wait.longest";
+    pub const JOURNAL_CHECKPOINTS: &str = "agentfs.journal.checkpoints";
     pub const REQUEST_TIME: &str = "agentfs.request.time";
     pub const REQUESTS: &str = "agentfs.requests";
     pub const REQUEST_LONGEST: &str = "agentfs.request.longest";
@@ -675,14 +676,23 @@ impl Telemetry {
     /// `.wait.longest`); the lag gate's waits by `cause`
     /// (`agentfs.gate.wait`, `.waits`, `.wait.longest`); and the tree views'
     /// FUSE requests by `op` (`agentfs.request.time`, `agentfs.requests`,
-    /// `agentfs.request.longest`). Every attribute value is observed, zero
-    /// included. Call once per process; a noop telemetry registers nothing.
+    /// `agentfs.request.longest`); and the journal checkpoints history's
+    /// compactors published (`agentfs.journal.checkpoints`). Every attribute
+    /// value is observed, zero included. Call once per process; a noop
+    /// telemetry registers nothing.
     pub fn observe_latency(&self) {
         use crate::tree_actor::stages::{Stage, Stages};
         let Some(inner) = &self.inner else {
             return;
         };
         let seconds = |nanos: u64| nanos as f64 / 1e9;
+        inner
+            .meter
+            .u64_observable_counter(names::JOURNAL_CHECKPOINTS)
+            .with_unit("{checkpoint}")
+            .with_description("Journal checkpoints history's compactors published")
+            .with_callback(|observer| observer.observe(Stages::current().checkpoints, &[]))
+            .build();
         type Read = fn(&Stages) -> Vec<(Option<KeyValue>, Stage)>;
         let holds: Read = |stages| {
             stages
@@ -1876,7 +1886,8 @@ mod tests {
         use crate::tree_actor::Recording;
         let h = Harness::new();
         h.telemetry.observe_latency();
-        for cause in ["lag", "overlay", "overdue"] {
+        assert!(h.sum(names::JOURNAL_CHECKPOINTS, &[]).is_some());
+        for cause in ["lag", "overlay"] {
             assert!(
                 h.sum(names::GATE_WAITS, &[("cause", cause)]).is_some(),
                 "{cause}"
@@ -1894,6 +1905,7 @@ mod tests {
             "close",
             "take",
             "fork_copy",
+            "page_image",
             "other",
         ];
         for kind in kinds {

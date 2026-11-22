@@ -1,50 +1,105 @@
-//! The journal's commit point: appending a step's record, and compacting the journal behind it
-//! (target git-model §3).
-
-use std::collections::BTreeMap;
+//! The journal's commit point: appending a step's record, and what the actor
+//! does under its lock at a built point so history's compactor can let the
+//! journal go behind it: the switch record, and its positions moved to
+//! carried frames (target git-model §3; docs/trees.md, "Recording and
+//! durability").
 
 use super::durable::RecordNo;
 use super::segment::FramePos;
-use super::{CompactError, Entry, OpenRecord, PointerChange, Record, Target};
-use crate::tree_actor::history::refs;
-use crate::tree_actor::recording::pages;
-use crate::tree_actor::stages::{Hold, Timer, Which, section};
-use crate::tree_actor::{Error, Result, TreeActor, TreeId, now_ns};
-
-/// When a journal this long after its last compaction compacts again.
-/// Constants, not a setting: restart memory is at most this plus live calls.
-pub(in crate::tree_actor) fn compact_at(len_after_last: u64) -> u64 {
-    (64_u64 << 20).max(len_after_last.saturating_mul(2))
-}
+use super::{Entry, PointerChange, Record, Switched};
+use crate::tree_actor::stages::{Hold, section};
+use crate::tree_actor::{Error, Result, TreeActor, now_ns};
 
 impl TreeActor {
-    /// At a built event, under the lock (`TreeActor::on_built`): every
-    /// pointer whose value is a step at or below History's built point
-    /// becomes the oid that step built, and each switch is told to History
-    /// before the next record ([`History::switched`], C3, C4). O(pointers
-    /// switched). Replaces the switch compaction made in its own hold.
+    /// Appends one [`Entry::Switch`] for every pointer whose step History
+    /// has built and whose built value its snapshot holds, row chains
+    /// included, then applies it: append first, apply second, as a step
+    /// does. Returns the record, or `None` when there was nothing to switch,
+    /// the append failed or the actor has stopped. A failed append changes
+    /// no pointer and is tried again at the next built point.
     ///
-    /// [`History::switched`]: crate::tree_actor::History::switched
-    #[expect(
-        dead_code,
-        reason = "interfaces of the compaction slice (latency-upkeep.md, slice 2), wired by it"
-    )]
-    pub(in crate::tree_actor) fn switch_built(&mut self) {
-        todo!()
+    /// Called under the lock in the two places the actor acts on a built
+    /// point: in `record_with`, right after a step's record, and in
+    /// `on_built`. Each caller passes the record returned to
+    /// `History::want_through`. O(1) when the built point has not moved
+    /// since the last full pass; otherwise O(pointers at a step) and one
+    /// append. No fsync, no journal read, no unlink.
+    ///
+    /// "Whose built value its snapshot holds": a fork's branch is set by its
+    /// fork step f to its upstream's value `Step(s)`, s < f, and History
+    /// holds it only once f is built. Until then it stays a step, and is
+    /// never given another pointer's oid.
+    ///
+    /// A step keeps its own time: the switch record never moves
+    /// `last_at_ns`, which the step just recorded applies its shape with, as
+    /// recovery and the builder do from the step's own record.
+    pub(in crate::tree_actor) fn switch_built(&mut self) -> Option<RecordNo> {
+        if self.is_stopped() {
+            return None;
+        }
+        let snapshot = self.history.snapshot();
+        let built = snapshot.at();
+        if self.switched_at == Some(built) {
+            return None;
+        }
+        let pointers: Vec<Switched> = self
+            .at_steps
+            .iter()
+            .filter(|(_, step)| **step <= built)
+            .filter_map(|(name, step)| {
+                Some(Switched {
+                    name: name.clone(),
+                    step: *step,
+                    oid: snapshot.pointers().get(name)?.to_string(),
+                })
+            })
+            .collect();
+        if pointers.is_empty() {
+            self.switched_at = Some(built);
+            return None;
+        }
+        let changes: Vec<PointerChange> = pointers.iter().map(Switched::change).collect();
+        let step_at_ns = self.last_at_ns;
+        let appended = self.append_record(Entry::Switch { pointers }, &[]);
+        self.last_at_ns = step_at_ns;
+        match appended {
+            Ok((seq, _)) => {
+                self.apply_pointers(&changes);
+                self.switched_at = Some(built);
+                Some(RecordNo::new(seq))
+            }
+            Err(e) => {
+                eprintln!("tree CompactionFailed: the switch record: {e}");
+                None
+            }
+        }
     }
 
-    /// At a built event, under the lock, only when the compactor carried
-    /// frames since the last time (`Relocations::generation` moved): moves
-    /// the actor's positions to the carried copies, so the unlinked
-    /// segments' space returns. The one rare walk compaction leaves under
-    /// the lock, timed as `Hold::Compaction` (design rule 1: named and
-    /// measured). Nothing else of compaction runs under the lock.
-    #[expect(
-        dead_code,
-        reason = "interfaces of the compaction slice (latency-upkeep.md, slice 2), wired by it"
-    )]
+    /// At a built event, under the lock, only when the compactor carried or
+    /// let go of frames since the last time (`Relocations::generation`
+    /// moved): moves the actor's positions (live opens' views, held page
+    /// writes, saved maps) to the carried copies, so the unlinked segments'
+    /// space returns. The one walk compaction leaves under the lock, timed
+    /// as `Hold::Compaction` (design rule 1: named and measured).
     pub(in crate::tree_actor) fn relocate_if_moved(&mut self) {
-        todo!()
+        let moved = self.journal.durability().relocations().clone();
+        let generation = moved.generation();
+        if generation == self.relocated {
+            return;
+        }
+        let _kind = section(Hold::Compaction);
+        for handle in self.handles.values_mut() {
+            handle.bytes.relocate(&moved);
+        }
+        crate::tree_actor::recording::pages::relocate(&mut self.pages, &moved);
+        for tree in self.trees.values_mut() {
+            for map in tree.bytes.values_mut() {
+                if map.on_frames() {
+                    map.relocate(&moved);
+                }
+            }
+        }
+        self.relocated = generation;
     }
 
     /// Appends one record, with no fsync: the journal's
@@ -64,7 +119,7 @@ impl TreeActor {
     }
 
     /// [`TreeActor::journal_record`] with nothing run before it: records of
-    /// one step that no compaction may come between.
+    /// one step, appended back to back.
     pub(in crate::tree_actor) fn append_record(
         &mut self,
         entry: Entry,
@@ -92,228 +147,8 @@ impl TreeActor {
     }
 
     /// What runs before any record: saved maps the builder has checked out
-    /// let go of their frames, and a compaction due since history trailed
-    /// runs at the first call after it caught up.
+    /// let go of their frames.
     pub(in crate::tree_actor) fn before_record(&mut self) {
         self.rebase_built();
-        self.compact_if_due();
     }
-
-    /// Names each step value `changes` read before the last compaction as
-    /// the oid it was built as: no record after a checkpoint names a step
-    /// the checkpoint covers (restart builds from the checkpoint and knows
-    /// no such step). [`Error::Format`] for one the compaction did not hold.
-    pub(in crate::tree_actor) fn resolve_compacted(
-        &self,
-        changes: &mut [PointerChange],
-    ) -> Result<()> {
-        let (through, built) = &self.compacted;
-        for change in changes.iter_mut() {
-            for target in [&mut change.new, &mut change.old].into_iter().flatten() {
-                if let Target::Step(step) = target
-                    && *step <= *through
-                {
-                    let oid = built.get(step).ok_or(Error::Format)?;
-                    *target = Target::Oid(oid.clone());
-                }
-            }
-        }
-        Ok(())
-    }
-
-    /// A fuzzy checkpoint (ARIES): the pointers and the live opens, written
-    /// as the first frame of a new segment, then every older segment dropped
-    /// whose records the builder has read and which holds no live open's call
-    /// or held page write. A file held open pins only its own frames, never
-    /// other files' saves: they are copied forward once the dead bytes they
-    /// pin exceed their own. A closed generation's page write stays out of
-    /// the fold (R12). Only with every step built: the checkpoint's pointers
-    /// are the built ones, and its redo start is its last record. Records
-    /// after the last step (calls, opens, page writes) build nothing the
-    /// checkpoint does not hold, so a file under constant writes never holds
-    /// compaction back.
-    pub(in crate::tree_actor) fn compact(&mut self) -> std::result::Result<(), CompactError> {
-        let _timer = Timer::start(Which::Compaction);
-        let _kind = section(Hold::Compaction);
-        if !self.history.steps_built() {
-            return Err(CompactError::Before(std::io::Error::other(
-                "history is not built through the journal's last step",
-            )));
-        }
-        let snapshot = self.history.snapshot();
-        let last = RecordNo::new(self.next.saturating_sub(1));
-        let opens = self
-            .handles
-            .iter()
-            .map(|(handle, h)| OpenRecord {
-                handle: *handle,
-                tree: h.tree.to_string(),
-                by: h.by.clone(),
-                object: h.object,
-                anonymous: self
-                    .trees
-                    .get(&h.tree)
-                    .is_some_and(|t| t.anonymous.contains(&h.object)),
-                meta: self
-                    .trees
-                    .get(&h.tree)
-                    .filter(|t| t.anonymous.contains(&h.object))
-                    .and_then(|t| t.meta_of(h.object).copied()),
-            })
-            .collect();
-        let checkpoint = Record {
-            seq: RecordNo::ZERO,
-            at_ns: now_ns(),
-            entry: Entry::Checkpoint {
-                next: RecordNo::new(self.next),
-                built: last,
-                pointers: snapshot.pointers().to_hex(),
-                upstreams: self.upstreams.to_text(),
-                opens,
-                page_saved: self.pages_saved_through(),
-                page_writes: self.pages_held(),
-                objects: snapshot
-                    .all_objects()
-                    .into_iter()
-                    .map(|(tree, objects)| (tree.to_string(), objects))
-                    .collect(),
-                // Every step is built: the actor's shapes are as of `built`.
-                locals: self
-                    .trees
-                    .iter()
-                    .map(|(tree, t)| (tree.to_string(), t.shape.locals()))
-                    .collect(),
-            },
-        };
-        self.journal.checkpoint(&checkpoint)?;
-        self.history.checkpointed(last);
-        // The records name built values only: no step past the checkpoint yet.
-        // A step's value here is its head; a row chain's (the step's event
-        // commit) is never read again: each row step names its chains' old
-        // values after any compaction (`TreeActor::record`).
-        let built: std::collections::BTreeMap<RecordNo, String> = self
-            .pointers
-            .iter()
-            .filter(|(name, _)| !name.starts_with(refs::ROWS))
-            .filter_map(|(name, target)| match target {
-                Target::Step(step) => Some((*step, snapshot.pointers().get(name)?.to_string())),
-                Target::Oid(_) => None,
-            })
-            .collect();
-        self.compacted = (last, built);
-        self.pointers = snapshot.pointers().to_targets();
-        let (handles, pages) = (&self.handles, &self.pages);
-        let live = |record: &Record| match &record.entry {
-            Entry::Call { handle, .. } => handles.contains_key(handle),
-            // A page write that names no tree is kept, never dropped.
-            Entry::PageWrite { tree, object, .. } => tree
-                .parse()
-                .map_or(true, |tree| holds(pages, tree, *object, record.seq.get())),
-            _ => false,
-        };
-        // The builder reads the records after its built point from the
-        // linked segments: those stay until it has.
-        let stats = self.journal.drop_behind(snapshot.at(), &live);
-        // Whatever was carried before a failure has a copy: move to it.
-        self.relocate_frames();
-        let stats = stats.map_err(|e| CompactError::After(std::io::Error::other(e.to_string())))?;
-        self.metrics.journal_dropped = self.metrics.journal_dropped.saturating_add(stats.segments);
-        Ok(())
-    }
-
-    /// Moves every position the actor holds (live opens' views, held page
-    /// writes, saved maps) to where compaction carried its frame, letting go
-    /// of the dropped segments. An open's calls are read back from the
-    /// journal, which finds them carried. The builder moves its own at its
-    /// next batch; a reader's map keeps its segment until the reader lets go.
-    fn relocate_frames(&mut self) {
-        let moved = self.journal.relocations().clone();
-        for handle in self.handles.values_mut() {
-            handle.bytes.relocate(&moved);
-        }
-        crate::tree_actor::recording::pages::relocate(&mut self.pages, &moved);
-        for tree in self.trees.values_mut() {
-            for map in tree.bytes.values_mut() {
-                if map.on_frames() {
-                    map.relocate(&moved);
-                }
-            }
-        }
-    }
-
-    pub(in crate::tree_actor) fn compact_if_due(&mut self) {
-        let length = self.journal.len();
-        if length < self.compact_threshold {
-            return;
-        }
-        // A checkpoint's pointers are the built ones: due, it waits for the
-        // first record after the builder has built every step and read past
-        // the oldest segment (else it could drop nothing). Calls after the
-        // builder's last batch never hold it back: they are live, and only
-        // the segment they share with dead records waits for the next step.
-        // The call path never waits on the builder; once the journal is twice
-        // its due length with steps unbuilt, the lag gate holds new work until
-        // the builder catches up.
-        let steps_built = self.history.steps_built();
-        self.history
-            .compaction_overdue(!steps_built && length >= self.compact_threshold.saturating_mul(2));
-        let read_past = self
-            .journal
-            .oldest_through()
-            .is_none_or(|oldest| self.history.built_through() >= oldest);
-        if !(steps_built && read_past) {
-            return;
-        }
-        match self.compact() {
-            Ok(()) => self.compact_threshold = compact_at(self.journal.len()),
-            // Untouched: the next step retries.
-            Err(e @ CompactError::Before(_)) => eprintln!("tree CompactionFailed: {e}"),
-            // The checkpoint stands; the segments not dropped wait for the next.
-            Err(e @ CompactError::After(_)) => {
-                eprintln!("tree CompactionFailed: {e}");
-                self.compact_threshold = compact_at(self.journal.len());
-            }
-        }
-    }
-}
-
-impl TreeActor {
-    /// The files with a live write-open whose earlier close moved `saved_through`,
-    /// for a checkpoint. This is the only home of that number while serving.
-    pub(in crate::tree_actor) fn pages_saved_through(&self) -> Vec<(String, u64, u64)> {
-        self.pages
-            .iter()
-            .filter(|(_, state)| state.saved_through > 0)
-            .map(|((tree, object), state)| (tree.to_string(), *object, state.saved_through))
-            .collect()
-    }
-
-    /// Every page write memory holds, in record order: what a checkpoint
-    /// names for recovery to read from the segments before it.
-    pub(in crate::tree_actor) fn pages_held(&self) -> Vec<RecordNo> {
-        let mut held: Vec<RecordNo> = self
-            .pages
-            .values()
-            .flat_map(|state| state.writes.iter().map(|(seq, _)| RecordNo::new(*seq)))
-            .collect();
-        held.sort_unstable();
-        held.dedup();
-        held
-    }
-}
-
-/// Whether memory holds the page write numbered `seq` of `object` in `tree`: what
-/// a compaction keeps. `writes` is in journal order.
-pub(in crate::tree_actor) fn holds(
-    pages: &BTreeMap<(TreeId, u64), pages::ObjectPages>,
-    tree: TreeId,
-    object: u64,
-    seq: u64,
-) -> bool {
-    pages.get(&(tree, object)).is_some_and(|state| {
-        state
-            .writes
-            .binary_search_by_key(&seq, |(number, _)| *number)
-            .is_ok()
-    })
 }

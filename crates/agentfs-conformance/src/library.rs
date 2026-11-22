@@ -1,5 +1,6 @@
 //! The shared calls on the real library: `TreeActor`, in this process.
 
+use crate::compact_turns::Turns;
 use crate::engine_names::EngineNames;
 use agentfs_contracts::clients::FileOwner;
 use agentfs_contracts::name::{VolumeName, WriterLabel};
@@ -7,10 +8,12 @@ use agentfs_contracts::pod::{PodContext, WriterAt};
 use agentfs_contracts::volume::{VolumeId, VolumeIdentity};
 use agentfs_core::tree_actor::{
     self, Attrs, Error, Kind as EngineKind, Perm, RenameMode, TreeActor, TreeId as EngineTree,
+    Upkeep,
 };
 use agentfs_model::calls::{CallError, Caller, Kind, Meta, Took, TreeCalls, TreeId};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 /// What a replay's create gives a file: the model's created file's metadata
 /// ([`Meta::FILE`]), mode 0644, owned by 0:0.
@@ -69,9 +72,9 @@ pub fn identity() -> VolumeIdentity {
     }
 }
 
-/// A new volume at `dir`, served with no pod context.
-pub fn create(dir: &Path) -> Result<TreeActor, Error> {
-    TreeActor::create(dir, &identity(), None, &PodContext::default())
+/// A new volume at `dir`, served with no pod context and `upkeep`.
+pub fn create(dir: &Path, upkeep: Upkeep) -> Result<TreeActor, Error> {
+    TreeActor::create_with(dir, &identity(), None, &PodContext::default(), upkeep)
 }
 
 /// `label` as a writer with no pod context: the model's labels (`c3`) as they are.
@@ -89,22 +92,35 @@ pub(crate) fn fail(e: Error) -> CallError {
     }
 }
 
-/// `TreeActor` and its state directory.
+/// `TreeActor` and its state directory. The volume compacts at every built
+/// event, and its compactor is parked at each gap in turn while a replayed
+/// call runs ([`Turns`]).
 pub struct Library {
     volume: Option<TreeActor>,
+    /// The open volume's compaction gate, ended before the volume is dropped.
+    turns: Arc<Turns>,
     dir: PathBuf,
     names: EngineNames,
     owners: BTreeMap<u64, Caller>,
 }
 
+impl Drop for Library {
+    fn drop(&mut self) {
+        // Before the volume's shutdown joins its compactor.
+        self.turns.end();
+    }
+}
+
 impl Library {
     /// A new volume at `dir`, seeded, its trees named by `names`.
     pub fn new(dir: &Path, names: EngineNames) -> Result<Self, CallError> {
-        let mut volume = create(dir).map_err(fail)?;
+        let turns = Turns::new();
+        let mut volume = create(dir, Upkeep::gated(turns.clone())).map_err(fail)?;
         seed(&mut volume, names.name(TreeId::ROOT)?).map_err(fail)?;
         volume.settle().map_err(fail)?;
         Ok(Self {
             volume: Some(volume),
+            turns,
             dir: dir.to_owned(),
             names,
             owners: BTreeMap::new(),
@@ -132,6 +148,8 @@ impl Library {
     /// invariants read git after each call, and the builder makes history
     /// behind the call path.
     fn settled<T>(&self, result: Result<T, CallError>) -> Result<T, CallError> {
+        // A replayed call ended: a compactor parked for it goes on.
+        self.turns.call_ended();
         let value = result?;
         self.v()?.settle().map_err(fail)?;
         Ok(value)
@@ -253,9 +271,13 @@ impl TreeCalls for Library {
 
     /// Drop the volume and open it again: recovery closes every open once.
     fn crash(&mut self) -> Result<(), CallError> {
+        self.turns.end();
         self.volume = None;
         self.owners.clear();
-        let volume = TreeActor::open(&self.dir, &PodContext::default()).map_err(fail)?;
+        self.turns = Turns::new();
+        let upkeep = Upkeep::gated(self.turns.clone());
+        let volume =
+            TreeActor::open_with(&self.dir, &PodContext::default(), upkeep).map_err(fail)?;
         // Open never waits for history; the invariants read it after each call.
         volume.settle().map_err(fail)?;
         self.volume = Some(volume);
