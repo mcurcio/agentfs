@@ -205,7 +205,9 @@ jobs:
           fi
           sudo modprobe dm_snapshot
       - run: ci/install-replay-log.sh "$RUNNER_TEMP/replay-log" >> "$GITHUB_ENV"
-      - run: cargo build --locked -p agentfs
+      # A failpoints build: the compaction marks park the compactor through
+      # AGENTFS_COMPACT_GATE, which no other build reads.
+      - run: cargo build --locked -p agentfs --features failpoints
       - name: replay each flush checkpoint
         run: sudo env PATH="$PATH" REPLAY_LOG="$REPLAY_LOG" AGENTFS_BIN="$AGENTFS_BIN" POWER_LOSS_DIR="$POWER_LOSS_DIR" ci/power-loss-trees.sh "${{ matrix.fs }}" flush
         env:

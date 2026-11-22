@@ -195,10 +195,12 @@ printf 'PASS\tenospc-before-commit-point\trename 0 or ENOSPC; one name holds it\
 rename_while_full tree.build_after_built_log NONE destination behind
 grep -Fq 'tree CopyStale' "$work/tree.build_after_built_log.log" || { cat "$work/tree.build_after_built_log.log" >&2; exit 1; }
 printf 'PASS\tenospc-after-commit-point\trename 0; destination\n' | tee -a "$work/results.tsv"
-# Only a failed fsync stops the actor: the file can no longer be trusted. A
-# write appends with no fsync; the first journal fsync after the mount's own two
-# (its stage, then its root client's attach) fails, the client's own or the
-# builder's behind the create, and every call after it answers EIO.
+# Only a failed fsync stops the actor: the file can no longer be trusted. The
+# mount's own steps (its stage, then its root client's attach) make two journal
+# fsyncs. The third fails: the builder's before it reads the switch record the
+# mount appends once those steps are built, or the client's own, or the
+# builder's behind the create, whichever comes first. Every call after it
+# answers EIO, the client's open included.
 rm -rf "$work/volume/state"
 "$bin" --state "$work/volume/state" init --volume t
 AGENTFS_FAILPOINTS='tree.wal_before_fsync=error@3' "$bin" --state "$work/volume/state" mount "$work/main" >"$work/fsync-mount.log" 2>&1 & pid=$!

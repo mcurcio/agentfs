@@ -73,12 +73,20 @@ check_held() {
   got=$(tree_git_file "$gitdir" root h | sha256sum | cut -d' ' -f1) || fail "missing held file"
   [ "$got" = "$want" ] || fail "wrong bytes for the held file"
 }
+# A file written and fsynced before a mark taken inside a compaction.
+check_kept() {
+  local n=$1 want got
+  want=$(printf 'compacted-%s\n' "$n" | sha256sum | cut -d' ' -f1)
+  got=$(tree_git_file "$gitdir" root "c$n" | sha256sum | cut -d' ' -f1) || fail "missing file $n kept across a compaction"
+  [ "$got" = "$want" ] || fail "wrong bytes for file $n kept across a compaction"
+}
 while read -r kind n; do
   case "$kind" in
     W|SW) check_write "$kind" "$n" ;;
     XW) check_unsynced "$n" ;;
     RN) check_rename ;;
     HC) check_held ;;
+    CP) check_kept "$n" ;;
   esac
 done < "$m/receipts"
 if [ -n "${CHECK_MARK:-}" ]; then
@@ -88,9 +96,10 @@ if [ -n "${CHECK_MARK:-}" ]; then
 import sys
 lines = open(sys.argv[1]).read().splitlines()
 kind, n = sys.argv[2], int(sys.argv[3])
-assert kind in ('F', 'C', 'SF', 'SC', 'XW', 'RN', 'HC') and n > 0
+assert kind in ('F', 'C', 'SF', 'SC', 'XW', 'RN', 'HC', 'CP', 'CN') and n > 0
+late = ('XW', 'RN', 'HC', 'CP', 'CN')
 main = n if kind in ('F', 'C') else 8
-forked = n if kind in ('SF', 'SC') else (2 if kind in ('XW', 'RN', 'HC') else 0)
+forked = n if kind in ('SF', 'SC') else (2 if kind in late else 0)
 prefix = ['S']
 for i in range(1, main + 1):
     prefix.extend([f'W {i}', f'F {i}'])
@@ -98,10 +107,13 @@ for i in range(1, main + 1):
 for i in range(1, forked + 1):
     prefix.extend([f'SW {i}', f'SF {i}'])
     if i < forked or kind != 'SF': prefix.append(f'SC {i}')
-if kind in ('XW', 'RN', 'HC'):
+if kind in late:
     prefix.extend(f'XW {i}' for i in range(1, (n if kind == 'XW' else 2) + 1))
-if kind in ('RN', 'HC'): prefix.append('RN 1')
-if kind == 'HC': prefix.append('HC 1')
+if kind in late[1:]: prefix.append('RN 1')
+if kind in late[2:]: prefix.append('HC 1')
+if kind in late[3:]:
+    prefix.extend(f'CP {i}' for i in range(1, (n if kind == 'CP' else 5) + 1))
+if kind == 'CN': prefix.append('CN 1')
 assert lines[:len(prefix)] == prefix, (lines, prefix)
 PYMARK
   case "$CHECK_MARK_KIND" in
@@ -115,6 +127,10 @@ PYMARK
     XW) for n in $(seq 1 "$CHECK_MARK_N"); do check_unsynced "$n"; done ;;
     RN) for n in 1 2; do check_unsynced "$n"; done; check_rename ;;
     HC) for n in 1 2; do check_unsynced "$n"; done; check_rename; check_held ;;
+    CP|CN)
+      for n in 1 2; do check_unsynced "$n"; done; check_rename; check_held
+      [ "$CHECK_MARK_KIND" = CP ] && files=$CHECK_MARK_N || files=5
+      for n in $(seq 1 "$files"); do check_kept "$n"; done ;;
   esac
 fi
 tree_git_no_duplicate_opens "$gitdir" || fail "duplicate Agentfs-Open"

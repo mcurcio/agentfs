@@ -102,11 +102,11 @@ commit, not only the close.
 
 With --metrics, every workload also reports `lock`: the volume lock's holds
 by kind of work (`compaction`, `catch_up`, `drops`, `close`, `take`,
-`fork_copy`, `other`; docs/telemetry.md, "The volume lock") and the waits
-to take it, from the metrics file read before the workload and again once
-its history is built and one more save (`fig-nudge`, the first call after
-history caught up, which runs the compaction the workload made due) is
-built too. Per kind: `holds`, the holds it ran in; `total_ms`,
+`fork_copy`, `page_image`, `other`; docs/telemetry.md, "The volume lock")
+and the waits to take it, from the metrics file read before the workload
+and again once its history is built and history's compactor is done with
+that build (`history.compactor_through`), so a compaction the workload made
+due is inside. Per kind: `holds`, the holds it ran in; `total_ms`,
 its time; `longest_ms`, its longest share of one hold, given only when that
 maximum, kept process-wide, grew during this workload (else null: an
 earlier workload's was longer). `longest_kind` names the kind with the
@@ -115,7 +115,7 @@ never warn or fail (owner, 2026-11-20). Run a workload alone (`--only`) to
 read its longest holds without an earlier workload's.
 
 Each such workload also reports `gate_wait`: the lag gate's waits by
-cause (`lag`, `overlay`, `overdue`), each `waits`, `total_ms` and
+cause (`lag`, `overlay`), each `waits`, `total_ms` and
 `longest_ms` as above; and `requests`: the view's FUSE requests by op
 (`lookup`, `getattr`, `open`, `create`, `read`, `write`, `flush`,
 `release`, `readdir`, `other`), each op with any requests giving
@@ -127,7 +127,7 @@ requests too.
 
 With --probe, `create`, `close_1g`, `close_frag` and `write_1m` also
 report `probe`: another file's stall while the workload runs, from its
-start until the nudge's build. A thread per view stats, opens and reads
+start until the compactor is done with its build. A thread per view stats, opens and reads
 4 KiB of `fig-probe` (written before the first workload, and touched by
 no workload) every 10 ms: `same` in the workload's view, which answers its
 requests on one thread, and `other` in --probe-view, another view of the
@@ -719,8 +719,9 @@ PEAKS = ("create", "close_1g", "write_1m")
 
 
 
-LOCK_KINDS = ("compaction", "catch_up", "drops", "close", "take", "fork_copy", "other")
-GATE_CAUSES = ("lag", "overlay", "overdue")
+LOCK_KINDS = ("compaction", "catch_up", "drops", "close", "take", "fork_copy", "page_image",
+              "other")
+GATE_CAUSES = ("lag", "overlay")
 OPS = ("lookup", "getattr", "open", "create", "read", "write", "flush", "release", "readdir",
        "other")
 # Workloads the probe runs beside (--probe).
@@ -888,18 +889,29 @@ def probe_views(args):
     return views
 
 
-def nudge(view, metrics, cap):
-    """One save of `fig-nudge` after a workload's history is built, then
-    waits for its build: the first call after history caught up runs the
-    compaction then due, which the workload's journal made due. Whether the
-    build was reached within `cap`."""
+def compacted(metrics, cap):
+    """Waits until history's compactor is done with the build of the record
+    last appended now: the compaction that build made due, if any, has ended,
+    on history's own thread. Read from the metrics file, which the view
+    rewrites at each built event and at each compaction's end. Whether that
+    was reached within `cap`."""
+    until = time.monotonic() + cap
+    renames = Renames(metrics)
     try:
-        write_file(os.path.join(view, "fig-nudge"), b"nudge\n")
-        os.stat(os.path.join(view, "fig-nudge"))
-    except OSError as error:
-        print(f"::warning title=tree views::the nudge after a workload failed: {error}", flush=True)
-        return False
-    return drain(metrics, cap) is not None
+        floor = (metrics_of(metrics) or {}).get("seq", 0) + 2
+        target = None
+        while True:
+            now = metrics_of(metrics)
+            if now and now.get("seq", 0) >= floor:
+                history = now["history"]
+                if target is None:
+                    target = history["appended"]
+                if history["built_through"] >= target and history["compactor_through"] >= target:
+                    return True
+            if not renames.wait(until):
+                return False
+    finally:
+        renames.close()
 
 
 def lock_hold_ms(metrics):
@@ -1064,11 +1076,11 @@ def main():
             figure.update(create_first_2000_ms=first,
                           ratio=round(mine / first, 3) if mine and first else None)
         if figure.get("drain_s") is not None:
-            # A compaction due once history caught up runs at the next call:
-            # the nudge is that call, so it lands in this workload's window.
-            nudged = nudge(args.view, args.metrics, args.drain_cap)
-            figure["lock"] = lock_figures(stages_before, stages_of(args.metrics)) if nudged else None
-            stages_after = stages_of(args.metrics) if nudged else None
+            # A compaction this workload made due runs at its build's event, on
+            # history's compactor: wait for it, so it lands in this window.
+            done = compacted(args.metrics, args.drain_cap)
+            figure["lock"] = lock_figures(stages_before, stages_of(args.metrics)) if done else None
+            stages_after = stages_of(args.metrics) if done else None
             figure["gate_wait"] = gate_figures(stages_before, stages_after)
             figure["requests"] = request_figures(stages_before, stages_after)
             lock = figure["lock"] or {}
@@ -1078,7 +1090,7 @@ def main():
                       f"{lock['hold'][kind]['longest_ms']} ms, longest wait "
                       f"{lock['wait']['longest_ms']} ms", flush=True)
         if probe:
-            # Stopped once the nudge's compaction ran, so its stall is inside.
+            # Stopped once the workload's compaction ran, so its stall is inside.
             figure["probe"] = probe.stop(grace)
             for label, calls in figure["probe"].items():
                 worst = {call: (v or {}).get("max_ms") for call, v in calls.items()
