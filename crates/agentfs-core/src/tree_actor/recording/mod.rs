@@ -39,6 +39,7 @@ use super::{Error, Result, Saved, TreeActor, TreeId};
 use crate::paths::RepoPath;
 pub use file_map::FileMap;
 use layout::{Layout, Positions};
+use pages::CloseCalls;
 
 /// Calls name byte positions, never lines; their bytes are in their frame's
 /// tail. Append finds EOF at save time.
@@ -338,7 +339,8 @@ impl CloseWork {
             }
             None => Vec::new(),
         };
-        let (outcome, map) = replay_judge(&self.saved, &pages::close_calls(&own, &pieces))?;
+        let calls = pages::close_calls(own.iter(), pieces.clone());
+        let (outcome, map) = replay_judge(&self.saved, calls)?;
         Ok(CloseDecision {
             work: self,
             outcome,
@@ -380,20 +382,29 @@ fn decided(saved: &FileMap, layout: &Layout, computed: &FileMap) -> Result<Decid
 
 /// `calls` replayed on `saved` and judged: a close that applies nothing
 /// changes nothing. "As it was" compares only the bytes the calls touched.
-fn replay_judge(
+/// The merge is cloned once, before the replay, for [`Layout::of_close`]:
+/// the open's calls are read twice where they are held, never copied.
+fn replay_judge<'a, O>(
     saved: &FileMap,
-    calls: &[(Call, FramePos)],
-) -> Result<(SaveOutcome, Option<Decided>)> {
-    if calls.is_empty() {
+    calls: CloseCalls<'a, FramePos, O>,
+) -> Result<(SaveOutcome, Option<Decided>)>
+where
+    O: Iterator<Item = &'a (u64, Call, FramePos)> + Clone,
+{
+    let for_layout = calls.clone();
+    let mut calls = calls.peekable();
+    if calls.peek().is_none() {
         return Ok((SaveOutcome::Unchanged, None));
     }
     let mut map = saved.clone();
     let mut ranges = Vec::new();
-    for (call, pos) in calls {
-        ranges.extend(call.touched(map.len()));
-        map.apply(call, pos)?;
+    for call in calls {
+        ranges.extend(call.call().touched(map.len()));
+        map.apply(call.call(), call.at())?;
     }
-    judge(saved, map, &ranges, || Layout::of_close(saved.len(), calls))
+    judge(saved, map, &ranges, || {
+        Layout::of_close(saved.len(), for_layout)
+    })
 }
 
 impl TreeActor {
@@ -1472,9 +1483,9 @@ impl TreeActor {
         }
         let own = self.own_calls(handle)?;
         let pieces = self.pages_close_pieces(h, &own);
-        let calls = pages::close_calls(&own, &pieces);
+        let calls = pages::close_calls(own.iter(), pieces.clone());
         let saved = t.bytes.get(&object).ok_or(Error::NotFound)?;
-        let (outcome, map) = replay_judge(saved, &calls)?;
+        let (outcome, map) = replay_judge(saved, calls)?;
         self.save_close(handle, outcome, map, pieces)
     }
 
@@ -1770,10 +1781,14 @@ mod tests {
             Some((writes, through)) => pages::close_pieces(saved.len(), &own, &writes, through),
             None => Vec::new(),
         };
-        let calls = pages::close_calls(&own, &pieces);
-        match changed(&saved, &calls).unwrap() {
+        let calls = pages::close_calls(own.iter(), pieces);
+        let collected: Vec<(Call, FramePos)> = calls
+            .clone()
+            .map(|call| (call.call().clone(), call.at().clone()))
+            .collect();
+        match changed(&saved, &collected).unwrap() {
             Some(map) => (
-                Layout::of_close(saved.len(), &calls).unwrap().outcome(),
+                Layout::of_close(saved.len(), calls).unwrap().outcome(),
                 map.to_vec().unwrap(),
             ),
             None => (SaveOutcome::Unchanged, saved.to_vec().unwrap()),

@@ -74,12 +74,17 @@ impl<L: Located> Run<L> {
 
     /// The run as the write it is.
     fn call(&self) -> (Call, L) {
+        self.clone().into_call()
+    }
+
+    /// The run as the write it is, its place moved, not cloned.
+    fn into_call(self) -> (Call, L) {
         (
             Call::Write {
                 offset: self.offset,
                 len: self.len,
             },
-            self.at.clone(),
+            self.at,
         )
     }
 }
@@ -197,70 +202,55 @@ pub(in crate::tree_actor) fn close_pieces(
 }
 
 /// The calls a close applies, in journal order, each with where its bytes
-/// are: the open's own calls merged with the page-write pieces
-/// [`close_pieces`] chose. The actor and the builder both run this, then
-/// [`FileMap::apply`]. Pure.
-pub(in crate::tree_actor) fn close_calls<L: Located>(
-    own: &[(u64, Call, L)],
-    pieces: &[(u64, Run<L>)],
-) -> Vec<(Call, L)> {
-    let mut calls = Vec::with_capacity(own.len() + pieces.len());
-    let mut own = own.iter().peekable();
-    let mut pieces = pieces.iter().peekable();
-    loop {
-        let call_first = match (own.peek(), pieces.peek()) {
-            (None, None) => return calls,
-            (Some(_), None) => true,
-            (None, Some(_)) => false,
-            (Some((call, _, _)), Some((write, _))) => call < write,
-        };
-        if call_first {
-            if let Some((_, call, pos)) = own.next() {
-                calls.push((call.clone(), pos.clone()));
-            }
-        } else if let Some((_, piece)) = pieces.next() {
-            calls.push(piece.call());
-        }
+/// are: the open's own calls (`own`, any cloneable iterator over where they
+/// are held) merged with the page-write pieces [`close_pieces`] chose, as a
+/// lazy [`CloseCalls`]. The actor and the builder both run this, then
+/// [`FileMap::apply`]. Nothing is collected: each part keeps its one copy of
+/// an open's calls. Pure.
+pub(in crate::tree_actor) fn close_calls<'a, L: Located + 'a, O>(
+    own: O,
+    pieces: Vec<(u64, Run<L>)>,
+) -> CloseCalls<'a, L, O>
+where
+    O: Iterator<Item = &'a (u64, Call, L)> + Clone,
+{
+    CloseCalls {
+        own: own.peekable(),
+        pieces: pieces.into_iter().peekable(),
     }
 }
 
 /// One call a close applies: one of the open's own calls, borrowed where
 /// the open's calls are held, or a page-write piece's call, made as the
-/// merge reaches it (one copy of each open's calls, ln6.10).
-#[expect(
-    dead_code,
-    reason = "interfaces of the one-copy slice (latency-upkeep.md, slice 5), wired by it"
-)]
+/// merge reaches it.
+#[derive(Clone, Debug)]
 pub(in crate::tree_actor) enum CloseCall<'a, L: Located> {
     Own(&'a Call, &'a L),
     Piece(Call, L),
 }
 
-#[expect(
-    dead_code,
-    reason = "interfaces of the one-copy slice (latency-upkeep.md, slice 5), wired by it"
-)]
 impl<L: Located> CloseCall<'_, L> {
     /// The call.
     pub(in crate::tree_actor) fn call(&self) -> &Call {
-        todo!()
+        match self {
+            Self::Own(call, _) => call,
+            Self::Piece(call, _) => call,
+        }
     }
 
     /// Where its bytes are.
     pub(in crate::tree_actor) fn at(&self) -> &L {
-        todo!()
+        match self {
+            Self::Own(_, at) => at,
+            Self::Piece(_, at) => at,
+        }
     }
 }
 
-/// [`close_calls`] as a lazy merge in journal order: the open's own calls
-/// (`own`, any cloneable iterator over where they are held: a `Vec`'s slice,
-/// the builder's persistent vector) with the chosen page-write pieces, never
-/// collected. A pass that must read the calls twice clones the merge before
-/// the first pass: O(1) plus the pieces left, which are few. Pure.
-#[expect(
-    dead_code,
-    reason = "interfaces of the one-copy slice (latency-upkeep.md, slice 5), wired by it"
-)]
+/// [`close_calls`]'s lazy merge in journal order: the open's own calls with
+/// the chosen page-write pieces, never collected. A pass that must read the
+/// calls twice clones the merge before the first pass: O(1) plus the pieces
+/// left, which are few. Pure.
 #[derive(Clone)]
 pub(in crate::tree_actor) struct CloseCalls<'a, L: Located + 'a, O>
 where
@@ -276,36 +266,61 @@ where
 {
     type Item = CloseCall<'a, L>;
 
-    /// The next call by journal number; an own call first at a tie, as
-    /// [`close_calls`] orders them.
+    /// The next call by journal number. An own call and a piece never share
+    /// one; were they to, the piece would come first.
     fn next(&mut self) -> Option<CloseCall<'a, L>> {
-        todo!(
-            "{}",
-            self.own.peek().is_some() || self.pieces.peek().is_some()
+        let own_first = match (self.own.peek(), self.pieces.peek()) {
+            (None, None) => return None,
+            (Some(_), None) => true,
+            (None, Some(_)) => false,
+            (Some((call, _, _)), Some((write, _))) => call < write,
+        };
+        if own_first {
+            let (_, call, at) = self.own.next()?;
+            Some(CloseCall::Own(call, at))
+        } else {
+            let (_, piece) = self.pieces.next()?;
+            let (call, at) = piece.into_call();
+            Some(CloseCall::Piece(call, at))
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let (own_low, own_high) = self.own.size_hint();
+        let pieces = self.pieces.len();
+        (
+            own_low.saturating_add(pieces),
+            own_high.and_then(|high| high.checked_add(pieces)),
         )
     }
 }
 
 /// The calls a close of an open applies to the saved bytes: [`close_calls`]
 /// over [`close_pieces`]. The same function live and at recovery.
-pub(in crate::tree_actor) fn calls_for_close(
+pub(in crate::tree_actor) fn calls_for_close<'a>(
     saved_len: u64,
-    own: &[(u64, Call, FramePos)],
+    own: &'a [(u64, Call, FramePos)],
     writes: &[(u64, Run)],
     saved_through: u64,
-) -> Vec<(Call, FramePos)> {
-    close_calls(own, &close_pieces(saved_len, own, writes, saved_through))
+) -> CloseCalls<'a, FramePos, std::slice::Iter<'a, (u64, Call, FramePos)>> {
+    close_calls(
+        own.iter(),
+        close_pieces(saved_len, own, writes, saved_through),
+    )
 }
 
 /// The calls a recorded save applies: the open's own calls merged with its
 /// page-write pieces, each resolved in the file's page writes; `None` when a
 /// piece names no run of its record. The builder's replay
 /// ([`super::layout::Layout::replay`]) and `agentfs verify` run it.
-pub(in crate::tree_actor) fn recorded_close_calls<L: Located>(
-    own: &[(u64, Call, L)],
+pub(in crate::tree_actor) fn recorded_close_calls<'a, L: Located + 'a, O>(
+    own: O,
     writes: &[(u64, Run<L>)],
     pieces: &[PagePiece],
-) -> Option<Vec<(Call, L)>> {
+) -> Option<CloseCalls<'a, L, O>>
+where
+    O: Iterator<Item = &'a (u64, Call, L)> + Clone,
+{
     let mut resolved = Vec::with_capacity(pieces.len());
     for piece in pieces {
         let record = piece.record.get();
@@ -316,7 +331,7 @@ pub(in crate::tree_actor) fn recorded_close_calls<L: Located>(
             .collect();
         resolved.push((record, resolve_piece(&runs, piece.offset, piece.len)?));
     }
-    Some(close_calls(own, &resolved))
+    Some(close_calls(own, resolved))
 }
 
 /// A piece of a page write, from its runs: the part of the run that holds
@@ -494,8 +509,8 @@ impl TreeActor {
         }
         own.sort_by_key(|(seq, _, _)| *seq);
         let mut image = saved.clone();
-        for (call, pos) in calls_for_close(saved.len(), &own, &state.writes, state.saved_through) {
-            image.apply(&call, &pos)?;
+        for call in calls_for_close(saved.len(), &own, &state.writes, state.saved_through) {
+            image.apply(call.call(), call.at())?;
         }
         if let Some(state) = self.pages.get_mut(key) {
             state.image = Some(image);
@@ -734,11 +749,104 @@ mod tests {
         }
     }
 
-    fn replay(mut map: FileMap, calls: &[(Call, FramePos)]) -> Vec<u8> {
-        for (call, pos) in calls {
-            map.apply(call, pos).unwrap();
+    fn replay<'a>(
+        mut map: FileMap,
+        calls: impl Iterator<Item = CloseCall<'a, FramePos>>,
+    ) -> Vec<u8> {
+        for call in calls {
+            map.apply(call.call(), call.at()).unwrap();
         }
         map.to_vec().unwrap()
+    }
+
+    /// The oracle: the merge as it was before it went lazy, which collected
+    /// the open's calls and the pieces into one vector.
+    fn vector_merge<L: Located>(
+        own: &[(u64, Call, L)],
+        pieces: &[(u64, Run<L>)],
+    ) -> Vec<(Call, L)> {
+        let mut calls = Vec::with_capacity(own.len() + pieces.len());
+        let mut own = own.iter().peekable();
+        let mut pieces = pieces.iter().peekable();
+        loop {
+            let call_first = match (own.peek(), pieces.peek()) {
+                (None, None) => return calls,
+                (Some(_), None) => true,
+                (None, Some(_)) => false,
+                (Some((call, _, _)), Some((write, _))) => call < write,
+            };
+            if call_first {
+                if let Some((_, call, pos)) = own.next() {
+                    calls.push((call.clone(), pos.clone()));
+                }
+            } else if let Some((_, piece)) = pieces.next() {
+                calls.push(piece.call());
+            }
+        }
+    }
+
+    /// A small deterministic generator: the property needs no crate.
+    struct Rng(u64);
+
+    impl Rng {
+        fn next(&mut self, below: u64) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0 % below.max(1)
+        }
+    }
+
+    fn owned<'a, L: Located + 'a>(calls: impl Iterator<Item = CloseCall<'a, L>>) -> Vec<(Call, L)> {
+        calls.map(|c| (c.call().clone(), c.at().clone())).collect()
+    }
+
+    #[test]
+    fn the_lazy_merge_matches_the_vector() {
+        use super::super::layout::Place;
+        use crate::tree_actor::journal::durable::RecordNo;
+        for seed in 1..=500u64 {
+            let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
+            // Journal numbers 1.., each an own call, a piece or neither:
+            // the two never share one.
+            let (mut own, mut pieces) = (Vec::new(), Vec::new());
+            for seq in 1..=rng.next(40) {
+                let at = Place {
+                    record: RecordNo::new(seq),
+                    at: rng.next(100),
+                };
+                let (offset, len) = (rng.next(64), rng.next(16));
+                match rng.next(3) {
+                    0 => {
+                        let call = match rng.next(3) {
+                            0 => Call::Write { offset, len },
+                            1 => Call::Append { len },
+                            _ => Call::Truncate(offset),
+                        };
+                        own.push((seq, call, at));
+                    }
+                    1 => pieces.push((seq, Run { offset, len, at })),
+                    _ => {}
+                }
+            }
+            let expected = vector_merge(&own, &pieces);
+            let mut lazy = close_calls(own.iter(), pieces.clone());
+            assert_eq!(
+                lazy.size_hint(),
+                (expected.len(), Some(expected.len())),
+                "seed {seed}"
+            );
+            let half = expected.len() / 2;
+            let first: Vec<(Call, Place)> = owned(lazy.by_ref().take(half));
+            let clone = lazy.clone();
+            let rest = owned(lazy);
+            assert_eq!([first.clone(), rest].concat(), expected, "seed {seed}");
+            assert_eq!(
+                owned(clone),
+                expected[half..],
+                "seed {seed}: the clone midway"
+            );
+        }
     }
 
     #[test]
@@ -890,7 +998,7 @@ mod tests {
         for (saved, own, writes, saved_through, expected, why) in cases {
             let calls = calls_for_close(saved.len() as u64, &own, &writes, saved_through);
             let map = t.map(saved);
-            assert_eq!(replay(map, &calls), expected, "{why}");
+            assert_eq!(replay(map, calls), expected, "{why}");
         }
     }
 
