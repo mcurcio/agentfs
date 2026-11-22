@@ -1,44 +1,77 @@
 //! The journal's commit point: appending a step's record, and what the actor
-//! does under its lock at a built event so history's compactor can let the
-//! journal go behind it (target git-model §3; docs/trees.md, "Recording and
+//! does under its lock at a built point so history's compactor can let the
+//! journal go behind it: the switch record, and its positions moved to
+//! carried frames (target git-model §3; docs/trees.md, "Recording and
 //! durability").
 
 use super::durable::RecordNo;
 use super::segment::FramePos;
-use super::{Entry, Record, Target};
+use super::{Entry, PointerChange, Record, Switched};
 use crate::tree_actor::stages::{Hold, section};
 use crate::tree_actor::{Error, Result, TreeActor, now_ns};
 
 impl TreeActor {
-    /// At a built event, under the lock: every pointer whose value is a step
-    /// at or below History's built point becomes the oid that step built,
-    /// row chains included, and each switch is told to History before the
-    /// next record ([`History::switched`], C3, C4): no record from then on
-    /// names that step, so a checkpoint past it lets the step head go.
-    /// O(pointers).
+    /// Appends one [`Entry::Switch`] for every pointer whose step History
+    /// has built and whose built value its snapshot holds, row chains
+    /// included, then applies it: append first, apply second, as a step
+    /// does. Returns the record, or `None` when there was nothing to switch,
+    /// the append failed or the actor has stopped. A failed append changes
+    /// no pointer and is tried again at the next built point.
     ///
-    /// [`History::switched`]: crate::tree_actor::History::switched
-    pub(in crate::tree_actor) fn switch_built(&mut self) {
+    /// Called under the lock in the two places the actor acts on a built
+    /// point: in `record_with`, right after a step's record, and in
+    /// `on_built`. Each caller passes the record returned to
+    /// `History::want_through`. O(1) when the built point has not moved
+    /// since the last full pass; otherwise O(pointers at a step) and one
+    /// append. No fsync, no journal read, no unlink.
+    ///
+    /// "Whose built value its snapshot holds": a fork's branch is set by its
+    /// fork step f to its upstream's value `Step(s)`, s < f, and History
+    /// holds it only once f is built. Until then it stays a step, and is
+    /// never given another pointer's oid.
+    ///
+    /// A step keeps its own time: the switch record never moves
+    /// `last_at_ns`, which the step just recorded applies its shape with, as
+    /// recovery and the builder do from the step's own record.
+    pub(in crate::tree_actor) fn switch_built(&mut self) -> Option<RecordNo> {
+        if self.is_stopped() {
+            return None;
+        }
         let snapshot = self.history.snapshot();
-        // EXPERIMENT (erratum 2026-11-22): only steps a published checkpoint
-        // keeps the head of, whose oid a fold from it knows.
-        let built = snapshot.at().min(self.history.checkpointed().built);
-
-        let at = RecordNo::new(self.next);
-        let switched: Vec<(String, RecordNo, String)> = self
-            .pointers
+        let built = snapshot.at();
+        if self.switched_at == Some(built) {
+            return None;
+        }
+        let pointers: Vec<Switched> = self
+            .at_steps
             .iter()
-            .filter_map(|(name, target)| match target {
-                Target::Step(step) if *step <= built => {
-                    let oid = snapshot.pointers().get(name)?;
-                    Some((name.clone(), *step, oid.to_string()))
-                }
-                _ => None,
+            .filter(|(_, step)| **step <= built)
+            .filter_map(|(name, step)| {
+                Some(Switched {
+                    name: name.clone(),
+                    step: *step,
+                    oid: snapshot.pointers().get(name)?.to_string(),
+                })
             })
             .collect();
-        for (name, step, oid) in switched {
-            self.pointers.set(&name, Some(Target::Oid(oid)));
-            self.history.switched(&name, step, at);
+        if pointers.is_empty() {
+            self.switched_at = Some(built);
+            return None;
+        }
+        let changes: Vec<PointerChange> = pointers.iter().map(Switched::change).collect();
+        let step_at_ns = self.last_at_ns;
+        let appended = self.append_record(Entry::Switch { pointers }, &[]);
+        self.last_at_ns = step_at_ns;
+        match appended {
+            Ok((seq, _)) => {
+                self.apply_pointers(&changes);
+                self.switched_at = Some(built);
+                Some(RecordNo::new(seq))
+            }
+            Err(e) => {
+                eprintln!("tree CompactionFailed: the switch record: {e}");
+                None
+            }
         }
     }
 

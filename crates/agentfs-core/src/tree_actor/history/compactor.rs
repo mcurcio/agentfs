@@ -35,12 +35,6 @@ pub(in crate::tree_actor) struct AtBuilt {
     pub objects: BuiltObjects,
     /// The builder's trees at B: the checkpoint's `locals` come from their shapes.
     pub trees: imbl::OrdMap<TreeId, Tree>,
-    /// Each pointer the actor switched from a step to an oid: the step, and
-    /// the record before which it switched ([`History::switched`]), kept
-    /// until a published checkpoint's `built` reaches that record. The
-    /// checkpoint drops the pointer's step head when the fold gives that
-    /// step and the switch is at or before B + 1 (C3, C4).
-    pub switched: imbl::OrdMap<String, (RecordNo, RecordNo)>,
 }
 
 /// The default floor of the due length: `Upkeep::default().compact_from`.
@@ -133,18 +127,13 @@ fn run(history: &History, journal: &JournalCompaction, compact_from: u64) {
 /// fold of the records at or below it (C8). `carried` is left empty:
 /// [`Sealed::new`] writes it.
 fn checkpoint_at(at: &AtBuilt, folded: &Folded) -> Checkpoint {
-    let next = at.built.next();
+    // The fold alone says which pointers stand at a step at B (C4): a
+    // switch record at or below B has made its pointer an oid already.
     let step_heads: BTreeMap<String, RecordNo> = folded
         .pointers
         .iter()
         .filter_map(|(name, target)| match target {
-            Target::Step(step) => {
-                let let_go = at
-                    .switched
-                    .get(name)
-                    .is_some_and(|switch| switch.0 == *step && switch.1 <= next);
-                (!let_go).then(|| (name.clone(), *step))
-            }
+            Target::Step(step) => Some((name.clone(), *step)),
             Target::Oid(_) => None,
         })
         .collect();

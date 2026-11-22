@@ -78,7 +78,7 @@ pub(in crate::tree_actor) const CHECKPOINT_TMP: &str = "checkpoint.tmp";
 /// | `page_saved` | the fold's last saving step per file with a live write-open (`Folded::saved_through`) |
 /// | `page_writes` | the page writes the fold holds (`Folded::page_writes`), sorted, each once |
 /// | `chunks` | the fold's chunk records no take, replace or save step has taken yet (`Folded::bytes`) |
-/// | `step_heads` | every pointer, row chains included, the fold gives as `Target::Step(s)`, unless the actor switched it from that step to its oid before record B + 1 (`AtBuilt::switched`). Its oid is `pointers[pointer]`. At most one per pointer (C3, C4) |
+/// | `step_heads` | every pointer, row chains included, the fold gives as `Target::Step(s)`: one a switch record at or below B names is an oid there. Its oid is `pointers[pointer]`. At most one per pointer (C3, C4) |
 /// | `carried` | the carry files this checkpoint names live frames in, written only by [`Sealed::new`] |
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(in crate::tree_actor) struct Checkpoint {

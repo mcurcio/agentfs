@@ -367,8 +367,18 @@ pub struct TreeActor {
     relocated: u64,
     /// The history's repack task, beside the builder; stopped after it.
     repacker: Option<Repacker>,
-    /// The pointers as the journal's records name them.
+    /// The pointers as the journal's records name them. They change only by
+    /// an appended record's changes ([`TreeActor::apply_pointers`]): a
+    /// step's, or a switch's.
     pointers: Pointers<Target>,
+    /// The pointers whose value is a step, each with that step: what
+    /// [`TreeActor::switch_built`] passes over, so its pass is bounded by
+    /// the pointers not yet switched and never by the volume's pointers.
+    at_steps: BTreeMap<String, RecordNo>,
+    /// The built point of the last full pass of
+    /// [`TreeActor::switch_built`]. None at open, so the first act after a
+    /// reopen makes a full pass.
+    switched_at: Option<RecordNo>,
     /// Each fork's upstream. The root has none.
     upstreams: Upstreams,
     trees: BTreeMap<TreeId, SavedTree>,
@@ -904,6 +914,13 @@ impl TreeActor {
                 history.appended_step(record.seq, change.build_cost()?);
             }
         }
+        // A switch record past the last step is no step: the builder is
+        // asked through it, as the actor asked when it appended it.
+        if let Some((record, _)) = frames[upto..].last()
+            && matches!(record.entry, Entry::Switch { .. })
+        {
+            history.want_through(record.seq);
+        }
         let builder = Builder {
             state,
             reader: JournalReader::open(Arc::clone(durability), salt, built)?,
@@ -1057,6 +1074,15 @@ impl TreeActor {
             compactor: None,
             relocated: 0,
             repacker: None,
+            at_steps: folded
+                .pointers
+                .iter()
+                .filter_map(|(name, target)| match target {
+                    Target::Step(step) => Some((name.clone(), *step)),
+                    Target::Oid(_) => None,
+                })
+                .collect(),
+            switched_at: None,
             // As the records name them: a step not yet built by its number.
             pointers: folded.pointers,
             upstreams: folded.upstreams,
@@ -1665,7 +1691,7 @@ impl TreeActor {
                 return Err(e);
             }
         };
-        self.pointers.apply_targets(&pointers);
+        self.apply_pointers(&pointers);
         for moved in &pointers {
             if let Some(moved) = refs::tree_of_branch(&moved.name) {
                 self.heads.insert(moved, RecordNo::new(seq));
@@ -1674,8 +1700,28 @@ impl TreeActor {
         // Each chain was checked before the record: this cannot fail.
         self.rows.apply(&rows)?;
         apply_sources(&mut self.sources, sources);
+        // The actor acts on the built point here: the switch record comes
+        // right behind the step's, never between a step's records.
+        let switched = self.switch_built();
         self.history.appended_step(RecordNo::new(seq), cost);
+        // A batch already running may end one record short of the switch
+        // record: the want makes the next one follow.
+        if let Some(switched) = switched {
+            self.history.want_through(switched);
+        }
         Ok((seq, tails, pos))
+    }
+
+    /// Applies an appended record's pointer changes: the one place the
+    /// actor's pointers move.
+    pub(in crate::tree_actor) fn apply_pointers(&mut self, changes: &[PointerChange]) {
+        self.pointers.apply_targets(changes);
+        for change in changes {
+            match &change.new {
+                Some(Target::Step(step)) => self.at_steps.insert(change.name.clone(), *step),
+                _ => self.at_steps.remove(&change.name),
+            };
+        }
     }
 
     /// Takes each map the builder built that is the same save as the actor's
@@ -1719,16 +1765,22 @@ impl TreeActor {
     pub(in crate::tree_actor) fn on_built(&mut self) {
         self.caught_up();
         self.rebase_built();
+        // No step follows this switch record, and the builder builds only
+        // what it is asked to: a volume at rest is built through its last
+        // record.
+        if let Some(switched) = self.switch_built() {
+            self.history.want_through(switched);
+        }
     }
 
     /// What the actor does under its lock at a built point it has not seen:
-    /// its saved trees onto the builder's ([`TreeActor::rebuild`]), its step
-    /// values switched to the oids built for them
-    /// ([`TreeActor::switch_built`]), and its positions moved to what the
-    /// compactor carried ([`TreeActor::relocate_if_moved`]).
+    /// its saved trees onto the builder's ([`TreeActor::rebuild`]), and its
+    /// positions moved to what the compactor carried
+    /// ([`TreeActor::relocate_if_moved`]). It appends nothing: a step's
+    /// record and `on_built` are where the switch record goes
+    /// ([`TreeActor::switch_built`]).
     fn caught_up(&mut self) {
         self.rebuild();
-        self.switch_built();
         self.relocate_if_moved();
     }
 

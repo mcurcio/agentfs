@@ -178,6 +178,34 @@ pub(super) enum Entry {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         rows: Vec<RowRecord>,
     },
+    /// The pointers named are their oids from this record on. Never empty.
+    /// Not a step: no writer, no commit, no lag. The actor appends it at a
+    /// built point (`TreeActor::switch_built`), and recovery's fold replays
+    /// it, so every value a later record names was set by a record before
+    /// it (docs/trees.md, "Recording and durability").
+    Switch { pointers: Vec<Switched> },
+}
+
+/// One pointer the actor switched at a built point: from the step that set
+/// its value to the oid that step built.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(super) struct Switched {
+    pub name: String,
+    pub step: RecordNo,
+    pub oid: String,
+}
+
+impl Switched {
+    /// As a pointer change: `old` is `Target::Step(step)`, `new` is
+    /// `Target::Oid(oid)`. The one form the actor applies and the fold
+    /// replays.
+    pub(super) fn change(&self) -> PointerChange {
+        PointerChange {
+            name: self.name.clone(),
+            new: Some(Target::Oid(self.oid.clone())),
+            old: Some(Target::Step(self.step)),
+        }
+    }
 }
 
 /// One event commit the build writes, in order: `chain` its ref

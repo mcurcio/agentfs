@@ -188,10 +188,6 @@ struct State {
     /// restart reads: the last checkpoint's `built`, or the record before
     /// its oldest step head when that is earlier.
     checkpointed_through: RecordNo,
-    /// Each pointer the actor switched from a step to an oid: the step, and
-    /// the record before which it switched. Kept until a published
-    /// checkpoint's `built` reaches that record (C3, C4).
-    switched: imbl::OrdMap<String, (RecordNo, RecordNo)>,
     /// A compaction stopped the actor: every checkpoint wait ends.
     compaction_stopped: bool,
     /// Built files' maps the actor has not taken yet, in the order built:
@@ -344,7 +340,6 @@ impl History {
                         built: opened.built(),
                     },
                     checkpointed_through: redo_through(opened.built(), opened.oldest_head()),
-                    switched: imbl::OrdMap::new(),
                     compaction_stopped: false,
                     gate: super::lag::LagGate::default(),
                     maps: Vec::new(),
@@ -579,39 +574,22 @@ impl History {
             pointers: Arc::clone(&state.pointers),
             objects: state.objects.clone(),
             trees: state.trees.clone()?,
-            switched: state.switched.clone(),
         })
-    }
-
-    /// The actor switched `pointer` from step `step` to the oid it was built
-    /// as, under its lock, before appending record `at`: no record from `at`
-    /// on names that step. Kept until a published checkpoint's `built`
-    /// reaches `at` (C3, C4); a later switch of the pointer replaces it.
-    /// O(log pointers).
-    pub(in crate::tree_actor) fn switched(&self, pointer: &str, step: RecordNo, at: RecordNo) {
-        self.state().switched.insert(pointer.to_owned(), (step, at));
     }
 
     /// A checkpoint at `published.built()` is in place: only now may History
     /// forget the built-log entries it covers (C3). From now
     /// [`History::checkpointed_through`] reports `published.built()`, or the
     /// record before `published.oldest_head()` when that is earlier, so the
-    /// builder keeps every step head a later record may name. Drops each
-    /// switch the checkpoint counted (`at <= built`), moves the generation
-    /// and the epoch, and counts the checkpoint (`Stages::checkpoints`). The
-    /// compactor's alone. O(switches).
+    /// builder keeps every step head a later record may name. Moves the
+    /// generation and the epoch, and counts the checkpoint
+    /// (`Stages::checkpoints`). The compactor's alone. O(1).
     pub(in crate::tree_actor) fn published(
         &self,
         published: &crate::tree_actor::journal::compaction::Published,
     ) {
         let mut state = self.state();
         let built = published.built();
-        state.switched = state
-            .switched
-            .iter()
-            .filter(|(_, (_, at))| *at > built)
-            .map(|(pointer, switch)| (pointer.clone(), *switch))
-            .collect();
         state.checkpointed = Checkpointed {
             generation: state.checkpointed.generation + 1,
             built,

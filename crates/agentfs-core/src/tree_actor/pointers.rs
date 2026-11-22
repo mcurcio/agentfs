@@ -61,9 +61,8 @@ impl Pointers<Target> {
     ///
     /// [`Error::PointerMoved`] when a change's `old` differs from the pointer
     /// now: a bug in the step that made it, caught before its record. A step's
-    /// value and an oid never match: a value read before a compaction is
-    /// named as the oid it was built as before this check
-    /// (`TreeActor::resolve_compacted`).
+    /// value and an oid never match: a pointer is a step until the switch
+    /// record that names it (`Entry::Switch`), and its oid from then on.
     pub fn check_targets(&self, changes: &[PointerChange]) -> Result<()> {
         for change in changes {
             if self.0.get(&change.name) != change.old.as_ref() {
