@@ -2273,3 +2273,17 @@ The slice is built: FLUSH answers at once (`Recording::flush`), a client's end n
 - **A client's end has no test of its own** for "waits for no fsync": `hold_fsync_with` is private to `tree_actor`, and `session.rs` is outside it. The change is one call removed.
 - **The first commit of the slice has a `wip(trees)` subject**: pushed to the wip branch before the rule against amending could be weighed against the subject. The later commits are conventional.
 - **Not run.** `ci/power-loss-trees.sh` (no `dm_log_writes` in the container): its two workloads and its checker were run on a local mount with `dmsetup` faked, each mark judged on a live copy of the state area, which is a kill's image, not a power cut's. `cargo test --workspace` in one invocation (run as five invocations that cover every package). The mdBook build.
+
+## 2026-11-22, PR #41 at 26ddacf: both phase-1 power-loss jobs red, in the driver's own wait (no power cut judged)
+
+**The red.** `ci/power-loss-trees.sh:238-240`, the held-file leg's wait before the `HC 1` mark, times out after 600 s on ext4 and xfs alike: "a compaction carrying h's frames: not reached", with `checkpoints 1`, `journal_carried_bytes 0`, `journal_dropped 0`, everything built and the compactor idle. No image was replayed and the oracle judged nothing, so this is not a durability failure.
+
+**Mechanism (read from the code and the metrics, not run).** The one compaction ran while `big` was still open, so nothing was covered and it carried and dropped nothing. It still set `len_after_last` (`history/compactor.rs`), and the next compaction is due at `max(64 MiB, 2 x len_after_last)`. The journal ends at about 151 MB, under twice the 74 MiB it held then, so no later compaction is ever due. The script's comment "the only built event from big's first byte to its save is that save's" is stale: every batch end is a built event to the compactor, batches with no step included. Which no-step batch fired is not proven; the likeliest is the take worker asking history to build through the last appended record while fork syncs of the new no-fsync legs are still queued (`at_rest` does not check `queued`).
+
+**For the end fix round (test only):**
+1. `at_rest` also requires `queued == 0`.
+2. Do not depend on a single compaction: after `close(big)`, while nothing is carried, write and close further logged files, each at least the journal's current length, bounded to about 3; `big` is saved by then, so the next due compaction must carry `h`.
+3. On failure print `history.built_through`, `queued`, `stages.compaction.count` at each metrics rename while `big` is open, and `mount.log`.
+Proof: both power-loss jobs reach `ack-hc-1` and the oracle judges every cut.
+
+**A product question this exposes (do not fix in the fix round; report it):** a compaction that frees nothing still doubles the threshold for the next one, so dead bytes can sit in the journal until it doubles again. Counting only what a compaction left behind after it freed something would retry a fruitless fold at every built event while a file is held open, so the rule needs a design answer, not a patch.
