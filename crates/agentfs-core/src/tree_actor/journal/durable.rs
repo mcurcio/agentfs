@@ -221,9 +221,23 @@ impl Durability {
         self.state().carries.clone()
     }
 
-    /// The journal's length: every linked segment, every carry file, and
-    /// every unlinked file a reader still holds. What compaction is due by,
-    /// and `Metrics::journal_bytes`.
+    /// The linked files' length: every segment in the table and every carry
+    /// file. What compaction is due by: an unlinked file a reader still
+    /// holds is on its way out, and counting it would raise the next due
+    /// length by bytes no compaction can free.
+    pub(in crate::tree_actor) fn linked(&self) -> u64 {
+        let state = self.state();
+        state
+            .segments
+            .iter()
+            .chain(&state.carries)
+            .map(|s| s.len())
+            .sum()
+    }
+
+    /// The journal's length on disk: every linked segment, every carry file,
+    /// and every unlinked file a reader still holds.
+    /// `Metrics::journal_bytes`.
     pub(in crate::tree_actor) fn len(&self) -> u64 {
         let mut state = self.state();
         state.unlinked.retain(|held| held.strong_count() > 0);

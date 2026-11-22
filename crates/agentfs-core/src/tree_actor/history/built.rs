@@ -192,6 +192,9 @@ struct State {
     /// restart reads: the last checkpoint's `built`, or the record before
     /// its oldest step head when that is earlier.
     checkpointed_through: RecordNo,
+    /// The generation of the last checkpoint whose compaction has ended
+    /// ([`History::compaction_ended`]).
+    compacted: u64,
     /// A compaction stopped the actor: every checkpoint wait ends.
     compaction_stopped: bool,
     /// Built files' maps the actor has not taken yet, in the order built:
@@ -344,6 +347,7 @@ impl History {
                         built: opened.built(),
                     },
                     checkpointed_through: redo_through(opened.built(), opened.oldest_head()),
+                    compacted: 0,
                     compaction_stopped: false,
                     gate: super::lag::LagGate::default(),
                     maps: Vec::new(),
@@ -429,6 +433,40 @@ impl History {
     pub(in crate::tree_actor) fn compaction_stopped(&self) {
         self.state().compaction_stopped = true;
         self.notify();
+    }
+
+    /// The compactor's compaction ended, after its unlink or its failure:
+    /// the checkpoint counted now has nothing of its compaction in flight.
+    /// Moves the epoch, so the journal's figures are read again after the
+    /// unlink. The compactor thread's alone.
+    pub(in crate::tree_actor) fn compaction_ended(&self) {
+        let mut state = self.state();
+        state.compacted = state.checkpointed.generation;
+        state.epoch += 1;
+        drop(state);
+        self.notify();
+    }
+
+    /// Returns once the compaction that published the checkpoint of
+    /// `generation` has ended: what it covers is unlinked, or its unlink
+    /// failed and was logged. [`History::wait_checkpointed`] returns at the
+    /// publish, which comes before the unlink.
+    ///
+    /// # Errors
+    ///
+    /// [`WaitError::Stopped`] at shutdown, or once a compaction stopped the
+    /// actor.
+    pub fn wait_compacted(&self, generation: u64) -> Result<(), WaitError> {
+        let mut state = self.state();
+        loop {
+            if state.compacted >= generation {
+                return Ok(());
+            }
+            if state.compaction_stopped || state.stopped || state.stopping {
+                return Err(WaitError::Stopped);
+            }
+            state = self.wait(state);
+        }
     }
 
     /// How many times the builder was asked: a test's sign that a waiter

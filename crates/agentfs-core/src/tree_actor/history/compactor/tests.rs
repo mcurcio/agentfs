@@ -198,6 +198,14 @@ impl Parked {
     fn end(self) {}
 }
 
+/// A new volume whose compactor parks at `parked`, which is dropped first:
+/// a failed assertion ends the gate before the volume's shutdown joins its
+/// compactor.
+fn gated(dir: &Path, upkeep: impl FnOnce(Arc<ChannelGate>) -> Upkeep) -> (TreeActor, Parked) {
+    let (gate, parked) = Parked::pair();
+    (new_actor_with(dir, upkeep(gate)), parked)
+}
+
 /// Holds the builder: each batch parks at its start until released.
 struct Held {
     parked: Receiver<()>,
@@ -258,8 +266,7 @@ fn a_compaction_threshold_is_constants() {
 fn a_kill_at_each_gap_keeps_every_returned_call() {
     for gap in Gap::ALL {
         let tmp = tempfile::tempdir().unwrap();
-        let (gate, parked) = Parked::pair();
-        let mut v = new_actor_with(tmp.path(), Upkeep::gated(gate));
+        let (mut v, parked) = gated(tmp.path(), |gate| Upkeep::gated(gate));
         let before = (v.history().checkpointed(), v.history().checkpointed_through());
         put(&mut v, ROOT, "a", b"one");
         parked.until(gap);
@@ -290,12 +297,10 @@ fn a_kill_at_each_gap_keeps_every_returned_call() {
 #[test]
 fn an_append_during_the_coverage_gap_survives_a_kill() {
     let tmp = tempfile::tempdir().unwrap();
-    let (gate, parked) = Parked::pair();
-    let upkeep = Upkeep {
+    let (mut v, parked) = gated(tmp.path(), |gate| Upkeep {
         gate: Some(gate),
         ..Upkeep::default()
-    };
-    let mut v = new_actor_with(tmp.path(), upkeep);
+    });
     put(&mut v, ROOT, "a", b"one");
     parked.until(Gap::Covered);
     // The newest segment starts at or before B: the call lands in it.
@@ -472,8 +477,7 @@ fn a_forks_branch_is_the_only_head_and_its_first_save_folds() {
 fn calls_run_while_the_compactor_is_parked() {
     for gap in Gap::ALL {
         let tmp = tempfile::tempdir().unwrap();
-        let (gate, parked) = Parked::pair();
-        let mut v = new_actor_with(tmp.path(), Upkeep::gated(gate));
+        let (mut v, parked) = gated(tmp.path(), |gate| Upkeep::gated(gate));
         put(&mut v, ROOT, "a", b"one");
         parked.until(gap);
         let (done, finished) = mpsc::channel();

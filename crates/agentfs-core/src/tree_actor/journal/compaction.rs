@@ -843,11 +843,12 @@ impl JournalCompaction {
         Ok(stats)
     }
 
-    /// The journal's length: every linked segment, every carry file, and
-    /// every unlinked file a reader still holds (C6). What compaction is
-    /// due by.
+    /// The linked files' length, segments and carry files: what compaction
+    /// is due by (`Durability::linked`). An unlinked file a reader still
+    /// holds (C6) counts in `Durability::len`, the journal's figure, and
+    /// not here.
     pub(in crate::tree_actor) fn len(&self) -> u64 {
-        self.durability.len()
+        self.durability.linked()
     }
 }
 

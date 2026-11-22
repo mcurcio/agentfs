@@ -1897,6 +1897,9 @@ pub(crate) mod test_support {
                 .wait_checkpointed(last.generation)
                 .expect("a checkpoint is published");
         }
+        history
+            .wait_compacted(last.generation)
+            .expect("its compaction ends");
         last
     }
 
@@ -2537,7 +2540,8 @@ mod tests {
         v.history().wait_built(step).unwrap();
         // The built event of the close's batch compacts, on history's
         // thread: the log's writes after it hold nothing back.
-        v.history().wait_checkpointed(generation).unwrap();
+        let published = v.history().wait_checkpointed(generation).unwrap();
+        v.history().wait_compacted(published.generation).unwrap();
         assert!(v.metrics().journal_dropped >= 1);
         // The linked files: an unlinked segment a holder still reads counts
         // in `Durability::len` until it lets go (C6), which the deferred

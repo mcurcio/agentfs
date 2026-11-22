@@ -9,7 +9,9 @@ use std::os::unix::fs::FileExt;
 
 use agentfs_contracts::name::WriterLabel;
 use agentfs_contracts::pod::PodContext;
-use agentfs_core::tree_actor::{Error, RenameMode, Saved, Took, TreeActor, TreeId};
+use agentfs_core::tree_actor::{
+    Error, Gap, RecordNo, RenameMode, Saved, Took, TreeActor, TreeId, Upkeep,
+};
 use trees::{ATTRS, checkout, fanned, new_actor, reopen, reopen_after_kill, rowless_fork, writer};
 
 const ROOT: TreeId = TreeId::Root;
@@ -1145,11 +1147,12 @@ fn a_frame_in_a_workloads_bytes_is_not_a_frame() {
     let tmp = tempfile::tempdir().unwrap();
     let mut v = new_actor(tmp.path());
     let path = trees::current_segment(tmp.path());
-    let salt = u32::from_le_bytes(fs::read(&path).unwrap()[4..8].try_into().unwrap());
     let h = v
         .write_open(ROOT, "a", &writer("writer"), Some(ATTRS))
         .unwrap();
     v.write(h, 0, b"returned", false).unwrap();
+    // The journal's salt: every frame carries it.
+    let salt = u32::from_le_bytes(fs::read(&path).unwrap()[4..8].try_into().unwrap());
     let built = built_so_far(&v, tmp.path());
     let mut bytes = b"workload ".to_vec();
     bytes.extend_from_slice(&forged(salt ^ 1));
@@ -1254,19 +1257,29 @@ fn an_earlier_format_does_not_open() {
 #[test]
 fn open_numbers_never_repeat_across_compaction() {
     let tmp = tempfile::tempdir().unwrap();
-    let mut v = new_actor(tmp.path());
+    let mut v = trees::new_actor_with(tmp.path(), trees::compacting());
     let first = put(&mut v, ROOT, "a", b"one");
+    let settled = v.settle().unwrap();
+    let checkpoint = trees::compacted_through(&v, settled);
     drop(v);
-    // Every open compacts; the journal then holds only a checkpoint.
-    drop(reopen(tmp.path()));
-    // Nothing but checkpoints can say what the next number is now.
-    assert_eq!(trees::segments(tmp.path()).len(), 1);
-    let journal = fs::read(trees::current_segment(tmp.path())).unwrap();
-    for (at, length) in frames(&journal) {
-        assert!(
-            String::from_utf8_lossy(&journal[at + 44..at + length]).contains("Checkpoint"),
-            "a frame past the checkpoints"
-        );
+    // The checkpoint is a file of its own: no segment holds one, and none
+    // but the newest holds a record at or below its built point. Nothing
+    // but the checkpoint can say what the next number is now.
+    let firsts = trees::segment_firsts(tmp.path());
+    let (_newest, covered) = firsts.split_last().unwrap();
+    assert!(
+        covered.iter().all(|first| *first > checkpoint.built.get()),
+        "{covered:?} at or below {:?}",
+        checkpoint.built
+    );
+    for segment in trees::segments(tmp.path()) {
+        let journal = fs::read(segment).unwrap();
+        for (at, length) in frames(&journal) {
+            assert!(
+                !String::from_utf8_lossy(&journal[at + 44..at + length]).contains("Checkpoint"),
+                "a checkpoint in a segment"
+            );
+        }
     }
     let mut v = reopen(tmp.path());
     let second = v.write_open(ROOT, "a", &writer("writer"), None).unwrap();
@@ -1281,11 +1294,12 @@ fn open_numbers_never_repeat_across_compaction() {
 }
 
 /// Takes the journal past the compaction threshold through real calls, leaving
-/// `FILLED` in the file so its save stays cheap. A compaction waits for the
-/// first call after the builder caught up: an open (closed, saving nothing) is
-/// that call.
+/// `FILLED` in the file so its save stays cheap, and returns once the
+/// compaction its built event starts has ended: history's compactor runs it,
+/// off the call path.
 const FILLED: &[u8] = b"xxxxxx";
 fn fill_journal(v: &mut TreeActor, path: &str) {
+    let generation = v.history().checkpointed().generation;
     let h = v
         .write_open(ROOT, path, &writer("filler"), Some(ATTRS))
         .unwrap();
@@ -1296,10 +1310,8 @@ fn fill_journal(v: &mut TreeActor, path: &str) {
     v.truncate(h, FILLED.len() as u64).unwrap();
     v.close(h).unwrap();
     v.settle().unwrap();
-    // An open is the first call after the builder caught up: it compacts.
-    if let Ok(h) = v.write_open(ROOT, path, &writer("filler"), None) {
-        v.close(h).unwrap();
-    }
+    let published = v.history().wait_checkpointed(generation).unwrap();
+    v.history().wait_compacted(published.generation).unwrap();
 }
 
 #[test]
@@ -1311,9 +1323,13 @@ fn a_log_held_open_does_not_pin_other_saves() {
         .unwrap();
     v.write(log, 0, b"before\n", true).unwrap();
     fill_journal(&mut v, "big");
-    // The step compacted: the other file's calls are gone, the log's stayed.
+    // The compaction ran: the segment the other file's calls filled is
+    // gone, and the log's call was carried out of it. What is left is the
+    // newest segment, which is never covered, and the carry file.
     let length = trees::journal_len(tmp.path());
-    assert!(length < 1 << 20, "journal holds {length} bytes");
+    assert!(length < 64 << 20, "journal holds {length} bytes");
+    assert_eq!(trees::segments(tmp.path()).len(), 1);
+    assert!(v.metrics().journal_carried_bytes > 0, "the log's call stayed");
     v.write(log, 0, b"after\n", true).unwrap();
     drop(v);
     let v = reopen(tmp.path());
@@ -1353,6 +1369,7 @@ fn a_held_open_pins_only_its_own_bytes() {
 
     let tmp = tempfile::tempdir().unwrap();
     let mut v = new_actor(tmp.path());
+    let generation = v.history().checkpointed().generation;
     let held = v
         .write_open(ROOT, "held", &writer("w"), Some(ATTRS))
         .unwrap();
@@ -1361,16 +1378,16 @@ fn a_held_open_pins_only_its_own_bytes() {
     }
     put(&mut v, ROOT, "small", b"dead bytes beside a live open");
     v.settle().unwrap();
-    // The first call after the builder caught up compacts: a checkpoint in a
-    // third segment, the two before it kept.
-    let poke = v.write_open(ROOT, "small", &writer("w"), None).unwrap();
-    v.close(poke).unwrap();
+    // The built event compacts: the checkpoint is a file of its own, and
+    // the two segments are kept.
+    let published = v.history().wait_checkpointed(generation).unwrap();
+    v.history().wait_compacted(published.generation).unwrap();
     assert_eq!(
         v.metrics().journal_carried_bytes,
         0,
         "a live open's frames moved"
     );
-    assert_eq!(trees::segments(tmp.path()).len(), 3);
+    assert_eq!(trees::segments(tmp.path()).len(), 2);
     assert!(trees::journal_len(tmp.path()) > 70 << 20);
     drop(v);
     let v = reopen(tmp.path());
@@ -1380,8 +1397,9 @@ fn a_held_open_pins_only_its_own_bytes() {
 /// A file held open across compactions has its frames carried forward, and
 /// the segments they came from give their space back: the journal's disk
 /// blocks, linked or unlinked but still open in this process, stay under
-/// twice its own bytes once the builder has run a batch (about ten times
-/// that while the actor's and the builder's positions held the old ones).
+/// twice its own bytes and the newest segment, which is never covered, once
+/// the builder has run a batch (three fills' worth while the actor's and
+/// the builder's positions held the old ones).
 #[test]
 fn carried_frames_free_their_old_segments() {
     let tmp = tempfile::tempdir().unwrap();
@@ -1402,7 +1420,7 @@ fn carried_frames_free_their_old_segments() {
     v.settle().unwrap();
     let blocks = trees::journal_blocks(tmp.path());
     assert!(
-        blocks < 2 * own,
+        blocks < 2 * own + (64 << 20),
         "{blocks} bytes of segment blocks for a held open of {own}"
     );
     v.write(held, 0, b"!", true).unwrap();
@@ -1524,23 +1542,6 @@ fn step_worker() {
     std::io::stdout().flush().unwrap();
     v.close(h).unwrap();
     v.settle().unwrap();
-    unreachable!("the failpoint kills this process");
-}
-
-#[cfg(feature = "failpoints")]
-#[test]
-fn compact_worker() {
-    let Some(root) = std::env::var_os("AGENTFS_TREE_STEP_WORKER") else {
-        return;
-    };
-    let mut v = new_actor(std::path::Path::new(&root));
-    let log = v
-        .write_open(ROOT, "log", &writer("logger"), Some(ATTRS))
-        .unwrap();
-    v.write(log, 0, b"returned\n", true).unwrap();
-    println!("OPEN {log}");
-    std::io::stdout().flush().unwrap();
-    fill_journal(&mut v, "big");
     unreachable!("the failpoint kills this process");
 }
 
@@ -1740,25 +1741,6 @@ fn fast_forward_worker() {
     panic!("a failpoint should have killed this worker");
 }
 
-#[cfg(feature = "failpoints")]
-#[test]
-fn a_kill_at_either_compact_failpoint_loses_nothing() {
-    let tmp = tempfile::tempdir().unwrap();
-    // The compaction at open is the first hit; the one at the step, the second.
-    for spec in [
-        "tree.compact_before_checkpoint=kill@2",
-        "tree.compact_before_drop=kill@2",
-    ] {
-        let state = tmp.path().join(spec);
-        let log = run_killed_worker("compact_worker", &state, spec);
-        let v = reopen(&state);
-        v.settle().unwrap();
-        assert_eq!(v.read(ROOT, "log").unwrap(), b"returned\n", "{spec}");
-        assert_eq!(v.read(ROOT, "big").unwrap(), FILLED, "{spec}");
-        assert_eq!(opens_saved(&state, log), 1, "{spec}");
-    }
-}
-
 /// A take of a file larger than a journal frame lands and reopens: its bytes
 /// are in chunk records before its step, its line maps hold none.
 #[test]
@@ -1785,8 +1767,8 @@ fn a_take_of_a_file_larger_than_a_frame_lands_and_reopens() {
 }
 
 /// Restart equals an uninterrupted run: a fork recorded as the first step
-/// after a compaction names the upstream's head as an oid, never a step the
-/// checkpoint covers, so a kill before its batch's built-log entry leaves a
+/// after a compaction names the upstream's head as the step the checkpoint
+/// keeps the head of, so a kill before its batch's built-log entry leaves a
 /// journal the next start builds.
 #[cfg(feature = "failpoints")]
 #[test]
@@ -1810,6 +1792,7 @@ fn fork_after_compaction_worker() {
         return;
     };
     let mut v = new_actor(std::path::Path::new(&root));
+    let generation = v.history().checkpointed().generation;
     let h = v
         .write_open(ROOT, "big", &writer("filler"), Some(ATTRS))
         .unwrap();
@@ -1821,9 +1804,13 @@ fn fork_after_compaction_worker() {
     v.truncate(h, FILLED.len() as u64).unwrap();
     v.close(h).unwrap();
     v.settle().unwrap();
+    // The close's built event compacts, on history's thread.
+    let published = v.history().wait_checkpointed(generation).unwrap();
+    v.history().wait_compacted(published.generation).unwrap();
     println!("OPEN {h}");
     std::io::stdout().flush().unwrap();
-    // The first record after history caught up: it compacts, then records.
+    // The first record after the compaction: the fork's branch is set to
+    // the root's step, whose head the checkpoint keeps.
     rowless_fork(&mut v);
     v.settle().unwrap();
     unreachable!("the failpoint kills this process");
@@ -1884,68 +1871,96 @@ fn a_file_linked_while_held_open_reopens_before_its_link_is_built() {
     );
 }
 
-#[cfg(feature = "failpoints")]
+/// The segments at or below `built` that are not the newest: what a
+/// compaction at `built` covers.
+fn covered(root: &std::path::Path, built: RecordNo) -> Vec<u64> {
+    let firsts = trees::segment_firsts(root);
+    let (_newest, rest) = firsts.split_last().unwrap();
+    rest.iter()
+        .copied()
+        .filter(|first| *first <= built.get())
+        .collect()
+}
+
+/// A compaction whose unlink fails: the checkpoint stands, the covered
+/// segments stay and the actor serves. Open does not compact, so a reopen
+/// leaves them; the next compaction lets them go.
 #[test]
 fn a_failure_before_the_drop_keeps_serving_and_the_next_compaction_drops() {
     let tmp = tempfile::tempdir().unwrap();
-    let mut v = new_actor(tmp.path());
+    let gate = trees::FailAt::new(Gap::BeforeUnlink, false);
+    let mut v = trees::new_actor_with(tmp.path(), Upkeep::gated(gate));
     put(&mut v, ROOT, "a", b"before");
-    let guard = agentfs_core::failpoints::configure("tree.compact_before_drop=error").unwrap();
-    fill_journal(&mut v, "big");
-    drop(guard);
+    let settled = v.settle().unwrap();
+    let checkpoint = trees::compacted_through(&v, settled);
     // The checkpoint stands; the old segments wait for the next compaction.
     assert!(!v.is_stopped());
     assert_eq!(v.read(ROOT, "a").unwrap(), b"before");
-    assert!(trees::journal_len(tmp.path()) > 64 << 20);
+    let kept = covered(tmp.path(), checkpoint.built);
+    assert!(!kept.is_empty(), "the covered segments stay");
     drop(v);
-    let mut v = reopen(tmp.path());
+    let mut v = trees::reopen_with(tmp.path(), trees::compacting());
     assert_eq!(v.read(ROOT, "a").unwrap(), b"before");
-    assert_eq!(v.read(ROOT, "big").unwrap(), FILLED);
-    // Open compacts: the old segments go.
-    assert!(trees::journal_len(tmp.path()) < 1 << 20);
+    assert_eq!(
+        covered(tmp.path(), checkpoint.built),
+        kept,
+        "open does not compact"
+    );
     put(&mut v, ROOT, "a", b"after");
+    let settled = v.settle().unwrap();
+    let checkpoint = trees::compacted_through(&v, settled);
+    assert_eq!(covered(tmp.path(), checkpoint.built), Vec::<u64>::new());
     assert_eq!(v.read(ROOT, "a").unwrap(), b"after");
 }
 
-#[cfg(feature = "failpoints")]
+/// A compaction that fails before its checkpoint is written changes nothing
+/// and is retried at the next built event.
 #[test]
 fn a_failure_before_the_checkpoint_is_retried_at_the_next_step() {
     let tmp = tempfile::tempdir().unwrap();
-    let mut v = new_actor(tmp.path());
-    let guard =
-        agentfs_core::failpoints::configure("tree.compact_before_checkpoint=error@*").unwrap();
-    fill_journal(&mut v, "big");
-    drop(guard);
+    let gate = trees::FailAt::new(Gap::Covered, false);
+    let mut v = trees::new_actor_with(tmp.path(), Upkeep::gated(gate.clone()));
+    let generation = v.history().checkpointed().generation;
+    put(&mut v, ROOT, "a", b"first");
+    let settled = v.settle().unwrap();
+    // Every compaction so far failed at its first gap: nothing is published.
     assert!(!v.is_stopped());
-    assert!(trees::journal_len(tmp.path()) > 64 << 20);
-    v.settle().unwrap();
+    assert_eq!(v.history().checkpointed().generation, generation);
+    assert!(!covered(tmp.path(), settled).is_empty());
+    gate.disarm();
     put(&mut v, ROOT, "a", b"next");
-    assert!(trees::journal_len(tmp.path()) < 1 << 20);
+    let settled = v.settle().unwrap();
+    let checkpoint = trees::compacted_through(&v, settled);
+    assert!(checkpoint.generation > generation);
+    assert_eq!(covered(tmp.path(), checkpoint.built), Vec::<u64>::new());
     assert_eq!(v.read(ROOT, "a").unwrap(), b"next");
 }
 
-/// A compaction's fsync that fails is sticky, as a leader's is: the page
-/// cache says nothing about the disk any more, so the actor stops and a
-/// later fsync never reports what the failed one lost as durable.
-#[cfg(feature = "failpoints")]
+/// A compaction's directory fsync that fails is sticky, as a leader's is:
+/// the page cache says nothing about the disk any more, so the actor stops
+/// and a later fsync never reports what the failed one lost as durable.
 #[test]
 fn a_failed_compaction_fsync_stops_the_actor() {
     let tmp = tempfile::tempdir().unwrap();
-    let mut v = new_actor(tmp.path());
-    let guard = agentfs_core::failpoints::configure("tree.compact_before_fsync=error").unwrap();
-    // Its last open is the first record after history caught up: it
-    // compacts, the fsync fails, and the open is refused.
-    fill_journal(&mut v, "big");
-    assert_eq!(
-        agentfs_core::failpoints::hits("tree.compact_before_fsync"),
-        1
-    );
-    drop(guard);
-    assert!(v.is_stopped());
+    let gate = trees::FailAt::new(Gap::Renamed, true);
+    gate.disarm();
+    let mut v = trees::new_actor_with(tmp.path(), Upkeep::gated(gate.clone()));
+    put(&mut v, ROOT, "big", FILLED);
+    let settled = v.settle().unwrap();
+    let generation = trees::compacted_through(&v, settled).generation;
+    // One step, whole before its built event starts the compaction that
+    // fails: no call of this test meets the stopped actor by chance.
+    gate.arm();
+    v.mkdir(ROOT, "d", ATTRS, &writer("w")).unwrap();
+    assert!(matches!(
+        v.history().wait_checkpointed(generation),
+        Err(agentfs_core::tree_actor::WaitError::Stopped)
+    ));
     assert!(
         v.write_open(ROOT, "a", &writer("w"), Some(ATTRS)).is_err(),
         "sticky"
     );
+    assert!(v.is_stopped());
     drop(v);
     let v = reopen(tmp.path());
     assert_eq!(v.read(ROOT, "big").unwrap(), FILLED);

@@ -120,6 +120,7 @@ fn run(history: &History, journal: &JournalCompaction, compact_from: u64) {
                 return;
             }
         }
+        history.compaction_ended();
     }
 }
 
