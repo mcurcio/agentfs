@@ -18,8 +18,8 @@
 //! ```
 //!
 //! A frame is appended with one `write`, and no fsync: a record is in the
-//! kernel when the call returns, and durable once a FLUSH, an fsync or an
-//! FSYNCDIR has made it so ([`durable`]). A frame never spans two segments.
+//! kernel when the call returns, and durable once an fsync, an FSYNCDIR or an
+//! `O_SYNC` write has made it so ([`durable`]); a close does not wait. A frame never spans two segments.
 //! The header is the record number's one home. Each write-open and step names
 //! its writer with the pod context it ran in (`WriterAt`), so a recovery close
 //! commits as the writer that opened.

@@ -5,6 +5,8 @@ set -euo pipefail
 fs=${1:?expected ext4 or xfs}; mode=${2:-fua}
 case "$fs" in ext4|xfs) ;; *) exit 2 ;; esac
 case "$mode" in fua|flush) ;; *) exit 2 ;; esac
+# The oracle refuses planted images before it judges a real one.
+"$(dirname "$0")/power-loss-trees-check.sh" self-test
 : "${REPLAY_LOG:?}" "${AGENTFS_BIN:?}"
 base=${POWER_LOSS_DIR:-${TMPDIR:-/tmp}}
 mkdir -p "$base"
@@ -42,7 +44,7 @@ cleanup() {
   dmsetup remove "$lw" 2>/dev/null || true
   for dev in "${devices[@]}"; do losetup -d "$dev" 2>/dev/null || true; done
   # Only publish diagnostic files; disk images and mounted state stay private.
-  for file in "$work"/*.log "$work"/*.tsv "$work"/external-receipts "$work"/marks "$work"/count; do
+  for file in "$work"/*.log "$work"/*.tsv "$work"/external-receipts "$work"/ops "$work"/marks "$work"/count; do
     [ ! -f "$file" ] || install -m 0644 "$file" "$artifacts/$(basename "$file")" || true
   done
   chmod 644 "$results" 2>/dev/null || true
@@ -59,6 +61,9 @@ dmsetup message "$lw" 0 mark mkfs
 mount "/dev/mapper/$lw" "$work/mnt" || notrun "cannot mount $fs test filesystem"
 export GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null
 "$AGENTFS_BIN" --state "$work/mnt/state" init --volume t
+# The operator's rules: an editor's temporary file is untracked (docs/trees.md,
+# "Rules and the untracked area").
+printf '%s\n' '*.tmp' > "$work/mnt/state/history.git/info/exclude"
 "$AGENTFS_BIN" --state "$work/mnt/state" mount "$work/main" --fork-mount "$work/sandbox" --fork-key power-loss \
   --metrics-output "$work/metrics.json" >"$work/mount.log" 2>&1 & pid=$!
 for _ in $(seq 1 200); do
@@ -66,66 +71,133 @@ for _ in $(seq 1 200); do
   kill -0 "$pid"; sleep .1
 done
 mountpoint -q "$work/main"; mountpoint -q "$work/sandbox"
+# The driver's log, off the device, read by the oracle in
+# ci/power-loss-trees-check.sh: every call that changes the volume is written
+# there before it is made, every fsync once it has returned, and every receipt
+# in the order of the external receipts.
+cat > "$work/driver_lib.py" <<'PYLIB'
+import json, os, subprocess
+class Driver:
+    def __init__(self, disk, external, ops, device, marks):
+        self.disk, self.external, self.ops, self.device, self.marks = disk, external, ops, device, marks
+    @staticmethod
+    def append(name, value):
+        with open(name, 'a') as f:
+            f.write(value + '\n'); f.flush(); os.fsync(f.fileno())
+    def log(self, **line):
+        self.append(self.ops, json.dumps(line))
+    def receipt(self, value):
+        """A call returned: said off the device, in one order in both files."""
+        self.log(t='receipt', name=value)
+        self.append(self.external, value)
+    def mark(self, kind, n):
+        """A dm-log-writes mark once a call returned, before any receipt of it
+        is written to the device."""
+        self.receipt(f'{kind} {n}')
+        name = f'ack-{kind.lower()}-{n}'
+        subprocess.run(['dmsetup', 'message', self.device, '0', 'mark', name], check=True)
+        self.append(self.marks, f'{name} {kind} {n}')
+    def on_disk(self, *values):
+        for value in values: self.append(self.disk, value)
+    # The calls. `unit * times` is what a write holds.
+    def create(self, tree, root, path):
+        self.log(t='op', op='create', tree=tree, path=path)
+        return os.open(f'{root}/{path}', os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    def write(self, tree, path, fd, unit, times=1):
+        self.log(t='op', op='write', tree=tree, path=path, data={'hex': unit.hex(), 'times': times})
+        data = unit * times
+        assert os.write(fd, data) == len(data)
+    def rename(self, tree, root, old, new):
+        self.log(t='op', op='rename', tree=tree, **{'from': old, 'to': new})
+        os.rename(f'{root}/{old}', f'{root}/{new}')
+    def fsync(self, fd):
+        """fsync, FSYNCDIR: every call so far survives a power cut from here."""
+        os.fsync(fd)
+        self.log(t='sync')
+PYLIB
 # A dm-log-writes mark follows each returned fsync/close before any receipt
 # is written to this device. Off-device receipts associate marks with calls.
 # Only after both marks do we fsync on-device receipts for the sweep oracle.
-python3 - "$work/main" "$work/sandbox" "$work/mnt/receipts" "$work/external-receipts" "$lw" "$work/marks" "$work/metrics.json" "$(dirname "$0")/trees-figures.py" <<'PYWORK'
-import importlib.util, json, os, subprocess, sys, time
-root, sandbox, disk, external, device, marks, metrics, figures = sys.argv[1:]
-def append(name, value):
-    with open(name, 'a') as f:
-        f.write(value + '\n'); f.flush(); os.fsync(f.fileno())
-def mark(kind, n):
-    value = f'{kind} {n}'
-    append(external, value)
-    name = f'ack-{kind.lower()}-{n}'
-    subprocess.run(['dmsetup', 'message', device, '0', 'mark', name], check=True)
-    append(marks, f'{name} {kind} {n}')
-append(external, 'S'); append(disk, 'S')
-dirfd = os.open(os.path.dirname(disk), os.O_RDONLY | os.O_DIRECTORY)
+python3 - "$work" "$lw" "$(dirname "$0")/trees-figures.py" <<'PYWORK'
+import importlib.util, json, os, sys, time
+work, device, figures = sys.argv[1:]
+sys.path.insert(0, work)
+from driver_lib import Driver
+root, sandbox, metrics = f'{work}/main', f'{work}/sandbox', f'{work}/metrics.json'
+d = Driver(f'{work}/mnt/receipts', f'{work}/external-receipts', f'{work}/ops', device, f'{work}/marks')
+d.append(d.external, 'S'); d.on_disk('S')
+dirfd = os.open(os.path.dirname(d.disk), os.O_RDONLY | os.O_DIRECTORY)
 os.fsync(dirfd); os.close(dirfd)
 for n in range(1, 9):
-    fd = os.open(f'{root}/f{n}', os.O_CREAT | os.O_WRONLY, 0o600)
-    data = f'acknowledged-{n}\n'.encode()
-    assert os.write(fd, data) == len(data)
-    append(external, f'W {n}')
-    os.fsync(fd); mark('F', n)
-    os.close(fd); mark('C', n)
-    for kind in ('W', 'F', 'C'):
-        append(disk, f'{kind} {n}')
+    fd = d.create('root', root, f'f{n}')
+    d.write('root', f'f{n}', fd, f'acknowledged-{n}\n'.encode())
+    d.receipt(f'W {n}')
+    d.fsync(fd); d.mark('F', n)
+    os.close(fd); d.mark('C', n)
+    d.on_disk(f'W {n}', f'F {n}', f'C {n}')
 # Two sandbox files: a step on the fork branch moves its pointers too.
 for n in range(1, 3):
-    fd = os.open(f'{sandbox}/s{n}', os.O_CREAT | os.O_WRONLY, 0o600)
-    data = f'sandbox-{n}\n'.encode()
-    assert os.write(fd, data) == len(data)
-    append(external, f'SW {n}')
-    os.fsync(fd); mark('SF', n)
-    os.close(fd); mark('SC', n)
-    for kind in ('SW', 'SF', 'SC'):
-        append(disk, f'{kind} {n}')
-# A write with no fsync, marked once close(2) returned: the close's FLUSH makes
-# the open's calls durable (git-model §3). A rename, marked once an fsync of
-# the view's directory returned: FSYNCDIR makes every record durable. The last
-# acknowledged rename of the run.
+    fd = d.create('fork', sandbox, f's{n}')
+    d.write('fork', f's{n}', fd, f'sandbox-{n}\n'.encode())
+    d.receipt(f'SW {n}')
+    d.fsync(fd); d.mark('SF', n)
+    os.close(fd); d.mark('SC', n)
+    d.on_disk(f'SW {n}', f'SF {n}', f'SC {n}')
+# A write with no fsync, marked once close(2) returned. A close does not wait
+# for the disk (docs/trees.md, "Recording and durability"): a cut here may lose
+# the file, and never keeps it without everything before it.
 for n in range(1, 3):
-    fd = os.open(f'{root}/x{n}', os.O_CREAT | os.O_WRONLY, 0o600)
-    data = f'unsynced-{n}\n'.encode()
-    assert os.write(fd, data) == len(data)
+    fd = d.create('root', root, f'x{n}')
+    d.write('root', f'x{n}', fd, f'unsynced-{n}\n'.encode())
     os.close(fd)
-    mark('XW', n); append(disk, f'XW {n}')
-fd = os.open(f'{root}/y', os.O_CREAT | os.O_WRONLY, 0o600)
-assert os.write(fd, b'renamed\n') == 8
-os.fsync(fd); os.close(fd)
-os.rename(f'{root}/y', f'{root}/r')
+    d.mark('XW', n); d.on_disk(f'XW {n}')
+# A rename, marked once an fsync of the view's directory returned: FSYNCDIR
+# makes every record durable, the two unsynced files' included.
+fd = d.create('root', root, 'y')
+d.write('root', 'y', fd, b'renamed\n')
+d.fsync(fd); os.close(fd)
+d.rename('root', root, 'y', 'r')
 viewfd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
-os.fsync(viewfd); os.close(viewfd)
-mark('RN', 1); append(disk, 'RN 1')
+d.fsync(viewfd); os.close(viewfd)
+d.mark('RN', 1); d.on_disk('RN 1')
+# Closes and a rename with no fsync anywhere: close nb and na, rename na over
+# nb, close nc, create nd. A cut keeps a prefix of these, in this order.
+for name in ('nb', 'na'):
+    fd = d.create('root', root, name)
+    d.write('root', name, fd, f'no-fsync-{name}\n'.encode())
+    os.close(fd)
+d.rename('root', root, 'na', 'nb')
+fd = d.create('root', root, 'nc')
+d.write('root', 'nc', fd, b'no-fsync-nc\n')
+os.close(fd)
+os.close(d.create('root', root, 'nd'))
+d.mark('NS', 1); d.on_disk('NS 1')
+# The editor pattern: a temporary file in the untracked area (`*.tmp`), renamed
+# into the tree. With an fsync of the temporary file first (leg 1), its bytes
+# are in the area or in the tree after any cut: the area's file is unlinked
+# only once the record that carries its bytes is durable. Without one (leg 2),
+# only the order holds.
+for leg, synced in ((1, True), (2, False)):
+    data = f'edited-{leg}\n'.encode()
+    unit = {'hex': data.hex(), 'times': 1}
+    d.log(t='leg', leg=leg, area=f'e{leg}.tmp', path=f'e{leg}', data=unit)
+    fd = os.open(f'{root}/e{leg}.tmp', os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    assert os.write(fd, data) == len(data)
+    if synced:
+        os.fsync(fd)
+        d.log(t='area_sync', leg=leg)
+    os.close(fd)
+    if synced:
+        d.mark('EF', leg); d.on_disk(f'EF {leg}')
+    d.log(t='op', op='put', tree='root', path=f'e{leg}', data=unit)
+    os.rename(f'{root}/e{leg}.tmp', f'{root}/e{leg}')
+    d.mark('ER', leg); d.on_disk(f'ER {leg}')
 # A file held open across a segment rollover, a compaction and a carry-forward
 # (docs/trees.md, "Recording and durability"): h's first 4 MiB sit in the first
 # segment; 70 MiB of another file roll the journal past it; the built event of
 # that file's save compacts on history's compactor, which drops the first
-# segment and carries h's frames forward. h's close, marked once it returned,
-# holds every byte.
+# segment and carries h's frames forward. h's fsync, marked once its close
+# returned, holds every byte.
 spec = importlib.util.spec_from_file_location('figures', figures)
 module = importlib.util.module_from_spec(spec); spec.loader.exec_module(module)
 renames = module.Renames(metrics)
@@ -138,23 +210,37 @@ def until(test, what):
     limit = time.monotonic() + 600
     while not test(metric() or {}):
         if not renames.wait(limit): sys.exit(f'{what}: not reached; metrics {metric()}')
+def at_rest(what):
+    """No built event is left to come: a metrics file written after this call
+    began shows history built through every record and no pointer at a step."""
+    floor = (metric() or {}).get('seq', 0) + 2
+    until(lambda m: m.get('seq', 0) >= floor
+          and m['history']['built_through'] >= m['history']['appended']
+          and m['history']['pointers_at_steps'] == 0, what)
 MIB = 1 << 20
+# The compactor compacts at a built event once the journal is long enough, and
+# then not again before it has doubled. So the only built event from big's
+# first byte to its save is that save's: before the bytes go in, the fork has
+# taken the root's last change, big's create (its sync is a step), and every
+# step so far is built.
 checkpoints = ((metric() or {}).get('stages') or {}).get('checkpoints', 0)
-held = os.open(f'{root}/h', os.O_CREAT | os.O_WRONLY, 0o600)
+held = d.create('root', root, 'h')
 for i in range(4):
-    assert os.write(held, bytes([0x41 + i]) * MIB) == MIB
-big = os.open(f'{root}/big', os.O_CREAT | os.O_WRONLY, 0o600)
+    d.write('root', 'h', held, bytes([0x41 + i]), MIB)
+big = d.create('root', root, 'big')
+until(lambda m: os.path.exists(f'{sandbox}/big'), "the fork's sync of big's create")
+at_rest("the mount at rest before big's writes")
 for i in range(70):
-    assert os.write(big, i.to_bytes(4, 'little') * (MIB // 4)) == MIB
+    d.write('root', 'big', big, i.to_bytes(4, 'little'), MIB // 4)
 os.close(big)
 # The view rewrites the file at each published checkpoint and at each
 # compaction's end: no call of this driver starts the compaction.
 until(lambda m: (m.get('stages') or {}).get('checkpoints', 0) > checkpoints
       and m.get('journal_carried_bytes', 0) > 0 and m.get('journal_dropped', 0) > 0,
       "a compaction carrying h's frames")
-assert os.write(held, b'held\n') == 5
-os.fsync(held); os.close(held)
-mark('HC', 1); append(disk, 'HC 1')
+d.write('root', 'h', held, b'held\n')
+d.fsync(held); os.close(held)
+d.mark('HC', 1); d.on_disk('HC 1')
 renames.close()
 PYWORK
 fusermount3 -u "$work/main"; fusermount3 -u "$work/sandbox"
@@ -171,9 +257,9 @@ wait "$pid"; pid=
 #   CP 5  those segments unlinked (the next compaction has started)
 #   CN 1  after that, a write appended to a new segment and not fsynced: the
 #         next segment's first frame is not durable
-# Before each CP mark a file c<n> is written and fsynced: it was returned, so it
-# survives a cut at that mark. Records after the checkpoint's point are not
-# durable at these marks unless a caller's fsync made them so.
+# Before each CP mark a file c<n> is written and fsynced: the fsync returned, so
+# the file survives a cut at that mark. Records after the checkpoint's point are
+# not durable at these marks unless a caller's fsync made them so.
 mkdir "$work/gate"
 mkfifo "$work/gate/at" "$work/gate/go"
 AGENTFS_COMPACT_GATE="$work/gate" "$AGENTFS_BIN" --state "$work/mnt/state" mount "$work/main" \
@@ -183,17 +269,13 @@ for _ in $(seq 1 200); do
   kill -0 "$pid"; sleep .1
 done
 mountpoint -q "$work/main"
-python3 - "$work/main" "$work/mnt/receipts" "$work/external-receipts" "$lw" "$work/marks" "$work/gate" <<'PYGATE'
-import os, select, subprocess, sys
-root, disk, external, device, marks, gate = sys.argv[1:]
-def append(name, value):
-    with open(name, 'a') as f:
-        f.write(value + '\n'); f.flush(); os.fsync(f.fileno())
-def mark(kind, n):
-    append(external, f'{kind} {n}')
-    name = f'ack-{kind.lower()}-{n}'
-    subprocess.run(['dmsetup', 'message', device, '0', 'mark', name], check=True)
-    append(marks, f'{name} {kind} {n}')
+python3 - "$work" "$lw" <<'PYGATE'
+import os, select, sys
+work, device = sys.argv[1:]
+sys.path.insert(0, work)
+from driver_lib import Driver
+root, gate = f'{work}/main', f'{work}/gate'
+d = Driver(f'{work}/mnt/receipts', f'{work}/external-receipts', f'{work}/ops', device, f'{work}/marks')
 # Read and write: neither end blocks opening, nor sees end of file.
 at = os.open(f'{gate}/at', os.O_RDWR)
 go = os.open(f'{gate}/go', os.O_RDWR)
@@ -211,23 +293,22 @@ def park(gap):
     while reached() != gap:
         os.write(go, b'go\n')
 def kept(n):
-    fd = os.open(f'{root}/c{n}', os.O_CREAT | os.O_WRONLY, 0o600)
-    data = f'compacted-{n}\n'.encode()
-    assert os.write(fd, data) == len(data)
-    os.fsync(fd); os.close(fd)
+    fd = d.create('root', root, f'c{n}')
+    d.write('root', f'c{n}', fd, f'compacted-{n}\n'.encode())
+    d.fsync(fd); os.close(fd)
 for n, gap in enumerate(('written', 'renamed', 'dir_synced', 'before_unlink'), 1):
     kept(n)
     park(gap)
-    mark('CP', n); append(disk, f'CP {n}')
+    d.mark('CP', n); d.on_disk(f'CP {n}')
     os.write(go, b'go\n')
 # The compaction parked at before_unlink unlinks, and the next one starts
 # only after it: its first gap is the event that the unlink is done.
 kept(5)
 park('covered')
-mark('CP', 5); append(disk, 'CP 5')
-fd = os.open(f'{root}/unsynced', os.O_CREAT | os.O_WRONLY, 0o600)
-assert os.write(fd, b'not durable\n') == 12
-mark('CN', 1); append(disk, 'CN 1')
+d.mark('CP', 5); d.on_disk('CP 5')
+fd = d.create('root', root, 'unsynced')
+d.write('root', 'unsynced', fd, b'not durable\n')
+d.mark('CN', 1); d.on_disk('CN 1')
 os.close(fd)
 # An empty line ends the gate: every gap passes from now on, so the unmount's
 # join of the compactor never waits on it.
@@ -238,7 +319,7 @@ wait "$pid"; pid=
 umount "$work/mnt"
 dmsetup remove "$lw"
 export REPLAY_DEV=$replay COW_DEV=$cow CHECK_MNT=$work/check CHECK_DM=$ck CHECK_COUNT=$work/count
-export FS=$fs AGENTFS_BIN RESULTS=$results EXTERNAL_RECEIPTS=$work/external-receipts
+export FS=$fs AGENTFS_BIN RESULTS=$results EXTERNAL_RECEIPTS=$work/external-receipts OPS=$work/ops
 export FORK
 FORK=$(sed -n 's/^fork tree: //p' "$work/mount.log")
 [ -n "$FORK" ] || notrun 'mount log names no sandbox tree'
@@ -250,7 +331,8 @@ import sys
 actual = open(sys.argv[1]).read().splitlines()
 expected = [f'ack-{kind.lower()}-{n} {kind} {n}' for n in range(1, 9) for kind in ('F', 'C')]
 expected += [f'ack-{kind.lower()}-{n} {kind} {n}' for n in range(1, 3) for kind in ('SF', 'SC')]
-expected += [f'ack-xw-{n} XW {n}' for n in range(1, 3)] + ['ack-rn-1 RN 1', 'ack-hc-1 HC 1']
+expected += [f'ack-xw-{n} XW {n}' for n in range(1, 3)] + ['ack-rn-1 RN 1', 'ack-ns-1 NS 1']
+expected += ['ack-ef-1 EF 1', 'ack-er-1 ER 1', 'ack-er-2 ER 2', 'ack-hc-1 HC 1']
 expected += [f'ack-cp-{n} CP {n}' for n in range(1, 6)] + ['ack-cn-1 CN 1']
 assert actual == expected, (actual, expected)
 PYMARKS

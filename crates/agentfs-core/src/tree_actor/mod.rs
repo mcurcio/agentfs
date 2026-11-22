@@ -2,8 +2,9 @@
 //!
 //! One exclusively locked actor owns a journal and the saved state the views
 //! serve. Every call is appended to the journal before it returns, with no
-//! fsync; a FLUSH, an fsync or an FSYNCDIR makes the records durable by group
-//! commit, outside the actor's lock ([`Recording`], [`Durability`]). A step's
+//! fsync; an fsync, an FSYNCDIR or an `O_SYNC` write makes the records durable
+//! by group commit, outside the actor's lock, and a close waits for none
+//! ([`Recording`], [`Durability`]). A step's
 //! record is the change itself and its commit point: the actor decides,
 //! appends and applies it, and runs no git. The builder makes each durable
 //! step's commits behind it, and [`History`], the one owner of the Git store,
@@ -1256,7 +1257,7 @@ impl TreeActor {
         Ok(self.history.wait_built(self.durability().appended())?)
     }
 
-    /// The last record a FLUSH or FSYNC of `open` must cover: every record
+    /// The last record an FSYNC of `open` must cover: every record
     /// appended so far. The open's own records (its open, calls and page
     /// writes) are not enough: a chmod, chown or `futimens` of its file is a
     /// step of its own, and `fsync(2)` covers a file's metadata. Group commit

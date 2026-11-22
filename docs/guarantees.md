@@ -271,9 +271,28 @@ pod can fill it for every volume on that node.
 
 The [tree views](trees.md) have their own limits, which that page lists. A tree
 view records every call in its journal before the call returns, so a returned call
-survives a crash of agentfs. It survives a power cut once the file's `close(2)` or
-`fsync(2)`, an `O_SYNC` write, or an `fsync(2)` of the view's directory has
-returned ([trees.md](trees.md#recording-and-durability)). Its git history is built
+survives a crash of agentfs. A `close(2)` promises that and no more: it returns
+once the file's calls are in the journal and does not wait for the disk. A call
+survives a power cut once an `fsync(2)` of the file or of the view's directory, or
+a write on an `O_SYNC` or `O_DSYNC` descriptor, has returned after it
+([trees.md](trees.md#recording-and-durability)).
+
+What a power cut can lose in a tree view:
+
+- **Every change since the last such call.** That is every change since the
+  last `fsync`, FSYNCDIR or `O_SYNC` write that returned, or since history's
+  builder last ran. It can be many saves, not one. What survives is always
+  everything up to some point: never a later change without the earlier ones.
+- **`sync(1)` and `syncfs(2)` do not help.** The kernel sends a FUSE mount no
+  request for them, so they make no closed save durable. A program that needs a
+  save to survive a power cut calls `fsync`.
+- **A failed disk shows late.** A journal fsync that fails is not a close's
+  error. It stops the tree's recording, and the next call answers `EIO`.
+- **One program's `fsync` pays for every view's unsynced writes.** An fsync
+  makes the whole journal durable, so it waits for bytes other programs wrote
+  and did not sync.
+
+Its git history is built
 behind the calls: a save is visible to the views at its release, and in Git's refs
 and commits once the builder reaches it; nothing in Git names an object that is not
 durable ([trees.md](trees.md#history-trails-the-files)).

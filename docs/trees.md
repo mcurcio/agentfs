@@ -275,7 +275,8 @@ no `#`, `@` or `/`, so the name parses back.
   root has no claim. The claim is released when the fork is dropped
   (`ClaimReleased`).
 - **Ends.** When a view is unmounted, its client is detached. Its open files close
-  as saves first, in handle order, durable before the detach returns; a write after
+  as saves first, in handle order, with no wait for the disk (as a close; see
+  [Recording and durability](#recording-and-durability)); a write after
   that answers `EROFS`. The end is one step with `AttachmentEnded`, then
   `LastDetached` when its tree has no client left.
 - **Restart.** A killed `mount` leaves its clients attached. The next mount
@@ -448,29 +449,59 @@ row and counts as released.
   saves can align repeated lines differently. Stored bytes and identities do not
   change.
 
-`fsync` and close make the file's calls durable; the final release publishes the
-file.
+`fsync` makes the file's calls durable; the final release publishes the file.
 
 ## Recording and durability
 
 Every file call is in the journal before it returns: one frame, written with one
 `write(2)` and no fsync. A call that returned survives a crash or kill of agentfs,
 because its frame is in the kernel. It survives a power cut once one of these has
-returned:
+returned after it:
 
-- `close(2)` of a descriptor that wrote (FUSE `FLUSH`), or `fsync(2)` of it;
+- `fsync(2)` or `fdatasync(2)` of a descriptor that wrote;
 - each `write(2)` of a descriptor opened `O_SYNC` or `O_DSYNC`;
 - `fsync(2)` of the view's directory (FSYNCDIR), or of a read-only descriptor.
 
 Each of these makes every record so far durable, not only the descriptor's own:
 creates, renames, unlinks, `mkdir`, `rmdir`, `symlink`, `chmod`, `chown` and
-time sets included, so `fchmod` then `fsync` keeps the mode. A power cut loses
-the calls and steps made since the last of these.
+time sets included, so `fchmod` then `fsync` keeps the mode.
 Waits share fsyncs (group commit): one fsync answers every wait whose records were
 written before it began. The fsync runs off the view's request thread and outside
-the actor's lock, so a waiting close holds no other call. A failed fsync stops the
+the actor's lock, so a waiting fsync holds no other call. A failed fsync stops the
 actor: its waiters get its error and every later call `EIO` (see
 [Recovery](#recovery)).
+
+**`close(2)` does not wait for the disk.** A close (FUSE `FLUSH`) returns once
+the descriptor's calls are in the journal, which they were when each returned.
+It makes no fsync and never returns a journal fsync's error; it answers `EIO`
+only once a failed fsync has stopped the actor. A client's end closes its open
+files as saves the same way, with no wait. A clean unmount makes every record
+durable before the state area's lease is released.
+
+**What a power cut loses.** It loses a suffix of the journal: no record
+survives without every record before it. The volume then opens as an
+uninterrupted run would stand had it stopped after some record, and that record
+is at or after the last one an `fsync`, FSYNCDIR or `O_SYNC` write that returned
+had covered. What this costs:
+
+- A power cut can lose every change since the last `fsync`, FSYNCDIR or `O_SYNC`
+  write, or since the builder's last batch (the builder makes every record
+  through its batch durable before it writes the batch's objects). That can be
+  many saves.
+- `sync(1)` and `syncfs(2)` send a FUSE mount no request, so they make no
+  closed save durable.
+- A failed journal fsync first shows as a later call's `EIO`, once the actor
+  has stopped, never as the close's own error.
+- One program's fsync pays for every view's unsynced bytes, because group
+  commit fsyncs the whole journal.
+
+**A change outside the journal that destroys bytes waits for the record that
+carries them.** A file moved from the untracked area into the tree is in the
+journal alone once the area's file is unlinked, so the view makes every record
+durable before that unlink, on its own thread and outside the actor's lock: bytes
+a program fsynced in the area are in the area or in the tree after any power
+cut. A file moved out of the tree is fsynced in the area, with its directory
+entry, before its unlink from the tree is recorded.
 
 ## File maps
 
@@ -1037,8 +1068,8 @@ either. The FUSE adapter uses zero entry and attribute TTLs and
 direct I/O, and negotiates neither passthrough nor the writeback cache. A read with
 no lock owner is a page fill and a write with `FUSE_WRITE_CACHE` is a page write.
 `max_background` is as high as the kernel allows, to keep a release ahead of a later
-open. One thread answers requests in order; a `FLUSH`, `FSYNC`, FSYNCDIR or `O_SYNC`
-write is answered from the journal's waiter thread once its records are durable. The queue worker takes one entry at a time, releasing the actor between takes,
+open. One thread answers requests in order; a `FLUSH` is answered at once, and an `FSYNC`, FSYNCDIR or `O_SYNC`
+write from the journal's waiter thread once its records are durable. The queue worker takes one entry at a time, releasing the actor between takes,
 and drops the kernel's pages of files a take changed. A file open for writing
 holds back that fork's syncs from its upstream until it closes; no alarm is raised
 for a waiting open. See [library/filesystem.md](library/filesystem.md).
@@ -1171,8 +1202,8 @@ rules would place a new name of the source's kind (so
 | Tracked directory | Tracked | The tree's rename; its untracked entries move with it |
 | Tracked file or link | Untracked | Moved out: its saved bytes, mode and owner are placed in the area, then its unlink is recorded |
 | Tracked directory | Untracked | `EXDEV`: `mv` copies the files across, then removes the tree's |
-| Untracked file | Tracked | Moved in: one save of the whole file under the new name, then the area's file is removed |
-| Untracked link | Tracked, no entry there | Moved in: a new link, then the area's link is removed |
+| Untracked file | Tracked | Moved in: one save of the whole file under the new name, made durable, then the area's file is removed |
+| Untracked link | Tracked, no entry there | Moved in: a new link, made durable, then the area's link is removed |
 | Untracked link | Tracked, an entry there | `EXDEV` |
 | Untracked directory, FIFO or socket | Tracked | `EXDEV` |
 | Anything untracked | Untracked | A plain rename in the area |
@@ -1325,7 +1356,12 @@ jobs in [development.md](development.md); the method is in
 - `e2e-tree-restart.sh`, `e2e-tree-recording-faults.sh`, `e2e-tree-enospc.sh`:
   view-host death, kills at each failpoint, state exhaustion.
 - `power-loss-trees.sh`: `dm-log-writes` replay on ext4 and XFS, on the upstream and
-  a fork, each checkpoint also rebuilding the refs from the journal alone.
+  a fork. At each checkpoint the volume opens, recovery saves what survived, the
+  recovered files are a prefix of the calls made that holds every call before the
+  last returned `fsync` or FSYNCDIR, and the refs rebuild from the journal alone.
+  Its legs include closes and a rename with no fsync, and an editor's temporary
+  file moved in from the untracked area, with and without an fsync. Its checker
+  first refuses planted images (`power-loss-trees-check.sh self-test`).
 - `measure-trees.sh`: plain-FUSE comparison, an hour of writes, 10,000 saves, 1 and
   100 MiB files, waits and a held log. `[phase1-measure]` in a pushed commit message
   runs them all.
