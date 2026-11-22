@@ -59,7 +59,7 @@ pub enum DurableError {
 }
 
 impl DurableError {
-    /// The errno a file call (FLUSH, FSYNC, FSYNCDIR) answers with.
+    /// The errno a file call (FSYNC, FSYNCDIR, an `O_SYNC` write) answers with.
     pub fn errno(&self) -> i32 {
         match self {
             Self::Io(errno) => *errno,
@@ -69,8 +69,9 @@ impl DurableError {
 }
 
 /// The journal's group commit, shared by the actor (the one appender) and by
-/// every caller that waits for durability: FLUSH, FSYNC, FSYNCDIR, an
-/// `O_SYNC` write, the builder before it reads a batch. Callable from any
+/// every caller that waits for durability: FSYNC, FSYNCDIR, an `O_SYNC`
+/// write, a move out of the untracked area, the builder before it reads a
+/// batch. A FLUSH does not wait. Callable from any
 /// thread; it takes the actor's lock never.
 ///
 /// Invariants: [`Durability::mark`] only rises; it rises to a record only

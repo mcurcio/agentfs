@@ -969,9 +969,13 @@ reaches its tree only through `sessions.session(id)`, a `TreeSession`, whose
 left out: a write answers `Error::ReadOnly` (`EROFS`) without a writer, and a
 handle call answers `NotFound` unless the open is this tree's and this
 writer's. `admit_then`, `durable_then` and `durable_all_then` run unlocked.
+`flush` answers a FLUSH at once, with no wait for the disk: `Error::Stopped`
+once a journal fsync has failed, never that fsync's own error. `durable_all`
+blocks the caller until every record so far is durable: what a view waits for
+before a change outside the journal destroys bytes a record carries.
 `unbind` removes the binding and, under the same lock,
 `TreeActor::close_writer` closes every open of the client's writer as a save,
-in handle order; then it makes them durable. A failure is logged and an
+in handle order, with no wait for the disk. A failure is logged and an
 unsaved close stays pending. Lock order: the actor, then the bindings.
 
 ### Rows and domain events
