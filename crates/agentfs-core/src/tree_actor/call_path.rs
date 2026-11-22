@@ -291,15 +291,15 @@ impl Recording {
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Box::new(hook));
     }
 
-    /// The last record a FLUSH of `open` must cover, read under the lock
+    /// The last record an fsync of `open` must cover, read under the lock
     /// ([`TreeActor::durable_through`]).
     fn durable_through(&self, open: u64) -> Result<RecordNo, Error> {
         self.actor()?.durable_through(open)
     }
 
-    /// FLUSH, FSYNC, `msync(MS_SYNC)` and each write of an `O_SYNC` or
-    /// `O_DSYNC` open: every record so far made durable, the file's metadata
-    /// steps included. Locks the actor only to read the last record; the
+    /// FSYNC, `msync(MS_SYNC)` and each write of an `O_SYNC` or `O_DSYNC`
+    /// open: every record so far made durable, the file's metadata steps
+    /// included. A FLUSH does not wait ([`Recording::flush`]). Locks the actor only to read the last record; the
     /// fsync runs outside the lock.
     ///
     /// # Errors
@@ -323,18 +323,23 @@ impl Recording {
 
     /// FLUSH (close(2)) of write-open `open`: its records were appended at
     /// each call, so it answers at once, never waiting for an fsync and never
-    /// returning a journal fsync's error (D1 in
-    /// docs/target-architecture/future/latency-upkeep.md bounds what a power
-    /// cut then loses). Takes neither the actor's lock nor Durability's
-    /// fsync. Not built yet: the view's FLUSH still calls
-    /// [`Recording::durable_then`] (slice 6).
+    /// returning a journal fsync's error. A power cut then loses a suffix of
+    /// the journal: every record since the last fsync, FSYNCDIR or `O_SYNC`
+    /// write that returned, or since the builder's last batch
+    /// (docs/trees.md, "Recording and durability"). Takes neither the
+    /// actor's lock nor Durability's fsync, so it does not look `open` up: a
+    /// view answers a FLUSH of a handle it does not hold itself.
     ///
     /// # Errors
     ///
     /// [`Error::Stopped`] once a journal fsync has failed: sticky, as for
     /// every later call (`Durability::has_failed`).
     pub fn flush(&self, open: u64) -> Result<(), Error> {
-        todo!("{open}")
+        let _ = open;
+        if self.durability.has_failed() {
+            return Err(Error::Stopped);
+        }
+        Ok(())
     }
 
     /// [`Recording::durable_all`] without blocking the caller.
@@ -534,6 +539,109 @@ mod tests {
             Box::new(move |r| answered.send(r.err().map(|e| e.errno())).unwrap()),
         );
         assert_eq!(answer.recv().unwrap(), Some(libc::ENOENT));
+    }
+
+    /// A bound on a hang, never a coordination: each answer comes on an event.
+    const HANG: std::time::Duration = std::time::Duration::from_secs(10);
+
+    /// The fsync's leader held in its fsync: `inside` says it is there, and
+    /// it goes on at `release`. Later fsyncs find both ends gone and pass.
+    fn hold_fsync(rec: &Recording) -> (mpsc::Receiver<()>, mpsc::Sender<()>) {
+        let (entered, inside) = sync_channel::<()>(0);
+        let (release, released) = mpsc::channel::<()>();
+        let released = Mutex::new(released);
+        rec.durability.hold_fsync_with(move || {
+            let _ = entered.send(());
+            let _ = released.lock().map(|r| r.recv());
+        });
+        (inside, release)
+    }
+
+    /// A served volume at rest, with one write of an open not yet durable.
+    fn unsynced_write(state: &std::path::Path) -> (Arc<Recording>, u64) {
+        let rec = Recording::serve(new_actor(state)).unwrap();
+        let h = rec
+            .actor()
+            .unwrap()
+            .write_open(TreeId::Root, "a", &writer("w"), Some(ATTRS))
+            .unwrap();
+        // The create is a step: once it is built, the builder has made its
+        // fsync and waits for the next step, so the next fsync is the test's.
+        rec.settle().unwrap();
+        rec.actor().unwrap().write(h, 0, b"x", false).unwrap();
+        (rec, h)
+    }
+
+    /// close(2) does not wait for the disk: with the journal's fsync held
+    /// and an FSYNCDIR waiting on it, a FLUSH of the open answers.
+    #[test]
+    fn a_close_answers_while_the_fsync_is_held() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (rec, h) = unsynced_write(tmp.path());
+        let (inside, release) = hold_fsync(&rec);
+        std::thread::scope(|scope| {
+            let rec = &rec;
+            let (synced, sync) = mpsc::channel();
+            scope.spawn(move || synced.send(rec.durable_all()).unwrap());
+            inside.recv().unwrap();
+            let (flushed, flush) = mpsc::channel();
+            scope.spawn(move || flushed.send(rec.flush(h)).unwrap());
+            let answered = flush.recv_timeout(HANG);
+            let waiting = sync.try_recv().is_err();
+            // Released before any assertion, so a failure never hangs the scope.
+            release.send(()).unwrap();
+            assert!(
+                matches!(answered, Ok(Ok(()))),
+                "the flush waited: {answered:?}"
+            );
+            assert!(waiting, "the FSYNCDIR answered inside the held fsync");
+            sync.recv().unwrap().unwrap();
+        });
+        assert_eq!(rec.durability.mark(), rec.durability.appended());
+    }
+
+    /// A journal fsync's failure is never a FLUSH's own error: before any
+    /// failure it answers, and once one has stopped the actor it says so.
+    #[test]
+    fn flush_reports_only_a_stopped_actor() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (rec, h) = unsynced_write(tmp.path());
+        assert!(rec.durability.mark() < rec.durability.appended());
+        assert!(matches!(rec.flush(h), Ok(())));
+        assert!(
+            rec.durability.mark() < rec.durability.appended(),
+            "the flush made no fsync"
+        );
+        rec.durability
+            .fsync_failed(&std::io::Error::from_raw_os_error(libc::EIO));
+        let stopped = rec.flush(h);
+        assert!(matches!(stopped, Err(Error::Stopped)), "{stopped:?}");
+        assert_eq!(stopped.unwrap_err().errno(), libc::EIO);
+    }
+
+    /// fsync(2), and so FSYNCDIR and an `O_SYNC` write, still wait for the
+    /// disk: with the journal's fsync held, none has answered.
+    #[test]
+    fn fsync_still_waits() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (rec, h) = unsynced_write(tmp.path());
+        let through = rec.durability.appended();
+        let (inside, release) = hold_fsync(&rec);
+        let (answered, answer) = mpsc::channel();
+        let (all_answered, all_answer) = mpsc::channel();
+        // Queued for the waiter thread, which leads the fsync held.
+        rec.durable_then(h, Box::new(move |r| answered.send(r.is_ok()).unwrap()));
+        inside.recv().unwrap();
+        rec.durable_all_then(Box::new(move |r| all_answered.send(r.is_ok()).unwrap()));
+        let waiting = answer.try_recv().is_err() && all_answer.try_recv().is_err();
+        let unmoved = rec.durability.mark() < through;
+        // Released before any assertion, so a failure never hangs the drop.
+        release.send(()).unwrap();
+        assert!(waiting, "an fsync answered inside the held fsync");
+        assert!(unmoved, "the mark moved inside the held fsync");
+        assert_eq!(answer.recv_timeout(HANG), Ok(true));
+        assert_eq!(all_answer.recv_timeout(HANG), Ok(true));
+        assert!(rec.durability.mark() >= through);
     }
 
     /// fsync(2) covers a file's metadata: a chmod and a `futimens` of the
