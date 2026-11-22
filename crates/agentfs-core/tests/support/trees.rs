@@ -37,8 +37,7 @@ pub fn new_actor(dir: &Path) -> TreeActor {
 
 /// A new volume [`identity`] served with `upkeep`.
 pub fn new_actor_with(dir: &Path, upkeep: Upkeep) -> TreeActor {
-    TreeActor::create_with(dir, &identity(), None, &PodContext::default(), upkeep)
-        .expect("creates")
+    TreeActor::create_with(dir, &identity(), None, &PodContext::default(), upkeep).expect("creates")
 }
 
 /// Opens the volume again, with `upkeep`.

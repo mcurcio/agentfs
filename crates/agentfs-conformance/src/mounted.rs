@@ -9,6 +9,7 @@
 //! so a take crosses FUSE at that point and needs no poll. Cost: this replay never
 //! exercises automatic takes (R1); the mounted P1 and P2 cases cover those.
 
+use crate::compact_turns::{Turns, answer_fifos, end_fifos};
 use crate::engine_names::EngineNames;
 use crate::library::{fail, seed};
 use agentfs_core::tree_actor::TreeId as EngineTree;
@@ -21,6 +22,8 @@ use std::os::fd::RawFd;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::Arc;
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 /// How long a mount may take to appear. A mount has no event of its own to wait on.
@@ -100,6 +103,12 @@ pub struct Mounted {
     child: Option<Child>,
     go: File,
     took: BufReader<File>,
+    /// The mount's compaction gate: its directory, whose turn it is, the
+    /// FIFOs' ends this harness holds, and the thread that answers the gate.
+    compact_gate: PathBuf,
+    turns: Arc<Turns>,
+    compact_fifos: (File, File),
+    answering: Option<JoinHandle<io::Result<()>>>,
     log: PathBuf,
     opens: BTreeMap<RawFd, Caller>,
     appends: VecDeque<bool>,
@@ -117,13 +126,14 @@ impl Mounted {
         with_fork: bool,
         appends: Vec<bool>,
     ) -> Result<Self, CallError> {
-        let (state, root, fork_view, gate) = (
+        let (state, root, fork_view, gate, compact_gate) = (
             work.join("state"),
             work.join("root"),
             work.join("fork"),
             work.join("gate"),
+            work.join("compact-gate"),
         );
-        for dir in [&root, &fork_view, &gate] {
+        for dir in [&root, &fork_view, &gate, &compact_gate] {
             std::fs::create_dir_all(dir).map_err(|e| io_fail("mkdir", &e))?;
         }
         // A trace's mkdir gives the mode it names: `mountable` admits only modes
@@ -148,22 +158,44 @@ impl Mounted {
             }
             // Every record durable and built, and the lease free, at the drop.
         }
-        for fifo in ["go", "took"] {
-            let path = c_path(&gate.join(fifo))?;
+        for fifo in [
+            gate.join("go"),
+            gate.join("took"),
+            compact_gate.join("at"),
+            compact_gate.join("go"),
+        ] {
+            let path = c_path(&fifo)?;
             // SAFETY: `path` is a valid C string for the call's duration.
             if unsafe { libc::mkfifo(path.as_ptr(), 0o600) } != 0 {
                 return Err(last_error("mkfifo"));
             }
         }
         // Read and write: neither side ever sees end of file, nor blocks opening.
-        let fifo = |name: &str| {
+        let fifo = |path: PathBuf| {
             OpenOptions::new()
                 .read(true)
                 .write(true)
-                .open(gate.join(name))
+                .open(path)
                 .map_err(|e| io_fail("open fifo", &e))
         };
-        let (go, took) = (fifo("go")?, BufReader::new(fifo("took")?));
+        let (go, took) = (
+            fifo(gate.join("go"))?,
+            BufReader::new(fifo(gate.join("took"))?),
+        );
+        // The mount compacts at every built event, parked at each gap in
+        // turn while a replayed call runs.
+        let turns = Turns::new();
+        let compact_fifos = (
+            fifo(compact_gate.join("at"))?,
+            fifo(compact_gate.join("go"))?,
+        );
+        let clone = |file: &File| file.try_clone().map_err(|e| io_fail("clone fifo", &e));
+        let answering = answer_fifos(
+            Arc::clone(&turns),
+            clone(&compact_fifos.0)?,
+            clone(&compact_fifos.1)?,
+        )
+        .map_err(|e| io_fail("spawn", &e))?;
         let mut mounted = Self {
             bin: bin.to_owned(),
             log: work.join("mount.log"),
@@ -176,6 +208,10 @@ impl Mounted {
             child: None,
             go,
             took,
+            compact_gate,
+            turns,
+            compact_fifos,
+            answering: Some(answering),
             opens: BTreeMap::new(),
             appends: appends.into(),
         };
@@ -209,6 +245,10 @@ impl Mounted {
             .arg("mount")
             .arg(&self.root)
             .env("AGENTFS_TAKE_GATE", &self.gate)
+            .env(
+                agentfs_core::failpoints::COMPACT_GATE_VAR,
+                &self.compact_gate,
+            )
             .stdin(Stdio::null())
             .stdout(log.try_clone().map_err(|e| io_fail("mount log", &e))?)
             .stderr(log);
@@ -306,6 +346,8 @@ impl Mounted {
     /// far: the invariants read git after each call, and the builder makes
     /// history behind the call path.
     fn settle(&mut self) -> Result<(), CallError> {
+        // A replayed call ended: a compactor parked for it goes on.
+        self.turns.call_ended();
         writeln!(self.go, "settle").map_err(|e| io_fail("ask the gate", &e))?;
         let mut answer = String::new();
         self.took
@@ -385,6 +427,8 @@ impl Mounted {
         for fd in held {
             self.close_fd(fd)?;
         }
+        // Before the unmount: the mount's shutdown joins its compactor.
+        self.end_compact_gate()?;
         self.unmount(false)?;
         // An empty line ends the gate (failpoints::TakeGate).
         self.go
@@ -403,8 +447,24 @@ impl Mounted {
     }
 }
 
+impl Mounted {
+    /// Ends the compaction gate and the thread that answers it. Once only.
+    fn end_compact_gate(&mut self) -> Result<(), CallError> {
+        let Some(answering) = self.answering.take() else {
+            return Ok(());
+        };
+        end_fifos(&self.turns, &self.compact_fifos.0, &self.compact_fifos.1)
+            .map_err(|e| io_fail("end the compaction gate", &e))?;
+        answering
+            .join()
+            .map_err(|_| CallError::new("the compaction gate's thread panicked"))?
+            .map_err(|e| io_fail("answer the compaction gate", &e))
+    }
+}
+
 impl Drop for Mounted {
     fn drop(&mut self) {
+        let _ = self.end_compact_gate();
         if let Some(mut child) = self.child.take() {
             let _ = child.kill();
             let _ = child.wait();

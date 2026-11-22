@@ -29,8 +29,7 @@ use crate::tree_actor::journal::{
 use crate::tree_actor::meta::{SetTime, Times};
 use crate::tree_actor::rows::{Chain, RowEvent, RowWrite};
 use crate::tree_actor::test_support::{
-    ATTRS, compact_now, never_due, new_actor_with, reopen_with, rowless_fork, same_pointers,
-    writer,
+    ATTRS, compact_now, never_due, new_actor_with, reopen_with, rowless_fork, same_pointers, writer,
 };
 use crate::tree_actor::{BUILT_LOG, History, JOURNAL, TreeActor, TreeId, Upkeep};
 
@@ -59,9 +58,7 @@ fn killed(dir: &Path) -> tempfile::TempDir {
 
 /// Saves `bytes` as `path`: its save's step.
 fn put(v: &mut TreeActor, tree: TreeId, path: &str, bytes: &[u8]) -> RecordNo {
-    let h = v
-        .write_open(tree, path, &writer("w"), Some(ATTRS))
-        .unwrap();
+    let h = v.write_open(tree, path, &writer("w"), Some(ATTRS)).unwrap();
     v.truncate(h, 0).unwrap();
     v.write(h, 0, bytes, false).unwrap();
     v.close(h).unwrap();
@@ -267,10 +264,16 @@ fn a_kill_at_each_gap_keeps_every_returned_call() {
     for gap in Gap::ALL {
         let tmp = tempfile::tempdir().unwrap();
         let (mut v, parked) = gated(tmp.path(), |gate| Upkeep::gated(gate));
-        let before = (v.history().checkpointed(), v.history().checkpointed_through());
+        let before = (
+            v.history().checkpointed(),
+            v.history().checkpointed_through(),
+        );
         put(&mut v, ROOT, "a", b"one");
         parked.until(gap);
-        let counted = (v.history().checkpointed(), v.history().checkpointed_through());
+        let counted = (
+            v.history().checkpointed(),
+            v.history().checkpointed_through(),
+        );
         // A step that sets a pointer, and its built event: a builder batch
         // runs while the compactor is parked, and trims at its start.
         put(&mut v, ROOT, "b", b"two");
@@ -278,7 +281,10 @@ fn a_kill_at_each_gap_keeps_every_returned_call() {
         if matches!(gap, Gap::Covered | Gap::Written | Gap::Renamed) {
             assert_eq!(counted, before, "{gap:?}: counted before it is in place");
             assert_eq!(
-                (v.history().checkpointed(), v.history().checkpointed_through()),
+                (
+                    v.history().checkpointed(),
+                    v.history().checkpointed_through()
+                ),
                 before,
                 "{gap:?}"
             );
@@ -426,7 +432,11 @@ fn a_step_named_after_the_checkpoint_folds_on_both() {
             let new = killed(tmp.path());
             let checkpoint = checkpoint_in(&new.path().join(JOURNAL));
             assert_eq!(checkpoint.built, built);
-            assert_eq!(checkpoint.step_heads.get(&kind.name()), Some(&s), "{kind:?}");
+            assert_eq!(
+                checkpoint.step_heads.get(&kind.name()),
+                Some(&s),
+                "{kind:?}"
+            );
             for copy in [&old, &new] {
                 let c = opened(copy.path());
                 assert_eq!(reads(&c), expected, "{kind:?} {switch_first}");
@@ -541,7 +551,10 @@ fn a_switched_head_is_let_go() {
         v.settle().unwrap();
         let s = step_of(&v, &kind.name());
         compact_now(&v);
-        assert_eq!(checkpoint_in(&journal).step_heads.get(&kind.name()), Some(&s));
+        assert_eq!(
+            checkpoint_in(&journal).step_heads.get(&kind.name()),
+            Some(&s)
+        );
         assert!(v.history().checkpointed_through() < s, "the head is kept");
         // The switch record at r > B, built, and a compaction at B2 >= r,
         // with no step on the pointer since.
@@ -563,7 +576,11 @@ fn a_switched_head_is_let_go() {
             "{kind:?}: the built log keeps {:?}",
             entries.iter().map(|e| e.through).collect::<Vec<_>>()
         );
-        assert!(!built_log::values(&entries).unwrap().contains_key(&(s, kind.name())));
+        assert!(
+            !built_log::values(&entries)
+                .unwrap()
+                .contains_key(&(s, kind.name()))
+        );
         let expected = reads(&v);
         drop(v);
         // A reopen reads the pointer's oid from the checkpoint.
@@ -734,7 +751,10 @@ fn a_carried_open_survives_each_gap() {
         v.settle().unwrap();
         assert_eq!(v.read(ROOT, "held").unwrap(), b"abcabcabc!");
         drop(v);
-        assert_eq!(opened(tmp.path()).read(ROOT, "held").unwrap(), b"abcabcabc!");
+        assert_eq!(
+            opened(tmp.path()).read(ROOT, "held").unwrap(),
+            b"abcabcabc!"
+        );
     }
     // The unlink fails: the checkpoint stands, the covered segment stays,
     // and a frame and its carried copy are both on disk.
@@ -1002,7 +1022,10 @@ fn a_step_with_a_switch_behind_it_keeps_its_own_time() {
             }
         ) && matches!(pair[1].0.entry, Entry::Switch { .. })
     });
-    assert!(behind_a_take, "a switch record right behind a take's record");
+    assert!(
+        behind_a_take,
+        "a switch record right behind a take's record"
+    );
     assert_eq!(v.read(ROOT, "new").unwrap(), b"a new file");
     times_hold(&mut v, tmp.path(), "a landing take");
 }

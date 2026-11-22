@@ -343,8 +343,11 @@ pub fn init(state: &Path, args: InitArgs, minter: Minter) -> Result<ExitCode> {
         root_owner: args.owner,
     };
     let cap = root_cap(&minter)?;
-    let mut volume =
-        VolumeService::new(TreeStateArea::at(state).with_upkeep(upkeep()), NoClients, DomainEvents::default());
+    let mut volume = VolumeService::new(
+        TreeStateArea::at(state).with_upkeep(upkeep()),
+        NoClients,
+        DomainEvents::default(),
+    );
     let ensured = match volume.ensure(spec.clone(), &at, &cap) {
         Ok(ensured) => ensured,
         Err(VolumeError::Busy) => return Ok(busy()),

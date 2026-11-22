@@ -183,7 +183,9 @@ pub(super) enum Entry {
     /// built point (`TreeActor::switch_built`), and recovery's fold replays
     /// it, so every value a later record names was set by a record before
     /// it (docs/trees.md, "Recording and durability").
-    Switch { pointers: Vec<Switched> },
+    Switch {
+        pointers: Vec<Switched>,
+    },
 }
 
 /// One pointer the actor switched at a built point: from the step that set

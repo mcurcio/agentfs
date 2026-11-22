@@ -1329,7 +1329,10 @@ fn a_log_held_open_does_not_pin_other_saves() {
     let length = trees::journal_len(tmp.path());
     assert!(length < 64 << 20, "journal holds {length} bytes");
     assert_eq!(trees::segments(tmp.path()).len(), 1);
-    assert!(v.metrics().journal_carried_bytes > 0, "the log's call stayed");
+    assert!(
+        v.metrics().journal_carried_bytes > 0,
+        "the log's call stayed"
+    );
     v.write(log, 0, b"after\n", true).unwrap();
     drop(v);
     let v = reopen(tmp.path());
