@@ -77,9 +77,11 @@ impl SessionBinder for Sessions {
     }
 
     /// Under the actor's lock the binding goes and every open of its writer
-    /// closes as a save; then, unlocked, every record is made durable. A
-    /// failure is logged: an unsaved close stays pending, saved at its tree's
-    /// next step or at restart.
+    /// closes as a save. No program waits on a client's death, so nothing
+    /// waits for the disk here: the saves' records are durable at the next
+    /// fsync, builder batch or shutdown (docs/trees.md, "Recording and
+    /// durability"). A failure is logged: an unsaved close stays pending,
+    /// saved at its tree's next step or at restart.
     fn unbind(&mut self, session: SessionId) {
         let actor = self.recording.actor();
         let authority = self.bindings().remove(&session);
@@ -96,7 +98,7 @@ impl SessionBinder for Sessions {
         #[expect(clippy::disallowed_methods, reason = "the session's own unbind")]
         let closed = actor.close_writer(cap.tree(), &cap.writes_as().writer);
         drop(actor);
-        if let Err(e) = closed.map(drop).and_then(|()| self.recording.durable_all()) {
+        if let Err(e) = closed {
             eprintln!("tree SaveFailed: client {}'s opens: {e}", cap.client());
         }
     }
@@ -186,8 +188,7 @@ impl TreeSession {
     }
 
     /// FLUSH of an open ([`Recording::flush`]): answered without a wait for
-    /// the disk. Not built yet: the view's FLUSH still waits
-    /// (docs/target-architecture/future/latency-upkeep.md, slice 6).
+    /// the disk.
     ///
     /// # Errors
     ///
@@ -199,7 +200,7 @@ impl TreeSession {
     /// Every record so far made durable, blocking the caller, never under
     /// the actor's lock ([`Recording::durable_all`]): what a move from the
     /// untracked area into the tree waits for before it unlinks the area's
-    /// file. Not built yet: nothing calls it before slice 6.
+    /// file.
     ///
     /// # Errors
     ///

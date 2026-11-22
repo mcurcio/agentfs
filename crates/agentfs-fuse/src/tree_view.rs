@@ -343,6 +343,8 @@ impl Views for ViewHost {
             })),
             untracked: Arc::new(Untracked::new(area, give)),
             notifier: Arc::default(),
+            #[cfg(test)]
+            in_durable: Arc::default(),
         };
         let notifier = Arc::clone(&view.notifier);
         let id = ViewId(self.next);
@@ -558,7 +560,13 @@ struct View {
     untracked: Arc<Untracked>,
     /// The view's kernel channel, once mounted.
     notifier: Arc<OnceLock<Notifier>>,
+    /// Tests: runs in place of the wait of [`View::durable_before_unlink`].
+    #[cfg(test)]
+    in_durable: Arc<Mutex<Option<DurableHook>>>,
 }
+
+#[cfg(test)]
+type DurableHook = Box<dyn Fn() -> Result<()> + Send>;
 
 struct Handles {
     next: u64,
@@ -744,7 +752,7 @@ fn sync_flags(flags: i32) -> bool {
     flags & (libc::O_SYNC | libc::O_DSYNC) != 0
 }
 
-/// A FLUSH, FSYNC or FSYNCDIR answered once its records are durable, from
+/// An FSYNC, FSYNCDIR or `O_SYNC` write answered once its records are durable, from
 /// whichever thread the durability wait ends on.
 fn answer_empty(reply: ReplyEmpty) -> agentfs_core::tree_actor::Then {
     Box::new(move |result| match result {
@@ -769,6 +777,19 @@ impl View {
     }
     fn handles(&self) -> Result<MutexGuard<'_, Handles>> {
         self.handles.lock().map_err(|_| Errno::EIO)
+    }
+    /// Every record so far made durable, on this thread and never under the
+    /// actor's lock: what a move into the tree waits for before it unlinks
+    /// the area's file. The file's bytes are then in the journal alone, and
+    /// a close no longer makes them durable, so an unlink that reached the
+    /// disk before its record would lose bytes a program had fsynced
+    /// (docs/trees.md, "Recording and durability").
+    fn durable_before_unlink(&self) -> Result<()> {
+        #[cfg(test)]
+        if let Some(hook) = &*self.in_durable.lock().map_err(|_| Errno::EIO)? {
+            return hook();
+        }
+        self.session.durable_all().map_err(errno)
     }
     /// A directory inode's tree path, and whether it is untracked.
     fn dir_of(&self, v: &SessionGuard<'_>, ino: INodeNo) -> Result<(String, bool)> {
@@ -1219,6 +1240,8 @@ impl View {
                 writing.containers(&to, meta_of).map_err(untracked::io)?;
                 // Read with the actor unlocked, as a read open's snapshot is.
                 drop(v);
+                // The area's copy and its directory entry are fsynced before
+                // the tracked name's removal is recorded (`AreaWrite::place`).
                 self.untracked
                     .place(&writing, &to, &mut map.reader(), map.len(), meta)?;
                 // The actor's lock is never taken under the area's hold.
@@ -1246,10 +1269,11 @@ impl View {
                 // One step under the actor's lock: the volume's calls wait
                 // while the bytes are copied into the journal.
                 v.replace_file(&to, attrs, &mut file, len).map_err(errno)?;
-                self.untracked.unlink(&from)?;
-                self.mark_moved(untracked::file_of(&st))?;
                 let object = v.object_at(&to).map_err(errno)?;
                 drop(v);
+                self.durable_before_unlink()?;
+                self.untracked.unlink(&from)?;
+                self.mark_moved(untracked::file_of(&st))?;
                 self.invalidate(object);
                 Ok(())
             }
@@ -1262,6 +1286,8 @@ impl View {
                     gid: attr.gid,
                 };
                 v.symlink(&to, &target, owner).map_err(errno)?;
+                drop(v);
+                self.durable_before_unlink()?;
                 self.untracked.unlink(&from)
             }
         }
@@ -1690,9 +1716,13 @@ impl Filesystem for View {
             setattr(self, Ok(()));
         }
     }
-    /// close(2) of a write-open: every record so far (the open's, and its
-    /// file's metadata steps) made durable before close returns. The fsync
-    /// runs off this thread; the reply comes when it ends.
+    /// close(2) of a write-open: answered at once. Each of the open's calls
+    /// was appended to the journal before it returned, and a close waits for
+    /// no fsync and returns no journal fsync's error: `EIO` only once a
+    /// failed fsync has stopped the actor. fsync, FSYNCDIR and each write of
+    /// an `O_SYNC` or `O_DSYNC` open still wait for the disk; a power cut
+    /// can lose every change since the last of them, or since the builder's
+    /// last batch (docs/trees.md, "Recording and durability").
     fn flush(
         &self,
         _req: &Request,
@@ -1710,9 +1740,9 @@ impl Filesystem for View {
             Ok(None) => return reply.error(Errno::EBADF),
             Err(e) => return reply.error(e),
         };
-        match handle {
-            Some(handle) => self.session.durable_then(handle, answer_empty(reply)),
-            None => reply.ok(),
+        match handle.map_or(Ok(()), |handle| self.session.flush(handle)) {
+            Ok(()) => reply.ok(),
+            Err(e) => reply.error(errno(e)),
         }
     }
     /// Every record so far made durable, as FSYNCDIR does; a write-open's
@@ -2244,6 +2274,7 @@ mod tests {
             })),
             untracked: Arc::new(Untracked::new(area, false)),
             notifier: Arc::default(),
+            in_durable: Arc::default(),
         }
     }
 
@@ -2574,6 +2605,72 @@ mod tests {
             view.half(&v, "z-area", false, NewKind::File).unwrap(),
             Half::Untracked
         );
+    }
+
+    /// A move into the tree unlinks the area's file only once its record is
+    /// durable: the file is there while the wait runs, and stays when the
+    /// wait fails, for a file and for a link.
+    #[test]
+    fn a_move_into_the_tree_keeps_the_area_file_until_its_record_is_durable() {
+        let tmp = tempfile::tempdir().unwrap();
+        drop(new_actor(tmp.path()));
+        let info = tmp.path().join("history.git/info");
+        std::fs::create_dir_all(&info).unwrap();
+        std::fs::write(info.join("exclude"), "*.tmp\n").unwrap();
+        let recording = Recording::open(tmp.path(), &PodContext::default()).unwrap();
+        let mut sessions = Sessions::new(recording);
+        let view = view(writing(&mut sessions, "client"));
+        let area = view.session.untracked_area().unwrap();
+        std::fs::write(area.path().join("a.tmp"), b"edited\n").unwrap();
+        std::os::unix::fs::symlink("target", area.path().join("l.tmp")).unwrap();
+        let root = INodeNo(1);
+        // A link moves only to a new name, so its second move has another.
+        for (from, to, again) in [
+            ("a.tmp", "notes.md", "notes.md"),
+            ("l.tmp", "link", "link2"),
+        ] {
+            let source = area.path().join(from);
+            // The wait finds the tree's entry recorded and the area's file
+            // still there, and fails.
+            let seen = Arc::new(Mutex::new(Vec::new()));
+            let (waits, there, session) = (Arc::clone(&seen), source.clone(), view.session.clone());
+            *view.in_durable.lock().unwrap() = Some(Box::new(move || {
+                let recorded = session.lock().is_ok_and(|v| v.node(to).is_ok());
+                waits
+                    .lock()
+                    .unwrap()
+                    .push((recorded, there.symlink_metadata().is_ok()));
+                Err(Errno::EIO)
+            }));
+            let moved = view.run_move(
+                root,
+                OsStr::new(from),
+                root,
+                OsStr::new(to),
+                RenameMode::Replace,
+            );
+            assert_eq!(moved, Err(Errno::EIO), "{from}");
+            assert_eq!(*seen.lock().unwrap(), [(true, true)], "{from}");
+            assert!(source.symlink_metadata().is_ok(), "{from} stays");
+            // The real wait: the move's record durable, then the unlink.
+            *view.in_durable.lock().unwrap() = None;
+            let durability = Arc::clone(sessions.recording().actor().unwrap().durability());
+            let before = durability.appended();
+            view.run_move(
+                root,
+                OsStr::new(from),
+                root,
+                OsStr::new(again),
+                RenameMode::Replace,
+            )
+            .unwrap();
+            assert!(source.symlink_metadata().is_err(), "{from} is gone");
+            assert!(durability.mark() > before, "{from}'s record is durable");
+        }
+        let v = view.actor().unwrap();
+        assert_eq!(v.read("notes.md").unwrap(), b"edited\n");
+        assert_eq!(v.readlink("link").unwrap(), b"target");
+        assert_eq!(v.readlink("link2").unwrap(), b"target");
     }
 
     /// A rename's plan follows its source's half and kind and its target's
