@@ -2314,3 +2314,11 @@ Proof: both power-loss jobs reach `ack-hc-1` and the oracle judges every cut.
 **Tests.** A unit test of the due formula with `released`. New, deterministic, fails today: `segment_bytes: 1` and a small `compact_from`; open `big`, write, make an unrelated step, wait for the compactor (a checkpoint is published, nothing dropped); close `big`, settle, wait for the compactor: the chunk's segment is gone.
 
 **Test-only, needed regardless.** `fill_journal`'s generation wait accepts any checkpoint (same pattern at `tree_actor.rs:1375-1387` and `1798-1812`). Add `History::wait_compactor(through)`, a blocking form of `compactor_through` (`compaction_ended` already notifies); in `fill_journal` call it after the create and before the first chunk, and in place of the two waits at 1313-1314. Do not use `trees::compacted_through(settled)` there: a compaction at the save, one record short of a trailing switch record, would hang it. With this rule in, the power-loss driver's fix (entry above) may reduce to its `queued == 0` wait and its diagnostics; keep whichever the run proves.
+
+## 2026-11-22, PR #41 at 3527853: `repack::tests::a_snapshot_reads_through_a_roll_up` timed out once in ci `test (all)`; mechanism NOT found yet
+
+**The red.** `crates/agentfs-core/src/tree_actor/history/repack.rs:905`, `guarded` inside `wait_written` (called at 1244) hit its `RecvTimeoutError`; 1024 passed, 1 failed. The same test passed on earlier runs of the same code, so it fails only sometimes.
+
+**Not investigated.** Nothing is known beyond the log line. Candidates to test, none shown: the switch record's extra no-step builder batch changes which built event the repack task's roll-up follows, so the "written" event the test waits for never fires in one ordering; or the test's guard is a wall-clock bound that a loaded runner misses (then the guard is a timer standing in for an event and the wait itself is wrong).
+
+**For the CI fix:** find the mechanism first (the orderings of built events, `wait_batch_end` and the repack task's steps in this test, with the switch record in), reproduce it deterministically, then fix the product or the test accordingly. Do not lengthen the guard as the fix.
