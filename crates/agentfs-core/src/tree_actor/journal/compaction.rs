@@ -245,6 +245,16 @@ pub(in crate::tree_actor) struct Carried {
     bytes: u64,
     /// The covered segments whose live frames (if any) now have a copy.
     unlink: Vec<RecordNo>,
+    /// The new carry file, if one was written.
+    made: Option<Made>,
+}
+
+/// The carry file one compaction wrote, with where each record it holds was
+/// carried before: what [`JournalCompaction::abandon`] undoes.
+#[derive(Clone, Debug)]
+pub(in crate::tree_actor) struct Made {
+    carry: Arc<Segment>,
+    earlier: Vec<(RecordNo, Option<(Arc<Segment>, u64)>)>,
 }
 
 impl Carried {
@@ -252,6 +262,12 @@ impl Carried {
     #[cfg(test)]
     pub(in crate::tree_actor) fn bytes(&self) -> u64 {
         self.bytes
+    }
+
+    /// The carry file this compaction wrote, for
+    /// [`JournalCompaction::abandon`].
+    pub(in crate::tree_actor) fn made(&self) -> Option<Made> {
+        self.made.clone()
     }
 }
 
@@ -271,7 +287,7 @@ impl Sealed {
     /// # Errors
     ///
     /// [`CompactionError::NotPublished`] when its `built` passes what
-    /// `durable` proves.
+    /// `durable` proves, or for step heads recovery's fold refuses.
     pub(in crate::tree_actor) fn new(
         mut checkpoint: Checkpoint,
         durable: Durable,
@@ -282,6 +298,18 @@ impl Sealed {
                 "a checkpoint at {} past the durable {}",
                 checkpoint.built.get(),
                 durable.through.get()
+            ))));
+        }
+        // What recovery's fold refuses (`journal::fold`): a checkpoint it
+        // cannot read never replaces one it can.
+        let unreadable = checkpoint.step_heads.iter().find(|(name, step)| {
+            !checkpoint.pointers.contains_key(*name) || **step > checkpoint.built
+        });
+        if let Some((name, step)) = unreadable {
+            return Err(CompactionError::NotPublished(io::Error::other(format!(
+                "a checkpoint at {} with the step head {name} at {}",
+                checkpoint.built.get(),
+                step.get()
             ))));
         }
         checkpoint.carried = carried.files;
@@ -649,6 +677,9 @@ impl JournalCompaction {
     /// copy in the relocations. A file whose live frames outweigh its dead
     /// bytes is kept as it is; one with none is let go without a copy.
     ///
+    /// A compaction that ends before its checkpoint is renamed hands
+    /// [`Carried::made`] to [`JournalCompaction::abandon`].
+    ///
     /// # Errors
     ///
     /// [`CompactionError::NotPublished`]: the new carry file is removed.
@@ -696,6 +727,7 @@ impl JournalCompaction {
             }
         }
         let mut bytes = 0;
+        let mut made = None;
         if !copies.is_empty() {
             let carry = Segment::create_carry(&self.dir, built).map_err(not_published)?;
             let written = self.copy(&carry, &copies, checkpoint.salt);
@@ -705,9 +737,12 @@ impl JournalCompaction {
                     carry.set_len(length);
                     self.durability.add_carry(Arc::clone(&carry), length);
                     // The copies stand: holders may move to them.
-                    for (record, tail) in moved {
-                        self.durability.relocations().moved(record, &carry, tail);
-                    }
+                    let relocations = self.durability.relocations();
+                    let earlier = moved
+                        .into_iter()
+                        .map(|(record, tail)| (record, relocations.moved(record, &carry, tail)))
+                        .collect();
+                    made = Some(Made { carry, earlier });
                     files.push(built);
                 }
                 Err(e) => {
@@ -721,7 +756,29 @@ impl JournalCompaction {
             files,
             bytes,
             unlink,
+            made,
         })
+    }
+
+    /// Lets go of the carry file a compaction made, when it ends before its
+    /// checkpoint is renamed: no checkpoint names the file, so it leaves
+    /// Durability's list, each record it holds is where it was before, and
+    /// the file is unlinked. A compaction that fails this way again and
+    /// again leaves nothing behind. A holder that moved to the file keeps
+    /// reading it until it moves again.
+    pub(in crate::tree_actor) fn abandon(&self, made: Option<Made>) {
+        let Some(Made { carry, earlier }) = made else {
+            return;
+        };
+        if !self.durability.remove_carry(&carry) {
+            return;
+        }
+        for (record, earlier) in earlier {
+            self.durability.relocations().put_back(record, earlier);
+        }
+        if let Err(e) = Durability::unlink(&carry) {
+            eprintln!("tree CompactionFailed: {}: {e}", carry.path().display());
+        }
     }
 
     /// Writes each frame of `copies` into `carry` (flag `carried`, record
@@ -801,14 +858,15 @@ impl JournalCompaction {
 
     /// Unlinks every covered segment `published` lets go, and every carry
     /// file it does not name, then fsyncs the directory. Each leaves the
-    /// segment table under Durability's lock in O(segments); its unlink runs
-    /// with no lock held. A reader holding an unlinked file keeps reading
+    /// segment table under Durability's lock in O(segments), once its unlink
+    /// has run with no lock held. A reader holding an unlinked file keeps reading
     /// it, and its bytes count in [`JournalCompaction::len`] until the last
     /// holder lets go.
     ///
     /// # Errors
     ///
-    /// [`CompactionError::NotDropped`]: what was not unlinked stays;
+    /// [`CompactionError::NotDropped`]: what was not unlinked stays in the
+    /// table, and the next compaction tries it again;
     /// [`CompactionError::Stopped`] for a failed fsync of the directory.
     pub(in crate::tree_actor) fn unlink_covered(
         &self,
@@ -819,21 +877,30 @@ impl JournalCompaction {
             carried_bytes: published.carried_bytes,
         };
         let mut unlinked = false;
+        // The unlink first: a file whose unlink fails is still in the
+        // table, where the next compaction finds it.
+        let table = self.durability.table();
         for first in &published.unlink {
-            if let Some(segment) = self.durability.remove_segment(*first) {
-                self.durability.relocations().dropped(&segment);
-                Durability::unlink(&segment).map_err(CompactionError::NotDropped)?;
+            let Some(segment) = table.iter().find(|s| s.first() == *first) else {
+                continue;
+            };
+            Durability::unlink(segment).map_err(CompactionError::NotDropped)?;
+            unlinked = true;
+            if self.durability.remove_segment(*first).is_some() {
+                self.durability.relocations().dropped(segment);
                 stats.segments += 1;
-                unlinked = true;
             }
         }
         for carry in self.durability.carries() {
             let named = super::segment::carry_built(carry.path())
                 .is_some_and(|built| published.carried.contains(&built));
-            if !named && self.durability.remove_carry(&carry) {
+            if named {
+                continue;
+            }
+            Durability::unlink(&carry).map_err(CompactionError::NotDropped)?;
+            unlinked = true;
+            if self.durability.remove_carry(&carry) {
                 self.durability.relocations().dropped(&carry);
-                Durability::unlink(&carry).map_err(CompactionError::NotDropped)?;
-                unlinked = true;
             }
         }
         if unlinked && let Err(e) = sync_dir(&self.dir) {

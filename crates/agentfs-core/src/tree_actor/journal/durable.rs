@@ -386,9 +386,8 @@ impl Durability {
         state.carries.push(carry);
     }
 
-    /// A covered segment leaves the table, O(segments), before the
-    /// compactor unlinks it with no lock held: the segment, if the table had
-    /// it.
+    /// A covered segment leaves the table, O(segments), once the compactor
+    /// has unlinked it with no lock held: the segment, if the table had it.
     pub(in crate::tree_actor) fn remove_segment(&self, first: RecordNo) -> Option<Arc<Segment>> {
         let mut state = self.state();
         let at = state.segments.iter().position(|s| s.first() == first)?;
@@ -398,8 +397,8 @@ impl Durability {
         Some(segment)
     }
 
-    /// A carry file no published checkpoint names any more leaves the list,
-    /// before the compactor unlinks it: whether the list had it.
+    /// A carry file no published checkpoint names leaves the list, once
+    /// the compactor has unlinked it: whether the list had it.
     pub(in crate::tree_actor) fn remove_carry(&self, carry: &Segment) -> bool {
         let mut state = self.state();
         let Some(at) = state.carries.iter().position(|c| c.same_file(carry)) else {
@@ -410,8 +409,8 @@ impl Durability {
         true
     }
 
-    /// Unlinks `file`, a segment or carry file already out of the table,
-    /// with no lock held (design rule 1).
+    /// Unlinks `file`, a segment or carry file, with no lock held (design
+    /// rule 1).
     ///
     /// # Errors
     ///

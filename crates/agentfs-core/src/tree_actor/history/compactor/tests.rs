@@ -859,7 +859,11 @@ fn a_carried_open_survives_each_gap() {
         Err(CompactionError::NotDropped(_))
     ));
     assert_eq!(v.journal.segment_firsts().len(), segments);
-    once(killed_at_rest(&v, tmp.path()).path());
+    let both = killed_at_rest(&v, tmp.path());
+    // Recovery reads each record once, the carried copy over its original.
+    let read: Vec<RecordNo> = frames_of(both.path()).iter().map(|f| f.0.seq).collect();
+    assert!(read[1..].is_sorted_by(|a, b| a < b), "read twice: {read:?}");
+    once(both.path());
     // The next compaction lets the segment go, and once the actor and the
     // builder have moved, nothing holds it.
     v.on_built();
@@ -873,6 +877,182 @@ fn a_carried_open_survives_each_gap() {
     assert_eq!(v.read(ROOT, "held").unwrap(), b"abcabcabc");
     drop(v);
     once(tmp.path());
+}
+
+/// The carry files of the journal in `root`, by built point.
+fn carry_files(root: &Path) -> Vec<RecordNo> {
+    let listed = segment::list_carries(&root.join(JOURNAL)).unwrap();
+    listed.into_iter().map(|(built, _)| built).collect()
+}
+
+/// A kill inside a compaction leaves a carry file no checkpoint names: the
+/// new one before the rename, the superseded one before the unlinks. Open
+/// removes it.
+#[test]
+fn open_removes_a_carry_file_no_checkpoint_names() {
+    let swept = |copy: &Path, what: &str| {
+        let named = checkpoint_in(&copy.join(JOURNAL)).carried;
+        assert_ne!(carry_files(copy), named, "{what}: no file to remove");
+        let c = opened(copy);
+        assert_eq!(carry_files(copy), named, "{what}");
+        assert_eq!(c.read(ROOT, "rolls").unwrap(), b"again", "{what}");
+        c
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    let mut v = new_actor_with(tmp.path(), carrying());
+    let held = held_open(&mut v);
+    v.settle().unwrap();
+    // The new carry file is written and the old checkpoint stands.
+    let (gate, parked) = Parked::pair();
+    let compacting = compaction(&v, gate);
+    parked.until(Gap::Written);
+    let copy = killed_at_rest(&v, tmp.path());
+    parked.end();
+    compacting.join().unwrap().unwrap().expect("compacts");
+    let c = swept(copy.path(), "before the rename");
+    assert_eq!(c.read(ROOT, "held").unwrap(), b"abcabcabc");
+    drop(c);
+    // The open ends: the next checkpoint names no carry file, and the
+    // first one's is still linked until the unlinks.
+    assert_eq!(carry_files(tmp.path()).len(), 1);
+    v.on_built();
+    v.close(held).unwrap();
+    v.settle().unwrap();
+    let (gate, parked) = Parked::pair();
+    let compacting = compaction(&v, gate);
+    parked.until(Gap::BeforeUnlink);
+    let copy = killed_at_rest(&v, tmp.path());
+    parked.end();
+    compacting.join().unwrap().unwrap().expect("compacts");
+    assert_eq!(carry_files(tmp.path()), []);
+    let c = swept(copy.path(), "before the unlinks");
+    assert_eq!(c.read(ROOT, "held").unwrap(), b"abcabcabc");
+}
+
+/// A compaction that fails before its rename leaves no carry file, on disk
+/// or in the journal's length, and the next one carries the same frames.
+#[test]
+fn a_compaction_failed_before_its_rename_leaves_no_carry_file() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut v = new_actor_with(tmp.path(), carrying());
+    let held = held_open(&mut v);
+    v.settle().unwrap();
+    for _ in 0..2 {
+        let linked = v.durability().linked();
+        let (gate, parked) = Parked::pair();
+        let compacting = compaction(&v, gate);
+        parked.until(Gap::Written);
+        assert_eq!(carry_files(tmp.path()).len(), 1, "the carry is written");
+        parked.fail();
+        assert!(matches!(
+            compacting.join().unwrap(),
+            Err(CompactionError::NotPublished(_))
+        ));
+        assert_eq!(carry_files(tmp.path()), []);
+        assert!(v.durability().carries().is_empty());
+        assert_eq!(v.durability().linked(), linked);
+        // A holder that moved to the copy reads on, and moves back.
+        v.on_built();
+        v.write(held, 0, b"!", true).unwrap();
+        put(&mut v, ROOT, "next", b"a built event");
+        v.settle().unwrap();
+    }
+    compact_now_carrying(&v);
+    assert_eq!(carry_files(tmp.path()).len(), 1);
+    v.on_built();
+    v.close(held).unwrap();
+    v.settle().unwrap();
+    assert_eq!(v.read(ROOT, "held").unwrap(), b"abcabcabc!!");
+    drop(v);
+    assert_eq!(
+        opened(tmp.path()).read(ROOT, "held").unwrap(),
+        b"abcabcabc!!"
+    );
+}
+
+/// An unlink that fails leaves its segment in the table: the journal's
+/// length still counts it, and the next compaction lets it go.
+#[test]
+fn a_failed_unlink_is_tried_again_by_the_next_compaction() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut v = new_actor_with(tmp.path(), carrying());
+    let held = held_open(&mut v);
+    v.settle().unwrap();
+    let firsts = v.journal.segment_firsts();
+    let file = v.journal.dir().join(segment::name_of(firsts[0]));
+    let aside = tmp.path().join("aside");
+    let (gate, parked) = Parked::pair();
+    let compacting = compaction(&v, gate);
+    parked.until(Gap::BeforeUnlink);
+    // A directory under the segment's name: its unlink fails, for root too.
+    fs::rename(&file, &aside).unwrap();
+    fs::create_dir(&file).unwrap();
+    parked.end();
+    assert!(matches!(
+        compacting.join().unwrap(),
+        Err(CompactionError::NotDropped(_))
+    ));
+    assert_eq!(v.journal.segment_firsts(), firsts);
+    fs::remove_dir(&file).unwrap();
+    fs::rename(&aside, &file).unwrap();
+    v.on_built();
+    put(&mut v, ROOT, "next", b"a built event");
+    compact_now_carrying(&v);
+    assert!(!v.journal.segment_firsts().contains(&firsts[0]));
+    assert!(!file.exists());
+    v.on_built();
+    v.close(held).unwrap();
+    v.settle().unwrap();
+    drop(v);
+    assert_eq!(opened(tmp.path()).read(ROOT, "held").unwrap(), b"abcabcabc");
+}
+
+/// A gate that fails at each gap fails the compaction as [`Gap::fault`]
+/// says, and History counts the checkpoint exactly when it was renamed.
+#[test]
+fn a_fault_at_each_gap_fails_as_its_class() {
+    for gap in Gap::ALL {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut v = new_actor_with(tmp.path(), carrying());
+        let held = held_open(&mut v);
+        v.settle().unwrap();
+        let before = v.history().checkpointed().built;
+        let (gate, parked) = Parked::pair();
+        let compacting = compaction(&v, gate);
+        parked.until(gap);
+        parked.fail();
+        let failed = compacting.join().unwrap().unwrap_err();
+        let on_disk = checkpoint_in(v.journal.dir()).built;
+        let counted = v.history().checkpointed().built;
+        match gap {
+            Gap::Covered | Gap::Written => {
+                assert!(
+                    matches!(failed, CompactionError::NotPublished(_)),
+                    "{gap:?}"
+                );
+                assert_eq!((on_disk, counted), (before, before), "{gap:?}");
+            }
+            // The rename happened and its fsync is the fault: the actor
+            // stops, and History may not trim by a checkpoint not durable.
+            Gap::Renamed => {
+                assert!(matches!(failed, CompactionError::Stopped(_)), "{gap:?}");
+                assert!(on_disk > before, "{gap:?}");
+                assert_eq!(counted, before, "{gap:?}");
+                assert!(v.write(held, 0, b"!", true).is_err(), "{gap:?}");
+            }
+            Gap::DirSynced | Gap::BeforeUnlink => {
+                assert!(matches!(failed, CompactionError::NotDropped(_)), "{gap:?}");
+                assert!(on_disk > before, "{gap:?}");
+                assert_eq!(counted, on_disk, "{gap:?}");
+            }
+        }
+        drop(v);
+        assert_eq!(
+            opened(tmp.path()).read(ROOT, "held").unwrap(),
+            b"abcabcabc",
+            "{gap:?}"
+        );
+    }
 }
 
 /// [`compact_now`] on a volume of any upkeep.

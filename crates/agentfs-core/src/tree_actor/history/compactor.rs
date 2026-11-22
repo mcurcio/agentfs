@@ -284,8 +284,14 @@ pub(in crate::tree_actor) fn compact_once(
         .collect();
     drop(folded);
     let carried = journal.carry(&checkpoint)?;
-    let sealed = Sealed::new(checkpoint, durable, carried)?;
-    let published = journal.publish(&sealed)?;
+    let made = carried.made();
+    let published =
+        Sealed::new(checkpoint, durable, carried).and_then(|sealed| journal.publish(&sealed));
+    if let Err(CompactionError::NotPublished(_)) = &published {
+        // The old checkpoint stands, and names no carry file made here.
+        journal.abandon(made);
+    }
+    let published = published?;
     let dir_synced = journal.gate(Gap::DirSynced);
     history.published(&published);
     dir_synced?;

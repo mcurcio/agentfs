@@ -791,6 +791,75 @@ impl View {
         }
         self.session.durable_all().map_err(errno)
     }
+    /// A WRITE: `then` gets the bytes written, at once, or for an open with
+    /// `O_SYNC` or `O_DSYNC` once the write's records are durable, from
+    /// whichever thread that wait ends on.
+    fn write_then(
+        &self,
+        fh: FileHandle,
+        offset: u64,
+        data: &[u8],
+        write_flags: WriteFlags,
+        then: Box<dyn FnOnce(Result<u32>) + Send>,
+    ) {
+        match self.untracked_fd(fh) {
+            Ok(Some(open)) => {
+                if open.moved {
+                    return then(Err(Errno::ESTALE));
+                }
+                // A page write lands where the kernel says; a write of an
+                // `O_APPEND` open at the file's end.
+                let append = open.append && !write_flags.contains(WriteFlags::FUSE_WRITE_CACHE);
+                let writing = self.untracked.writing();
+                let written = untracked::write(&writing, &open.fd, offset, data, append);
+                return then(written.map(|()| data.len() as u32));
+            }
+            Ok(None) => {}
+            Err(e) => return then(Err(e)),
+        }
+        // The guards drop before a durability wait is queued.
+        let result = (|| {
+            let mut v = self.actor()?;
+            let handles = self.handles()?;
+            match handles.entries.get(&fh.0).ok_or(Errno::EBADF)? {
+                Open::Write { handle, sync, .. }
+                    if write_flags.contains(WriteFlags::FUSE_WRITE_CACHE) =>
+                {
+                    v.page_writeback(*handle, offset, data).map_err(errno)?;
+                    Ok(sync.then_some(*handle))
+                }
+                Open::Write {
+                    handle,
+                    append,
+                    sync,
+                    ..
+                } => {
+                    v.write(*handle, offset, data, *append).map_err(errno)?;
+                    Ok(sync.then_some(*handle))
+                }
+                _ => Err(Errno::EBADF),
+            }
+        })();
+        let written = data.len() as u32;
+        match result {
+            Ok(None) => then(Ok(written)),
+            Ok(Some(handle)) => self.session.durable_then(
+                handle,
+                Box::new(move |result| then(result.map(|()| written).map_err(errno))),
+            ),
+            Err(e) => then(Err(e)),
+        }
+    }
+    /// What a FLUSH answers, with no wait for the disk.
+    fn run_flush(&self, fh: FileHandle) -> Result<()> {
+        let handle = self
+            .handles()?
+            .entries
+            .get(&fh.0)
+            .map(open_handle)
+            .ok_or(Errno::EBADF)?;
+        handle.map_or(Ok(()), |handle| self.session.flush(handle).map_err(errno))
+    }
     /// A directory inode's tree path, and whether it is untracked.
     fn dir_of(&self, v: &SessionGuard<'_>, ino: INodeNo) -> Result<(String, bool)> {
         if is_untracked(ino) {
@@ -1601,58 +1670,16 @@ impl Filesystem for View {
         reply: ReplyWrite,
     ) {
         let _request = measured::request(measured::Op::Write);
-        match self.untracked_fd(fh) {
-            Ok(Some(open)) => {
-                if open.moved {
-                    return reply.error(Errno::ESTALE);
-                }
-                // A page write lands where the kernel says; a write of an
-                // `O_APPEND` open at the file's end.
-                let append = open.append && !write_flags.contains(WriteFlags::FUSE_WRITE_CACHE);
-                let writing = self.untracked.writing();
-                return match untracked::write(&writing, &open.fd, offset, data, append) {
-                    Ok(()) => reply.written(data.len() as u32),
-                    Err(e) => reply.error(e),
-                };
-            }
-            Ok(None) => {}
-            Err(e) => return reply.error(e),
-        }
-        // The guards drop before a durability wait is queued.
-        let result = (|| {
-            let mut v = self.actor()?;
-            let handles = self.handles()?;
-            match handles.entries.get(&fh.0).ok_or(Errno::EBADF)? {
-                Open::Write { handle, sync, .. }
-                    if write_flags.contains(WriteFlags::FUSE_WRITE_CACHE) =>
-                {
-                    v.page_writeback(*handle, offset, data).map_err(errno)?;
-                    Ok(sync.then_some(*handle))
-                }
-                Open::Write {
-                    handle,
-                    append,
-                    sync,
-                    ..
-                } => {
-                    v.write(*handle, offset, data, *append).map_err(errno)?;
-                    Ok(sync.then_some(*handle))
-                }
-                _ => Err(Errno::EBADF),
-            }
-        })();
-        let written = data.len() as u32;
-        match result {
-            Ok(None) => reply.written(written),
-            Ok(Some(handle)) => self.session.durable_then(
-                handle,
-                Box::new(move |result| match result {
-                    Ok(()) => reply.written(written),
-                    Err(e) => reply.error(errno(e)),
-                }),
-            ),
-            Err(e) => reply.error(e),
-        }
+        self.write_then(
+            fh,
+            offset,
+            data,
+            write_flags,
+            Box::new(move |written| match written {
+                Ok(written) => reply.written(written),
+                Err(e) => reply.error(e),
+            }),
+        );
     }
     fn setattr(
         &self,
@@ -1732,17 +1759,9 @@ impl Filesystem for View {
         reply: ReplyEmpty,
     ) {
         let _request = measured::request(measured::Op::Flush);
-        let handle = match self
-            .handles()
-            .map(|h| h.entries.get(&fh.0).map(open_handle))
-        {
-            Ok(Some(handle)) => handle,
-            Ok(None) => return reply.error(Errno::EBADF),
-            Err(e) => return reply.error(e),
-        };
-        match handle.map_or(Ok(()), |handle| self.session.flush(handle)) {
+        match self.run_flush(fh) {
             Ok(()) => reply.ok(),
-            Err(e) => reply.error(errno(e)),
+            Err(e) => reply.error(e),
         }
     }
     /// Every record so far made durable, as FSYNCDIR does; a write-open's
@@ -2605,6 +2624,59 @@ mod tests {
             view.half(&v, "z-area", false, NewKind::File).unwrap(),
             Half::Untracked
         );
+    }
+
+    /// close(2) through the view waits for no fsync, and a write waits for
+    /// one exactly when its open has `O_SYNC` or `O_DSYNC`: the write is
+    /// answered once the journal's mark covers it. The opens stay open, so
+    /// the builder has no step to make durable.
+    #[test]
+    fn a_close_waits_for_no_fsync_and_a_sync_opens_write_waits() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut sessions = Sessions::new(new_actor(tmp.path()));
+        let view = view(writing(&mut sessions, "client"));
+        let durability = Arc::clone(sessions.recording().actor().unwrap().durability());
+        let open = |name: &str, flags: i32| {
+            let mut volume = view.actor().unwrap();
+            let flags = libc::O_WRONLY | libc::O_CREAT | flags;
+            FileHandle(
+                view.open_file(&mut volume, name, flags, Some(ATTRS))
+                    .unwrap(),
+            )
+        };
+        let write = |fh: FileHandle| {
+            let (answered, answer) = std::sync::mpsc::channel();
+            let mark = Arc::clone(&durability);
+            view.write_then(
+                fh,
+                0,
+                b"bytes",
+                WriteFlags::empty(),
+                Box::new(move |written| answered.send((written, mark.mark())).unwrap()),
+            );
+            answer.recv_timeout(Duration::from_secs(10)).unwrap()
+        };
+        let plain = open("plain", 0);
+        let (written, mark) = write(plain);
+        assert_eq!(written, Ok(5));
+        assert!(mark < durability.appended(), "a plain write waited");
+        view.run_flush(plain).unwrap();
+        assert!(
+            durability.mark() < durability.appended(),
+            "the close made an fsync"
+        );
+        for (name, flags) in [("sync", libc::O_SYNC), ("dsync", libc::O_DSYNC)] {
+            let fh = open(name, flags);
+            let (written, mark) = write(fh);
+            assert_eq!(written, Ok(5), "{name}");
+            assert_eq!(
+                mark,
+                durability.appended(),
+                "{name}: answered before the disk"
+            );
+            view.run_flush(fh).unwrap();
+        }
+        assert_eq!(view.run_flush(FileHandle(99)), Err(Errno::EBADF));
     }
 
     /// A move into the tree unlinks the area's file only once its record is

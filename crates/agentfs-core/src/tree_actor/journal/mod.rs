@@ -1023,6 +1023,14 @@ impl Journal {
         // A checkpoint renamed but not yet synced, and every cut above, are
         // durable before History may trim the built log by it.
         sync_dir(dir)?;
+        // A carry file the checkpoint does not name is no checkpoint's: a
+        // compaction died before its rename, or after it and before its
+        // unlinks. Only now, with the checkpoint's own name durable.
+        for (carried, path) in segment::list_carries(dir)? {
+            if !checkpoint.carried.contains(&carried) {
+                fs::remove_file(&path)?;
+            }
+        }
         let frames: Vec<Frame> = std::iter::once(checkpoint_frame)
             .chain(before.into_values())
             .chain(after)
@@ -1147,7 +1155,7 @@ impl Journal {
 
 #[cfg(test)]
 mod tests {
-    use super::compaction::{JournalCompaction, Sealed};
+    use super::compaction::{CompactionError, JournalCompaction, Sealed};
     use super::*;
 
     fn checkpoint(built: u64) -> Checkpoint {
@@ -1244,6 +1252,45 @@ mod tests {
         let stats = port.unlink_covered(&published).unwrap();
         assert_eq!(stats.carried_bytes, bytes);
         stats
+    }
+
+    /// C1 and the reader's own checks, at construction: a checkpoint past
+    /// what is durable, or one recovery's fold would refuse, is not sealed.
+    #[test]
+    fn a_checkpoint_recovery_could_not_read_is_not_sealed() {
+        let (_tmp, dir, mut journal) = journal_of(1);
+        for seq in 1..=2 {
+            let (record, tail) = call(seq, 7, b"x");
+            journal.append(&record, &tail).unwrap();
+        }
+        let port = JournalCompaction::new(dir.clone(), Arc::clone(journal.durability()), None);
+        let seal = |checkpoint: Checkpoint, durable: u64| {
+            let durable = port.wait_durable(RecordNo::new(durable)).unwrap();
+            let carried = port.carry(&checkpoint).unwrap();
+            Sealed::new(checkpoint, durable, carried)
+        };
+        let refused = |sealed: std::result::Result<Sealed, CompactionError>| {
+            assert!(matches!(sealed, Err(CompactionError::NotPublished(_))));
+        };
+        let mut checkpoint = checkpoint_with(2, Vec::new());
+        checkpoint.salt = journal.salt();
+        refused(seal(checkpoint.clone(), 1));
+        let head = |step: u64| {
+            let mut checkpoint = checkpoint.clone();
+            checkpoint
+                .step_heads
+                .insert("refs/heads/root".into(), RecordNo::new(step));
+            checkpoint
+        };
+        // A head with no pointer, and a head past the built point.
+        refused(seal(head(1), 2));
+        let mut past = head(3);
+        past.pointers
+            .insert("refs/heads/root".into(), "0".repeat(40));
+        refused(seal(past.clone(), 2));
+        past.step_heads
+            .insert("refs/heads/root".into(), RecordNo::new(2));
+        seal(past, 2).unwrap();
     }
 
     #[test]

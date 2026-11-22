@@ -84,6 +84,19 @@ pub(in crate::tree_actor) fn list(dir: &Path) -> io::Result<Vec<(RecordNo, PathB
     Ok(found)
 }
 
+/// The carry files in `dir`, by the built point each name gives.
+pub(in crate::tree_actor) fn list_carries(dir: &Path) -> io::Result<Vec<(RecordNo, PathBuf)>> {
+    let mut found = Vec::new();
+    for entry in fs::read_dir(dir)? {
+        let path = entry?.path();
+        if let Some(built) = carry_built(&path) {
+            found.push((built, path));
+        }
+    }
+    found.sort();
+    Ok(found)
+}
+
 impl Segment {
     /// A new, empty segment whose first record will be `first`. Its directory
     /// entry is not yet durable: [`super::durable::Durability`] fsyncs the
@@ -319,10 +332,28 @@ impl Relocations {
     }
 
     /// `record`'s frame is now at `tail` of `segment`.
-    pub(super) fn moved(&self, record: RecordNo, segment: &Arc<Segment>, tail: u64) {
+    /// With where it was carried before, for [`Relocations::put_back`].
+    pub(super) fn moved(
+        &self,
+        record: RecordNo,
+        segment: &Arc<Segment>,
+        tail: u64,
+    ) -> Option<(Arc<Segment>, u64)> {
         let mut moved = self.moved_table();
-        moved.table.insert(record, (Arc::clone(segment), tail));
         moved.generation += 1;
+        moved.table.insert(record, (Arc::clone(segment), tail))
+    }
+
+    /// `record`'s copy in a carry file no checkpoint came to name is let
+    /// go: its frame is where it was before that copy, `earlier` (an older
+    /// carry file) or its own segment.
+    pub(super) fn put_back(&self, record: RecordNo, earlier: Option<(Arc<Segment>, u64)>) {
+        let mut moved = self.moved_table();
+        moved.generation += 1;
+        match earlier {
+            Some(earlier) => moved.table.insert(record, earlier),
+            None => moved.table.remove(&record),
+        };
     }
 
     /// `segment` is unlinked: the frames carried into it that no later copy
