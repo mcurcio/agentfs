@@ -608,7 +608,7 @@ fn nodes(v: &TreeActor) -> Vec<(String, Node)> {
 #[test]
 fn directory_numbers_and_times_survive_compaction_and_reopen() {
     let tmp = tempfile::tempdir().unwrap();
-    let mut v = new_actor(tmp.path());
+    let mut v = trees::new_actor_with(tmp.path(), trees::compacting());
     let w = writer("w");
     mkdir(&mut v, ROOT, "a");
     mkdir(&mut v, ROOT, "a/b");
@@ -616,22 +616,25 @@ fn directory_numbers_and_times_survive_compaction_and_reopen() {
     v.set_times(ROOT, "a", Some(SetTime::At(5)), Some(SetTime::At(6)), &w)
         .unwrap();
     let seen = nodes(&v);
+    // Every step built and compacted: the reopen starts from a checkpoint
+    // at the last record.
+    let settled = v.settle().unwrap();
+    assert_eq!(trees::compacted_through(&v, settled).built, settled);
     drop(v);
-    // A reopen with every step built compacts at once: the journal is its
-    // checkpoint alone.
-    let mut v = reopen(tmp.path());
+    let mut v = trees::reopen_with(tmp.path(), trees::compacting());
     assert_eq!(nodes(&v), seen);
-    assert_eq!(trees::segments(tmp.path()).len(), 1);
-    // Steps after the checkpoint, built before the next reopen: it replays
-    // them on the checkpoint's numbers and times, then compacts again.
+    // Steps after the checkpoint, built and compacted before the next
+    // reopen: the checkpoint holds their numbers and times.
     mkdir(&mut v, ROOT, "c");
     v.rename(ROOT, "a/b", "c/b", RenameMode::Replace, &w)
         .unwrap();
     v.set_times(ROOT, "c/b/f", None, Some(SetTime::At(9)), &w)
         .unwrap();
     let seen = nodes(&v);
+    let settled = v.settle().unwrap();
+    assert_eq!(trees::compacted_through(&v, settled).built, settled);
     drop(v);
-    let v = reopen(tmp.path());
+    let v = trees::reopen_with(tmp.path(), trees::compacting());
     assert_eq!(nodes(&v), seen);
     drop(v);
     let v = reopen(tmp.path());

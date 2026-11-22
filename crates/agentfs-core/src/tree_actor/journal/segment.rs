@@ -326,11 +326,15 @@ impl Relocations {
     }
 
     /// `segment` is unlinked: the frames carried into it that no later copy
-    /// names are no longer anywhere.
+    /// names are no longer anywhere. The table changes only for a carry
+    /// file; a segment that held no carried frame moves no holder.
     pub(super) fn dropped(&self, segment: &Segment) {
         let mut moved = self.moved_table();
+        let before = moved.table.len();
         moved.table.retain(|_, (held, _)| !held.same_file(segment));
-        moved.generation += 1;
+        if moved.table.len() != before {
+            moved.generation += 1;
+        }
     }
 
     /// Where `record`'s frame was carried, if it was.

@@ -160,6 +160,7 @@ fn every_environment_variable_is_documented() {
         .chain(crate::otel::ENV_VARS.iter().copied())
         .chain(crate::otel::SDK_ENV_VARS.iter().copied())
         .chain(std::iter::once(agentfs_core::failpoints::ENV_VAR))
+        .chain(std::iter::once(agentfs_core::failpoints::COMPACT_GATE_VAR))
         .filter(|var| !spans.iter().any(|s| s == var))
         .collect();
     assert!(
