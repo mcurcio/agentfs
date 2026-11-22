@@ -2228,3 +2228,18 @@ The slice is built: compaction on history's compactor, the switch as a journal r
 - **Mutation probes run** (planted, run, reverted): P2.1 (the check at `Written` fails, as the page says), P2.2, P2.3, P2.4, P2.7 (the library replay reports 13 traces and their calls), P2.10b, P2.11, P2.12, P2.13, P2.15a, P2.15b, P2.15c, P2.15d, P2.16. P2.15a fails earlier than the page says (no switch record is found); P2.15b fails in the first run, not the third (the second save's own unbuilt step is switched).
 - **Not built.** The `held_open` figures workload of 2.9: it needs a row in `ci/trees-budget.json` and in the tracer's list of figure names, neither in lane A's paths.
 - **Not run.** 2.9's release figures (6.5 GB free on the container's disk; `close_1g` needs about 5 GB beside a release build). `ci/power-loss-trees.sh` (no kernel modules in the container). Probes P2.5, P2.6, P2.8, P2.10a and P2.14.
+
+## 2026-11-22, PR #41 at a819159: `ci/e2e-tree-enospc.sh` red, a counted failpoint the slice 2 audit missed
+
+**The red.** phase-1's "journal and state exhaustion" job: `rename_while_full tree.build_after_built_log` waits 60 s for `tree CopyStale` and never sees it (`ci/e2e-tree-enospc.sh:195-196`).
+
+**Mechanism (read from the code, not run).** The case mounts with `tree.build_after_built_log=sleep(30000)@2`, assuming the mount's rebind is batch 1 and the rename's batch is hit 2. Since slice 2 each built event that leaves a pointer at a built step appends a switch record and asks the builder for it (`on_built`, `switch_built`, `History::want_through`), and a switch-only batch is a full batch that passes the failpoint. So hit 2 is the switch record's batch, which has no ref to move; the woken copy succeeds on the full disk and `CopyStale` is never logged. `ci/e2e-tree-recording-faults.sh` was re-counted for this (`kill@3`, an `at_rest` wait); this script's two `sleep(30000)@2` specs were not. It is a race, not a fixed miscount: the count depends on whether the rename's record lands before the worker's `on_built`, and the setup mount is killed without waiting to be at rest.
+
+**Fix to make in the end fix round (test only):**
+1. Move `at_rest` from `ci/e2e-tree-recording-faults.sh` into `ci/tree-git-test-lib.sh`, taking the metrics file path.
+2. In `rename_while_full`: mount the setup and the faulted mount with `--metrics-output`; `at_rest` before the setup mount's kill and after the root is attached; take the hit count as a parameter (`tree.before_step` stays `@2`, `tree.build_after_built_log` becomes `@3`); rewrite the counts comment.
+3. Assert before the client starts that the log does not yet hold the "triggered" line, so a miscount fails at once with a clear message.
+
+**Not proven; settle with one run before closing:** why the rename's own batch logged neither `CopyStale` nor `HistoryBuildFailed` while the disk was still full. Either it found room (repack expiry or the drops thread freed pages), or the builder stalled until unmount, which would be a product bug. After the 60 s loop and before removing the filler, print whether `destination` is in git, the state area's `du`, and `history.built_through` against `appended`.
+
+**Class.** A counted hit on a builder failpoint depends on how many no-step batches a mount makes. The page (`latency-upkeep.md`, "keep their batches") left the re-count to a hand audit. A failpoint qualifier that counts only batches holding a step would remove the class; argue it as its own change.
