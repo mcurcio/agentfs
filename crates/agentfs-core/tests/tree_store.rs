@@ -541,8 +541,14 @@ fn a_drop_and_its_row_are_one_record() {
     );
     drop((trees, recording));
 
+    // The builder is held, so no built point moves and no switch record
+    // comes between the three steps' records: the third append is the drop's.
     let after = tmp.path().join("after");
-    run_killed("drop_worker", &after, "tree.wal_after_payload=kill@3");
+    run_killed(
+        "drop_worker",
+        &after,
+        "tree.build_before_batch=error@*;tree.wal_after_payload=kill@3",
+    );
     let recording = reopen(&after);
     let trees = service(&recording);
     assert_eq!(phase(&trees, fork), ForkPhase::Dropped);

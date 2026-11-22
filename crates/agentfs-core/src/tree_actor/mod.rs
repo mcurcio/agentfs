@@ -313,6 +313,11 @@ pub struct HistoryMetrics {
     pub lag_ms_max: u64,
     /// `current`, `lagging`, `stalled` or `failed`.
     pub health: String,
+    /// Pointers whose value is still a step: set by a step not yet built,
+    /// or built and not yet switched to its commit by a switch record. With
+    /// `built_through` at `appended` and this at zero, the volume is at
+    /// rest: no built event is left to append anything.
+    pub pointers_at_steps: u64,
 }
 
 /// Process-local counters for observing save and queue costs. Durations are
@@ -1214,6 +1219,7 @@ impl TreeActor {
                 Health::Stalled => "stalled",
             }
             .to_owned(),
+            pointers_at_steps: self.at_steps.len() as u64,
         };
         metrics
     }
