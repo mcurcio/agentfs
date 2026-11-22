@@ -278,7 +278,8 @@ pub(in crate::tree_actor) struct Inputs<'a, L: super::super::recording::layout::
     pub object: u64,
     pub path: &'a str,
     pub before_len: u64,
-    pub own: &'a [(u64, Call, L)],
+    /// The open's calls, where the builder holds them.
+    pub own: &'a imbl::Vector<(u64, Call, L)>,
     pub writes: &'a [(u64, Run<L>)],
     pub pieces: &'a [PagePiece],
     pub recorded: &'a Layout,
@@ -395,7 +396,7 @@ impl Evidence {
             })
             .collect();
         let recorded = Layout::of_ranges(self.recorded.len, &self.recorded.ranges)?;
-        let replayed = Layout::replay(self.before_len, &own, &writes, &pieces)?;
+        let replayed = Layout::replay(self.before_len, own.iter(), &writes, &pieces)?;
         Ok(replayed.as_ref() == Some(&recorded))
     }
 }
