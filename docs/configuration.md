@@ -1138,7 +1138,7 @@ in `+failpoints`, and it warns at start when the variable is set); release
 builds and the image have no failpoints and ignore it. Never set it in
 production. In the same builds, `AGENTFS_TAKE_GATE=<dir>` stops `mount`'s
 queue worker: it takes only when a test asks through the fifos `go` and `took`
-in that directory (`agentfs_core::failpoints::TakeGate`). `AGENTFS_COMPACT_GATE=<dir>`
+in that directory (`agentfs_core::failpoints::TakeGate`). `AGENTFS_COMPACT_GATE`, set to a directory,
 gives every tree volume the binary opens (`mount`, `host`, `init`, `fork end`) a
 compaction gate on the fifos `at` and `go` in that directory: one journal frame per
 segment, a compaction at every built event, and the compactor parked at each of its

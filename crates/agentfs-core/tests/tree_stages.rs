@@ -398,6 +398,41 @@ fn each_kind_of_hold_is_recorded_when_its_work_runs() {
     assert_eq!(of(&kinds, "compaction"), 0, "{kinds:?}");
 }
 
+/// A page fill that builds a file's image from a live open's calls reads the
+/// journal under the actor's lock: a named hold of its own, `page_image`,
+/// and so one the lock's guard lets read (a debug build panics on a journal
+/// read under the lock in any hold that is not named for it).
+#[test]
+fn a_page_fill_under_the_lock_is_a_page_image_hold() {
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(PoisonError::into_inner);
+    let tmp = tempfile::tempdir().unwrap();
+    let rec = Recording::create(
+        &tmp.path().join("state"),
+        &identity(),
+        None,
+        &PodContext::default(),
+    )
+    .unwrap();
+    let w = writer("test-writer");
+    let h = rec
+        .actor()
+        .unwrap()
+        .write_open(TreeId::Root, "a", &w, Some(ATTRS))
+        .unwrap();
+    rec.actor().unwrap().write(h, 0, b"calls", false).unwrap();
+    let object = rec.actor().unwrap().open_object(h).unwrap();
+    let (kinds, _) = holds_during(|| {
+        let filled = rec
+            .actor()
+            .unwrap()
+            .page_fill(TreeId::Root, object, 0, 4096)
+            .unwrap();
+        assert_eq!(filled, b"calls");
+    });
+    assert_eq!(of(&kinds, "page_image"), 1, "{kinds:?}");
+    rec.close_with(h, |_| Ok(())).unwrap();
+}
+
 /// A call held at the lag gate is counted under the cause that held it,
 /// from its hold to the built event that admits it: here the overlay limit.
 #[test]
