@@ -92,8 +92,9 @@ pub struct Upkeep {
     /// and the frame would take it past this. Default 64 MiB.
     pub segment_bytes: u64,
     /// The floor of compaction's due length: the journal compacts at a
-    /// built event once it is twice its baseline (its length after the last
-    /// compaction, less the frames of opens saved since), and at least this
+    /// built event once it is twice its baseline (what its last compaction
+    /// left linked at or below its built point, less the frames of opens
+    /// saved since; nothing appended after that point), and at least this
     /// long. Default 64 MiB. Unread when `gate` is set.
     pub compact_from: u64,
     /// Parks the compactor at each gap; with one, the compactor compacts at

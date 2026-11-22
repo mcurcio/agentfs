@@ -1155,7 +1155,7 @@ impl Journal {
 
 #[cfg(test)]
 mod tests {
-    use super::compaction::{CompactionError, JournalCompaction, Sealed};
+    use super::compaction::{Below, CompactionError, JournalCompaction, Sealed};
     use super::*;
 
     fn checkpoint(built: u64) -> Checkpoint {
@@ -1244,7 +1244,7 @@ mod tests {
         checkpoint.salt = journal.salt();
         let port = JournalCompaction::new(dir.to_owned(), Arc::clone(journal.durability()), None);
         let durable = port.wait_durable(checkpoint.built).unwrap();
-        let carried = port.carry(&checkpoint).unwrap();
+        let carried = port.carry(&checkpoint, &Below::default()).unwrap();
         let bytes = carried.bytes();
         let sealed = Sealed::new(checkpoint, durable, carried).unwrap();
         assert!(sealed.checkpoint().carried.len() <= 1);
@@ -1266,7 +1266,7 @@ mod tests {
         let port = JournalCompaction::new(dir.clone(), Arc::clone(journal.durability()), None);
         let seal = |checkpoint: Checkpoint, durable: u64| {
             let durable = port.wait_durable(RecordNo::new(durable)).unwrap();
-            let carried = port.carry(&checkpoint).unwrap();
+            let carried = port.carry(&checkpoint, &Below::default()).unwrap();
             Sealed::new(checkpoint, durable, carried)
         };
         let refused = |sealed: std::result::Result<Sealed, CompactionError>| {

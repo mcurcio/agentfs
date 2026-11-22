@@ -341,6 +341,207 @@ fn a_save_after_a_fruitless_compaction_is_due() {
     assert_eq!(v.read(ROOT, "big").unwrap(), vec![b'x'; 64 << 10]);
 }
 
+/// Parks the builder at each batch's start and again once it has read the
+/// record it builds through: a test's hold on where a built point falls.
+struct Stepped {
+    at: Receiver<Option<RecordNo>>,
+    go: Sender<()>,
+}
+
+fn step_builder(history: &History) -> Stepped {
+    let (reached, at) = mpsc::channel();
+    let (go, gate) = mpsc::channel::<()>();
+    history.on_batch_read(move |read| {
+        let _ = reached.send(read);
+        let _ = gate.recv();
+    });
+    Stepped { at, go }
+}
+
+impl Stepped {
+    /// Where the builder is parked: `None` at a batch's start, else the
+    /// record it will build through.
+    fn next(&self) -> Option<RecordNo> {
+        self.at.recv_timeout(BOUND).expect("the builder parks")
+    }
+
+    fn go(&self) {
+        self.go.send(()).unwrap();
+    }
+
+    /// Every batch from now on runs unparked.
+    fn end(self, history: &History) {
+        history.on_batch_read(|_| {});
+        drop(self.go);
+    }
+}
+
+/// The baseline is what a compaction kept of what it covered: the bytes at
+/// or below its built point, the ones in the segment that point falls in
+/// too, and none appended after it. An open's frames at or below the point
+/// are in it until the open's save is built.
+#[test]
+fn a_baseline_holds_no_byte_after_the_built_point() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut v = new_actor_with(
+        tmp.path(),
+        Upkeep {
+            segment_bytes: 1 << 30,
+            compact_from: u64::MAX,
+            gate: None,
+        },
+    );
+    let history = v.history().clone();
+    let big = v
+        .write_open(ROOT, "big", &writer("w"), Some(ATTRS))
+        .unwrap();
+    v.write(big, 0, &[b'x'; 8 << 10], true).unwrap();
+    v.settle().unwrap();
+    let stepped = step_builder(&history);
+    put(&mut v, ROOT, "other", b"an unrelated step");
+    assert_eq!(stepped.next(), None, "the batch starts");
+    let below = v.durability().linked();
+    stepped.go();
+    let read = stepped.next().expect("the batch read its last record");
+    assert_eq!(read, v.durability().appended());
+    v.write(big, 8 << 10, &[b'y'; 64 << 10], true).unwrap();
+    stepped.go();
+    assert_eq!(history.wait_built(read).unwrap(), read);
+    let journal =
+        JournalCompaction::new(v.journal.dir().to_owned(), Arc::clone(v.durability()), None);
+    let (stats, mut baseline) = compact_once(&history, &journal)
+        .unwrap()
+        .expect("a compaction at the built point");
+    stepped.end(&history);
+    assert_eq!(
+        v.journal.segment_firsts().len(),
+        1,
+        "one segment, never covered"
+    );
+    assert_eq!(stats.segments, 0);
+    assert!(v.durability().linked() > below + (64 << 10));
+    assert_eq!(
+        baseline.due_at(1),
+        2 * below,
+        "the bytes at or below the point"
+    );
+    baseline.ended(&[big]);
+    let due = baseline.due_at(1);
+    assert!(
+        due <= 2 * (below - (8 << 10)),
+        "the open's first write comes off"
+    );
+    assert!(
+        due > 2 * (below - (9 << 10)),
+        "and only its frames at or below the point"
+    );
+    v.close(big).unwrap();
+    v.settle().unwrap();
+}
+
+/// A compaction that ran while a large open was being written, at a built
+/// point behind the open's last calls: what the open appended after that
+/// point is growth, never the baseline. The save's built event is due and
+/// every call of the open goes, the ones the compaction covered and the
+/// ones appended after it.
+#[test]
+fn bytes_appended_after_a_compactions_built_point_go_with_their_save() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut v = new_actor_with(
+        tmp.path(),
+        Upkeep {
+            segment_bytes: 1,
+            compact_from: 4096,
+            gate: None,
+        },
+    );
+    let history = v.history().clone();
+    let big = v
+        .write_open(ROOT, "big", &writer("w"), Some(ATTRS))
+        .unwrap();
+    let created = v.settle().unwrap();
+    history.wait_compactor(created).unwrap();
+    v.write(big, 0, &[b'x'; 8 << 10], true).unwrap();
+    let early = v.durability().appended();
+    // The builder reads through an unrelated step and parks; the open's
+    // larger write lands behind that point before the batch is built.
+    let stepped = step_builder(&history);
+    put(&mut v, ROOT, "other", b"an unrelated step");
+    assert_eq!(stepped.next(), None, "the batch starts");
+    stepped.go();
+    let read = stepped.next().expect("the batch read its last record");
+    v.write(big, 8 << 10, &[b'y'; 64 << 10], true).unwrap();
+    let late = v.durability().appended();
+    assert!(late > read, "the write follows the batch's read");
+    let generation = history.checkpointed().generation;
+    stepped.go();
+    let fruitless = history.wait_checkpointed(generation).unwrap();
+    assert!(
+        fruitless.built < late,
+        "the compaction ran behind the write"
+    );
+    history.wait_compactor(fruitless.built).unwrap();
+    let linked = v.journal.segment_firsts();
+    assert!(
+        linked.contains(&early) && linked.contains(&late),
+        "a live open's call was dropped"
+    );
+    stepped.end(&history);
+    v.close(big).unwrap();
+    let settled = v.settle().unwrap();
+    history.wait_compactor(settled).unwrap();
+    let linked = v.journal.segment_firsts();
+    assert!(
+        !linked.contains(&early),
+        "the saved open's call from before the compaction is still linked"
+    );
+    assert!(
+        !linked.contains(&late),
+        "the saved open's call from after the compaction's built point is still linked"
+    );
+    let mut bytes = vec![b'x'; 8 << 10];
+    bytes.extend_from_slice(&[b'y'; 64 << 10]);
+    assert_eq!(v.read(ROOT, "big").unwrap(), bytes);
+}
+
+/// While a file is held open with nothing new to free, unrelated built
+/// events do not each fold the journal: the open's bytes are the baseline,
+/// and the next compaction waits for the journal to double.
+#[test]
+fn built_events_under_a_held_open_do_not_each_compact() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut v = new_actor_with(
+        tmp.path(),
+        Upkeep {
+            segment_bytes: 1,
+            compact_from: 4096,
+            gate: None,
+        },
+    );
+    let history = v.history().clone();
+    let big = v
+        .write_open(ROOT, "big", &writer("w"), Some(ATTRS))
+        .unwrap();
+    let created = v.settle().unwrap();
+    history.wait_compactor(created).unwrap();
+    v.write(big, 0, &[b'x'; 64 << 10], true).unwrap();
+    let chunk = v.durability().appended();
+    let generation = history.checkpointed().generation;
+    let events = 16;
+    for n in 0..events {
+        put(&mut v, ROOT, &format!("other{n}"), b"an unrelated step");
+        let settled = v.settle().unwrap();
+        history.wait_compactor(settled).unwrap();
+    }
+    let ran = history.checkpointed().generation - generation;
+    assert_eq!(ran, 1, "compactions across {events} built events");
+    assert!(v.journal.segment_firsts().contains(&chunk));
+    v.close(big).unwrap();
+    let settled = v.settle().unwrap();
+    history.wait_compactor(settled).unwrap();
+    assert!(!v.journal.segment_firsts().contains(&chunk));
+}
+
 /// 2.1: a kill at any gap of a compaction loses nothing returned, and the
 /// volume opens with the same reads. While the compactor is parked before
 /// its checkpoint is in place, History still reports the last published

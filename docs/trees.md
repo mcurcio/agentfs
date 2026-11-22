@@ -704,11 +704,14 @@ appends it and applies it to the saved state the views serve; it runs no git.
 - **Compaction runs on history's own thread, the compactor, and no call waits
   for it.** At a built event, once the linked files (segments and carry files)
   pass `max(64 MiB, twice their baseline)`, it compacts at the built point B.
-  The baseline is their length after the last compaction, less the call
-  frames that compaction kept for opens whose saves are built since: those
-  bytes are dead, so a compaction that ran while a large file was open and
-  freed nothing does not hold the next one off until the journal doubles. In
-  this order:
+  The baseline is what the last compaction kept of what it covered: the
+  linked bytes at or below its built point (the carry files, the covered
+  segments it kept, and the segment that point falls in, up to the point),
+  less the call frames it kept for opens whose saves are built since. Those
+  frames are dead, and what a file appends after a compaction's built point
+  is growth, never baseline. So a compaction that ran while a large file was
+  open and freed nothing does not hold the next one off: the built event of
+  the file's save is due. In this order:
   1. It waits until every record at or below B is durable.
   2. It folds the records from the last checkpoint through B, as recovery does,
      and writes a checkpoint at B to `checkpoint.tmp`: the built pointers,
@@ -728,13 +731,17 @@ appends it and applies it to the saved state the views serve; it runs no git.
   records the checkpoint covers until its journal rolls. A held file pins only
   its own frames, so at the built event of a save, once the linked files are
   at least 64 MiB, they are back under about twice the live opens' bytes plus
-  a segment. Three things sit outside that count: a frame's head (a few dozen
-  bytes a call, which matters only for many tiny writes); a held page
+  a segment. Two things sit outside that count: a frame's head (a few dozen
+  bytes a call, which matters only for many tiny writes), and a held page
   write, which is kept by file while any write-open of the file lives and
-  leaves the baseline only at the next compaction; and the bytes a file
-  appends after the built point of a compaction that runs while it is open,
-  which stay linked after its save until the journal doubles or the volume
-  is mounted again. A frame is named by its record and an offset into it,
+  leaves the baseline only at the next compaction. The segment in that bound
+  is the newest one: the last bytes of a large save stay in it, dead, until
+  the journal rolls. What the rule costs: while a file is written faster
+  than history is built, the bytes appended after the built point can
+  outweigh what the last compaction kept, and a built event then compacts
+  again and frees nothing of that file. With the build keeping up, a held
+  file is folded again only when the linked files have doubled. A frame is
+  named by its record and an offset into it,
   wherever it is carried, so a save's digest does not change when it moves.
   The journal records where each carried frame went. The actor moves its live
   opens, held page writes and saved maps there at its next built event, a walk

@@ -234,6 +234,24 @@ pub(in crate::tree_actor) struct Durable {
     through: RecordNo,
 }
 
+/// The bytes each segment holds at or below a fold's point, by the
+/// segment's first record: what [`JournalCompaction::fold_through`] read of
+/// it. A segment the journal rolled to since has none.
+#[derive(Debug, Default)]
+pub(in crate::tree_actor) struct Below(BTreeMap<RecordNo, u64>);
+
+impl Below {
+    /// The bytes at or below the point in the segments that are none of
+    /// `covered`: in the segment the point falls in.
+    fn outside(&self, covered: &[Arc<Segment>]) -> u64 {
+        self.0
+            .iter()
+            .filter(|(first, _)| covered.iter().all(|segment| segment.first() != **first))
+            .map(|(_, bytes)| bytes)
+            .sum()
+    }
+}
+
 /// Live frames copied out of the segments a checkpoint lets go, durable:
 /// the carry files the checkpoint will name. Only
 /// [`JournalCompaction::carry`] makes one.
@@ -247,6 +265,8 @@ pub(in crate::tree_actor) struct Carried {
     unlink: Vec<RecordNo>,
     /// The new carry file, if one was written.
     made: Option<Made>,
+    /// The bytes at or below the checkpoint's built point that stay linked.
+    kept: u64,
 }
 
 /// The carry file one compaction wrote, with where each record it holds was
@@ -268,6 +288,15 @@ impl Carried {
     /// [`JournalCompaction::abandon`].
     pub(in crate::tree_actor) fn made(&self) -> Option<Made> {
         self.made.clone()
+    }
+
+    /// What the compaction keeps of what its checkpoint covers: the bytes
+    /// at or below the built point that stay linked once its unlinks have
+    /// run. The carry files the checkpoint names, the covered segments kept
+    /// as they are, and the segment the built point falls in up to that
+    /// point. Nothing appended after the built point is in it.
+    pub(in crate::tree_actor) fn kept(&self) -> u64 {
+        self.kept
     }
 }
 
@@ -592,7 +621,8 @@ impl JournalCompaction {
     /// The recovery fold (`journal::fold`) over the published checkpoint,
     /// the live frames it names and every record after it at or below
     /// `durable`'s point, read from the segments with no lock held. One
-    /// definition of each transition: the fold recovery runs.
+    /// definition of each transition: the fold recovery runs. With it, the
+    /// bytes it read of each segment ([`Below`]).
     ///
     /// # Errors
     ///
@@ -601,7 +631,7 @@ impl JournalCompaction {
     pub(in crate::tree_actor) fn fold_through(
         &self,
         durable: &Durable,
-    ) -> std::result::Result<Folded, CompactionError> {
+    ) -> std::result::Result<(Folded, Below), CompactionError> {
         let not_published = |e: Error| CompactionError::NotPublished(io::Error::other(e));
         let (previous, frame) = read_checkpoint(&self.dir).map_err(not_published)?;
         let live = Live::of(&previous);
@@ -612,7 +642,7 @@ impl JournalCompaction {
             .iter()
             .map(|built| carry_name(*built))
             .collect();
-        let mut files: Vec<(Arc<Segment>, RecordNo)> = self
+        let mut files: Vec<(Arc<Segment>, RecordNo, bool)> = self
             .durability
             .carries()
             .into_iter()
@@ -623,18 +653,19 @@ impl JournalCompaction {
                     .and_then(|n| n.to_str())
                     .is_some_and(|n| named.contains(n))
             })
-            .map(|carry| (carry, previous.built))
+            .map(|carry| (carry, previous.built, false))
             .collect();
         files.extend(
             self.durability
                 .table()
                 .into_iter()
-                .map(|segment| (segment, durable.through)),
+                .map(|segment| (segment, durable.through, true)),
         );
         let mut after = Vec::new();
-        'files: for (file, through) in files {
+        let mut below = Below::default();
+        for (file, through, segment) in files {
             let mut at = 0;
-            loop {
+            let later = loop {
                 match frame_at(&file, at, salt, through).map_err(|e| not_published(e.into()))? {
                     At::Frame(found, len) => {
                         at += len;
@@ -647,16 +678,23 @@ impl JournalCompaction {
                             after.push(*found);
                         }
                     }
-                    At::Later => break 'files,
-                    At::End => break,
+                    At::Later => break true,
+                    At::End => break false,
                 }
+            };
+            if segment {
+                below.0.insert(file.first(), at);
+            }
+            if later {
+                break;
             }
         }
         let frames: Vec<Frame> = std::iter::once(frame)
             .chain(before.into_values())
             .chain(after)
             .collect();
-        fold(&frames).map_err(not_published)
+        let folded = fold(&frames).map_err(not_published)?;
+        Ok((folded, below))
     }
 
     /// The covered segments: each before the newest whose next segment
@@ -676,6 +714,8 @@ impl JournalCompaction {
     /// them into `carry-<built>`, fsynced with the directory, and records each
     /// copy in the relocations. A file whose live frames outweigh its dead
     /// bytes is kept as it is; one with none is let go without a copy.
+    /// `below` is the fold's reading of each segment, for
+    /// [`Carried::kept`].
     ///
     /// A compaction that ends before its checkpoint is renamed hands
     /// [`Carried::made`] to [`JournalCompaction::abandon`].
@@ -686,6 +726,7 @@ impl JournalCompaction {
     pub(in crate::tree_actor) fn carry(
         &self,
         checkpoint: &Checkpoint,
+        below: &Below,
     ) -> std::result::Result<Carried, CompactionError> {
         let built = checkpoint.built;
         let not_published = CompactionError::NotPublished;
@@ -703,6 +744,7 @@ impl JournalCompaction {
         let mut files = Vec::new();
         let mut copies: Vec<(Arc<Segment>, super::Header, u64)> = Vec::new();
         let mut unlink = Vec::new();
+        let mut kept = 0;
         let mut decide = |file: &Arc<Segment>| -> io::Result<bool> {
             let frames = frames_of(file, checkpoint.salt)?;
             let length = file.len();
@@ -719,13 +761,18 @@ impl JournalCompaction {
                 let built = super::segment::carry_built(carry.path())
                     .ok_or_else(|| not_published(io::Error::other("a carry file's name")))?;
                 files.push(built);
+                kept += carry.len();
             }
         }
-        for segment in self.covered(built) {
-            if !decide(&segment).map_err(not_published)? {
+        let covered = self.covered(built);
+        for segment in &covered {
+            if decide(segment).map_err(not_published)? {
+                kept += segment.len();
+            } else {
                 unlink.push(segment.first());
             }
         }
+        kept += below.outside(&covered);
         let mut bytes = 0;
         let mut made = None;
         if !copies.is_empty() {
@@ -734,6 +781,7 @@ impl JournalCompaction {
             match written {
                 Ok((moved, length)) => {
                     bytes = length;
+                    kept += length;
                     carry.set_len(length);
                     self.durability.add_carry(Arc::clone(&carry), length);
                     // The copies stand: holders may move to them.
@@ -757,6 +805,7 @@ impl JournalCompaction {
             bytes,
             unlink,
             made,
+            kept,
         })
     }
 
