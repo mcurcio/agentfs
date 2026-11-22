@@ -2243,3 +2243,16 @@ The slice is built: compaction on history's compactor, the switch as a journal r
 **Not proven; settle with one run before closing:** why the rename's own batch logged neither `CopyStale` nor `HistoryBuildFailed` while the disk was still full. Either it found room (repack expiry or the drops thread freed pages), or the builder stalled until unmount, which would be a product bug. After the 60 s loop and before removing the filler, print whether `destination` is in git, the state area's `du`, and `history.built_through` against `appended`.
 
 **Class.** A counted hit on a builder failpoint depends on how many no-step batches a mount makes. The page (`latency-upkeep.md`, "keep their batches") left the re-count to a hand audit. A failpoint qualifier that counts only batches holding a step would remove the class; argue it as its own change.
+
+## 2026-11-22, PR #41 at 69d2434: `e2e (FUSE mount)` red, `a_drain_ends_a_crashed_hosts_clients` fails only sometimes
+
+**The red.** `crates/agentfs/tests/launcher_host.rs:186`: "the host wrote no hello", from the second host's `hello()` at line 800, started right after `host.kill()` (798). The same test passed on the same sha in the push run, so it is a race, and by the repo's rule a broken test or a product bug to find, never a rerun.
+
+**Not determined.** `hello()` panics before the test reads the second host's exit status or stderr, so the log cannot say why the host exited.
+
+**Suspicion (read, not run): a stale test assumption.** "Once `wait()` returns for the killed host, the state lock is free." Tree git children keep the lease descriptor through exec (`tree_git.rs`, `attach_lease_signal`), so a `git fast-import` child of a builder batch holds the lock until it exits. The second host tries the lock once, gets `Busy` and exits 75 before its hello. Slice 2 widens the window: `on_built` appends a switch record and asks the builder, so a batch follows the open's own batch right when the test kills. `a_restarted_host_rebinds_and_stacks` (kill at line 659) has the same race. **Not excluded:** a slice 2 product bug where the second open refuses the killed state (a fold error on a switch record, exit 1).
+
+**For the end fix round:**
+1. Make `Host::hello` on EOF wait for the child and panic with its exit status and stderr, so a failing run says which case it is.
+2. If 75: the test must wait on the event, not a timer: the killed host's process group (its git children) has exited, or the documented launcher contract of starting again on 75. Use it at lines 663 and 799, and add a case that holds the lease in a child across the kill and asserts the first start exits 75 and a later one writes its hello.
+3. If exit 1: a product bug. Reproduce in `crates/agentfs-core/tests/tree_actor.rs` by copying the state area between a step's built-log entry and its switch-only batch, then reopening.
