@@ -272,6 +272,17 @@ fn holds_during(work: impl FnOnce()) -> (Vec<(&'static str, u64)>, u64) {
     (kinds, after.lock_wait.count - before.lock_wait.count)
 }
 
+/// How many of this process's threads are named `name`.
+fn threads_named(name: &str) -> usize {
+    std::fs::read_dir("/proc/self/task")
+        .unwrap()
+        .filter(|task| {
+            let comm = task.as_ref().unwrap().path().join("comm");
+            std::fs::read_to_string(comm).is_ok_and(|n| n.trim_end() == name)
+        })
+        .count()
+}
+
 /// The holds of `kind` in `kinds`.
 fn of(kinds: &[(&'static str, u64)], kind: &str) -> u64 {
     kinds
@@ -283,9 +294,11 @@ fn of(kinds: &[(&'static str, u64)], kind: &str) -> u64 {
 
 /// Each kind of work under the actor's lock is recorded in the hold it
 /// runs in (docs/telemetry.md, "The volume lock"): a plain call is
-/// `other` only, a close is `close`, a built point reached is `catch_up`
-/// with its `drops`, a fork is `fork_copy`, a take is `take`, and a
-/// compaction is `compaction`. Every hold is also one wait to take the lock.
+/// `other` only, a close is `close`, a built point reached is `catch_up`,
+/// a fork is `fork_copy`, a take is `take`, and a compaction is
+/// `compaction`. Every hold is also one wait to take the lock. No drop runs
+/// under the lock: what a catch-up lets go drops on the volume's
+/// `tree-drops` thread, so `drops` stays zero.
 #[test]
 fn each_kind_of_hold_is_recorded_when_its_work_runs() {
     let _one = ONE_AT_A_TIME.lock().unwrap_or_else(PoisonError::into_inner);
@@ -330,7 +343,11 @@ fn each_kind_of_hold_is_recorded_when_its_work_runs() {
     });
     assert!(of(&kinds, "close") >= 1, "{kinds:?}");
     assert!(of(&kinds, "catch_up") >= 1, "{kinds:?}");
-    assert!(of(&kinds, "drops") >= 1, "{kinds:?}");
+    assert_eq!(of(&kinds, "drops"), 0, "{kinds:?}");
+    assert!(
+        threads_named("tree-drops") >= 1,
+        "the volume's drop thread runs"
+    );
     assert_eq!(of(&kinds, "take") + of(&kinds, "fork_copy"), 0);
     assert_eq!(of(&kinds, "compaction"), 0);
 
