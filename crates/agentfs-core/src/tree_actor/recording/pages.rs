@@ -488,6 +488,7 @@ impl TreeActor {
     /// Builds the image if it has none: the saved map plus every live open's
     /// calls and the file's page writes, by the one close rule.
     fn pages_build_image(&mut self, key: &(TreeId, u64)) -> Result<()> {
+        let _kind = crate::tree_actor::stages::section(crate::tree_actor::stages::Hold::PageImage);
         let state = self.pages.get(key).ok_or(Error::NotFound)?;
         if state.image.is_some() {
             return Ok(());

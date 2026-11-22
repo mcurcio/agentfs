@@ -20,21 +20,32 @@ use agentfs_contracts::volume::{
 };
 
 use crate::store::{TreeStore, io_kind};
-use crate::tree_actor::{self, Recording};
+use crate::tree_actor::{self, Recording, Upkeep};
 
 /// A volume's state area at one path.
 pub struct TreeStateArea {
     root: PathBuf,
+    /// How `create` and `open` serve the volume's journal.
+    upkeep: Upkeep,
     /// The volume `open` recovered, and the store over it.
     served: Option<(Arc<Recording>, TreeStore)>,
 }
 
 impl TreeStateArea {
+    /// The state area at `root`, served with `Upkeep::default()`.
     pub fn at(root: &Path) -> Self {
         Self {
             root: root.to_owned(),
+            upkeep: Upkeep::default(),
             served: None,
         }
+    }
+
+    /// The upkeep `create` and `open` pass on.
+    #[must_use]
+    pub fn with_upkeep(mut self, upkeep: Upkeep) -> Self {
+        self.upkeep = upkeep;
+        self
     }
 
     /// The volume `open` recovered, served; `None` before.
@@ -88,7 +99,7 @@ impl StateArea for TreeStateArea {
             name: name.clone(),
             id: VolumeId(uuid::Uuid::new_v4()),
         };
-        match Recording::create(&self.root, &identity, root_owner, at) {
+        match Recording::create_with(&self.root, &identity, root_owner, at, self.upkeep.clone()) {
             Ok(recording) => {
                 // Every record durable before the call returns.
                 drop(recording);
@@ -105,8 +116,9 @@ impl StateArea for TreeStateArea {
     }
 
     fn open(&mut self, at: &PodContext) -> Result<VolumeIdentity, VolumeError> {
-        let recording =
-            Recording::open(&self.root, at).map_err(|e| volume_error(&self.root, &e))?;
+        let recording = Recording::open_with(&self.root, at, self.upkeep.clone())
+            .map_err(|e| volume_error(&self.root, &e))?;
+
         let identity = recording
             .actor()
             .map_err(|e| volume_error(&self.root, &e))?

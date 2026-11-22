@@ -4,7 +4,6 @@
 //! timer), and measures each tree's lag for the lag gate (docs/trees.md,
 //! "History trails the files").
 //!
-use std::collections::BTreeMap;
 use std::io;
 use std::sync::{Arc, Condvar, LazyLock, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
@@ -16,6 +15,7 @@ use super::super::journal::durable::RecordNo;
 use super::retired::{DeferredDrops, Retired};
 use super::{Objects, refs};
 use crate::tree_actor::call_path::Then;
+use crate::tree_actor::journal::compaction::Published;
 use crate::tree_actor::pointers::Pointers;
 use crate::tree_actor::recording::FileMap;
 use crate::tree_actor::tree::{EventNumber, Tree};
@@ -156,8 +156,9 @@ struct State {
     /// Each tree's object numbers as built.
     objects: BuiltObjects,
     /// The builder's trees as built: what the actor's saved trees rest on
-    /// (`SavedTree::rebuilt`). None until the first built event.
-    trees: imbl::OrdMap<TreeId, Tree>,
+    /// (`SavedTree::rebuilt`) and a checkpoint's locals come from. None until
+    /// the first built event since open.
+    trees: Option<imbl::OrdMap<TreeId, Tree>>,
     failed: Option<BuildError>,
     /// The request count the failed batch started at: a wait asked after it
     /// waits for the retry.
@@ -180,9 +181,19 @@ struct State {
     stopped: bool,
     /// Each tree's lag and the builder's rates.
     gate: super::lag::LagGate,
-    /// The journal's last checkpoint's redo start: built-log entries at or
-    /// before it name nothing a restart reads.
-    checkpointed: RecordNo,
+    /// The last checkpoint counted: this open's compactor's publishes, or
+    /// the one the journal opened at.
+    checkpointed: Checkpointed,
+    /// Built-log entries and builder heads at or before it name nothing a
+    /// restart reads: the last checkpoint's `built`, or the record before
+    /// its oldest step head when that is earlier.
+    checkpointed_through: RecordNo,
+    /// Each pointer the actor switched from a step to an oid: the step, and
+    /// the record before which it switched. Kept until a published
+    /// checkpoint's `built` reaches that record (C3, C4).
+    switched: imbl::OrdMap<String, (RecordNo, RecordNo)>,
+    /// A compaction stopped the actor: every checkpoint wait ends.
+    compaction_stopped: bool,
     /// Built files' maps the actor has not taken yet, in the order built:
     /// each save, create and take, and each map rebased onto its checkout.
     maps: Vec<(TreeId, u64, FileMap)>,
@@ -261,21 +272,29 @@ impl BuiltSnapshot {
         self.objects.get(&tree).unwrap_or(&NONE)
     }
 
-    /// Every tree's object numbers as built, as a checkpoint holds them.
-    pub(in crate::tree_actor) fn all_objects(&self) -> BTreeMap<TreeId, BTreeMap<u64, u64>> {
-        self.objects
-            .iter()
-            .map(|(tree, objects)| {
-                let objects = objects.iter().map(|(id, object)| (*id, *object)).collect();
-                (*tree, objects)
-            })
-            .collect()
-    }
 
     /// `tree`'s queue as built: each entry's ref and commit, in queue order.
     pub(in crate::tree_actor) fn queue(&self, tree: TreeId) -> Vec<(String, Oid)> {
         self.pointers.under(&refs::queue(tree))
     }
+}
+
+/// A checkpoint History has counted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Checkpointed {
+    /// Checkpoints this open's compactor has published: 0 for the one
+    /// `Journal::open` read.
+    pub generation: u64,
+    /// Its built point B.
+    pub built: RecordNo,
+}
+
+/// What [`History::checkpointed_through`] reports for a checkpoint at
+/// `built` whose oldest step head is `oldest_head`.
+fn redo_through(built: RecordNo, oldest_head: Option<RecordNo>) -> RecordNo {
+    oldest_head.map_or(built, |head| {
+        built.min(RecordNo::new(head.get().saturating_sub(1)))
+    })
 }
 
 /// The one owner of the Git store. Takes, push, the CLI and tests reach
@@ -287,6 +306,9 @@ pub struct History {
 
 impl History {
     /// History over `repo`, built through `built` with these pointers.
+    /// `opened` is the checkpoint `Journal::open` read: generation 0, and
+    /// the redo start [`History::checkpointed_through`] reports until the
+    /// first publish.
     ///
     /// # Errors
     ///
@@ -297,6 +319,7 @@ impl History {
         pointers: Pointers,
         owners: Owners,
         objects: BuiltObjects,
+        opened: &Published,
     ) -> std::io::Result<Self> {
         Ok(Self {
             inner: Arc::new(Inner {
@@ -306,7 +329,7 @@ impl History {
                     pointers: Arc::new(pointers),
                     owners,
                     objects,
-                    trees: imbl::OrdMap::new(),
+                    trees: None,
                     failed: None,
                     failed_at: 0,
                     wanted: built,
@@ -317,7 +340,13 @@ impl History {
                     unbuilt: std::collections::VecDeque::new(),
                     stopping: false,
                     stopped: false,
-                    checkpointed: RecordNo::ZERO,
+                    checkpointed: Checkpointed {
+                        generation: 0,
+                        built: opened.built(),
+                    },
+                    checkpointed_through: redo_through(opened.built(), opened.oldest_head()),
+                    switched: imbl::OrdMap::new(),
+                    compaction_stopped: false,
                     gate: super::lag::LagGate::default(),
                     maps: Vec::new(),
                     gated: Vec::new(),
@@ -354,10 +383,52 @@ impl History {
         &self.inner.repo
     }
 
-    /// The last checkpoint's redo start: built-log entries at or before it
-    /// name nothing a restart reads.
+    /// What the last checkpoint lets go: built-log entries and builder heads
+    /// at or before it name nothing a restart reads. Its `built`, or the
+    /// record before its oldest step head when that is earlier.
     pub(in crate::tree_actor) fn checkpointed_through(&self) -> RecordNo {
+        self.state().checkpointed_through
+    }
+
+    /// The last checkpoint counted. O(1).
+    pub fn checkpointed(&self) -> Checkpointed {
         self.state().checkpointed
+    }
+
+    /// Returns once a checkpoint of a generation after `after` is published,
+    /// with it.
+    ///
+    /// # Errors
+    ///
+    /// [`WaitError::Stopped`] at shutdown, or once a compaction stopped the
+    /// actor (a failed fsync, which `Durability` reports first);
+    /// [`WaitError::Failed`] at a failed built event after the call, as
+    /// [`History::wait_built`]. A compaction that failed and will be retried
+    /// does not end the wait.
+    pub fn wait_checkpointed(&self, after: u64) -> Result<Checkpointed, WaitError> {
+        let mut state = self.state();
+        let ended = state.ends.ended;
+        loop {
+            if state.checkpointed.generation > after {
+                return Ok(state.checkpointed);
+            }
+            if state.compaction_stopped || state.stopped || state.stopping {
+                return Err(WaitError::Stopped);
+            }
+            if state.ends.ended > ended
+                && let Some(error) = &state.failed
+            {
+                return Err(WaitError::Failed(error.clone()));
+            }
+            state = self.wait(state);
+        }
+    }
+
+    /// A compaction ended in `Stopped`: every [`History::wait_checkpointed`]
+    /// ends, and the compactor thread with it.
+    pub(in crate::tree_actor) fn compaction_stopped(&self) {
+        self.state().compaction_stopped = true;
+        self.notify();
     }
 
     /// How many times the builder was asked: a test's sign that a waiter
@@ -365,13 +436,6 @@ impl History {
     #[cfg(all(test, feature = "failpoints"))]
     pub(in crate::tree_actor) fn requests(&self) -> u64 {
         self.state().requests
-    }
-
-    /// A checkpoint whose redo start is `built` is durable: the builder may
-    /// drop the built-log entries it covers.
-    pub(in crate::tree_actor) fn checkpointed(&self, built: RecordNo) {
-        let mut state = self.state();
-        state.checkpointed = state.checkpointed.max(built);
     }
 
     /// The actor appended step `step`, with `cost` its tree and about the
@@ -466,21 +530,6 @@ impl History {
         None
     }
 
-    /// Whether every step appended is built: what a compaction waits for.
-    pub(in crate::tree_actor) fn steps_built(&self) -> bool {
-        self.state().unbuilt.is_empty()
-    }
-
-    /// A compaction due long enough that the lag gate holds every tree's new
-    /// work until the builder has built every step (or `false`: no longer).
-    pub(in crate::tree_actor) fn compaction_overdue(&self, overdue: bool) {
-        let mut state = self.state();
-        if state.gate.compaction_overdue(overdue) {
-            drop(state);
-            self.notify();
-        }
-    }
-
     /// A batch is built and its built-log entry durable: the built point
     /// moves. `owners`, `objects` and `trees` are the builder's own persistent
     /// maps, shared: O(1).
@@ -497,7 +546,7 @@ impl History {
         state.pointers = Arc::new(pointers);
         state.owners = owners;
         state.objects = objects;
-        state.trees = trees;
+        state.trees = Some(trees);
         state.failed = None;
         while state
             .unbuilt
@@ -522,53 +571,59 @@ impl History {
     }
 
     /// The compactor's view of History at its built point, read in one hold
-    /// (C8, C9): O(1), every field shared.
-    #[expect(
-        dead_code,
-        reason = "interfaces of the compaction slice (latency-upkeep.md, slice 2), wired by it"
-    )]
-    pub(in crate::tree_actor) fn at_built(&self) -> super::compactor::AtBuilt {
-        todo!()
+    /// (C8, C9): O(1), every field shared. `None` until the first built
+    /// event since open, when History has no trees at the built point.
+    pub(in crate::tree_actor) fn at_built(&self) -> Option<super::compactor::AtBuilt> {
+        let state = self.state();
+        Some(super::compactor::AtBuilt {
+            built: state.built,
+            pointers: Arc::clone(&state.pointers),
+            objects: state.objects.clone(),
+            trees: state.trees.clone()?,
+            switched: state.switched.clone(),
+        })
     }
 
-    /// The actor rolled its journal to a new segment whose first record is
-    /// `first`, under its lock: every segment that starts before it is
-    /// rolled past and may be unlinked once covered (C2a). O(1).
-    #[expect(
-        dead_code,
-        reason = "interfaces of the compaction slice (latency-upkeep.md, slice 2), wired by it"
-    )]
-    pub(in crate::tree_actor) fn rolled(&self, first: RecordNo) {
-        todo!("{first:?}")
-    }
-
-    /// The actor switched `pointer` from a step to the oid it was built as,
-    /// under its lock, before appending record `at`: no record from `at` on
-    /// names that step, so History lets go of the pointer's step head once
-    /// its built point reaches `at` (C3, C4). O(log pointers).
-    #[expect(
-        dead_code,
-        reason = "interfaces of the compaction slice (latency-upkeep.md, slice 2), wired by it"
-    )]
-    pub(in crate::tree_actor) fn switched(&self, pointer: &str, at: RecordNo) {
-        todo!("{pointer} {at:?}")
+    /// The actor switched `pointer` from step `step` to the oid it was built
+    /// as, under its lock, before appending record `at`: no record from `at`
+    /// on names that step. Kept until a published checkpoint's `built`
+    /// reaches `at` (C3, C4); a later switch of the pointer replaces it.
+    /// O(log pointers).
+    pub(in crate::tree_actor) fn switched(&self, pointer: &str, step: RecordNo, at: RecordNo) {
+        self.state()
+            .switched
+            .insert(pointer.to_owned(), (step, at));
     }
 
     /// A checkpoint at `published.built()` is in place: only now may History
     /// forget the built-log entries it covers (C3). From now
     /// [`History::checkpointed_through`] reports `published.built()`, or the
     /// record before `published.oldest_head()` when that is earlier, so the
-    /// builder keeps every step head a later record may name. Replaces
-    /// `checkpointed`. O(1).
-    #[expect(
-        dead_code,
-        reason = "interfaces of the compaction slice (latency-upkeep.md, slice 2), wired by it"
-    )]
+    /// builder keeps every step head a later record may name. Drops each
+    /// switch the checkpoint counted (`at <= built`), moves the generation
+    /// and the epoch, and counts the checkpoint (`Stages::checkpoints`). The
+    /// compactor's alone. O(switches).
     pub(in crate::tree_actor) fn published(
         &self,
         published: &crate::tree_actor::journal::compaction::Published,
     ) {
-        todo!("{published:?}")
+        let mut state = self.state();
+        let built = published.built();
+        state.switched = state
+            .switched
+            .iter()
+            .filter(|(_, (_, at))| *at > built)
+            .map(|(pointer, switch)| (pointer.clone(), *switch))
+            .collect();
+        state.checkpointed = Checkpointed {
+            generation: state.checkpointed.generation + 1,
+            built,
+        };
+        state.checkpointed_through = redo_through(built, published.oldest_head());
+        state.epoch += 1;
+        drop(state);
+        crate::tree_actor::stages::checkpointed();
+        self.notify();
     }
 
     /// Values the actor let go under its lock (replaced saved maps and
@@ -866,7 +921,8 @@ impl History {
         since: RecordNo,
     ) -> Option<(RecordNo, imbl::OrdMap<TreeId, Tree>)> {
         let state = self.state();
-        (state.built > since && !state.trees.is_empty()).then(|| (state.built, state.trees.clone()))
+        let trees = state.trees.as_ref().filter(|_| state.built > since)?;
+        Some((state.built, trees.clone()))
     }
 
     /// Each tree's lag, the oldest unbuilt step's age and the builder's health.

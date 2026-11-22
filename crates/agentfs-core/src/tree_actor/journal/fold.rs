@@ -7,6 +7,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use agentfs_contracts::pod::WriterAt;
 use git2::Oid;
 
+use super::compaction::Checkpoint;
 use super::durable::RecordNo;
 use super::segment::FramePos;
 use super::{
@@ -59,9 +60,11 @@ pub(in crate::tree_actor) struct FoldedOpen {
 /// What a journal's frames add up to (git-model §12).
 #[derive(Debug, PartialEq, Eq)]
 pub(in crate::tree_actor) struct Folded {
-    /// The pointers as the records name them: oids from the checkpoint, and
-    /// the steps after it as [`Target`]s.
+    /// The pointers as the records name them: oids from the checkpoint (its
+    /// step heads as their steps), and the steps after it as [`Target`]s.
     pub(in crate::tree_actor) pointers: Pointers<Target>,
+    /// The journal's salt, the checkpoint's.
+    pub(in crate::tree_actor) salt: u32,
     /// The checkpoint's redo start: its pointers' oids are as of this record.
     pub(in crate::tree_actor) built: RecordNo,
     /// Each tree's object numbers as of `built`, from the checkpoint.
@@ -431,18 +434,7 @@ pub(in crate::tree_actor) fn fold(frames: &[Frame]) -> Result<Folded> {
     let mut frames = frames.iter();
     let Some((
         Record {
-            entry:
-                Entry::Checkpoint {
-                    next,
-                    built,
-                    pointers,
-                    upstreams,
-                    opens,
-                    page_saved,
-                    objects,
-                    locals,
-                    ..
-                },
+            entry: Entry::Checkpoint(checkpoint),
             ..
         },
         _,
@@ -450,16 +442,40 @@ pub(in crate::tree_actor) fn fold(frames: &[Frame]) -> Result<Folded> {
     else {
         return Err(Error::Format);
     };
+    let Checkpoint {
+        salt,
+        built,
+        pointers,
+        upstreams,
+        opens,
+        page_saved,
+        objects,
+        locals,
+        step_heads,
+        ..
+    } = checkpoint;
+    let next = checkpoint.next();
+    if step_heads.keys().any(|name| !pointers.contains_key(name)) {
+        return Err(Error::Format);
+    }
     let mut folded = Folded {
+        // A pointer a record after the checkpoint may still name by its
+        // step stands as that step (C4); its oid is the checkpoint's.
         pointers: Pointers::new(
             pointers
                 .iter()
                 .map(|(name, hex)| {
                     parse_oid(hex)?;
-                    Ok((name.clone(), Target::Oid(hex.clone())))
+                    let target = match step_heads.get(name) {
+                        Some(step) if step <= built => Target::Step(*step),
+                        Some(_) => return Err(Error::Format),
+                        None => Target::Oid(hex.clone()),
+                    };
+                    Ok((name.clone(), target))
                 })
                 .collect::<Result<_>>()?,
         ),
+        salt: *salt,
         built: *built,
         objects: objects
             .iter()

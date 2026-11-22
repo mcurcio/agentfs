@@ -2,7 +2,9 @@
 //! (target git-model §3, §12; docs/trees.md, "Recording and durability").
 //!
 //! ```text
+//! journal/checkpoint               the newest checkpoint: one frame
 //! journal/<first record:020>.seg   one segment, about 64 MiB of frames
+//! journal/carry-<built:020>        live frames a compaction carried
 //! frame  = header head tail
 //! header = "AFJ3" | u32le salt | u64le record | u64le mark | u32le flags
 //!          | u32le head_len | u32le tail_len | u32le crc32(head + tail)
@@ -22,20 +24,22 @@
 //! its writer with the pod context it ran in (`WriterAt`), so a recovery close
 //! commits as the writer that opened.
 //!
-//! Compaction writes a checkpoint frame at the start of a new segment, as of
-//! the built point, then drops (unlinks) every older segment whose records
-//! are all built and which holds no live open's call or held page write. A
-//! live open's frames are copied forward only when the dead bytes they pin
-//! exceed their own. Recovery folds the last checkpoint, the live frames it
-//! names from before it, and every frame after it.
+//! History's compactor, on its own thread and never under the actor's lock,
+//! writes the checkpoint file as of history's built point B ([`compaction`]),
+//! then unlinks every segment the actor has rolled past whose records are all
+//! at or below B. A live open's frames, held page writes and untaken chunks
+//! are copied into a carry file only when the dead bytes they pin exceed
+//! their own. Recovery folds the checkpoint, the live frames it names, and
+//! every frame after B.
 //!
 //! The salt is random per journal and kept through compaction, so a workload's
 //! bytes inside a tail cannot pass as a frame. At an invalid frame after the
-//! last valid record `r`, a later valid frame whose mark passes `r` shows that
-//! a record in the hole was durable: that is corruption, which an operator
-//! decides about (docs/runbooks/recording-failures.md). Otherwise the hole is
-//! a torn tail, records no fsync had covered: it is saved aside and cut off,
-//! with every later segment.
+//! last valid record `r`, or a record number past `r + 1` (a lost segment), a
+//! later valid frame whose mark passes `r` shows that a record in the hole was
+//! durable: that is corruption, which an operator decides about
+//! (docs/runbooks/recording-failures.md). Otherwise the hole is a torn tail,
+//! records no fsync had covered: it is saved aside and cut off, with every
+//! later segment.
 
 mod commit_point;
 pub(super) mod compaction;
@@ -60,19 +64,19 @@ use super::recording::{Call, FileMap};
 use super::stages::{self, Timer, Which};
 use super::tree::{MergeFileIdentity, NameHistory};
 use super::{Error, Result, referee};
-pub(super) use commit_point::compact_at;
+use compaction::{Checkpoint, Live, Published};
 use durable::{Durability, RecordNo};
 #[cfg(test)]
-pub(super) use fold::{Folded, LiveOpen};
-pub(super) use fold::{FoldedOpen, Replay, fold, link_map, runs_from_frame};
-use segment::{FramePos, Relocations, SEGMENT_BYTES, Segment};
+pub(super) use fold::LiveOpen;
+pub(super) use fold::{Folded, FoldedOpen, Replay, fold, link_map, runs_from_frame};
+use segment::{FramePos, Segment, carry_name};
 
 const MAGIC: &[u8; 4] = b"AFJ3";
 const HEADER: usize = 44;
 /// The header bytes its own checksum covers.
 const HEADER_SUMMED: usize = 40;
 pub(super) const MAX_FRAME: usize = 96 << 20;
-/// Header flag bit 0: a live open's frame copied forward by compaction.
+/// Header flag bit 0: a live frame compaction copied into a carry file.
 const CARRIED: u32 = 1;
 
 /// One frame as a record and where its tail is.
@@ -132,27 +136,10 @@ impl Record {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(super) enum Entry {
-    /// The first frame only: what every record before `next` adds up to.
-    /// `built` is the redo start, at most the built log's point: every pointer
-    /// value is an oid as of it. `page_saved`: tree, object, saved_through.
-    /// `objects`: each tree's object of each named file, by identity, as of
-    /// `built`; the steps after it move them (git-model §3). The live opens'
-    /// calls before it are read from the segments they were kept or carried
-    /// in. `locals`: each tree's directory numbers and times, and its
-    /// files' times, as of `next`: what history never holds.
-    Checkpoint {
-        next: RecordNo,
-        built: RecordNo,
-        pointers: BTreeMap<String, String>,
-        objects: BTreeMap<String, BTreeMap<u64, u64>>,
-        locals: BTreeMap<String, TreeLocals>,
-        upstreams: BTreeMap<String, String>,
-        opens: Vec<OpenRecord>,
-        page_saved: Vec<(String, u64, u64)>,
-        /// The page writes before the checkpoint that memory held: recovery
-        /// reads them from the segments they were kept or carried in.
-        page_writes: Vec<RecordNo>,
-    },
+    /// The checkpoint file's one frame, never a segment's: what every record
+    /// at or below its `built` adds up to ([`Checkpoint`]). The live frames
+    /// before it are read from the segments and carry files that hold them.
+    Checkpoint(Checkpoint),
     /// An open of an existing file; no pointers move.
     Open {
         tree: String,
@@ -559,33 +546,25 @@ pub(super) struct PointerChange {
     pub old: Option<Target>,
 }
 
-#[derive(Debug, thiserror::Error)]
-pub(super) enum CompactError {
-    /// No checkpoint was written: the journal is as it was.
-    #[error("journal compaction failed before its checkpoint: {0}")]
-    Before(io::Error),
-    /// The checkpoint is written and durable, but an older segment could not
-    /// be dropped: it stays, and the next compaction tries again.
-    #[error("journal compaction failed after its checkpoint: {0}")]
-    After(io::Error),
-}
-
-/// What one [`Journal::drop_behind`] did.
+/// What one compaction let go (`JournalCompaction::unlink_covered`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(in crate::tree_actor) struct DropStats {
     pub segments: u64,
     pub carried_bytes: u64,
 }
 
+/// The actor's end of the journal: where it appends. The segment table and
+/// the journal's length are [`Durability`]'s.
 pub(super) struct Journal {
     dir: PathBuf,
-    /// Every linked segment in order, with its length; the last is appended to.
-    segments: Vec<(Arc<Segment>, u64)>,
+    /// The segment appended to: the newest in the table.
+    current: Arc<Segment>,
     salt: u32,
     unknown: bool,
     durability: Arc<Durability>,
-    /// Bytes compaction has copied forward since open.
-    carried: u64,
+    /// The next frame starts a new segment once the current one has a record
+    /// and the frame would take it past this (`Upkeep::segment_bytes`).
+    segment_bytes: u64,
 }
 
 fn crc_body(head: &[u8], tail: &[u8]) -> u32 {
@@ -803,156 +782,173 @@ fn draw_salt() -> io::Result<u32> {
     Ok(u32::from_le_bytes(salt))
 }
 
-/// The last record a checkpoint covers: every record before its `next`.
-fn covered_by(checkpoint: &Record) -> RecordNo {
-    match &checkpoint.entry {
-        Entry::Checkpoint { next, .. } => RecordNo::new(next.get().saturating_sub(1)),
-        _ => checkpoint.seq,
+/// Reads a whole file of a journal: a segment or a carry file.
+fn read_all(path: &Path) -> Result<Vec<u8>> {
+    match fs::read(path) {
+        Ok(bytes) => Ok(bytes),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Err(Error::CorruptJournal(0)),
+        Err(e) => Err(e.into()),
     }
 }
 
-/// Whether a frame from before checkpoint `checkpoint` is one it names as
-/// live: a call of an open it lists, or a page write it held.
-fn named_live(checkpoint: &Entry, record: &Record) -> bool {
-    let Entry::Checkpoint {
-        next,
-        opens,
-        page_writes,
-        ..
-    } = checkpoint
-    else {
-        return false;
-    };
-    record.seq < *next
-        && match &record.entry {
-            Entry::Call { handle, .. } => opens.iter().any(|open| open.handle == *handle),
-            Entry::PageWrite { .. } => page_writes.binary_search(&record.seq).is_ok(),
-            _ => false,
-        }
+/// A frame of `segment` at `offset` of `bytes`, its tail where it is.
+fn found_frame(segment: &Arc<Segment>, header: &Header, record: Record, offset: usize) -> Frame {
+    let tail_at = (offset + HEADER + header.head) as u64;
+    (
+        record,
+        Tail {
+            pos: FramePos::new(Arc::clone(segment), header.record, tail_at),
+            len: header.tail as u64,
+        },
+    )
 }
 
-/// One frame found at open.
-struct Found {
-    frame: Frame,
-    carried: bool,
+/// Where a segment's valid frames end before what follows is judged.
+struct Hole {
+    index: usize,
+    offset: usize,
 }
 
 impl Journal {
-    /// A new journal in the new directory `dir`, holding `first` (a
-    /// checkpoint) in its first segment; draws the salt. Each is fsynced.
-    pub fn create(dir: &Path, first: &Record) -> Result<()> {
+    /// A new journal in the new directory `dir`: draws the salt, writes
+    /// `first` (its salt replaced) as the checkpoint file, then the empty
+    /// first segment, named `first.next()`. Each is fsynced.
+    pub fn create(dir: &Path, first: &Checkpoint) -> Result<()> {
         fs::DirBuilder::new().mode(0o700).create(dir)?;
-        let segment = Segment::create(dir, covered_by(first).next())?;
-        let head = first.head()?;
-        let bytes = frame_bytes(draw_salt()?, first.seq, RecordNo::ZERO, &head, &[])
-            .ok_or(Error::TooLarge)?;
-        segment.file().write_all_at(&bytes, 0)?;
+        let mut first = first.clone();
+        first.salt = draw_salt()?;
+        compaction::write_first(dir, &first)?;
+        let segment = Segment::create(dir, first.next())?;
         segment.file().sync_all()?;
         sync_dir(dir)?;
         sync_parent(dir)?;
         Ok(())
     }
 
-    /// The journal and the frames recovery folds: the last checkpoint, the
-    /// live frames it names from before it (kept or carried, each once, in
-    /// record order), then every frame after it. Every segment is checked,
-    /// one at a time; no tail is held in memory. At a torn tail: saves its
-    /// bytes to `journal/torn`, logs `tree JournalTail: <n> bytes at
-    /// <offset>`, truncates its segment and removes every later one. The
-    /// durable mark starts at the highest mark a frame carries; the caller
-    /// makes the rest durable before serving.
+    /// The journal, the frames recovery folds, and the checkpoint it read.
+    /// The frames are the checkpoint's, the live frames it names from at or
+    /// before its `built` (from a carry file before a surviving segment,
+    /// each once, in record order), then every frame after `built`. Every
+    /// segment is checked, one at a time; no tail is held in memory. At a
+    /// torn tail (an invalid frame, or a record past the next number: a lost
+    /// or wholly torn segment): saves its bytes to `journal/torn`, logs
+    /// `tree JournalTail: <n> bytes at <offset>`, cuts its segment (removing
+    /// it when nothing valid is left) and removes every later one. With no
+    /// segment left, one named for the next record is made. The directory
+    /// is fsynced before it returns. The durable mark starts at the highest
+    /// mark a frame carries, and at least the checkpoint's `built`; the
+    /// caller makes the rest durable before serving.
     ///
     /// # Errors
     ///
-    /// [`Error::CorruptJournal`] for a missing, empty or checkpointless
-    /// journal (offset 0); at an invalid frame that a later valid frame's
-    /// mark shows held a durable record (its offset over the segments in
-    /// order); and where the valid records end before `built`, the built
-    /// log's point (records the builder made durable before it built them).
-    /// Nothing is changed then.
-    pub fn open(dir: &Path, built: RecordNo) -> Result<(Self, Vec<Frame>)> {
+    /// [`Error::CorruptJournal`] for a journal with no checkpoint file, or a
+    /// damaged one, or a carry file it names missing or damaged (offset 0);
+    /// at a hole that a later valid frame's mark shows held a durable record
+    /// (its offset over the segments in order); and where the valid records
+    /// end before `built`, the built log's point (records the builder made
+    /// durable before it built them). [`Error::Format`] for a checkpoint or
+    /// a carried frame in a segment. Nothing is changed then.
+    pub fn open(
+        dir: &Path,
+        built: RecordNo,
+        segment_bytes: u64,
+    ) -> Result<(Self, Vec<Frame>, Published)> {
+        let (checkpoint, checkpoint_frame) = compaction::read_checkpoint(dir)?;
+        let salt = checkpoint.salt;
+        let live = Live::of(&checkpoint);
         let listed = match segment::list(dir) {
             Ok(listed) => listed,
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Err(Error::CorruptJournal(0)),
             Err(e) => return Err(e.into()),
         };
-        let Some((_, first_path)) = listed.first() else {
-            return Err(Error::CorruptJournal(0));
-        };
-        let mut start = [0; 8];
-        File::open(first_path)?
-            .read_exact_at(&mut start, 0)
-            .map_err(|_| Error::CorruptJournal(0))?;
-        if &start[..4] != MAGIC {
-            return Err(Error::CorruptJournal(0));
+        // The carried copies first: one wins over a surviving original.
+        let mut before: BTreeMap<RecordNo, Frame> = BTreeMap::new();
+        let mut carries = Vec::new();
+        for carried in &checkpoint.carried {
+            let path = dir.join(carry_name(*carried));
+            let bytes = read_all(&path)?;
+            let carry = Segment::open(RecordNo::ZERO, &path)?;
+            let mut offset = 0;
+            while offset < bytes.len() {
+                let (header, head, _) =
+                    read_frame(&bytes[offset..], salt).ok_or(Error::CorruptJournal(0))?;
+                let record =
+                    Record::parse(header.record, head).map_err(|_| Error::CorruptJournal(0))?;
+                if live.names(&record) {
+                    before
+                        .entry(record.seq)
+                        .or_insert_with(|| found_frame(&carry, &header, record, offset));
+                }
+                offset += header.frame_len() as usize;
+            }
+            carries.push(carry);
         }
-        let salt = u32_at(&start, 4);
-        let mut found: Vec<Found> = Vec::new();
-        let mut segments: Vec<(Arc<Segment>, u64)> = Vec::new();
-        // The last frame's number, and the last record the valid frames hold.
+        let mut segments: Vec<Arc<Segment>> = Vec::new();
+        let mut after: Vec<Frame> = Vec::new();
+        // The last record read, and the last valid record after `built`.
         let mut last = RecordNo::ZERO;
-        let mut covered = RecordNo::ZERO;
-        let mut mark = RecordNo::ZERO;
+        let mut covered = checkpoint.built;
+        let mut mark = checkpoint.built;
         let mut global = 0_usize;
-        let mut hole: Option<(usize, usize, Vec<u8>)> = None;
+        let mut hole: Option<Hole> = None;
         for (index, (first, path)) in listed.iter().enumerate() {
             let bytes = fs::read(path)?;
             let segment = Segment::open(*first, path)?;
             let mut offset = 0;
             while offset < bytes.len() {
-                let Some((header, head, tail)) = read_frame(&bytes[offset..], salt) else {
-                    hole = Some((index, offset, bytes[offset..].to_vec()));
+                let Some((header, head, _)) = read_frame(&bytes[offset..], salt) else {
+                    hole = Some(Hole { index, offset });
                     break;
                 };
                 let record = Record::parse(header.record, head)
                     .map_err(|_| Error::CorruptJournal(global + offset))?;
-                let checkpoint = matches!(record.entry, Entry::Checkpoint { .. });
-                let carried = header.flags & CARRIED != 0;
-                if !checkpoint && !carried {
-                    if record.seq <= last {
-                        return Err(Error::CorruptJournal(global + offset));
-                    }
-                    last = record.seq;
+                if matches!(record.entry, Entry::Checkpoint(_)) || header.flags & CARRIED != 0 {
+                    return Err(Error::Format);
                 }
-                covered = covered.max(if checkpoint {
-                    covered_by(&record)
-                } else {
-                    record.seq
-                });
+                if record.seq <= last {
+                    return Err(Error::CorruptJournal(global + offset));
+                }
+                if record.seq > checkpoint.built {
+                    // Records after the checkpoint follow on, one by one: a
+                    // later number is a hole (a lost segment).
+                    if record.seq != covered.next() {
+                        hole = Some(Hole { index, offset });
+                        break;
+                    }
+                    covered = record.seq;
+                }
+                last = record.seq;
                 mark = mark.max(header.mark);
-                let tail_at = (offset + HEADER + head.len()) as u64;
-                found.push(Found {
-                    frame: (
-                        record,
-                        Tail {
-                            pos: FramePos::new(Arc::clone(&segment), header.record, tail_at),
-                            len: tail.len() as u64,
-                        },
-                    ),
-                    carried,
-                });
-                offset += HEADER + header.head + header.tail;
+                let len = header.frame_len() as usize;
+                if record.seq > checkpoint.built {
+                    after.push(found_frame(&segment, &header, record, offset));
+                } else if live.names(&record) {
+                    before
+                        .entry(record.seq)
+                        .or_insert_with(|| found_frame(&segment, &header, record, offset));
+                }
+                offset += len;
             }
-            segments.push((segment, offset as u64));
+            segment.set_len(offset as u64);
+            segments.push(segment);
             if hole.is_some() {
                 break;
             }
             global += bytes.len();
         }
         if built > covered {
-            let at = hole
-                .as_ref()
-                .map_or(global, |(_, offset, _)| global + offset);
+            let at = hole.as_ref().map_or(global, |hole| global + hole.offset);
             return Err(Error::CorruptJournal(at));
         }
-        if let Some((index, offset, rest)) = hole {
+        if let Some(Hole { index, offset }) = hole {
             // One segment in memory at a time: frames never span two.
+            let rest = fs::read(&listed[index].1)?[offset..].to_vec();
             let later = &listed[index + 1..];
-            let mut durable = durable_past(&rest[1..], salt, covered);
+            let mut durable = durable_past(&rest, salt, covered);
             for (_, path) in later {
                 durable = durable || durable_past(&fs::read(path)?, salt, covered);
             }
-            if (index == 0 && offset == 0) || durable {
+            if durable {
                 return Err(Error::CorruptJournal(global + offset));
             }
             let mut saved = OpenOptions::new()
@@ -967,76 +963,65 @@ impl Journal {
             }
             saved.sync_all()?;
             eprintln!("tree JournalTail: {torn} bytes at {}", global + offset);
-            let (segment, length) = &segments[index];
-            segment.file().set_len(*length)?;
-            segment.file().sync_all()?;
-            for (_, path) in &listed[index + 1..] {
+            if offset == 0 {
+                // Nothing valid is left in it: its name would pass the next record.
+                if let Some(segment) = segments.pop() {
+                    fs::remove_file(segment.path())?;
+                }
+            } else {
+                let segment = &segments[index];
+                segment.file().set_len(offset as u64)?;
+                segment.file().sync_all()?;
+            }
+            for (_, path) in later {
                 fs::remove_file(path)?;
             }
-            sync_dir(dir)?;
         }
-        let Some(at) = found
-            .iter()
-            .rposition(|f| matches!(f.frame.0.entry, Entry::Checkpoint { .. }))
-        else {
-            return Err(Error::CorruptJournal(0));
-        };
-        let checkpoint = found[at].frame.clone();
-        let mut before: BTreeMap<RecordNo, Frame> = BTreeMap::new();
-        for (index, f) in found.iter().enumerate() {
-            if (index < at || f.carried) && named_live(&checkpoint.0.entry, &f.frame.0) {
-                before
-                    .entry(f.frame.0.seq)
-                    .or_insert_with(|| f.frame.clone());
-            }
+        if segments.is_empty() {
+            segments.push(Segment::create(dir, covered.next())?);
         }
-        let after = found[at + 1..]
-            .iter()
-            .filter(|f| !f.carried)
-            .map(|f| f.frame.clone());
-        let frames: Vec<Frame> = std::iter::once(checkpoint)
+        // A checkpoint renamed but not yet synced, and every cut above, are
+        // durable before History may trim the built log by it.
+        sync_dir(dir)?;
+        let frames: Vec<Frame> = std::iter::once(checkpoint_frame)
             .chain(before.into_values())
             .chain(after)
             .collect();
-        let dir_file = File::open(dir)?;
-        let durability = Durability::new(
-            segments.iter().map(|(s, _)| Arc::clone(s)).collect(),
-            dir_file,
-            covered,
-            mark,
-        );
+        let current = segments.last().map(Arc::clone).ok_or(Error::CorruptJournal(0))?;
+        let durability = Durability::new(segments, File::open(dir)?, covered, mark);
+        for carry in carries {
+            durability.add_carry(carry, 0);
+        }
+        let published = Published::of_open(&checkpoint);
         Ok((
             Self {
                 dir: dir.to_owned(),
-                segments,
+                current,
                 salt,
                 unknown: false,
                 durability,
-                carried: 0,
+                segment_bytes,
             },
             frames,
+            published,
         ))
     }
 
-    /// The segment appended to.
-    fn current(&self) -> &(Arc<Segment>, u64) {
-        // Open and create leave one segment at least; nothing removes the last.
-        &self.segments[self.segments.len() - 1]
-    }
-
     /// Starts segment `first` before a frame of `bytes` bytes when the
-    /// current one has records and would pass its size. A segment named
-    /// `first` already (a checkpoint's, holding only it and carried frames)
-    /// takes the frame however long it grows: the name is taken.
+    /// current one has records and would pass its size. The new segment is
+    /// in the table before any record is appended to it: the roll event the
+    /// compaction's coverage rule reads (C2a).
     fn roll(&mut self, first: RecordNo, bytes: u64) -> io::Result<bool> {
-        let (segment, length) = self.current();
-        if *length == 0 || length.saturating_add(bytes) <= SEGMENT_BYTES || segment.first() >= first
+        let length = self.current.len();
+        if length == 0
+            || length.saturating_add(bytes) <= self.segment_bytes
+            || self.current.first() >= first
         {
             return Ok(false);
         }
         let segment = Segment::create(&self.dir, first)?;
         self.durability.add_segment(Arc::clone(&segment));
-        self.segments.push((segment, 0));
+        self.current = segment;
         Ok(true)
     }
 
@@ -1059,7 +1044,8 @@ impl Journal {
             .ok_or(Error::TooLarge)?;
         stages::copied(tail.len() as u64);
         self.roll(record.seq, bytes.len() as u64)?;
-        let (segment, at) = self.current().clone();
+        let segment = Arc::clone(&self.current);
+        let at = segment.len();
         let written = (|| -> io::Result<()> {
             crate::failpoints::hit("tree.wal_before_header")?;
             segment.file().write_all_at(&bytes, at)?;
@@ -1071,8 +1057,7 @@ impl Journal {
             }
             return Err(e.into());
         }
-        let last = self.segments.len() - 1;
-        self.segments[last].1 = at + bytes.len() as u64;
+        segment.set_len(at + bytes.len() as u64);
         self.durability.appended_to(record.seq);
         Ok(FramePos::new(
             segment,
@@ -1096,199 +1081,17 @@ impl Journal {
         self.salt
     }
 
-    /// Compaction's first half: `checkpoint` as the first frame of a new
-    /// segment (or of the current one while it holds nothing past it), then
-    /// every segment and the directory fsynced, so the durable mark rises to
-    /// the last record it covers.
-    ///
-    /// # Errors
-    ///
-    /// [`CompactError::Before`]: the journal is as it was.
-    pub fn checkpoint(&mut self, checkpoint: &Record) -> std::result::Result<(), CompactError> {
-        let first = covered_by(checkpoint).next();
-        let head = checkpoint
-            .head()
-            .map_err(|e| CompactError::Before(e.into()))?;
-        let bytes = frame_bytes(
-            self.salt,
-            checkpoint.seq,
-            self.durability.mark(),
-            &head,
-            &[],
-        )
-        .ok_or_else(|| CompactError::Before(io::Error::from_raw_os_error(libc::EFBIG)))?;
-        // An empty segment, or one holding only what this checkpoint covers
-        // (an earlier checkpoint, carried frames), takes it as it is.
-        let rolled = if self.current().1 == 0 || self.current().0.first() >= first {
-            false
-        } else {
-            let segment = Segment::create(&self.dir, first).map_err(CompactError::Before)?;
-            self.segments.push((segment, 0));
-            true
-        };
-        let (segment, at) = self.current().clone();
-        let written = (|| -> io::Result<()> {
-            crate::failpoints::hit("tree.compact_before_checkpoint")?;
-            segment.file().write_all_at(&bytes, at)
-        })();
-        // Every segment, so every record the checkpoint covers is on disk (a
-        // restart's frames may be only in the kernel); then the mark rises. A
-        // failed fsync stops the journal, as a leader's does.
-        let written = written.and_then(|()| {
-            let synced = (|| -> io::Result<()> {
-                for (each, _) in &self.segments {
-                    crate::failpoints::hit("tree.compact_before_fsync")?;
-                    each.sync()?;
-                }
-                sync_dir(&self.dir)
-            })();
-            synced.inspect_err(|e| self.durability.fsync_failed(e))
-        });
-        if let Err(e) = written {
-            if rolled {
-                self.segments.pop();
-                let _ = fs::remove_file(segment.path());
-            } else if segment.file().set_len(at).is_err() {
-                self.unknown = true;
-            }
-            return Err(CompactError::Before(e));
-        }
-        if rolled {
-            self.durability.add_segment(Arc::clone(&segment));
-        }
-        self.durability.covered(covered_by(checkpoint));
-        let last = self.segments.len() - 1;
-        self.segments[last].1 = at + bytes.len() as u64;
-        Ok(())
-    }
+    /// The journal's directory.
+    #[cfg(test)]
+    pub fn dir(&self) -> &Path {
 
-    /// Drops every segment before the current one whose records are all
-    /// `<= built` and which holds no frame `live` accepts (a live open's call,
-    /// a held page write). A segment whose live frames pin more dead bytes
-    /// than their own has them copied forward (flag `carried`, the record
-    /// number kept), fsynced, and is dropped too. A reader holding a segment
-    /// keeps reading it; its space returns when the last lets go.
-    ///
-    /// # Errors
-    ///
-    /// A failed read, copy or unlink: the segments not dropped yet stay.
-    pub fn drop_behind(
-        &mut self,
-        built: RecordNo,
-        live: &dyn Fn(&Record) -> bool,
-    ) -> Result<DropStats> {
-        crate::failpoints::hit("tree.compact_before_drop")?;
-        let mut stats = DropStats::default();
-        let mut index = 0;
-        while index + 1 < self.segments.len() {
-            let (segment, length) = self.segments[index].clone();
-            let mut at = 0;
-            let mut newest = RecordNo::ZERO;
-            let mut kept: Vec<(u64, Header)> = Vec::new();
-            let mut kept_bytes = 0;
-            while at < length {
-                let mut bytes = [0; HEADER];
-                segment.read_exact_at(&mut bytes, at)?;
-                let header = read_header(&bytes, self.salt)
-                    .ok_or_else(|| io::Error::other("invalid frame in an open journal"))?;
-                let mut head = vec![0; header.head];
-                segment.read_exact_at(&mut head, at + HEADER as u64)?;
-                let record = Record::parse(header.record, &head)?;
-                newest = newest.max(record.seq);
-                if live(&record) {
-                    kept.push((at, header));
-                    kept_bytes += header.frame_len();
-                }
-                at += header.frame_len();
-            }
-            if newest > built {
-                break;
-            }
-            if !kept.is_empty() && length - kept_bytes <= kept_bytes {
-                index += 1;
-                continue;
-            }
-            let mut moved = Vec::new();
-            let current = Arc::clone(&self.current().0);
-            if !kept.is_empty() {
-                let mut end = self.current().1;
-                for (from, header) in &kept {
-                    let mut body = vec![0; header.head + header.tail];
-                    segment.read_exact_at(&mut body, from + HEADER as u64)?;
-                    // Rewriting computes a new header checksum: never launder a bad frame.
-                    if crc_body(&body[..header.head], &body[header.head..]) != header.crc {
-                        return Err(io::Error::other("invalid frame in an open journal").into());
-                    }
-                    let copy = header_bytes(
-                        self.salt,
-                        header.record,
-                        self.durability.mark(),
-                        header.flags | CARRIED,
-                        header.head as u32,
-                        header.tail as u32,
-                        header.crc,
-                    );
-                    current.file().write_all_at(&copy, end)?;
-                    current.file().write_all_at(&body, end + HEADER as u64)?;
-                    moved.push((header.record, end + (HEADER + header.head) as u64));
-                    end += header.frame_len();
-                    stats.carried_bytes += header.frame_len();
-                    stages::copied(header.tail as u64);
-                }
-                let last = self.segments.len() - 1;
-                self.segments[last].1 = end;
-                // The copies stand before their originals go; a failed fsync
-                // stops the journal, as a leader's does.
-                current
-                    .sync()
-                    .inspect_err(|e| self.durability.fsync_failed(e))?;
-            }
-            // The copies stand: holders may move to them, then the original goes.
-            for (record, tail) in moved {
-                self.durability.relocations().moved(record, &current, tail);
-            }
-            self.durability.relocations().dropped(&segment);
-            fs::remove_file(segment.path())?;
-            self.durability.remove_segment(segment.first());
-            self.segments.remove(index);
-            stats.segments += 1;
-        }
-        self.carried += stats.carried_bytes;
-        if stats.segments > 0 {
-            // Only space rides on it: a dropped segment that comes back after
-            // a power cut holds records the checkpoint covers.
-            sync_dir(&self.dir).inspect_err(|e| self.durability.fsync_failed(e))?;
-        }
-        Ok(stats)
-    }
-
-    /// Every linked segment's bytes: what compaction is due by.
-    pub fn len(&self) -> u64 {
-        self.segments.iter().map(|(_, length)| length).sum()
-    }
-
-    /// The last record the oldest segment can hold when a later one exists:
-    /// once history is built through it, a compaction can drop it.
-    pub fn oldest_through(&self) -> Option<RecordNo> {
-        let next = self.segments.get(1)?.0.first();
-        Some(RecordNo::new(next.get().saturating_sub(1)))
-    }
-
-    /// Bytes compaction has copied forward since open.
-    pub fn carried(&self) -> u64 {
-        self.carried
-    }
-
-    /// Where compaction carried each live frame: what a holder reads to
-    /// move its positions off a dropped segment.
-    pub fn relocations(&self) -> &Relocations {
-        self.durability.relocations()
+        &self.dir
     }
 
     /// The linked segments' first records, in order.
     #[cfg(test)]
     pub fn segment_firsts(&self) -> Vec<RecordNo> {
-        self.segments.iter().map(|(s, _)| s.first()).collect()
+        self.durability.table().iter().map(|s| s.first()).collect()
     }
 }
 
