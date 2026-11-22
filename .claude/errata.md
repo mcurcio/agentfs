@@ -2287,3 +2287,11 @@ The slice is built: FLUSH answers at once (`Recording::flush`), a client's end n
 Proof: both power-loss jobs reach `ack-hc-1` and the oracle judges every cut.
 
 **A product question this exposes (do not fix in the fix round; report it):** a compaction that frees nothing still doubles the threshold for the next one, so dead bytes can sit in the journal until it doubles again. Counting only what a compaction left behind after it freed something would retry a fruitless fold at every built event while a file is held open, so the rule needs a design answer, not a patch.
+
+## 2026-11-22, PR #41 at a6a8174: `e2e (phase 1 tree views)` fails only sometimes, a race in `ci/trees-untracked.py`
+
+**The red.** `ci/trees-untracked.py:310`, `early_fork`: `assert name not in names` fails for `repo`. The same job passed on the same sha in the other ci run.
+
+**Mechanism (read, not run).** `early_fork` asserts the fork's listing lacks `repo`, but `repo` is a recorded directory (`docs/trees.md`: "`git init repo` in a view records the directory `repo`"), and every step that saves the root enqueues a sync in each fork, taken at the next built event. "The fork never shows `repo`" holds only while the script outruns that sync. The failing run was a slow one (3.6 s where the passing run took 0.26 s), and its fork was mid-sync. Nothing a user would see is wrong. Whether slices 2 or 6 shifted the odds is not established.
+
+**For the end fix round (test only):** in `early_fork`, drop `repo` from the absent list; first wait (as `delivered()` does in `ci/e2e-trees.sh`) until the fork shows the root's last tracked names (`draft.txt`, `t2`, `repo`), then assert `repo` is an empty directory, `repo/.git` and `repo/x` do not exist in the fork, and the untracked names and `u/x.log` are absent. Update the module docstring's `early-fork` line. Today the absence checks pass trivially when the sync has not arrived.
