@@ -848,7 +848,7 @@ impl Journal {
     /// end before `built`, the built log's point (records the builder made
     /// durable before it built them). [`Error::Format`] for a checkpoint or
     /// a carried frame in a segment. Nothing is changed then.
-    pub fn open(
+    pub fn open_with(
         dir: &Path,
         built: RecordNo,
         segment_bytes: u64,
@@ -1007,6 +1007,14 @@ impl Journal {
         ))
     }
 
+    /// [`Journal::open_with`] with the default segment size, and the frames
+    /// alone: the tests' read of a journal.
+    #[cfg(test)]
+    pub fn open(dir: &Path, built: RecordNo) -> Result<(Self, Vec<Frame>)> {
+        let (journal, frames, _) = Self::open_with(dir, built, segment::SEGMENT_BYTES)?;
+        Ok((journal, frames))
+    }
+
     /// Starts segment `first` before a frame of `bytes` bytes when the
     /// current one has records and would pass its size. The new segment is
     /// in the table before any record is appended to it: the roll event the
@@ -1097,27 +1105,27 @@ impl Journal {
 
 #[cfg(test)]
 mod tests {
+    use super::compaction::{JournalCompaction, Sealed};
     use super::*;
 
-    fn checkpoint(next: u64) -> Record {
-        checkpoint_with(next, Vec::new())
+    fn checkpoint(built: u64) -> Checkpoint {
+        checkpoint_with(built, Vec::new())
     }
 
-    fn checkpoint_with(next: u64, opens: Vec<OpenRecord>) -> Record {
-        Record {
-            seq: RecordNo::ZERO,
-            at_ns: 1,
-            entry: Entry::Checkpoint {
-                next: RecordNo::new(next),
-                built: RecordNo::new(next.saturating_sub(1)),
-                pointers: BTreeMap::new(),
-                upstreams: BTreeMap::new(),
-                opens,
-                page_saved: Vec::new(),
-                page_writes: Vec::new(),
-                objects: BTreeMap::new(),
-                locals: BTreeMap::new(),
-            },
+    fn checkpoint_with(built: u64, opens: Vec<OpenRecord>) -> Checkpoint {
+        Checkpoint {
+            salt: 0,
+            built: RecordNo::new(built),
+            pointers: BTreeMap::new(),
+            objects: BTreeMap::new(),
+            locals: BTreeMap::new(),
+            upstreams: BTreeMap::new(),
+            opens,
+            page_saved: Vec::new(),
+            page_writes: Vec::new(),
+            chunks: Vec::new(),
+            step_heads: BTreeMap::new(),
+            carried: Vec::new(),
         }
     }
 
@@ -1137,13 +1145,20 @@ mod tests {
         )
     }
 
-    fn journal() -> (tempfile::TempDir, PathBuf, Journal) {
+    /// A new journal whose segments roll past `segment_bytes`.
+    fn journal_of(segment_bytes: u64) -> (tempfile::TempDir, PathBuf, Journal) {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("journal");
-        Journal::create(&dir, &checkpoint(1)).unwrap();
-        let (journal, frames) = Journal::open(&dir, RecordNo::ZERO).unwrap();
+        Journal::create(&dir, &checkpoint(0)).unwrap();
+        let (journal, frames, published) =
+            Journal::open_with(&dir, RecordNo::ZERO, segment_bytes).unwrap();
         assert_eq!(frames.len(), 1);
+        assert_eq!(published.built(), RecordNo::ZERO);
         (tmp, dir, journal)
+    }
+
+    fn journal() -> (tempfile::TempDir, PathBuf, Journal) {
+        journal_of(segment::SEGMENT_BYTES)
     }
 
     fn tails(frames: &[Frame]) -> Vec<(u64, Vec<u8>)> {
@@ -1173,42 +1188,62 @@ mod tests {
         }
     }
 
+    /// Publishes `checkpoint` (its salt the journal's) on `journal` as the
+    /// compactor does, then unlinks what it covers.
+    fn compact(dir: &Path, journal: &Journal, mut checkpoint: Checkpoint) -> DropStats {
+        checkpoint.salt = journal.salt();
+        let port = JournalCompaction::new(dir.to_owned(), Arc::clone(journal.durability()), None);
+        let durable = port.wait_durable(checkpoint.built).unwrap();
+        let carried = port.carry(&checkpoint).unwrap();
+        let bytes = carried.bytes();
+        let sealed = Sealed::new(checkpoint, durable, carried).unwrap();
+        assert!(sealed.checkpoint().carried.len() <= 1);
+        let published = port.publish(&sealed).unwrap();
+        let stats = port.unlink_covered(&published).unwrap();
+        assert_eq!(stats.carried_bytes, bytes);
+        stats
+    }
+
     #[test]
     fn frames_round_trip_and_compaction_keeps_the_salt_and_live_tails() {
-        let (_tmp, dir, mut journal) = journal();
-        let first = call(1, 7, b"one");
+        let (_tmp, dir, mut journal) = journal_of(1);
+        let first = call(1, 7, &[b"one".as_slice(), &[0; 256]].concat());
         let second = call(2, 8, b"\0two\xff");
+
         let pos = journal.append(&first.0, &first.1).unwrap();
         assert_eq!(pos.bytes(0, 3).unwrap(), b"one");
+        // Two frames in one segment: the live one pins the dead one.
+        journal.segment_bytes = segment::SEGMENT_BYTES;
         let held = journal.append(&second.0, &second.1).unwrap().at(1);
+        journal.segment_bytes = 1;
+        let third = call(3, 8, b"three");
+        journal.append(&third.0, &third.1).unwrap();
         let salt = journal.salt;
-        journal
-            .checkpoint(&checkpoint_with(3, vec![open_record(8)]))
-            .unwrap();
-        let live = |record: &Record| matches!(record.entry, Entry::Call { handle: 8, .. });
+        let stats = compact(&dir, &journal, checkpoint_with(2, vec![open_record(8)]));
         // The first segment's live frame pins more dead bytes than its own:
-        // copied forward, and the segment dropped.
-        let stats = journal.drop_behind(RecordNo::new(2), &live).unwrap();
+        // carried, and the segment unlinked.
         assert_eq!(stats.segments, 1);
         assert!(stats.carried_bytes > 0);
         assert_eq!(journal.segment_firsts(), vec![RecordNo::new(3)]);
+        assert!(dir.join(carry_name(RecordNo::new(2))).exists());
         // A holder moves to the copy: the same name, the same bytes, the
-        // dropped segment no longer held.
-        let moved = held.relocated(journal.relocations()).unwrap();
+        // unlinked segment no longer held.
+        let relocations = journal.durability().relocations();
+        let moved = held.relocated(relocations).unwrap();
         assert_eq!(moved.key(), held.key());
         assert_eq!(moved.bytes(0, 3).unwrap(), b"two");
-        assert_eq!(moved.segment.first(), RecordNo::new(3));
-        assert!(held.relocated(journal.relocations()).is_some());
-        assert!(moved.relocated(journal.relocations()).is_none());
-        let third = call(3, 8, b"three");
-        journal.append(&third.0, &third.1).unwrap();
+        assert_eq!(moved.segment.first(), RecordNo::ZERO);
+        assert!(held.relocated(relocations).is_some());
+        assert!(moved.relocated(relocations).is_none());
+        let fourth = call(4, 8, b"four");
+        journal.append(&fourth.0, &fourth.1).unwrap();
         drop(journal);
         let (journal, frames) = Journal::open(&dir, RecordNo::ZERO).unwrap();
         assert_eq!(journal.salt, salt);
-        assert!(matches!(frames[0].0.entry, Entry::Checkpoint { .. }));
+        assert!(matches!(frames[0].0.entry, Entry::Checkpoint(_)));
         assert_eq!(
             tails(&frames[1..]),
-            vec![(2, second.1.clone()), (3, third.1.clone())]
+            vec![(2, second.1.clone()), (3, third.1), (4, fourth.1)]
         );
     }
 
@@ -1219,16 +1254,34 @@ mod tests {
         let big = call(2, 8, &[9; 4096]);
         journal.append(&small.0, &small.1).unwrap();
         journal.append(&big.0, &big.1).unwrap();
-        journal
-            .checkpoint(&checkpoint_with(3, vec![open_record(8)]))
-            .unwrap();
-        let live = |record: &Record| matches!(record.entry, Entry::Call { handle: 8, .. });
-        let stats = journal.drop_behind(RecordNo::new(2), &live).unwrap();
+        journal.segment_bytes = 1;
+        let next = call(3, 8, b"y");
+        journal.append(&next.0, &next.1).unwrap();
+        let stats = compact(&dir, &journal, checkpoint_with(2, vec![open_record(8)]));
         assert_eq!(stats, DropStats::default());
         assert_eq!(journal.segment_firsts().len(), 2);
         drop(journal);
         let (_, frames) = Journal::open(&dir, RecordNo::ZERO).unwrap();
-        assert_eq!(tails(&frames[1..]), vec![(2, big.1)]);
+        assert_eq!(tails(&frames[1..]), vec![(2, big.1), (3, next.1)]);
+    }
+
+    /// The newest segment is never covered, and one is covered only once the
+    /// next starts at or before the checkpoint's `built + 1` (C2, C2a).
+    #[test]
+    fn only_a_segment_the_journal_rolled_past_is_covered() {
+        let (_tmp, dir, mut journal) = journal_of(1);
+        for seq in 1..=3 {
+            let (record, tail) = call(seq, 1, b"dead");
+            journal.append(&record, &tail).unwrap();
+        }
+        // Built through 2: segment 2's next starts at 3, so 1 and 2 go.
+        assert_eq!(compact(&dir, &journal, checkpoint(2)).segments, 2);
+        assert_eq!(journal.segment_firsts(), vec![RecordNo::new(3)]);
+        // Built through 3: 3 is the newest, never covered.
+        assert_eq!(compact(&dir, &journal, checkpoint(3)).segments, 0);
+        drop(journal);
+        let (_, frames) = Journal::open(&dir, RecordNo::new(3)).unwrap();
+        assert_eq!(frames.len(), 1, "every record is the checkpoint's");
     }
 
     #[test]
@@ -1243,10 +1296,10 @@ mod tests {
         assert_eq!(listed.len(), 2);
         assert!(listed[0].0 == RecordNo::new(1));
         for (_, path) in &listed {
-            assert!(fs::metadata(path).unwrap().len() <= SEGMENT_BYTES);
+            assert!(fs::metadata(path).unwrap().len() <= segment::SEGMENT_BYTES);
         }
         assert_eq!(
-            journal.len(),
+            journal.durability().len(),
             listed
                 .iter()
                 .map(|(_, p)| fs::metadata(p).unwrap().len())
@@ -1259,35 +1312,6 @@ mod tests {
         drop(journal);
         let (_, frames) = Journal::open(&dir, RecordNo::ZERO).unwrap();
         assert_eq!(frames.len(), 71);
-    }
-
-    /// Frames carried past a segment's size into a checkpoint's segment
-    /// (named for the next record) leave the next record there: a segment of
-    /// that name is taken.
-    #[test]
-    fn a_checkpoint_segment_carried_past_its_size_takes_the_next_record() {
-        let (_tmp, dir, mut journal) = journal();
-        let block = vec![5; 1 << 20];
-        // Three segments, each with fewer live frames (handle 8) than dead.
-        let mut live_frames = 0;
-        for seq in 1..=192 {
-            let handle = if seq % 64 < 30 { 8 } else { 9 };
-            live_frames += usize::from(handle == 8);
-            let (record, tail) = call(seq, handle, &block);
-            journal.append(&record, &tail).unwrap();
-        }
-        assert!(journal.segment_firsts().len() >= 3);
-        journal
-            .checkpoint(&checkpoint_with(193, vec![open_record(8)]))
-            .unwrap();
-        let live = |record: &Record| matches!(record.entry, Entry::Call { handle: 8, .. });
-        let stats = journal.drop_behind(RecordNo::new(192), &live).unwrap();
-        assert!(stats.carried_bytes > SEGMENT_BYTES, "{stats:?}");
-        let next = call(193, 8, &block);
-        journal.append(&next.0, &next.1).unwrap();
-        drop(journal);
-        let (_, frames) = Journal::open(&dir, RecordNo::ZERO).unwrap();
-        assert_eq!(frames.len(), 1 + live_frames + 1);
     }
 
     #[test]
@@ -1305,8 +1329,10 @@ mod tests {
         assert!(!journal.unknown());
     }
 
+    /// No checkpoint file, or a damaged one, is corruption at offset 0;
+    /// `checkpoint.tmp` is never read.
     #[test]
-    fn a_missing_empty_or_frameless_journal_is_corruption_at_zero() {
+    fn a_missing_or_damaged_checkpoint_is_corruption_at_zero() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("journal");
         assert!(matches!(
@@ -1318,12 +1344,12 @@ mod tests {
             Journal::open(&dir, RecordNo::ZERO),
             Err(Error::CorruptJournal(0))
         ));
-        let path = dir.join(segment::name_of(RecordNo::new(1)));
-        fs::write(&path, b"").unwrap();
+        fs::write(dir.join(compaction::CHECKPOINT_TMP), b"").unwrap();
         assert!(matches!(
             Journal::open(&dir, RecordNo::ZERO),
             Err(Error::CorruptJournal(0))
         ));
+        let path = dir.join(compaction::CHECKPOINT);
         fs::write(&path, vec![7; 100]).unwrap();
         assert!(matches!(
             Journal::open(&dir, RecordNo::ZERO),
@@ -1337,7 +1363,7 @@ mod tests {
         let (_tmp, dir, mut journal) = journal();
         let first = call(1, 1, b"one");
         journal.append(&first.0, &first.1).unwrap();
-        let length = journal.len();
+        let length = journal.durability().len();
         drop(journal);
         let path = only_segment(&dir);
         let mut file = OpenOptions::new().append(true).open(&path).unwrap();
@@ -1345,7 +1371,7 @@ mod tests {
         drop(file);
         let (journal, frames) = Journal::open(&dir, RecordNo::ZERO).unwrap();
         assert_eq!(frames.len(), 2);
-        assert_eq!(journal.len(), length);
+        assert_eq!(journal.durability().len(), length);
         assert_eq!(fs::metadata(&path).unwrap().len(), length);
         assert_eq!(fs::read(dir.join("torn")).unwrap(), b"AFJ3 torn");
     }
@@ -1356,7 +1382,7 @@ mod tests {
         let (tmp, dir, mut journal) = journal();
         let first = call(1, 1, b"one");
         journal.append(&first.0, &first.1).unwrap();
-        let hole = journal.len();
+        let hole = journal.durability().len();
         let second = call(2, 1, b"two");
         journal.append(&second.0, &second.1).unwrap();
         if durable {
@@ -1390,7 +1416,7 @@ mod tests {
         let (_tmp, dir, hole) = damaged_middle(false);
         let (journal, frames) = Journal::open(&dir, RecordNo::ZERO).unwrap();
         assert_eq!(frames.len(), 2, "the checkpoint and the first call");
-        assert_eq!(journal.len(), hole);
+        assert_eq!(journal.durability().len(), hole);
         assert_eq!(fs::metadata(only_segment(&dir)).unwrap().len(), hole);
         assert!(dir.join("torn").exists());
     }
@@ -1438,24 +1464,72 @@ mod tests {
         assert_eq!(segment::list(&dir).unwrap().len(), 1);
     }
 
-    /// A checkpoint fsyncs every segment before the mark rises to what it
-    /// covers: a restart's frames may be only in the kernel, and no leader's
-    /// fsync covers them after.
+    /// C7: covered segments unlinked and the next segment's frames lost, or
+    /// no segment left at all, with nothing after the checkpoint durable:
+    /// the journal opens at the checkpoint, a segment named for the next
+    /// record made where none is left.
     #[test]
-    fn a_checkpoint_fsyncs_every_segment_it_covers() {
-        let (_tmp, dir, mut journal) = journal();
-        let block = vec![5; 1 << 20];
-        for seq in 1..=66 {
-            let (record, tail) = call(seq, 1, &block);
+    fn a_journal_with_nothing_durable_after_its_checkpoint_opens() {
+        let (_tmp, dir, mut journal) = journal_of(1);
+        for seq in 1..=4 {
+            let (record, tail) = call(seq, 1, b"dead");
             journal.append(&record, &tail).unwrap();
         }
-        assert_eq!(segment::list(&dir).unwrap().len(), 2);
-        assert_eq!(journal.durability().mark(), RecordNo::ZERO);
-        let before = segment::SYNCS.with(std::cell::Cell::get);
-        journal.checkpoint(&checkpoint(67)).unwrap();
-        let synced = segment::SYNCS.with(std::cell::Cell::get) - before;
-        assert_eq!(synced, 3, "both segments and the checkpoint's");
-        assert_eq!(journal.durability().mark(), RecordNo::new(66));
+        compact(&dir, &journal, checkpoint(3));
+        drop(journal);
+        let listed = segment::list(&dir).unwrap();
+        assert_eq!(listed.len(), 1, "{listed:?}");
+        // The next segment's first frame torn: never durable.
+        fs::write(&listed[0].1, b"AFJ3").unwrap();
+        let (journal, frames) = Journal::open(&dir, RecordNo::new(3)).unwrap();
+        assert_eq!(frames.len(), 1);
+        assert_eq!(journal.segment_firsts(), vec![RecordNo::new(4)]);
+        drop(journal);
+        // No segment left at all.
+        for (_, path) in segment::list(&dir).unwrap() {
+            fs::remove_file(path).unwrap();
+        }
+        let (mut journal, frames) = Journal::open(&dir, RecordNo::new(3)).unwrap();
+        assert_eq!(frames.len(), 1);
+        assert_eq!(journal.segment_firsts(), vec![RecordNo::new(4)]);
+        let (record, tail) = call(4, 1, b"next");
+        journal.append(&record, &tail).unwrap();
+        drop(journal);
+        let (_, frames) = Journal::open(&dir, RecordNo::new(3)).unwrap();
+        assert_eq!(tails(&frames[1..]), vec![(4, b"next".to_vec())]);
+    }
+
+    /// 2.13: a lost segment after the checkpoint that held a record proven
+    /// durable refuses to open: by a later frame's mark, or by the built log
+    /// past the lost records with no later segment.
+    #[test]
+    fn a_lost_durable_segment_refuses_to_open() {
+        let (_tmp, dir, mut journal) = journal_of(1);
+        for seq in 1..=2 {
+            let (record, tail) = call(seq, 1, b"durable");
+            journal.append(&record, &tail).unwrap();
+        }
+        journal.durability().make_all_durable().unwrap();
+        let (record, tail) = call(3, 1, b"marked");
+        journal.append(&record, &tail).unwrap();
+        drop(journal);
+        let listed = segment::list(&dir).unwrap();
+        assert_eq!(listed.len(), 3);
+        // The middle segment unlinked by hand: record 3's mark says 2 was durable.
+        fs::remove_file(&listed[1].1).unwrap();
+        assert!(matches!(
+            Journal::open(&dir, RecordNo::ZERO),
+            Err(Error::CorruptJournal(_))
+        ));
+        assert_eq!(segment::list(&dir).unwrap().len(), 2, "nothing changed");
+        // No later segment, but the built log is past the lost record.
+        fs::remove_file(&listed[2].1).unwrap();
+        assert!(matches!(
+            Journal::open(&dir, RecordNo::new(2)),
+            Err(Error::CorruptJournal(_))
+        ));
+        // Built only through the first: what was lost was never durable.
+        assert!(Journal::open(&dir, RecordNo::new(1)).is_ok());
     }
 
     /// The builder's reader never reads past the durable mark: a frame in the

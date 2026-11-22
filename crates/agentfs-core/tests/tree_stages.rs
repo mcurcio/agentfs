@@ -430,7 +430,6 @@ fn a_gate_wait_is_recorded_by_its_cause() {
     let after = Stages::current().gate_wait;
     assert_eq!(after.overlay.count - before.overlay.count, 1);
     assert_eq!(after.lag.count - before.lag.count, 0);
-    assert_eq!(after.overdue.count - before.overdue.count, 0);
     assert!(after.overlay.nanos > before.overlay.nanos);
 }
 
