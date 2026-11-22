@@ -319,7 +319,7 @@ must exit 1, and the tracer runs it before the figures.
 
 | Workload | What it does | Deadline | Bar |
 |---|---|---|---|
-| `close_4k` | Rewrites and closes a 4 KiB file 200 times | 60 s | p50 3.5 ms, finished |
+| `close_4k` | Rewrites and closes a 4 KiB file 200 times | 60 s | p50 3.5 ms and p99 10 ms, finished |
 | `create` | Creates one-line files in the root, up to 50,000 | 300 s | 50,000 created: the engine's 100,000 in 600 s, over half the time |
 | `close_64m` | Writes a 64 MiB file in 1 MiB blocks and closes it | 120 s | The engine's close of a dirty 1 GiB file (12 s on ext4, 8 s on XFS), unscaled |
 | `close_1g` | Writes a 1 GiB file in 1 MiB blocks; times the close and `stat` alone | 300 s | The engine's close of a dirty 1 GiB file: 12 s on ext4, 8 s on XFS |
@@ -338,7 +338,9 @@ must exit 1, and the tracer runs it before the figures.
   reaches agentfs just after `close(2)` returns, and it answers requests
   one at a time and in order. So the `stat` returns only once the save is
   recorded: the guarantee each figure carries is "saved before the view
-  answers any later request; history built later". The builder makes the
+  answers any later request; history built later". No timed save waits
+  for the disk: a close makes no fsync (docs/trees.md, "Recording and
+  durability"), and no workload calls `fsync`. The builder makes the
   commits behind it, and each workload reports `drain_s`, the time from its
   last save to the built point reaching it (from `--metrics-output`, read at
   each rename of the file into place, its `seq` showing a snapshot taken
@@ -376,14 +378,14 @@ must exit 1, and the tracer runs it before the figures.
   not targets. The owner, 2026-11-20: "I dont have a number in mind. Im just
   looking to cut waste".
 - **Each workload reports the volume lock by kind.** `lock` holds, for
-  each kind of work under the volume's lock (compaction, catching up with
-  history, drops, closes, takes, fork copies, other:
+  each kind of work under the volume's lock (compaction's walk, catching
+  up with history, drops, closes, takes, fork copies, page images, other:
   [telemetry](telemetry.md#the-volume-lock)), the holds it ran in, its
   time and its longest share of one hold, and the waits to take the lock,
-  between the metrics file before the workload and after its history is
-  built. One more save, `fig-nudge`, is made and built first: a
-  compaction the workload made due runs at the first call after history
-  caught up, and the nudge is that call. A longest share is given only
+  between the metrics file before the workload and the one written once
+  its history is built and history's compactor is done with that build
+  (`history.compactor_through`), so a compaction the workload made due is
+  inside the window. A longest share is given only
   when the process-wide maximum grew in that workload, so run a workload
   alone (`--only`) to read its own. These figures have no bar and never
   warn or fail.
@@ -395,7 +397,8 @@ must exit 1, and the tracer runs it before the figures.
   locally; the tracer does not pass it, because it adds requests beside
   the gated `create`). Beside `create`, `close_1g`, `close_frag` and
   `write_1m`, a thread per view stats, opens and reads a file no workload
-  touches every 10 ms, until the nudge is built: in the workload's own
+  touches every 10 ms, until the compactor is done with the workload's
+  build: in the workload's own
   view, and in another view of the volume (`--probe-view`, a fork's
   mount). `probe` gives p50, p99 and the longest of each call in each
   view. A stall in the workload's view alone is that view's one request
@@ -485,7 +488,8 @@ observation each):
 | `close_1g`, close and `stat` (total with the writes) | 5.44 s (5.85 s) | 5.75 s (6.05 s) |
 | `write_1g`, last 64 writes against a 1 MiB file's (ratio) | 0.40 ms against 0.59 ms (0.67) | 0.29 ms against 0.40 ms (0.72) |
 
-`close_1g` is the fsync of the journal's gigabyte. That run did not measure the 1 GiB save's history: it had
+`close_1g` was then the fsync of the journal's gigabyte; a close no longer
+waits for it (below). That run did not measure the 1 GiB save's history: it had
 not finished building within the 180 s the script waits on XFS, and the
 builder then held a saved file whole (about 6 GB for a 1 GiB save).
 
@@ -591,51 +595,111 @@ On one 4-CPU container (ext4, release build; local observations, not CI):
 | `memory_create`, 50,000 files, persistent maps and overlay in place | 2.67 KiB a file (2.61 to 2.70 before the overlay) | 1.64 KiB a file with the arena cap |
 | `create`'s RssAnon peak, 50,000 files, default `agentfs.overlayLimit` | | about 81 MiB; with an 8 MiB limit 77.5 MiB, so the overlay is a small part of it |
 | Restart after a kill, 100,000 files, built point 400 records past the checkpoint: RssAnon peak (mount) | 370 to 386 MiB (46 to 49 s) | 328 to 333 MiB (38 to 39 s), each tree read once, at the built point |
-| `close_frag`: the close of 200,000 random writes | 110.4 s under the actor lock | 0.51 to 0.59 s (two runs); the longest lock hold is the journal's compaction, then the drop of the save's 200,000-piece map at its built event (below) |
+| `close_frag`: the close of 200,000 random writes | 110.4 s under the actor lock | 0.51 to 0.59 s (two runs), decided with the lock released |
 | `write_1m`: peak over memory before | 670 MiB | 774 MiB: a million appends leave the large map's leaves about half full |
 
-`close_frag` and `write_1m` miss their bars and warn. A close's work no
-longer runs under the actor lock (docs/trees.md, "File maps"), but the
-rebuild at the save's built event still drops its old map under it, in time
-proportional to the map's pieces, and sequential write pieces are not merged.
+`close_frag` and `write_1m` miss their bars and warn:
+
+- **`close_frag`'s longest lock hold is 128 ms** against a bar of 50 ms
+  (201 ms before; the table below). Nothing is dropped under the lock any
+  more: the map a rebuild replaces is freed on the volume's `tree-drops`
+  thread, and the journal compacts on history's compactor (docs/trees.md,
+  "History trails the files" and "The journal"). What holds the lock
+  longest now is the actor's walk onto the frames a compaction carried,
+  with the open's 200,000-piece map in hand (114 ms), then the fork view's
+  take of that save (91 ms) and the close's land (55 ms).
+- **`write_1m`'s peak is 885 MiB over the view's memory before**, against a
+  bar of 256 MiB. A close and the builder now read an open's calls once,
+  as a lazy merge, where each copied them into vectors of its own; the
+  peak was 893 MiB before that and 885 MiB after (one run each, on the
+  container of the table below; the 774 MiB above is another container's),
+  so the copies were not where the memory is. An open of a million small appends holds a million pieces:
+  sequential writes are not merged into one piece, and a million appends
+  leave the large map's leaves about half full. Neither has been measured
+  apart from the other.
 
 The volume lock by kind and another file's stall, each workload run alone
 on a fresh volume (`trees-figures.py --only W --metrics --probe
 --probe-view FORK`, through `agentfs mount --fork-mount FORK -- COMMAND`
-on the release build; same container, ext4; one run each; local
-observations, not CI). Each lock cell is the kind's longest share of one
-hold, in ms; the kinds not shown held the lock under 0.4 ms or not at all.
+on the release build; one 4-CPU container, Intel Xeon at 2.10 GHz, ext4;
+one run each; local observations, not CI). "Before" is commit 9eae003:
+compaction, and the drop of what a catch-up replaced, ran under the lock
+at a call, and a close waited for the disk. "After" is commit 26ddacf:
+compaction runs on history's compactor, drops on the `tree-drops` thread,
+and a close returns once its calls are in the journal. Each lock cell is
+the kind's longest share of one hold, in ms, before → after; "none" is a
+kind that held the lock in no hold. No run built a page image or copied a
+fork under the lock.
 
 | Workload | compaction | drops | close | take | catch_up | other | Longest lock wait |
 |---|---|---|---|---|---|---|---|
-| `close_1g` | **1,244** | 0.03 | 0.28 | 0.37 | 0.37 | 7.8 | 1,241 |
-| `write_1m` | **1,166** | 60 | 72 | 0.27 | 0.08 | 45 | 1,166 |
-| `close_frag` | **233** | 41 | 55 | 123 | 0.08 | 6.9 | 233 |
-| `create` (50,000) | none | 37 | 11 | 36 | **120** | 43 | 147 |
+| `close_1g` | 1,331 → none | 0.04 → none | 0.28 → 0.30 | 0.35 → 0.34 | 0.06 → 0.08 | 2.9 → 4.2 | **1,331 → 2.3** |
+| `write_1m` | 1,142 → none | 245 → none | 62 → 71 | 0.14 → 94 | under 0.1 | 2.5 → 14 | **1,133 → 87** |
+| `close_frag` | 201 → 114 | 87 → none | 53 → 55 | 110 → 91 | under 0.1 | 5.9 → 14 | **196 → 128** |
+| `create` (50,000) | none | 118 → none | 20 → 17 | 39 → 145 | 134 → 178 | 31 → 63 | 163 → 194 |
 
-The probe's calls on another file, in ms (p50 / p99 / longest of its
-stats, and the longest of any call), with the longest request on each
-workload view's one thread and the longest wait at the lag gate:
+After, the `compaction` kind is the actor's walk onto the frames a
+compaction carried, not the compaction
+([telemetry](telemetry.md#the-volume-lock)).
 
-| Workload | Same view: stat | Same view: longest call | Other view: stat | Other view: longest call | Longest request on the view's thread | Longest gate wait |
-|---|---|---|---|---|---|---|
-| `close_1g` | 0.26 / 1.1 / 1,239 | 1,239 | 0.27 / 0.95 / 1,241 | 1,241 | `create` 1,244 (the nudge, behind compaction) | none |
-| `write_1m` | 0.14 / 0.48 / 962 | 1,183 | 0.28 / 0.71 / 68 | 1,167 | `create` 1,183 (the nudge); `release` 970 | none |
-| `close_frag` | 0.24 / 1.4 / 503 | 503 | 0.27 / 1.3 / 233 | 233 | `release` 509 (the close) | none |
-| `create` (50,000) | 0.13 / 12.4 / 116 | 116 | 0.09 / 12.8 / 119 | 153 | `flush` 147 | `lag` 3,983 (17 waits, 21 s in all) |
+The probe's calls on another file, in ms, before → after: the longest
+call (a stat, an open or a read) in each view, the longest request on the
+workload view's one thread, and the lag gate's waits. The probe's stat
+took 0.1 to 0.3 ms at p50 in every run, and under 2 ms at p99 in every
+run but `create`'s (9 to 12 ms, before and after).
 
-- **Compaction causes the longest holds** in every workload that writes a
-  large journal: it runs at the first call after history has built the
-  workload's steps, and another view's file waits nearly all of it (1.24 s
-  for `close_1g`, 1.17 s for `write_1m`).
-- **The view's one thread stalls its own files as long as the lock does.**
-  The close of `close_frag` held its view's thread 509 ms (its `release`),
-  so a stat of another file in that view waited 503 ms, while another view
-  waited at most 233 ms, the compaction. `write_1m`'s close held its
-  thread 970 ms the same way.
+| Workload | Same view: longest call | Other view: longest call | Longest request on the view's thread | Lag gate waits |
+|---|---|---|---|---|
+| `close_1g` | 1,332 → 35 | 1,331 → 35 | `create` 1,332 (a save behind compaction) → `getattr` 4.2 | none |
+| `write_1m` | 1,133 → 860 | 1,134 → 87 | `create` 1,143 (a save behind compaction) → `release` 870 (the close) | none |
+| `close_frag` | 366 → 377 | 199 → 124 | `release` 371 → 382 (the close) | none |
+| `create` (50,000) | 164 → 195 | 164 → 197 | `create` 165 → `release` 196 | 11 waits, 11 s in all, longest 2.8 s → 18 waits, 36 s in all, longest 7.0 s |
+
+The same pair of runs, for what a save costs:
+
+| Figure | Before | After |
+|---|---|---|
+| `close_4k`, 200 saves, p50 (p99) | 1.16 ms (4.38 ms) | 0.39 ms (1.88 ms) |
+| `close_1g`, close and `stat` | 0.70 s | 0.001 s |
+| `create`, 50,000 created in (median save, from 1,000 files on) | 76.3 s (0.84 to 0.99 ms) | 73.4 s (0.16 to 0.52 ms) |
+| `create`, `drain_s` | 157 s | 155 s |
+| `history_1g`, the 1 GiB save's `drain_s` | 37.2 s | 42.3 s |
+
+- **No call waits for compaction.** Before, compaction held the lock 1.1
+  to 1.3 s in each workload that writes a large journal, at the first call
+  after history had built the workload's steps, and another view's file
+  waited nearly all of it. After, the longest wait for the lock through
+  `close_1g` is 2.3 ms and another view's slowest call 35 ms; through
+  `write_1m`, 87 ms.
+- **Compaction leaves one walk under the lock.** When a compaction carries
+  a live open's frames, the actor moves its maps onto them at its next
+  built event. That walk took 114 ms in `close_frag`, whose map has
+  200,000 pieces, and did not run in the other three workloads.
+- **Nothing is dropped under the lock.** The drops took 87 to 245 ms of
+  one hold before, and 1.7 s of `create`'s holds in all.
+- **A close costs its journal append.** It no longer waits for an fsync,
+  so `close_4k`'s p50 fell to a third, and the close of a dirty 1 GiB file
+  from the fsync of its gigabyte to 1 ms: those bytes reach the disk at
+  the builder's next batch or a program's own `fsync`. Measured another
+  way when that change landed (400 saves of 4 KiB as open, write, close
+  and stat; release build, local ext4, two runs each): p50 1.12 and 1.22 ms before, 0.41 and 0.36 ms
+  after, with `close(2)` alone at 0.55 and 0.59 ms before and 0.04 ms
+  after. `close_1g`, `close_64m` and `close_4k` therefore time no disk
+  wait, and their bars, the recording engine's fsynced closes, are marks
+  for regressions only.
+- **The view's one thread stalls its own files as long as a close's
+  decision takes.** The close of `close_frag` held its view's thread
+  382 ms (its `release`) and `write_1m`'s 870 ms, so a stat of another
+  file in that view waited as long, while another view waited at most 124
+  and 87 ms. Nothing here changed that.
+- **What holds the lock longest now** is a take of a large save (91 to
+  145 ms), the catch-up onto a built point in a tree of 50,000 files
+  (178 ms), and the land of a close with a large map (55 to 71 ms). The
+  take's share rose in `write_1m` and `create` between the two runs; one
+  run each does not say why.
 - **The lag gate holds only new work.** During `create` it held the
-  workload's own saves up to 4.0 s, but the probe, which never writes,
-  waited at most 153 ms, about the longest catch-up of the lock (120 ms).
+  workload's own saves up to 7.0 s, but the probe, which never writes,
+  waited at most 197 ms, about the longest catch-up of the lock (178 ms).
   A write to another file of the same tree would wait at the gate too; the
   probe does not measure that.
 

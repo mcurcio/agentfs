@@ -1312,7 +1312,8 @@ What the tree views do not support:
   ([telemetry](telemetry.md#the-volume-lock), `compaction` and
   `page_image`). Sequential writes
   are not merged into one piece, so an open of a million small appends holds a
-  million pieces (a 774 MiB peak in one local run).
+  million pieces (peaks of 774 and 885 MiB in two local runs;
+  [performance](performance.md#tree-views-release-build)).
 - **A restart copies every checkout.** Each start writes the private checkouts
   of the built point whole, so its time grows with the tree (38 to 39 s for
   100,000 files in one local run).
