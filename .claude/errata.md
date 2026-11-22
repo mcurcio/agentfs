@@ -2295,3 +2295,22 @@ Proof: both power-loss jobs reach `ack-hc-1` and the oracle judges every cut.
 **Mechanism (read, not run).** `early_fork` asserts the fork's listing lacks `repo`, but `repo` is a recorded directory (`docs/trees.md`: "`git init repo` in a view records the directory `repo`"), and every step that saves the root enqueues a sync in each fork, taken at the next built event. "The fork never shows `repo`" holds only while the script outruns that sync. The failing run was a slow one (3.6 s where the passing run took 0.26 s), and its fork was mid-sync. Nothing a user would see is wrong. Whether slices 2 or 6 shifted the odds is not established.
 
 **For the end fix round (test only):** in `early_fork`, drop `repo` from the absent list; first wait (as `delivered()` does in `ci/e2e-trees.sh`) until the fork shows the root's last tracked names (`draft.txt`, `t2`, `repo`), then assert `repo` is an empty directory, `repo/.git` and `repo/x` do not exist in the fork, and the untracked names and `u/x.log` are absent. Update the module docstring's `early-fork` line. Today the absence checks pass trivially when the sync has not arrived.
+
+## 2026-11-22, PR #41 at d38694e: `a_log_held_open_does_not_pin_other_saves` fails only sometimes; a product bug in the compactor's due rule
+
+**The red.** `crates/agentfs-core/tests/tree_actor.rs:1330`: "journal holds 69207626 bytes" (ci `test (default)`).
+
+**Mechanism (read, not run).** A compaction that runs at a built event while a large file is still open covers nothing it can drop (`journal/compaction.rs`, `carry` keeps a covered segment whose live bytes outweigh its dead ones), returns `Ok(Some)`, and sets `len_after_last` to the journal's whole length (`history/compactor.rs`). The next compaction is due at twice that, so the save that kills those bytes is not due. The test's two waits accept that no-op checkpoint. The power-loss driver's timeout (entry above) is the same mechanism.
+
+**A user sees it.** With the default `Upkeep`, any built event (another file's step, a fork sync, a switch-only batch) while a large open is in flight and the journal is at least 64 MiB triggers it. Up to the journal's length at that moment stays as dead bytes until the journal doubles and a built event follows; on an idle volume, indefinitely. There is no absolute bound, which contradicts `docs/trees.md` ("under about twice the live opens' bytes plus a segment").
+
+**The rule to build (main loop's decision; build this, do not redesign):** subtract the bytes of opens that have ended from the baseline.
+- `journal/mod.rs`: `Change::saved_open() -> Option<u64>` beside `build_cost`.
+- `history/built.rs`: `appended_step` takes that handle (the actor's call and the replay's); state keeps `(step, handle)` pairs; `History::take_ended(through) -> Vec<u64>` gives the saves built at or below `through`.
+- `history/compactor.rs`: `compact_once` also returns each open's call-frame bytes from the fold's opens. `run` keeps `pinned: BTreeMap<u64, u64>` and `released: u64`, and is due at `len >= compact_at(from, len_after_last - released)`. Each `Ok(Some)` replaces `pinned` and zeroes `released`.
+- Check, and say in the report: whether every way an open ends is a `Save` step; held page writes are keyed by file, not by open, and are not covered by this rule.
+- `docs/trees.md`: the bound's sentence, to match.
+
+**Tests.** A unit test of the due formula with `released`. New, deterministic, fails today: `segment_bytes: 1` and a small `compact_from`; open `big`, write, make an unrelated step, wait for the compactor (a checkpoint is published, nothing dropped); close `big`, settle, wait for the compactor: the chunk's segment is gone.
+
+**Test-only, needed regardless.** `fill_journal`'s generation wait accepts any checkpoint (same pattern at `tree_actor.rs:1375-1387` and `1798-1812`). Add `History::wait_compactor(through)`, a blocking form of `compactor_through` (`compaction_ended` already notifies); in `fill_journal` call it after the create and before the first chunk, and in place of the two waits at 1313-1314. Do not use `trees::compacted_through(settled)` there: a compaction at the save, one record short of a trailing switch record, would hang it. With this rule in, the power-loss driver's fix (entry above) may reduce to its `queued == 0` wait and its diagnostics; keep whichever the run proves.
