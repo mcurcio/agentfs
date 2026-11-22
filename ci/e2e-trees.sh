@@ -48,7 +48,9 @@ start() {
     echo "the tree mounts did not start" >&2
     return 1
 }
-start
+# The first mount writes its metrics file: trees-untracked.py's early-fork
+# waits on it for the fork to take the root's changes.
+start --metrics-output "$work/metrics.json"
 python3 - "$work/main" "$work/fork" <<'PY'
 import os
 from pathlib import Path
@@ -139,7 +141,7 @@ PY
 # read after the restart.
 "${as_root[@]}" python3 ci/trees-posix.py view "$work/main"
 "${as_root[@]}" python3 ci/trees-untracked.py view "$work/main" "$pid"
-python3 ci/trees-untracked.py early-fork "$work/fork"
+python3 ci/trees-untracked.py early-fork "$work/fork" "$work/metrics.json"
 mmap_status=0
 python3 ci/trees-mmap.py "$work/main" "$work/state/history.git" || mmap_status=$?
 tmpfile_status=0

@@ -13,8 +13,12 @@ these rules (ci/e2e-trees.sh writes them before the first mount):
                                            the merged listing, rmdir, moves and
                                            links across and within the halves,
                                            a FIFO and a unix socket, O_TMPFILE
-    trees-untracked.py early-fork MOUNT    a fork made before any of them shows
-                                           none of the root's untracked files
+    trees-untracked.py early-fork MOUNT METRICS
+                                           a fork made before any of them, once
+                                           it has taken the root's tracked names
+                                           (the nested repository's directory
+                                           too, empty), shows none of the root's
+                                           untracked files
     trees-untracked.py writer DB           writes the database until killed
     trees-untracked.py remount MOUNT HOST  after a kill and a restart, the root's
                                            untracked files are still there
@@ -48,6 +52,7 @@ these rules (ci/e2e-trees.sh writes them before the first mount):
 import ctypes
 import errno
 import hashlib
+import importlib.util
 import json
 import os
 import socket
@@ -304,9 +309,29 @@ def view(root):
         sock.close()
 
 
-def early_fork(root):
+def early_fork(root, metrics):
+    # The fork takes each of the root's saves at a built event after it, and
+    # the mount rewrites its metrics file at each one: wait on those renames
+    # until the fork shows the root's last tracked names. Before that the
+    # checks below would pass with nothing delivered. The bound only ends a
+    # hang.
+    spec = importlib.util.spec_from_file_location(
+        "figures", Path(__file__).with_name("trees-figures.py"))
+    figures = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(figures)
+    renames = figures.Renames(str(metrics))
+    limit = time.monotonic() + 120
+    tracked = {"draft.txt", "t2", "repo"}
+    while not tracked <= set(os.listdir(root)):
+        assert renames.wait(limit), (tracked, os.listdir(root))
+    renames.close()
+    # The repository's directory is recorded, so the fork has it; what is in
+    # it is not.
+    assert os.listdir(root / "repo") == [], os.listdir(root / "repo")
+    assert not (root / "repo" / ".git").exists()
+    assert not (root / "repo" / "x").exists()
     names = set(os.listdir(root))
-    for name in (".env", "app.log", "sessions", "state.db", "repo"):
+    for name in (".env", "app.log", "sessions", "state.db"):
         assert name not in names, (name, names)
     assert not (root / "u" / "x.log").exists()
 
@@ -558,7 +583,7 @@ def readonly(root):
 if __name__ == "__main__":
     commands = {
         "view": lambda: view(Path(sys.argv[2])),
-        "early-fork": lambda: early_fork(Path(sys.argv[2])),
+        "early-fork": lambda: early_fork(Path(sys.argv[2]), Path(sys.argv[3])),
         "writer": lambda: writer(Path(sys.argv[2])),
         "remount": lambda: remount(Path(sys.argv[2])),
         "history": lambda: history(Path(sys.argv[2])),
