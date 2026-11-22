@@ -205,24 +205,43 @@ def metric():
     try:
         with open(metrics) as f: return json.load(f)
     except (OSError, ValueError): return None
+# What the metrics showed while big was open, one line for each file seen:
+# printed with the mount's log when a wait below is not reached.
+seen = []
+def sample():
+    m = metric()
+    if m and (not seen or seen[-1]['seq'] != m.get('seq')):
+        stages = m.get('stages') or {}
+        seen.append({'seq': m.get('seq'), 'built_through': m['history']['built_through'],
+                     'appended': m['history']['appended'], 'queued': m.get('queued'),
+                     'compactions': (stages.get('compaction') or {}).get('count'),
+                     'checkpoints': stages.get('checkpoints')})
 def until(test, what):
     # The view rewrites the file at each built event: wait on its renames.
     limit = time.monotonic() + 600
     while not test(metric() or {}):
-        if not renames.wait(limit): sys.exit(f'{what}: not reached; metrics {metric()}')
+        sample()
+        if not renames.wait(limit):
+            for line in seen: print(json.dumps(line), file=sys.stderr)
+            with open(f'{work}/mount.log') as f: sys.stderr.write(f.read())
+            sys.exit(f'{what}: not reached; metrics {metric()}')
 def at_rest(what):
     """No built event is left to come: a metrics file written after this call
-    began shows history built through every record and no pointer at a step."""
+    began shows history built through every record, no pointer at a step and
+    no fork sync queued (a sync is a step, and its built event another)."""
     floor = (metric() or {}).get('seq', 0) + 2
     until(lambda m: m.get('seq', 0) >= floor
           and m['history']['built_through'] >= m['history']['appended']
-          and m['history']['pointers_at_steps'] == 0, what)
+          and m['history']['pointers_at_steps'] == 0
+          and m['queued'] == 0, what)
 MIB = 1 << 20
-# The compactor compacts at a built event once the journal is long enough, and
-# then not again before it has doubled. So the only built event from big's
-# first byte to its save is that save's: before the bytes go in, the fork has
-# taken the root's last change, big's create (its sync is a step), and every
-# step so far is built.
+# The compactor compacts at a built event once the journal is long enough.
+# Before big's bytes go in, the fork has taken the root's last change, big's
+# create (its sync is a step), every step so far is built and no sync is
+# queued, so no step's built event is due before big's save. A batch with no
+# step is a built event too, and one may still compact while big is open: it
+# frees nothing, and big's bytes come off the compactor's baseline once its
+# save is built, so that save's built event compacts all the same.
 checkpoints = ((metric() or {}).get('stages') or {}).get('checkpoints', 0)
 held = d.create('root', root, 'h')
 for i in range(4):
@@ -232,6 +251,7 @@ until(lambda m: os.path.exists(f'{sandbox}/big'), "the fork's sync of big's crea
 at_rest("the mount at rest before big's writes")
 for i in range(70):
     d.write('root', 'big', big, i.to_bytes(4, 'little'), MIB // 4)
+    sample()
 os.close(big)
 # The view rewrites the file at each published checkpoint and at each
 # compaction's end: no call of this driver starts the compaction.
