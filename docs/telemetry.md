@@ -155,7 +155,7 @@ history inside a close) counts to the inner kind only. Every hold is one
 |---|---|
 | `compaction` | The actor's walk onto the frames a compaction carried, at a built event. The compaction itself runs on history's compactor and holds no call ([trees](trees.md#the-journal)); its time is the `compaction` stage |
 | `catch_up` | Moving the saved trees onto history's built point, at a step or a built event |
-| `drops` | Dropping the maps and shapes catching up let go: the last drop of a large file map |
+| `drops` | Dropping a map or shape under the lock. It reads zero: what catching up lets go is dropped on the volume's `tree-drops` thread, off the lock ([trees](trees.md#history-trails-the-files)) |
 | `close` | A close's first half and its land, a close decided under the lock, and pending closes saved again |
 | `take` | A take's inputs, the entries it leaves waiting, and its land |
 | `fork_copy` | A fork's step, its untracked area's copy included |

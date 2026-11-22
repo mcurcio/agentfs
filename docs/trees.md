@@ -929,6 +929,15 @@ the private checkouts copied, the checked-out files' maps rebased onto them
   names) is admitted, and the calls after it wait until it is built. A failed
   builder holds nothing back here either: the overlay cannot shrink while it
   has failed.
+- **Deferred drops.** Moving onto a built point replaces saved maps and
+  shapes, and freeing one costs time in proportion to its size: a map of
+  200,000 pieces, or a base file's link to unlink. The actor hands what it
+  replaced to History in O(1) under its lock, and one thread per volume,
+  `tree-drops`, frees it: no call and no view's request thread waits for a
+  drop. Memory a catch-up let go is therefore freed a moment after the built
+  event, not at it. A shutdown waits until everything handed over is freed,
+  so no base file's link outlives the state area's lease; a drop that
+  panicked is logged then (`tree DropsFailed`) and stops nothing.
 
 ## When history cannot check a save
 
