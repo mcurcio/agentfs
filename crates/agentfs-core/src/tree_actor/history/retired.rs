@@ -1,7 +1,7 @@
 //! Deferred drops: the large values a catch-up with history lets go (replaced
 //! saved maps, shapes, a map's base file), handed to History and dropped
 //! after the actor's lock is released, on a thread that serves no requests
-//! (docs/target-architecture/future/latency-upkeep.md).
+//! (docs/trees.md, "History trails the files").
 
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::thread::JoinHandle;
