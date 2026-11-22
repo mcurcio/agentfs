@@ -46,8 +46,11 @@ use crate::fsutil::sync_dir;
 pub use agentfs_contracts::{NotATree, TreeId};
 pub use call_path::{Progress, Recording, Then};
 use history::builder::{BuildState, Builder, JournalReader, copy_all};
-pub use history::built::{BuildError, BuiltSnapshot, Health, History, Lag, TreeLag, WaitError};
+pub use history::built::{
+    BuildError, BuiltSnapshot, Checkpointed, Health, History, Lag, TreeLag, WaitError,
+};
 use history::built_log::{self, BuiltLog};
+use history::compactor::{COMPACT_FROM, Compactor};
 use history::message::Message;
 use history::repack::Repacker;
 use history::retired::Retired;
@@ -58,10 +61,12 @@ pub use history::verify::{
     VerifyReport, release, verify_flagged,
 };
 use history::{check_objects, clean_packs, read_trees, refs, remove_stale_locks, sync_marker};
+pub use journal::compaction::{ChannelGate, CompactGate, Gap};
+use journal::compaction::{Checkpoint, JournalCompaction, Published};
 pub use journal::durable::{Durability, DurableError, RecordNo};
+use journal::segment::SEGMENT_BYTES;
 use journal::{
-    Change, Entry, Journal, PointerChange, Record, Replay, RowRecord, SaveOutcome, Target,
-    compact_at, fold,
+    Change, Entry, Journal, PointerChange, Replay, RowRecord, SaveOutcome, Target, fold,
 };
 pub use meta::{Attrs, Kind, Meta, Perm, SetTime, Times};
 use pointers::Pointers;
@@ -75,7 +80,57 @@ use stages::Stages;
 use tree::{EventNumber, SavedTree};
 pub use untracked::{AreaWrite, UntrackedArea};
 
-const FORMAT: &str = "agentfs-trees-13\n";
+const FORMAT: &str = "agentfs-trees-14\n";
+
+/// How one open volume keeps its journal (docs/library/core.md, "Git-backed
+/// tree views"). Fixed for the life of the open; nothing of it is stored in
+/// the state area.
+#[derive(Clone)]
+pub struct Upkeep {
+    /// The next frame starts a new segment once the current one has a record
+    /// and the frame would take it past this. Default 64 MiB.
+    pub segment_bytes: u64,
+    /// The floor of compaction's due length: the journal compacts at a
+    /// built event once it is twice its length after the last compaction,
+    /// and at least this long. Default 64 MiB. Unread when `gate` is set.
+    pub compact_from: u64,
+    /// Parks the compactor at each gap; with one, the compactor compacts at
+    /// every built event. Default none.
+    pub gate: Option<Arc<dyn CompactGate>>,
+}
+
+impl Default for Upkeep {
+    fn default() -> Self {
+        Self {
+            segment_bytes: SEGMENT_BYTES,
+            compact_from: COMPACT_FROM,
+            gate: None,
+        }
+    }
+}
+
+impl std::fmt::Debug for Upkeep {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Upkeep")
+            .field("segment_bytes", &self.segment_bytes)
+            .field("compact_from", &self.compact_from)
+            .field("gate", &self.gate.as_ref().map(|_| ".."))
+            .finish()
+    }
+}
+
+impl Upkeep {
+    /// One frame per segment (`segment_bytes: 1`), `compact_from` as the
+    /// default, and `gate`: a compaction at every built event that covers
+    /// every segment but the newest. What `AGENTFS_COMPACT_GATE` sets.
+    pub fn gated(gate: Arc<dyn CompactGate>) -> Self {
+        Self {
+            segment_bytes: 1,
+            gate: Some(gate),
+            ..Self::default()
+        }
+    }
+}
 /// The volume identity file: [`VolumeIdentity`] as JSON, written once by
 /// [`TreeActor::create`], read before any write at every open.
 const IDENTITY: &str = "volume";
@@ -280,11 +335,13 @@ pub struct Metrics {
     pub queued: u64,
     /// Time and Git children by stage, process-wide (see [`stages`]).
     pub stages: Stages,
-    /// The journal's segments' bytes now: what a held open file keeps from compaction.
+    /// The journal's bytes now: its segments, its carry files, and unlinked
+    /// files a reader still holds; what a held open file keeps from
+    /// compaction.
     pub journal_bytes: u64,
     /// Segments compaction has dropped since open.
     pub journal_dropped: u64,
-    /// Bytes compaction has copied forward since open: a live open's frames
+    /// Bytes compaction has copied into carry files since open: live frames
     /// that pinned more dead bytes than their own.
     pub journal_carried_bytes: u64,
     /// History as built behind the call path.
@@ -303,6 +360,11 @@ pub struct TreeActor {
     /// The one owner of the Git store; the builder runs behind it.
     history: History,
     builder: Option<JoinHandle<()>>,
+    /// History's compactor, beside the builder; joined before it.
+    compactor: Option<Compactor>,
+    /// The relocations' generation the actor last moved its positions at
+    /// ([`TreeActor::relocate_if_moved`]).
+    relocated: u64,
     /// The history's repack task, beside the builder; stopped after it.
     repacker: Option<Repacker>,
     /// The pointers as the journal's records name them.
@@ -324,7 +386,6 @@ pub struct TreeActor {
     /// The last record's time: what a step just recorded applies its times at.
     last_at_ns: u64,
     stopped: bool,
-    compact_threshold: u64,
     metrics: Metrics,
     waiting_since: BTreeMap<String, Instant>,
     pages: BTreeMap<(TreeId, u64), pages::ObjectPages>,
@@ -336,10 +397,6 @@ pub struct TreeActor {
     /// Each key's last touching step, kept while its tree's queue holds an
     /// entry ([`takes`]).
     touched: takes::Touched,
-    /// The last compaction's redo start, and the oid each step value the
-    /// pointers held then was built as: a step whose pointers were read
-    /// before that compaction names oids, never a step it covers.
-    compacted: (RecordNo, BTreeMap<RecordNo, String>),
     /// The operator's rules, read once at open: where each new name lives.
     rules: Arc<agentfs_rules::RuleSet>,
     /// Each tree's untracked area and its hold.
@@ -580,6 +637,21 @@ impl TreeActor {
         root_owner: Option<FileOwner>,
         service: &PodContext,
     ) -> Result<Self> {
+        Self::create_with(root, identity, root_owner, service, Upkeep::default())
+    }
+
+    /// [`TreeActor::create`], served with `upkeep`.
+    ///
+    /// # Errors
+    ///
+    /// As [`TreeActor::create`].
+    pub fn create_with(
+        root: &Path,
+        identity: &VolumeIdentity,
+        root_owner: Option<FileOwner>,
+        service: &PodContext,
+        upkeep: Upkeep,
+    ) -> Result<Self> {
         crate::history::init_libgit2();
         if !root.exists() {
             fs::DirBuilder::new()
@@ -628,32 +700,31 @@ impl TreeActor {
         repo.sync_objects()?;
         Journal::create(
             &root.join(JOURNAL),
-            &Record {
-                seq: RecordNo::ZERO,
-                at_ns: now_ns(),
-                entry: Entry::Checkpoint {
-                    next: RecordNo::new(1),
-                    built: RecordNo::ZERO,
-                    pointers: [(refs::branch(TreeId::Root), head.to_string())]
-                        .into_iter()
-                        .collect(),
-                    upstreams: BTreeMap::new(),
-                    opens: Vec::new(),
-                    page_saved: Vec::new(),
-                    page_writes: Vec::new(),
-                    objects: BTreeMap::new(),
-                    locals: [(
-                        TreeId::Root.to_string(),
-                        journal::TreeLocals {
-                            dirs: [(String::new(), (0, Times::at(now_ns())))]
-                                .into_iter()
-                                .collect(),
-                            files: BTreeMap::new(),
-                        },
-                    )]
+            &Checkpoint {
+                salt: 0,
+                built: RecordNo::ZERO,
+                pointers: [(refs::branch(TreeId::Root), head.to_string())]
                     .into_iter()
                     .collect(),
-                },
+                upstreams: BTreeMap::new(),
+                opens: Vec::new(),
+                page_saved: Vec::new(),
+                page_writes: Vec::new(),
+                chunks: Vec::new(),
+                objects: BTreeMap::new(),
+                locals: [(
+                    TreeId::Root.to_string(),
+                    journal::TreeLocals {
+                        dirs: [(String::new(), (0, Times::at(now_ns())))]
+                            .into_iter()
+                            .collect(),
+                        files: BTreeMap::new(),
+                    },
+                )]
+                .into_iter()
+                .collect(),
+                step_heads: BTreeMap::new(),
+                carried: Vec::new(),
             },
         )?;
         drop(repo);
@@ -661,7 +732,7 @@ impl TreeActor {
         write_durably(&root, "format", FORMAT.as_bytes())?;
         fs::remove_file(&marker)?;
         sync_dir(&root)?;
-        Self::serve(root, lock, identity.clone(), service.clone())
+        Self::serve(root, lock, identity.clone(), service.clone(), upkeep)
     }
 
     /// Recovers a volume and serves it. Reads `format` and `volume` before any
@@ -684,6 +755,15 @@ impl TreeActor {
     /// [`Error::History`] when history cannot be built, and any failure of a
     /// recovery close.
     pub fn open(root: &Path, service: &PodContext) -> Result<Self> {
+        Self::open_with(root, service, Upkeep::default())
+    }
+
+    /// [`TreeActor::open`], served with `upkeep`.
+    ///
+    /// # Errors
+    ///
+    /// As [`TreeActor::open`].
+    pub fn open_with(root: &Path, service: &PodContext, upkeep: Upkeep) -> Result<Self> {
         found_volume(root)?;
         crate::history::init_libgit2();
         let root = root.canonicalize()?;
@@ -691,7 +771,7 @@ impl TreeActor {
         // Again under the lock: a create may have been cut short since.
         let identity = found_volume(&root)?;
         fs::set_permissions(&root, fs::Permissions::from_mode(0o700))?;
-        Self::serve(root, lock, identity, service.clone())
+        Self::serve(root, lock, identity, service.clone(), upkeep)
     }
 
     /// The volume identity file's content.
@@ -720,7 +800,7 @@ impl TreeActor {
         root: &Path,
         lock: &Arc<FileLock>,
         frames: &[journal::Frame],
-        folded_built: RecordNo,
+        opened: &Published,
         (built_log, entries): (BuiltLog, Vec<built_log::BuiltEntry>),
         durability: &Arc<Durability>,
         salt: u32,
@@ -734,6 +814,7 @@ impl TreeActor {
         // Before any git command: an empty config silently loses core.fsync,
         // and an empty HEAD is "not a git repository".
         repo.write_config(&refs::head(), &BTreeMap::new())?;
+        let folded_built = opened.built();
         let built = folded_built.max(built_log::built_through(&entries));
         let values = built_log::values(&entries)?;
         let upto = frames
@@ -815,8 +896,7 @@ impl TreeActor {
             heads,
         )?;
         let objects = objects.into_iter().collect();
-        let history = History::new(repo, built, pointers.clone(), owners, objects)?;
-        history.checkpointed(folded_built);
+        let history = History::new(repo, built, pointers.clone(), owners, objects, opened)?;
         // The steps replayed past the built point are the builder's to build,
         // and the lag gate's to count, as at their call.
         for (record, _) in &frames[upto..] {
@@ -936,13 +1016,17 @@ impl TreeActor {
         lock: Arc<FileLock>,
         identity: VolumeIdentity,
         service: PodContext,
+        upkeep: Upkeep,
     ) -> Result<Self> {
         // Before anything is written: a rule that is not built refuses the
         // volume (`Error::Rules`, carried by Volume as `RulesRefused`).
         let rules = Arc::new(read_rules(&root)?);
         let (built_log, entries) = BuiltLog::open(&root.join(BUILT_LOG))?;
-        let (journal, frames) =
-            Journal::open(&root.join(JOURNAL), built_log::built_through(&entries))?;
+        let (journal, frames, opened) = Journal::open(
+            &root.join(JOURNAL),
+            built_log::built_through(&entries),
+            upkeep.segment_bytes,
+        )?;
         let folded = fold(&frames)?;
         let Started {
             history,
@@ -956,7 +1040,7 @@ impl TreeActor {
             &root,
             &lock,
             &frames,
-            folded.built,
+            &opened,
             (built_log, entries),
             journal.durability(),
             journal.salt(),
@@ -970,6 +1054,8 @@ impl TreeActor {
             journal,
             history,
             builder: Some(builder),
+            compactor: None,
+            relocated: 0,
             repacker: None,
             // As the records name them: a step not yet built by its number.
             pointers: folded.pointers,
@@ -985,20 +1071,27 @@ impl TreeActor {
             next: folded.next_seq.max(built.get().saturating_add(1)),
             last_at_ns: 0,
             stopped: false,
-            compact_threshold: compact_at(0),
             metrics: Metrics::default(),
             waiting_since: BTreeMap::new(),
             pages: BTreeMap::new(),
             changed: Vec::new(),
             heads: BTreeMap::new(),
             touched: BTreeMap::new(),
-            compacted: (RecordNo::ZERO, BTreeMap::new()),
             rules,
             areas: untracked::Areas::new(&root),
             verification,
             _lock: lock,
         };
         // After the builder, and once the volume stops it on any error below.
+        volume.compactor = Some(Compactor::start(
+            volume.history.clone(),
+            JournalCompaction::new(
+                root.join(JOURNAL),
+                Arc::clone(volume.journal.durability()),
+                upkeep.gate,
+            ),
+            upkeep.compact_from,
+        )?);
         volume.repacker = Some(Repacker::start(
             volume.history.clone(),
             root.join("history.git"),
@@ -1031,19 +1124,11 @@ impl TreeActor {
             );
         }
         volume.metrics.queued = volume.pointers.under(refs::QUEUES).len() as u64;
-        // A journal whose steps are all built compacts at once; otherwise at
-        // the first record after the builder catches up. Open never waits.
-        if volume.history.steps_built() {
-            if let Err(e) = volume.compact() {
-                eprintln!("tree CompactionFailed: {e}");
-            }
-            volume.compact_threshold = compact_at(volume.journal.len());
-        } else {
-            volume.compact_threshold = 0;
-        }
-        // Every recovered record durable before anything is served: a kill
-        // keeps the kernel's frames, a power cut after it would not. A
-        // compaction just made has done it.
+        // Open never compacts: History has no trees at its built point until
+        // the builder's first built event, and the compactor compacts there,
+        // once due. Every recovered record durable before anything is
+        // served: a kill keeps the kernel's frames, a power cut after it
+        // would not.
         volume.durability().make_all_durable()?;
         Ok(volume)
     }
@@ -1076,8 +1161,10 @@ impl TreeActor {
     pub fn metrics(&self) -> Metrics {
         let mut metrics = self.metrics.clone();
         metrics.stages = Stages::current();
-        metrics.journal_bytes = self.journal.len();
-        metrics.journal_carried_bytes = self.journal.carried();
+        let durability = self.journal.durability();
+        metrics.journal_bytes = durability.len();
+        metrics.journal_dropped = durability.removed();
+        metrics.journal_carried_bytes = durability.carried();
         for since in self.waiting_since.values() {
             let nanos = u64::try_from(since.elapsed().as_nanos()).unwrap_or(u64::MAX);
             metrics.wait_nanos = metrics.wait_nanos.saturating_add(nanos);
@@ -1534,14 +1621,11 @@ impl TreeActor {
         );
         let recorded = (|| -> Result<Appended> {
             crate::failpoints::hit("tree.before_step")?;
-            // A compaction due runs before the step's pointers are checked:
-            // values read before it are named as what they were built as.
             if before {
                 self.before_record();
             }
-            self.resolve_compacted(&mut pointers)?;
-            // Each chain's pointer, read after any compaction: its old value
-            // is never a step the compaction covers.
+            // Each chain's pointer, as the records name it: its old value may
+            // be a step a checkpoint keeps the head of (C4).
             let step = Target::Step(RecordNo::new(self.next + ahead));
             let mut chains = BTreeSet::new();
             for row in &rows {
@@ -1633,8 +1717,19 @@ impl TreeActor {
     /// O(1) plus the batch's maps and what changed since the last built point.
     /// Lock order: the actor, then History.
     pub(in crate::tree_actor) fn on_built(&mut self) {
-        self.rebuild();
+        self.caught_up();
         self.rebase_built();
+    }
+
+    /// What the actor does under its lock at a built point it has not seen:
+    /// its saved trees onto the builder's ([`TreeActor::rebuild`]), its step
+    /// values switched to the oids built for them
+    /// ([`TreeActor::switch_built`]), and its positions moved to what the
+    /// compactor carried ([`TreeActor::relocate_if_moved`]).
+    fn caught_up(&mut self) {
+        self.rebuild();
+        self.switch_built();
+        self.relocate_if_moved();
     }
 
     /// Moves every saved tree onto the builder's at the built point, when it
@@ -1669,11 +1764,9 @@ impl TreeActor {
         }
     }
 
-    /// After a step is applied: the saved trees onto a new built point, and a
-    /// compaction when one is due.
+    /// After a step is applied: the actor catches up with a new built point.
     fn after_step(&mut self) {
-        self.rebuild();
-        self.compact_if_due();
+        self.caught_up();
     }
 }
 
@@ -1684,6 +1777,10 @@ impl TreeActor {
     pub(in crate::tree_actor) fn shut_down(&mut self) {
         let appended = self.journal.durability().appended();
         self.history.stop(appended);
+        // History is stopping: the compactor ends after any compaction in flight.
+        if let Some(compactor) = self.compactor.take() {
+            compactor.join();
+        }
         if let Some(builder) = self.builder.take() {
             let _ = builder.join();
         }
@@ -1712,7 +1809,67 @@ pub(crate) mod test_support {
     use agentfs_contracts::pod::{PodContext, WriterAt};
     use agentfs_contracts::volume::{VolumeId, VolumeIdentity};
 
-    use super::{Attrs, Perm, TreeActor, TreeId};
+    use std::sync::Arc;
+
+    use super::{Attrs, Checkpointed, ChannelGate, Perm, RecordNo, TreeActor, TreeId, Upkeep};
+    use super::{JournalCompaction, history::compactor::compact_once};
+
+    /// A volume's upkeep that never compacts on its own: one frame per
+    /// segment, never due, no gate. What [`compact_now`] runs on.
+    pub(crate) fn never_due() -> Upkeep {
+        Upkeep {
+            segment_bytes: 1,
+            compact_from: u64::MAX,
+            gate: None,
+        }
+    }
+
+    /// A compaction at every built event, never parked: `Upkeep::gated` over
+    /// a gate whose two ends are dropped.
+    pub(crate) fn compacting() -> Upkeep {
+        let (gate, _, _) = ChannelGate::pair();
+        Upkeep::gated(gate)
+    }
+
+    /// The checkpoint History counts once one at or past `through` is
+    /// published: waits past each generation while its `built` is below.
+    pub(crate) fn compacted_through(v: &TreeActor, through: RecordNo) -> Checkpointed {
+        let history = v.history();
+        let mut last = history.checkpointed();
+        while last.built < through {
+            last = history
+                .wait_checkpointed(last.generation)
+                .expect("a checkpoint is published");
+        }
+        last
+    }
+
+    /// One compaction at the built point once every record is built, on a
+    /// [`never_due`] volume: the thread's own sequence, run here.
+    pub(crate) fn compact_now(v: &TreeActor) {
+        v.settle().expect("settles");
+        let journal =
+            JournalCompaction::new(v.journal.dir().to_owned(), Arc::clone(v.durability()), None);
+        compact_once(v.history(), &journal).expect("compacts");
+    }
+
+    /// A new volume `test` served with `upkeep`.
+    pub(crate) fn new_actor_with(dir: &Path, upkeep: Upkeep) -> TreeActor {
+        TreeActor::create_with(dir, &identity(), None, &PodContext::default(), upkeep)
+            .expect("creates")
+    }
+
+    /// The volume in `dir` reopened with `upkeep`.
+    pub(crate) fn reopen_with(dir: &Path, upkeep: Upkeep) -> TreeActor {
+        TreeActor::open_with(dir, &PodContext::default(), upkeep).expect("reopens")
+    }
+
+    fn identity() -> VolumeIdentity {
+        VolumeIdentity {
+            name: VolumeName::parse("test").expect("a safe name"),
+            id: VolumeId(uuid::Uuid::from_u128(1)),
+        }
+    }
 
     /// What a test's create gives a file: mode 0644, owned by 1000:1000.
     pub(crate) const ATTRS: Attrs = Attrs {
@@ -1735,11 +1892,7 @@ pub(crate) mod test_support {
 
     /// A new volume `test` with a fixed id, served with an empty pod context.
     pub(crate) fn new_actor(dir: &Path) -> TreeActor {
-        let identity = VolumeIdentity {
-            name: VolumeName::parse("test").expect("a safe name"),
-            id: VolumeId(uuid::Uuid::from_u128(1)),
-        };
-        TreeActor::create(dir, &identity, None, &PodContext::default()).expect("creates")
+        TreeActor::create(dir, &identity(), None, &PodContext::default()).expect("creates")
     }
 
     pub(crate) fn reopen(dir: &Path) -> TreeActor {

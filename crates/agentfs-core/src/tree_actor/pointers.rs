@@ -132,16 +132,8 @@ impl Pointers<Oid> {
             .collect()
     }
 
-    /// The pointers as a record names them.
-    pub fn to_targets(&self) -> Pointers<Target> {
-        Pointers(
-            self.0
-                .iter()
-                .map(|(name, oid)| (name.clone(), Target::Oid(oid.to_string())))
-                .collect(),
-        )
-    }
 }
+
 
 #[cfg(test)]
 mod tests {
