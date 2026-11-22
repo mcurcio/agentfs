@@ -131,9 +131,7 @@ impl Pointers<Oid> {
             .map(|(name, oid)| (name.clone(), oid.to_string()))
             .collect()
     }
-
 }
-
 
 #[cfg(test)]
 mod tests {

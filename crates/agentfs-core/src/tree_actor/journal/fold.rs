@@ -11,8 +11,8 @@ use super::compaction::Checkpoint;
 use super::durable::RecordNo;
 use super::segment::FramePos;
 use super::{
-    Change, Entry, Frame, OpenRecord, Record, RunHead, SaveOutcome, Tail, Target, TreeLocals,
-    chunk_map, take_chunks,
+    Change, Entry, Frame, OpenRecord, PointerChange, Record, RunHead, SaveOutcome, Tail, Target,
+    TreeLocals, chunk_map, take_chunks,
 };
 use crate::tree_actor::history::Objects;
 use crate::tree_actor::history::upstreams::Upstreams;
@@ -548,7 +548,24 @@ pub(in crate::tree_actor) fn fold(frames: &[Frame]) -> Result<Folded> {
                 pointers,
                 ..
             } => {
-                folded.pointers.check_targets(pointers)?;
+                // EXPERIMENT (erratum 2026-11-22): a head's step and its oid
+                // are the same value; the actor switched it with no record.
+                let named: Vec<PointerChange> = pointers
+                    .iter()
+                    .map(|change| {
+                        let mut change = change.clone();
+                        if let (Some(Target::Oid(oid)), Some(Target::Step(step))) =
+                            (&change.old, folded.pointers.get(&change.name))
+                            && step_heads.get(&change.name) == Some(&step)
+                            && checkpoint.pointers.get(&change.name) == Some(oid)
+                        {
+                            change.old = Some(Target::Step(step));
+                        }
+                        change
+                    })
+                    .collect();
+                folded.pointers.check_targets(&named)?;
+
                 folded.pointers.apply_targets(pointers);
                 folded.add_step(seq, by, change)?;
                 if matches!(

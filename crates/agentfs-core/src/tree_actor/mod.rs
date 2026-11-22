@@ -1811,7 +1811,7 @@ pub(crate) mod test_support {
 
     use std::sync::Arc;
 
-    use super::{Attrs, Checkpointed, ChannelGate, Perm, RecordNo, TreeActor, TreeId, Upkeep};
+    use super::{Attrs, ChannelGate, Checkpointed, Perm, RecordNo, TreeActor, TreeId, Upkeep};
     use super::{JournalCompaction, history::compactor::compact_once};
 
     /// A volume's upkeep that never compacts on its own: one frame per
@@ -1921,7 +1921,8 @@ mod tests {
     /// names, and the same values but where the actor switched a step to
     /// the oid it was built as ([`TreeActor::switch_built`]).
     fn same_pointers(folded: &Pointers<Target>, v: &TreeActor) {
-        let names = |p: &Pointers<Target>| -> Vec<String> { p.iter().map(|(n, _)| n.clone()).collect() };
+        let names =
+            |p: &Pointers<Target>| -> Vec<String> { p.iter().map(|(n, _)| n.clone()).collect() };
         assert_eq!(names(folded), names(&v.pointers));
         for (name, value) in folded.iter() {
             let actor = v.pointers.get(name);
@@ -2243,7 +2244,6 @@ mod tests {
         assert_eq!(v.row(Chain::Volume).as_deref(), Some("v"));
     }
 
-
     /// Files the restart test's volume holds at its checkpoint, and after it.
     const RESTART_FILES: (usize, usize) = (500, 100);
     const RESTART_WORKER: &str = "AGENTFS_TREE_RESTART_WORKER";
@@ -2479,16 +2479,24 @@ mod tests {
         // thread: the log's writes after it hold nothing back.
         v.history().wait_checkpointed(generation).unwrap();
         assert!(v.metrics().journal_dropped >= 1);
-        assert!(
-            v.durability().len() < (66 << 20) - (32 << 20),
-            "{} bytes",
-            v.durability().len()
-        );
+        // The linked files: an unlinked segment a holder still reads counts
+        // in `Durability::len` until it lets go (C6), which the deferred
+        // drops do on their own thread.
+        let linked: u64 = fs::read_dir(tmp.path().join(JOURNAL))
+            .unwrap()
+            .map(|entry| entry.unwrap())
+            .filter(|entry| {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                name.ends_with(".seg") || name.starts_with("carry-")
+            })
+            .map(|entry| entry.metadata().unwrap().len())
+            .sum();
+        assert!(linked < (66 << 20) - (32 << 20), "{linked} bytes");
 
         v.close(log).unwrap();
         drop(v);
         let v = reopen(tmp.path());
-        assert_eq!(v.read(ROOT, "log").unwrap(), b"line\nline\nline\n");
+        assert_eq!(v.read(ROOT, "log").unwrap(), b"line\nline\n");
         assert_eq!(v.read(ROOT, "big").unwrap().len(), 66 << 20);
     }
 

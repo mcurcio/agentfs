@@ -116,7 +116,9 @@ impl CallReader {
     ///
     /// As [`CallReader::for_each_call`].
     pub(in crate::tree_actor) fn calls(&self, handle: u64) -> Result<Vec<(u64, Call, FramePos)>> {
-        crate::tree_actor::stages::assert_unlocked(crate::tree_actor::stages::Unlocked::JournalRead);
+        crate::tree_actor::stages::assert_unlocked(
+            crate::tree_actor::stages::Unlocked::JournalRead,
+        );
         let mut calls = Vec::new();
         self.for_each_call(handle, |seq, call, pos| {
             calls.push((seq, call, pos));

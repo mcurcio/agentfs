@@ -272,7 +272,6 @@ impl BuiltSnapshot {
         self.objects.get(&tree).unwrap_or(&NONE)
     }
 
-
     /// `tree`'s queue as built: each entry's ref and commit, in queue order.
     pub(in crate::tree_actor) fn queue(&self, tree: TreeId) -> Vec<(String, Oid)> {
         self.pointers.under(&refs::queue(tree))
@@ -590,9 +589,7 @@ impl History {
     /// reaches `at` (C3, C4); a later switch of the pointer replaces it.
     /// O(log pointers).
     pub(in crate::tree_actor) fn switched(&self, pointer: &str, step: RecordNo, at: RecordNo) {
-        self.state()
-            .switched
-            .insert(pointer.to_owned(), (step, at));
+        self.state().switched.insert(pointer.to_owned(), (step, at));
     }
 
     /// A checkpoint at `published.built()` is in place: only now may History

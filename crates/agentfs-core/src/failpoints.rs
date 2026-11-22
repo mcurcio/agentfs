@@ -198,7 +198,6 @@ mod compact_gate {
     }
 }
 
-
 /// Takes at a test's points, not the queue worker's (git-model §18's replay).
 #[cfg(feature = "failpoints")]
 mod take_gate {
