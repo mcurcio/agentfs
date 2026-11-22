@@ -25,6 +25,9 @@ notrun() { printf 'NOTRUN\t%s\tsetup\t%s\n' "$fs" "$*" | tee -a "$results" >&2; 
 [ "$(id -u)" = 0 ] || notrun 'requires root on a dedicated CI runner'
 [ -x "$REPLAY_LOG" ] && [ -x "$AGENTFS_BIN" ] || notrun 'missing replay-log or agentfs binary'
 [ -c /dev/fuse ] || notrun 'missing /dev/fuse'
+# The compaction marks park the mount's compactor through AGENTFS_COMPACT_GATE,
+# which only a failpoints build reads.
+"$AGENTFS_BIN" --version | grep -q failpoints || notrun 'agentfs is not a failpoints build'
 for cmd in dmsetup losetup blockdev mount umount fusermount3 git python3 modprobe "mkfs.$fs"; do command -v "$cmd" >/dev/null || notrun "missing $cmd"; done
 for mod in dm_log_writes dm_snapshot; do modprobe "$mod" || notrun "missing kernel module $mod"; done
 suffix=$$
@@ -119,9 +122,10 @@ os.fsync(viewfd); os.close(viewfd)
 mark('RN', 1); append(disk, 'RN 1')
 # A file held open across a segment rollover, a compaction and a carry-forward
 # (docs/trees.md, "Recording and durability"): h's first 4 MiB sit in the first
-# segment; 70 MiB of another file roll the journal past it; once history is
-# built, the next call compacts, drops the old segments and carries h's frames
-# forward. h's close, marked once it returned, holds every byte.
+# segment; 70 MiB of another file roll the journal past it; the built event of
+# that file's save compacts on history's compactor, which drops the first
+# segment and carries h's frames forward. h's close, marked once it returned,
+# holds every byte.
 spec = importlib.util.spec_from_file_location('figures', figures)
 module = importlib.util.module_from_spec(spec); spec.loader.exec_module(module)
 renames = module.Renames(metrics)
@@ -135,6 +139,7 @@ def until(test, what):
     while not test(metric() or {}):
         if not renames.wait(limit): sys.exit(f'{what}: not reached; metrics {metric()}')
 MIB = 1 << 20
+checkpoints = ((metric() or {}).get('stages') or {}).get('checkpoints', 0)
 held = os.open(f'{root}/h', os.O_CREAT | os.O_WRONLY, 0o600)
 for i in range(4):
     assert os.write(held, bytes([0x41 + i]) * MIB) == MIB
@@ -142,12 +147,10 @@ big = os.open(f'{root}/big', os.O_CREAT | os.O_WRONLY, 0o600)
 for i in range(70):
     assert os.write(big, i.to_bytes(4, 'little') * (MIB // 4)) == MIB
 os.close(big)
-floor = (metric() or {}).get('seq', 0) + 2
-until(lambda m: m.get('seq', 0) >= floor, 'a metrics file after the big save')
-target = metric()['history']['appended']
-until(lambda m: m['history']['built_through'] >= target, 'history built through the big save')
-poke = os.open(f'{root}/poke', os.O_CREAT | os.O_WRONLY, 0o600); os.close(poke)
-until(lambda m: m.get('journal_carried_bytes', 0) > 0 and m.get('journal_dropped', 0) > 0,
+# The view rewrites the file at each published checkpoint and at each
+# compaction's end: no call of this driver starts the compaction.
+until(lambda m: (m.get('stages') or {}).get('checkpoints', 0) > checkpoints
+      and m.get('journal_carried_bytes', 0) > 0 and m.get('journal_dropped', 0) > 0,
       "a compaction carrying h's frames")
 assert os.write(held, b'held\n') == 5
 os.fsync(held); os.close(held)
@@ -155,6 +158,82 @@ mark('HC', 1); append(disk, 'HC 1')
 renames.close()
 PYWORK
 fusermount3 -u "$work/main"; fusermount3 -u "$work/sandbox"
+wait "$pid"; pid=
+# Power cuts inside a compaction (docs/trees.md, "Recording and durability"), in
+# a mount of its own, after the one above has unmounted so its marks keep the
+# default segment size. With the compaction gate the journal has one frame per
+# segment and compacts at every built event; this driver marks the log device
+# while the compactor is parked at a gap, then answers `go`:
+#   CP 1  the checkpoint written to checkpoint.tmp and fsynced, not renamed
+#   CP 2  renamed into place, its directory not yet fsynced
+#   CP 3  its directory fsynced, History not yet told
+#   CP 4  History told, the segments it covers still linked
+#   CP 5  those segments unlinked (the next compaction has started)
+#   CN 1  after that, a write appended to a new segment and not fsynced: the
+#         next segment's first frame is not durable
+# Before each CP mark a file c<n> is written and fsynced: it was returned, so it
+# survives a cut at that mark. Records after the checkpoint's point are not
+# durable at these marks unless a caller's fsync made them so.
+mkdir "$work/gate"
+mkfifo "$work/gate/at" "$work/gate/go"
+AGENTFS_COMPACT_GATE="$work/gate" "$AGENTFS_BIN" --state "$work/mnt/state" mount "$work/main" \
+  >"$work/compact-mount.log" 2>&1 & pid=$!
+for _ in $(seq 1 200); do
+  if mountpoint -q "$work/main"; then break; fi
+  kill -0 "$pid"; sleep .1
+done
+mountpoint -q "$work/main"
+python3 - "$work/main" "$work/mnt/receipts" "$work/external-receipts" "$lw" "$work/marks" "$work/gate" <<'PYGATE'
+import os, select, subprocess, sys
+root, disk, external, device, marks, gate = sys.argv[1:]
+def append(name, value):
+    with open(name, 'a') as f:
+        f.write(value + '\n'); f.flush(); os.fsync(f.fileno())
+def mark(kind, n):
+    append(external, f'{kind} {n}')
+    name = f'ack-{kind.lower()}-{n}'
+    subprocess.run(['dmsetup', 'message', device, '0', 'mark', name], check=True)
+    append(marks, f'{name} {kind} {n}')
+# Read and write: neither end blocks opening, nor sees end of file.
+at = os.open(f'{gate}/at', os.O_RDWR)
+go = os.open(f'{gate}/go', os.O_RDWR)
+pending = b''
+def reached():
+    """The next gap the compactor parks at. The bound only ends a hang."""
+    global pending
+    while b'\n' not in pending:
+        if not select.select([at], [], [], 600)[0]:
+            sys.exit('the compactor reached no gap')
+        pending += os.read(at, 4096)
+    line, pending = pending.split(b'\n', 1)
+    return line.decode()
+def park(gap):
+    while reached() != gap:
+        os.write(go, b'go\n')
+def kept(n):
+    fd = os.open(f'{root}/c{n}', os.O_CREAT | os.O_WRONLY, 0o600)
+    data = f'compacted-{n}\n'.encode()
+    assert os.write(fd, data) == len(data)
+    os.fsync(fd); os.close(fd)
+for n, gap in enumerate(('written', 'renamed', 'dir_synced', 'before_unlink'), 1):
+    kept(n)
+    park(gap)
+    mark('CP', n); append(disk, f'CP {n}')
+    os.write(go, b'go\n')
+# The compaction parked at before_unlink unlinks, and the next one starts
+# only after it: its first gap is the event that the unlink is done.
+kept(5)
+park('covered')
+mark('CP', 5); append(disk, 'CP 5')
+fd = os.open(f'{root}/unsynced', os.O_CREAT | os.O_WRONLY, 0o600)
+assert os.write(fd, b'not durable\n') == 12
+mark('CN', 1); append(disk, 'CN 1')
+os.close(fd)
+# An empty line ends the gate: every gap passes from now on, so the unmount's
+# join of the compactor never waits on it.
+os.write(go, b'\n')
+PYGATE
+fusermount3 -u "$work/main"
 wait "$pid"; pid=
 umount "$work/mnt"
 dmsetup remove "$lw"
@@ -172,6 +251,7 @@ actual = open(sys.argv[1]).read().splitlines()
 expected = [f'ack-{kind.lower()}-{n} {kind} {n}' for n in range(1, 9) for kind in ('F', 'C')]
 expected += [f'ack-{kind.lower()}-{n} {kind} {n}' for n in range(1, 3) for kind in ('SF', 'SC')]
 expected += [f'ack-xw-{n} XW {n}' for n in range(1, 3)] + ['ack-rn-1 RN 1', 'ack-hc-1 HC 1']
+expected += [f'ack-cp-{n} CP {n}' for n in range(1, 6)] + ['ack-cn-1 CN 1']
 assert actual == expected, (actual, expected)
 PYMARKS
 # Locate each mark and scan the pinned replay tool's flagged entries once.
@@ -180,7 +260,7 @@ while read -r mark kind n; do
   [[ "$entry" =~ ^[0-9]+@[0-9]+$ ]] || { printf 'FAIL\t%s\t%s\tinvalid replay entry\n' "$fs" "$mark" >> "$results"; exit 1; }
   printf '%s\t%s\t%s\t%s\n' "$mark" "$kind" "$n" "$entry" >> "$work/mark-entries.tsv"
 done < "$work/marks"
-"$REPLAY_LOG" --log "$log" --find -vv --end-mark ack-hc-1 > "$work/entry-flags.log"
+"$REPLAY_LOG" --log "$log" --find -vv --end-mark ack-cn-1 > "$work/entry-flags.log"
 python3 - "$work/mark-entries.tsv" "$work/entry-flags.log" "$work/durable-entries.tsv" <<'PYDURABLE' || { printf 'FAIL\t%s\tmarks\tdurable entry mapping failed\n' "$fs" >> "$results"; exit 1; }
 import bisect, re, sys
 marks, flags_file, result = sys.argv[1:]

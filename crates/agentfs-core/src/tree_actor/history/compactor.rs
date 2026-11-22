@@ -93,7 +93,8 @@ impl Compactor {
     }
 }
 
-/// The thread's loop: one compaction at each built event once due.
+/// The thread's loop: one compaction at each built event once due, then
+/// History is told the compactor is done with that event.
 fn run(history: &History, journal: &JournalCompaction, compact_from: u64) {
     let mut seen = history.ends();
     let mut len_after_last = 0;
@@ -103,24 +104,26 @@ fn run(history: &History, journal: &JournalCompaction, compact_from: u64) {
         if !built {
             continue;
         }
-        if !journal.gated() && journal.len() < compact_at(compact_from, len_after_last) {
-            continue;
-        }
-        match compact_once(history, journal) {
-            Ok(Some(_)) => len_after_last = journal.len(),
-            Ok(None) => {}
-            Err(e @ CompactionError::NotPublished(_)) => eprintln!("tree CompactionFailed: {e}"),
-            Err(e @ CompactionError::NotDropped(_)) => {
-                eprintln!("tree CompactionFailed: {e}");
-                len_after_last = journal.len();
+        let through = history.built_through();
+        if journal.gated() || journal.len() >= compact_at(compact_from, len_after_last) {
+            match compact_once(history, journal) {
+                Ok(Some(_)) => len_after_last = journal.len(),
+                Ok(None) => {}
+                Err(e @ CompactionError::NotPublished(_)) => {
+                    eprintln!("tree CompactionFailed: {e}");
+                }
+                Err(e @ CompactionError::NotDropped(_)) => {
+                    eprintln!("tree CompactionFailed: {e}");
+                    len_after_last = journal.len();
+                }
+                Err(e @ CompactionError::Stopped(_)) => {
+                    eprintln!("tree CompactionFailed: {e}");
+                    history.compaction_stopped();
+                    return;
+                }
             }
-            Err(e @ CompactionError::Stopped(_)) => {
-                eprintln!("tree CompactionFailed: {e}");
-                history.compaction_stopped();
-                return;
-            }
         }
-        history.compaction_ended();
+        history.compaction_ended(through);
     }
 }
 

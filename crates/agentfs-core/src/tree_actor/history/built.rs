@@ -183,6 +183,9 @@ struct State {
     stopping: bool,
     /// The builder has exited.
     stopped: bool,
+    /// Tests: the builder waits for work ([`History::wait_builder_idle`]).
+    #[cfg(test)]
+    builder_idle: bool,
     /// Each tree's lag and the builder's rates.
     gate: super::lag::LagGate,
     /// The last checkpoint counted: this open's compactor's publishes, or
@@ -195,6 +198,8 @@ struct State {
     /// The generation of the last checkpoint whose compaction has ended
     /// ([`History::compaction_ended`]).
     compacted: u64,
+    /// The built point of the last built event the compactor is done with.
+    compactor_through: RecordNo,
     /// A compaction stopped the actor: every checkpoint wait ends.
     compaction_stopped: bool,
     /// Built files' maps the actor has not taken yet, in the order built:
@@ -342,12 +347,15 @@ impl History {
                     unbuilt: std::collections::VecDeque::new(),
                     stopping: false,
                     stopped: false,
+                    #[cfg(test)]
+                    builder_idle: false,
                     checkpointed: Checkpointed {
                         generation: 0,
                         built: opened.built(),
                     },
                     checkpointed_through: redo_through(opened.built(), opened.oldest_head()),
                     compacted: 0,
+                    compactor_through: built,
                     compaction_stopped: false,
                     gate: super::lag::LagGate::default(),
                     maps: Vec::new(),
@@ -435,16 +443,24 @@ impl History {
         self.notify();
     }
 
-    /// The compactor's compaction ended, after its unlink or its failure:
-    /// the checkpoint counted now has nothing of its compaction in flight.
+    /// The compactor is done with the built event at `through`: it was not
+    /// due, or its compaction ended, after its unlink or its failure. The
+    /// checkpoint counted now has nothing of its compaction in flight.
     /// Moves the epoch, so the journal's figures are read again after the
     /// unlink. The compactor thread's alone.
-    pub(in crate::tree_actor) fn compaction_ended(&self) {
+    pub(in crate::tree_actor) fn compaction_ended(&self, through: RecordNo) {
         let mut state = self.state();
         state.compacted = state.checkpointed.generation;
+        state.compactor_through = state.compactor_through.max(through);
         state.epoch += 1;
         drop(state);
         self.notify();
+    }
+
+    /// The built point of the last built event the compactor is done with:
+    /// whatever compaction a build through it made due has ended. O(1).
+    pub fn compactor_through(&self) -> RecordNo {
+        self.state().compactor_through
     }
 
     /// Returns once the compaction that published the checkpoint of
@@ -563,6 +579,17 @@ impl History {
         }
     }
 
+    /// Tests: returns once the builder waits for work with nothing wanted
+    /// past the built point: its last batch is over, its copies of the
+    /// refs and checkouts included, so the state area holds still.
+    #[cfg(test)]
+    pub(in crate::tree_actor) fn wait_builder_idle(&self) {
+        let mut state = self.state();
+        while !(state.builder_idle && state.wanted <= state.built) {
+            state = self.wait(state);
+        }
+    }
+
     /// Asks the builder to build through record `through`, steps or not,
     /// without waiting: the actor's overlay holds entries sealed at a record
     /// after the last step (a call, an open), which only a build through it
@@ -587,6 +614,10 @@ impl History {
             if state.wanted > state.built {
                 if state.failed.is_none() || state.requests > *seen {
                     *seen = state.requests;
+                    #[cfg(test)]
+                    {
+                        state.builder_idle = false;
+                    }
                     return Some(state.wanted);
                 }
                 if state.stopping {
@@ -594,6 +625,11 @@ impl History {
                 }
             } else if state.stopping {
                 break;
+            }
+            #[cfg(test)]
+            {
+                state.builder_idle = true;
+                self.inner.changed.notify_all();
             }
             state = self.wait(state);
         }

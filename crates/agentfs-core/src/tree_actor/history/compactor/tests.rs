@@ -43,17 +43,38 @@ fn copy_dir(from: &Path, to: &Path) {
         let entry = entry.unwrap();
         if entry.file_type().unwrap().is_dir() {
             copy_dir(&entry.path(), &to.join(entry.file_name()));
-        } else {
-            fs::copy(entry.path(), to.join(entry.file_name())).unwrap();
+            continue;
+        }
+        match fs::copy(entry.path(), to.join(entry.file_name())) {
+            // Two tasks go on beside an idle builder, and a kill may leave
+            // what either was doing. The drops thread lets base files go:
+            // open clears that directory. The repack task writes temporary
+            // packs and expires the packs an earlier roll-up superseded,
+            // whose objects that roll-up's pack holds: open removes the
+            // temporary files and an index that names a pack now gone.
+            Err(e)
+                if e.kind() == io::ErrorKind::NotFound
+                    && (from.ends_with("bases") || from.ends_with("objects/pack")) => {}
+            copied => {
+                copied.unwrap_or_else(|e| panic!("copying {}: {e}", entry.path().display()));
+            }
         }
     }
 }
 
-/// A kill: the state area as it is now, in a directory of its own.
+/// A kill: the state area as it is now, in a directory of its own. The
+/// builder is held or idle and the compactor parked or done, so the journal
+/// and the store hold still while they are copied.
 fn killed(dir: &Path) -> tempfile::TempDir {
     let copy = tempfile::tempdir().unwrap();
     copy_dir(dir, copy.path());
     copy
+}
+
+/// [`killed`], once the builder's last batch is over: `v` is settled.
+fn killed_at_rest(v: &TreeActor, dir: &Path) -> tempfile::TempDir {
+    v.history().wait_builder_idle();
+    killed(dir)
 }
 
 /// Saves `bytes` as `path`: its save's step.
@@ -289,7 +310,7 @@ fn a_kill_at_each_gap_keeps_every_returned_call() {
                 "{gap:?}"
             );
         }
-        let copy = killed(tmp.path());
+        let copy = killed_at_rest(&v, tmp.path());
         parked.end();
         let c = opened(copy.path());
         assert_eq!(reads(&c), reads(&v), "{gap:?}");
@@ -323,7 +344,7 @@ fn an_append_during_the_coverage_gap_survives_a_kill() {
     parked.go();
     v.history().wait_checkpointed(generation).unwrap();
     v.settle().unwrap();
-    let copy = killed(tmp.path());
+    let copy = killed_at_rest(&v, tmp.path());
     parked.end();
     let c = opened(copy.path());
     assert_eq!(c.read(ROOT, "b").unwrap(), b"returned");
@@ -425,11 +446,11 @@ fn a_step_named_after_the_checkpoint_folds_on_both() {
             v.settle().unwrap();
             let expected = reads(&v);
             let head = v.head(ROOT).unwrap();
-            let old = killed(tmp.path());
+            let old = killed_at_rest(&v, tmp.path());
             assert!(checkpoint_in(&old.path().join(JOURNAL)).built < s);
             parked.end();
             compacting.join().unwrap().unwrap().expect("compacts");
-            let new = killed(tmp.path());
+            let new = killed_at_rest(&v, tmp.path());
             let checkpoint = checkpoint_in(&new.path().join(JOURNAL));
             assert_eq!(checkpoint.built, built);
             assert_eq!(
@@ -471,7 +492,7 @@ fn a_forks_branch_is_the_only_head_and_its_first_save_folds() {
     put(&mut v, fork, "a", b"sandbox");
     let expected = reads(&v);
     let (root_head, fork_head) = (v.head(ROOT).unwrap(), v.head(fork).unwrap());
-    let copy = killed(tmp.path());
+    let copy = killed_at_rest(&v, tmp.path());
     drop(v);
     for dir in [copy.path(), tmp.path()] {
         let c = opened(dir);
@@ -626,7 +647,8 @@ fn a_switched_queue_entry_is_deleted_by_its_landing() {
     assert!(landed, "the landing names the entry's oid");
     assert_eq!(v.read(ROOT, "a").unwrap(), b"sandbox");
     let expected = reads(&v);
-    let copy = killed(tmp.path());
+    v.settle().unwrap();
+    let copy = killed_at_rest(&v, tmp.path());
     drop(v);
     for dir in [copy.path(), tmp.path()] {
         assert_eq!(reads(&opened(dir)), expected);
@@ -734,7 +756,7 @@ fn a_carried_open_survives_each_gap() {
         let (gate, parked) = Parked::pair();
         let compacting = compaction(&v, gate);
         parked.until(gap);
-        let copy = killed(tmp.path());
+        let copy = killed_at_rest(&v, tmp.path());
         parked.end();
         let stats = compacting.join().unwrap().unwrap().expect("compacts");
         assert!(stats.carried_bytes > 0, "{gap:?}: nothing was carried");
@@ -772,7 +794,7 @@ fn a_carried_open_survives_each_gap() {
         Err(CompactionError::NotDropped(_))
     ));
     assert_eq!(v.journal.segment_firsts().len(), segments);
-    once(killed(tmp.path()).path());
+    once(killed_at_rest(&v, tmp.path()).path());
     // The next compaction lets the segment go, and once the actor and the
     // builder have moved, nothing holds it.
     v.on_built();
@@ -894,7 +916,7 @@ fn reopens_after_a_switch(kind: Kind, by: By, stop: Stop) {
     at_rest(&history, &v);
     let expected = reads(&v);
     let head = v.head(ROOT).unwrap();
-    let rested = killed(tmp.path());
+    let rested = killed_at_rest(&v, tmp.path());
     // The built event switches what the last batch built, once: a second
     // one with no build between appends nothing.
     let appended = v.durability().appended();
@@ -978,7 +1000,8 @@ fn times(v: &TreeActor) -> BTreeMap<(String, String), Times> {
 /// saved trees rest on the builder's.
 fn times_hold(v: &mut TreeActor, dir: &Path, what: &str) {
     let live = times(v);
-    let copy = killed(dir);
+    v.settle().unwrap();
+    let copy = killed_at_rest(v, dir);
     let c = opened(copy.path());
     assert_eq!(times(&c), live, "{what}: a reopened copy's times");
     v.settle().unwrap();
@@ -1069,7 +1092,7 @@ fn a_forks_branch_is_switched_once_the_fork_is_built() {
     at_rest(&history, &v);
     let expected = reads(&v);
     let heads = (v.head(ROOT).unwrap(), v.head(fork).unwrap());
-    let at_second = killed(tmp.path());
+    let at_second = killed_at_rest(&v, tmp.path());
     // The lease goes with the last holder of History.
     drop((v, history));
     for dir in [at_first.path(), at_second.path(), tmp.path()] {

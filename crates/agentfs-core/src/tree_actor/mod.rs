@@ -318,6 +318,10 @@ pub struct HistoryMetrics {
     /// `built_through` at `appended` and this at zero, the volume is at
     /// rest: no built event is left to append anything.
     pub pointers_at_steps: u64,
+    /// The built point of the last built event history's compactor is done
+    /// with: at or past a record, the compaction its build made due, if
+    /// any, has ended.
+    pub compactor_through: u64,
 }
 
 /// Process-local counters for observing save and queue costs. Durations are
@@ -1220,6 +1224,7 @@ impl TreeActor {
             }
             .to_owned(),
             pointers_at_steps: self.at_steps.len() as u64,
+            compactor_through: self.history.compactor_through().get(),
         };
         metrics
     }
