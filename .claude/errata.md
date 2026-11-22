@@ -2135,3 +2135,28 @@ This is the fourth defect in the bespoke repack mechanism (Feed race, reader rac
 4. **Worktree builds filled the disk four times.** Each worktree builds its own target (20-37 GB). Check-ins now free finished worktrees.
 
 Open residuals: agentfs-ln6.9 (compaction holds the actor lock), ln6.10 (write_1m peak memory), ln6.15 (edges-file fsync), ln6.16 (.pack without .idx), ln6.17 (pin or log git's version).
+
+## 2026-11-22, agentfs-ln6.9 (latency slice 2, lane A): blocked twice on gaps in the page; re-cut for its tests and failpoints
+
+**The block (second attempt, at b60dcc4).** The implementer stopped before building, on gaps in the amended page (1832478), not in the design. The page says open does not compact. But `ci/e2e-tree-recording-faults.sh:144-165` kills `agentfs init` at `tree.compact_before_checkpoint` and `tree.compact_before_drop`, which only an opening compaction reaches. A small volume is never due, so after the slice neither point fires, and `phase-1.yml`'s "kill at recording boundaries" step would turn red. The script was outside lane A's paths. The report found five more gaps:
+- The three compaction failpoints had no settled fate.
+- `tests/tree_dirs.rs:609` relied on a reopen compacting, and passed only because a small volume never rolls.
+- Many in-process tests relied on "the first call after the builder caught up compacts" (`tests/tree_actor.rs` `fill_journal` and its users, `:1255`, `:1793-1937`; `tests/tree_stages.rs:373-394`). The only event the page offered to wait on was `AGENTFS_COMPACT_GATE`, a process-wide variable, which would park the compactor of every volume that other tests in the same binary open in parallel.
+- `ci/measure-trees.py:160` counted only `*.seg` as journal bytes.
+- `Relocations::dropped` and `FramePos::relocated` compared segments by `first`, and carry files all have `first` 0.
+
+The re-cut found two more:
+- `src/store.rs:548` and the in-crate tests that call `v.compact()` (`tree_actor/mod.rs`, `journal/readback.rs`) relied on a direct or opening compaction.
+- The error-path tests (`NotPublished`, `NotDropped`, `Stopped`) used the failpoints being deleted.
+
+**The re-cut (docs/target-architecture/future/latency-upkeep.md, "Slice 2"; the design is unchanged).**
+1. **Owned paths.** Lane A's row now lists every file slice 2 touches. Lanes B and C have landed. The page has a table of each test and script that assumed a compaction at open or at a call, with its line at b60dcc4 and what it becomes.
+2. **Failpoints.** The three are deleted from `POINTS` and `journal/mod.rs`. They never had rows in `docs/configuration.md`. The compaction gate is the one mechanism that parks, kills and fails a compaction:
+   - A kill is a process killed while parked: the e2e script's new loop of five gated mounts, one per gap. The script's opening loop keeps `tree.after_ref_rebuild` alone.
+   - A copy of the state area taken while parked is 2.1 and 2.14.
+   - An error is a gate's `Err` at a gap, classed by `Gap::fault`: `Covered` and `Written` give `NotPublished`, `Renamed` gives `Stopped`, and `DirSynced` and `BeforeUnlink` give `NotDropped`.
+3. **Events.** The gate is a per-volume `Upkeep` option, passed to `{TreeActor, Recording}::{create_with, open_with}` and `TreeStateArea::with_upkeep`. The library reads no environment variable. Only `launcher::upkeep()` reads `AGENTFS_COMPACT_GATE`, in failpoints builds, and wraps a `FifoGate`. In-process tests use a `ChannelGate`. History gains a public published event, `History::checkpointed()` and `wait_checkpointed(after)`, a generation that tests and tooling wait past. It moves History's epoch, so the metrics file is rewritten at each publish. `Stages::checkpoints` counts it, exported as `agentfs.journal.checkpoints`. Tests make a volume due without 64 MiB through `Upkeep`: `Upkeep::gated` is one frame per segment and a compaction at every built event, and a small `compact_from` or `segment_bytes` works without a gate. These are library options, not keys, so only `AGENTFS_COMPACT_GATE` goes into `docs/configuration.md`. `compact_once` now returns `None` only when B has not moved past the last checkpoint, so a gated small volume publishes at every built event.
+4. **Carry files.** Segments compare by path (`Segment::same_file`). `ci/measure-trees.py` and the tests' `journal_len` and `journal_blocks` count `carry-*` files. The journal's figures move to `Durability::{len, removed, carried}`, because the compactor, not the actor, drops and carries.
+5. **The partial patch** (lag.rs without the overdue stop, stages.rs with `Hold::PageImage` and `assert_unlocked`, the telemetry test, the pages.rs line) applies cleanly to b60dcc4, and the implementer applies it first. It is at `/tmp/claude-0/-home-user-agentfs/d9d7fd5b-08fa-53a9-9d39-8e3a2341a15d/scratchpad/slice2-partial.patch`. It needs `History::compaction_overdue`, its caller in `commit_point.rs` and `tree_stages.rs:433` removed in the same commit. If the file is lost, the page describes the same edits.
+
+**Not run:** nothing was built or tested for the re-cut. It is a reading of the code at b60dcc4: the call sites of `TreeActor::open` and `Recording::open`, `failpoints.rs`, the scripts, and the tests named above.

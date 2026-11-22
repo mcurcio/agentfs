@@ -323,11 +323,11 @@ The interfaces are committed as compiling code with `todo!()` bodies and no beha
 
 **Slices 3 and 4 stay gated.** Slice 0 gives no figure that justifies either one. `create`'s slowest call was 116 to 153 ms against a catch-up hold of 120 ms, measured at one tree size, so nothing shows the growth with tree size that slice 3 targets. No workload exercised a client death or a fork copy, which slice 4 targets.
 
-**Owned paths are disjoint.** Every lane builds into its own worktree's `target/`. No lane adds a dependency, so `Cargo.lock` is untouched. A lane that needs a file outside its list writes an erratum and stops.
+**Owned paths are disjoint.** Lanes B and C have landed (slice 1 in 331b8b2 and b60dcc4, slice 5 in 3d5512f), so lane A's list is slice 2's alone; every file slice 2 touches is in it, each with its reason under "Slice 2" below. Every lane builds into its own worktree's `target/`. No lane adds a dependency, so `Cargo.lock` is untouched. A lane that needs a file outside its list writes an erratum and stops.
 
 | Lane | Owns (repo-relative) |
 |---|---|
-| A | `crates/agentfs-core/src/tree_actor/journal/`; `crates/agentfs-core/src/tree_actor/history/{compactor.rs,built.rs,lag.rs,built_log.rs}`; `crates/agentfs-core/src/tree_actor/{mod.rs,call_path.rs,stages.rs}`; `crates/agentfs-core/src/{session.rs,store.rs,telemetry.rs,failpoints.rs}`; `crates/agentfs-core/tests/{tree_actor.rs,tree_stages.rs,crash_points.rs}`; `crates/agentfs-fuse/src/tree_view.rs`, `crates/agentfs-fuse/src/tree_view/untracked.rs`; `crates/agentfs-conformance/`; `ci/power-loss-trees.sh`, `ci/power-loss-trees-check.sh`, `ci/trees-figures.py`; one line of `crates/agentfs-core/src/tree_actor/recording/pages.rs` (slice 2's guard); `docs/target-architecture/git-model.md`, `docs/trees.md`, `docs/guarantees.md`, `docs/telemetry.md`, `docs/architecture.md`, `docs/configuration.md`, `docs/runbooks/upgrading-the-sidecar.md` |
+| A | Slice 2 (re-cut 2026-11-22): `crates/agentfs-core/src/tree_actor/journal/`; `crates/agentfs-core/src/tree_actor/history/{compactor.rs,built.rs,lag.rs,built_log.rs}`; `crates/agentfs-core/src/tree_actor/{mod.rs,call_path.rs,stages.rs}`; `crates/agentfs-core/src/{session.rs,store.rs,state_area.rs,telemetry.rs,failpoints.rs}`; one line of `crates/agentfs-core/src/tree_actor/recording/pages.rs` (slice 2's guard); `crates/agentfs-core/tests/{tree_actor.rs,tree_stages.rs,tree_dirs.rs,crash_points.rs,support/trees.rs}`; `crates/agentfs/src/launcher/{mod.rs,serving.rs}`, `crates/agentfs/src/reference_tests.rs`; `crates/agentfs-fuse/src/tree_view.rs`, `crates/agentfs-fuse/src/tree_view/untracked.rs`; `crates/agentfs-conformance/`; `crates/agentfs-model/VERIFYING.md` (only the Phase 1 paragraph that names the mounted replay's gates); `ci/e2e-tree-recording-faults.sh`, `ci/power-loss-trees.sh`, `ci/power-loss-trees-check.sh`, `ci/trees-figures.py`, `ci/measure-trees.py`; `docs/target-architecture/git-model.md`, `docs/trees.md`, `docs/guarantees.md`, `docs/telemetry.md`, `docs/architecture.md`, `docs/configuration.md`, `docs/library/core.md`, `docs/runbooks/upgrading-the-sidecar.md`; `.claude/errata.md` |
 | B | `crates/agentfs-core/src/tree_actor/history/retired.rs` |
 | C | `crates/agentfs-core/src/tree_actor/recording/{pages.rs,layout.rs,mod.rs}`; `crates/agentfs-core/src/tree_actor/history/{builder.rs,verify.rs}` |
 
@@ -344,11 +344,29 @@ The interfaces are committed as compiling code with `todo!()` bodies and no beha
 - **The switch record.** At each built event, under its lock, `TreeActor::switch_built` turns every pointer whose value is a step at or below History's built point into the oid built for it, row chains included. It tells History each switch before its next record: `History::switched(pointer, step, at)`, with `at` the actor's next record number. The record is keyed by pointer and tied to its step, so a later step on the same pointer is never taken for the switched one. **History keeps it until `History::published` reports a checkpoint with `built ≥ at`.** A compaction that read `AtBuilt` before the switch has `B < at`, because B is at most the last record appended at the read. So no checkpoint misses a switch it should count, and the head goes at the first compaction at or after `at - 1`. That bounds it: at most one switch record and one head per pointer. The stubs' "reaches `at`" (`built.rs:545-549`) and "passes" (`compactor.rs:42-47`) are both replaced by this rule. So is the second review's "until its built point passes the record", which names the earliest moment the head may go, not the rule. The builder is unchanged. Recovery gives it no row-chain heads (`mod.rs:800-805`), and it drops heads at or below `checkpointed_through()`, which never passes `Published::oldest_head() - 1`.
 - **C6: holders move at the built event, as a named fallback.** The compactor copies live frames into `carry-<B>` files and records each copy in `Relocations`. A holder that still names an unlinked segment keeps reading it through its `Arc<Segment>`, and those bytes count in `JournalCompaction::len` until the last holder lets go. The builder moves its positions at its next batch, as today. The actor moves its positions in `TreeActor::relocate_if_moved`, which `on_built` runs only when `Relocations::generation()` moved. That walk is the one piece of compaction left under the lock, timed as `Hold::Compaction` (design rule 1: "named and measured"). It runs only when a live open's dead neighbours outweigh its own frames.
 - **The compactor has its own thread**, started beside the builder, ended once History is stopping, and joined by `TreeActor`'s shutdown before the builder's join and before the lease is released. A publish in flight finishes or leaves only `checkpoint.tmp`.
-- **When to compact has one home**, `history::compactor::compact_at`. Only the compactor thread reads it, at a built event, together with the coverage rule below. `commit_point::compact_at` and `TreeActor::compact_threshold` are deleted. The only other decider is the compaction gate, which exists only in failpoints builds and compacts at every built event.
-- **Open does not compact.** History's trees are empty until the builder's first built event (`built.rs:157-159`, `:309`), so a checkpoint made before then would carry empty `locals`. `State::trees` becomes `Option<imbl::OrdMap<TreeId, Tree>>`, `None` until then. `History::at_built` returns `None` while it is, and `built_trees` reads the same `Option` in place of its `is_empty` guard (`built.rs:869`). A reopened volume compacts at its first built event, once due. Tests that relied on every open compacting (`tests/tree_actor.rs:1255`, `:1904`, `:1937`) drive compaction through the gate instead. This replaces "open still compacts". Conformance still compacts across reopens through the gate (2.7).
+- **When to compact has one home**, `history::compactor::compact_at(from, len_after_last)`, which is `max(from, 2 × len_after_last)` with `from` the volume's `Upkeep::compact_from` (64 MiB by default). Only the compactor thread reads it, at a built event. `commit_point::compact_at` and `TreeActor::compact_threshold` are deleted. The only other decider is the volume's compaction gate (`Upkeep::gate`, below): with a gate, the compactor compacts at every built event and ignores `compact_at`. `compact_once` returns `None` before History's first built event since open, and when B is not past the last published checkpoint's `built`. Otherwise it publishes a checkpoint at B and unlinks what is covered, which may be nothing. (Re-cut 2026-11-22: this replaces "or when nothing is covered past the last checkpoint", so a gated test of a small volume publishes at every built event.)
+- **Open does not compact.** History's trees are empty until the builder's first built event (`built.rs:157-159`, `:309`), so a checkpoint made before then would carry empty `locals`. `State::trees` becomes `Option<imbl::OrdMap<TreeId, Tree>>`, `None` until then. `History::at_built` returns `None` while it is, and `built_trees` reads the same `Option` in place of its `is_empty` guard (`built.rs:869`). A reopened volume compacts at its first built event, once due. Every test and script that relied on open compacting, or on "the first call after the builder caught up compacts", is listed under "Tests and scripts that assumed a compaction at open or at a call" below, with what it becomes. This replaces "open still compacts". Conformance still compacts across reopens through the gate (2.7).
 - **B may fall between a take's chunk records and its step.** The fold's `bytes` (chunks with no step yet) become the checkpoint's `chunks`, and `carry` copies them.
 - **`Durability` is the one owner of the segment table and the journal's length.** It already holds `segments`, `add_segment` and `remove_segment`. **C2 and C2a are one rule there: a segment is covered when the next segment in the table starts at or before B + 1.** The actor adds each segment under its lock before appending to it (`durable.rs:289-295`; `journal/mod.rs:1038`, `:1157`). That call is the roll event the second review asked for. The newest segment, whose end is not yet known, is never covered. `History::rolled` and `AtBuilt::rolled` are deleted. Lock order: the actor, then History, then Durability, then Relocations. The `Journal` the actor holds keeps only its append position.
 - **One order, enforced when each value is built:** `wait_durable`, `fold_through`, the checkpoint built with `carried` empty, `carry(&checkpoint)`, `Sealed::new(checkpoint, durable, carried)`, `publish(&sealed)`, `History::published`, then `unlink_covered`. `Sealed::new` is the only maker of the only value `publish` takes. It refuses a checkpoint whose `built` passes `durable.through` with `NotPublished`, which is logged and retried. It writes `Checkpoint::carried` from the `Carried` it consumes, the one source of that list. The check runs when the seal is made, not at compile time: the types force the order, and the record numbers are compared at run time.
+
+**Settled in the re-cut of 2026-11-22 (after the second block; see `.claude/errata.md`).** The design above is unchanged. These settle how tests and tooling reach compaction, so no test depends on open or a call compacting.
+- **A volume's upkeep is an option of its open, never process state.** `Upkeep` holds the segment size, `compact_from` and the gate. It is passed to `TreeActor::{create_with, open_with}`, `Recording::{create_with, open_with}` and `TreeStateArea::with_upkeep`. `create`, `open` and `TreeStateArea::at` use `Upkeep::default()`, which is today's behaviour: 64 MiB segments, a 64 MiB floor and no gate. The library reads no environment variable for it. The binary reads `AGENTFS_COMPACT_GATE` at its edge, in one function of `launcher/mod.rs` (`upkeep()`), and only in failpoints builds. Every open of a tree volume there calls it: `mount` and `host` through `serving.rs`, `init`, and `fork end`. So in-process tests that open volumes in parallel each carry their own gate, and none parks another's compactor.
+- **The compaction gate is the one mechanism that parks, kills and fails a compaction.** `tree.compact_before_checkpoint`, `tree.compact_before_fsync` and `tree.compact_before_drop` are deleted from `failpoints::POINTS` and from `journal/mod.rs`. They have no rows in `docs/configuration.md`, so nothing is removed there. `every_hit_is_listed` keeps `POINTS` equal to the code. A kill is a process killed while its compactor is parked at a gap (the e2e script below), or the state area copied while parked (2.1, 2.14). Power loss is 2.6's marks, taken while parked. An error is a gate that returns `Err` at a gap: the compaction fails there, classed by `Gap::fault`:
+
+  | Gap | Where it sits | An `Err` there |
+  |---|---|---|
+  | `Covered` | after the coverage check, before `wait_durable` | `NotPublished`: nothing written, retried at the next built event |
+  | `Written` | `checkpoint.tmp` written and fsynced, before the rename (inside `publish`) | `NotPublished`: `checkpoint.tmp` stays and open ignores it |
+  | `Renamed` | after the rename, before the directory's fsync (inside `publish`) | `Stopped`, as that fsync failing: `Durability::fsync_failed`, and the actor stops |
+  | `DirSynced` | after the directory's fsync, before `History::published` | `NotDropped`: `History::published` still runs, and nothing is unlinked |
+  | `BeforeUnlink` | after `History::published`, before `unlink_covered` | `NotDropped`: the checkpoint stands, the segments stay for the next compaction |
+
+  The gate is called on the compactor thread with no lock held: not History's, Durability's or the relocations' (C9).
+- **The published event.** `History::checkpointed()` and `History::wait_checkpointed(after)` report a generation and the `built` of the last checkpoint. The generation counts the checkpoints this open's compactor has published. It is 0 for the checkpoint `Journal::open` read, which `start_history` passes to `History::new` in place of `checkpointed(folded_built)`. Tests and tooling read the generation, act, then wait past it. Nothing waits on `journal_dropped`, a length or a timer. `History::published` is the compactor's alone and the one place the generation moves. In the same hold it moves History's epoch, so the `--metrics-output` worker (`tree_view.rs`, `metrics_worker`, which waits on the epoch) rewrites its file at each published checkpoint. It also adds one to `Stages::checkpoints`, exported to OpenTelemetry as `agentfs.journal.checkpoints` and in the metrics file as `stages.checkpoints`. `Stages::compaction` (existing) now times each compaction on the compactor thread, from the coverage check to the unlink, whether it published or not. When a compaction ends in `Stopped`, the compactor records the failure through `Durability::fsync_failed` first, so the actor's next call stops. It then calls `History::compaction_stopped`, which ends every `wait_checkpointed` with `WaitError::Stopped` and ends the compactor thread.
+- **How a test makes a volume due without 64 MiB.** Its `Upkeep`. A gate compacts at every built event; a small `compact_from` makes the journal due early; a small `segment_bytes` makes segments roll, so they can be covered. `Upkeep::gated(gate)` is one frame per segment plus the gate, so every built event covers every segment but the newest. These are library options, not configuration keys. `docs/library/core.md` documents `Upkeep` and the published event. `docs/configuration.md` gains only `AGENTFS_COMPACT_GATE`, beside `AGENTFS_TAKE_GATE` under "Test builds only", and `reference_tests.rs`'s `every_environment_variable_is_documented` chains `failpoints::COMPACT_GATE_VAR` beside `failpoints::ENV_VAR`.
+- **Carry files are compared by identity.** A carry file is a `Segment` outside the segment table. Its `first` is `RecordNo::ZERO`, so `JournalReader::next_segment` never picks it. Two segments are the same file when their paths are equal (`Segment::same_file`). `Relocations::dropped` and `FramePos::relocated` compare that way, never by `first`. `Segment`'s `Debug` prints its file name.
+- **Where the journal's figures come from.** The compactor drops and carries, not the actor. So `Metrics::journal_dropped` reads `Durability::removed()`, the segments removed from the table since open. `Metrics::journal_carried_bytes` reads `Durability::carried()`, the bytes written to carry files since open. `Metrics::journal_bytes` reads `Durability::len()`, the figure `JournalCompaction::len` returns: segments, carry files and unlinked files still held. `Journal::{len, carried}` move to `Durability`; their callers in `mod.rs` (`metrics`, the test at `:2325`) and in `journal/mod.rs`'s tests read them there. `ci/measure-trees.py`'s `journal_size` and `tests/support/trees.rs`'s `journal_len` and `journal_blocks` count `*.seg` and `carry-*` files; `segments` stays the `*.seg` files. A directory listing cannot see unlinked files still held; `journal_blocks` reads those through `/proc/self/fd` as today. `measure-trees.py`'s `compactions` reads `stages.checkpoints`.
 
 **Signatures (committed in 5a80783 to a5ef18e; this slice changes the ones marked `// changed`, and the bodies are its work).** `crates/agentfs-core/src/tree_actor/journal/compaction.rs`:
 
@@ -396,14 +414,53 @@ pub(in crate::tree_actor) enum CompactionError {
 }
 
 impl JournalCompaction {
-    pub(in crate::tree_actor) fn new(dir: PathBuf, durability: Arc<Durability>) -> Self;
+    pub(in crate::tree_actor) fn new(dir: PathBuf, durability: Arc<Durability>, gate: Option<Arc<dyn CompactGate>>) -> Self; // changed (re-cut)
+    pub(in crate::tree_actor) fn gate(&self, gap: Gap) -> Result<(), CompactionError>; // new (re-cut): Ok at once with no gate; an Err classed by Gap::fault
+    pub(in crate::tree_actor) fn gated(&self) -> bool;                                  // new (re-cut): the compactor then compacts at every built event
     pub(in crate::tree_actor) fn wait_durable(&self, through: RecordNo) -> Result<Durable, DurableError>;
     pub(in crate::tree_actor) fn fold_through(&self, durable: &Durable) -> Result<Folded, CompactionError>;
     pub(in crate::tree_actor) fn carry(&self, checkpoint: &Checkpoint) -> Result<Carried, CompactionError>;
     pub(in crate::tree_actor) fn publish(&self, sealed: &Sealed) -> Result<Published, CompactionError>; // changed
     pub(in crate::tree_actor) fn unlink_covered(&self, published: &Published) -> Result<DropStats, CompactionError>;
-    pub(in crate::tree_actor) fn len(&self) -> u64;
+    pub(in crate::tree_actor) fn len(&self) -> u64;                                     // Durability::len()
 }
+
+// Re-cut 2026-11-22: Gap moves here from compactor.rs, beside the I/O it sits between.
+// Gap, CompactGate and ChannelGate are public, re-exported from `tree_actor`.
+
+/// A gap in one compaction, where the volume's gate parks the compactor.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Gap { Covered, Written, Renamed, DirSynced, BeforeUnlink }
+impl Gap {
+    /// Every gap, in the order one compaction passes them.
+    pub const ALL: [Gap; 5] = [Gap::Covered, Gap::Written, Gap::Renamed, Gap::DirSynced, Gap::BeforeUnlink];
+    /// Its line on the FIFO gate: `covered`, `written`, `renamed`, `dir_synced`, `before_unlink`.
+    pub fn name(self) -> &'static str;
+    /// What an `Err` returned at this gap fails: the table under "Settled in the re-cut".
+    pub(in crate::tree_actor) fn fault(self, error: std::io::Error) -> CompactionError;
+}
+
+/// Parks a volume's compactor at each gap of every compaction, and may fail
+/// the step after a gap. Called on the compactor thread with no lock held.
+pub trait CompactGate: Send + Sync {
+    /// Returns when the compactor may go on past `gap`; `Err(e)` fails the
+    /// compaction there, as `gap.fault(e)` says.
+    fn at(&self, gap: Gap) -> std::io::Result<()>;
+}
+
+/// The in-process gate: each gap reached is sent on a channel, and the
+/// compactor waits for the holder's verdict. A gap nobody receives, or
+/// reached once the verdict sender is dropped, passes at once, so a pair
+/// with both ends dropped is a gate that never parks.
+pub struct ChannelGate {
+    reached: std::sync::Mutex<std::sync::mpsc::Sender<Gap>>,
+    verdicts: std::sync::Mutex<std::sync::mpsc::Receiver<std::io::Result<()>>>,
+}
+impl ChannelGate {
+    /// The gate, the receiver of each gap it reaches, and the sender of verdicts.
+    pub fn pair() -> (Arc<Self>, std::sync::mpsc::Receiver<Gap>, std::sync::mpsc::Sender<std::io::Result<()>>);
+}
+impl CompactGate for ChannelGate { fn at(&self, gap: Gap) -> std::io::Result<()>; }
 ```
 
 `crates/agentfs-core/src/tree_actor/history/compactor.rs`:
@@ -417,16 +474,21 @@ pub(in crate::tree_actor) struct AtBuilt {
     pub trees: imbl::OrdMap<TreeId, Tree>,
     pub switched: imbl::OrdMap<String, (RecordNo, RecordNo)>,  // changed: pointer -> (step, at); `rolled` deleted
 }
-pub(in crate::tree_actor) fn compact_at(len_after_last: u64) -> u64;   // max(64 MiB, 2 × len), moved from commit_point.rs
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(in crate::tree_actor) enum Gap { Covered, Written, Renamed, DirSynced, BeforeUnlink }
+/// The default floor of the due length: `Upkeep::default().compact_from`.
+pub(in crate::tree_actor) const COMPACT_FROM: u64 = 64 << 20;                       // new (re-cut)
+pub(in crate::tree_actor) fn compact_at(from: u64, len_after_last: u64) -> u64;     // changed (re-cut): max(from, 2 × len), moved from commit_point.rs
+// `Gap` moved to journal/compaction.rs (re-cut).
 pub(in crate::tree_actor) struct Compactor { thread: Option<JoinHandle<()>> }
 impl Compactor {
-    pub(in crate::tree_actor) fn start(history: History, journal: JournalCompaction) -> std::io::Result<Self>;
+    /// At each built event: with a gate (`journal.gated()`), compacts; without, compacts
+    /// once `journal.len() >= compact_at(compact_from, len after the last compaction)`.
+    pub(in crate::tree_actor) fn start(history: History, journal: JournalCompaction, compact_from: u64) -> std::io::Result<Self>; // changed (re-cut)
     pub(in crate::tree_actor) fn join(self);
 }
-/// The thread's one sequence, and the unit tests'. `None` before History's
-/// first built event since open, or when nothing is covered past the last checkpoint.
+/// The thread's one sequence, and the in-crate tests' `compact_now`. `None` before
+/// History's first built event since open, or when B is not past the last published
+/// checkpoint's `built` (changed in the re-cut). Runs the gate at Covered, DirSynced
+/// and BeforeUnlink; `publish` runs it at Written and Renamed.
 pub(in crate::tree_actor) fn compact_once(history: &History, journal: &JournalCompaction) -> Result<Option<DropStats>, CompactionError>;
 ```
 
@@ -435,7 +497,122 @@ pub(in crate::tree_actor) fn compact_once(history: &History, journal: &JournalCo
 ```rust
 pub(in crate::tree_actor) fn at_built(&self) -> Option<AtBuilt>;                          // changed: None until the first built event
 pub(in crate::tree_actor) fn switched(&self, pointer: &str, step: RecordNo, at: RecordNo); // changed: the step it switched from
-pub(in crate::tree_actor) fn published(&self, published: &Published);  // replaces `checkpointed`; drops switches with at <= built
+pub(in crate::tree_actor) fn published(&self, published: &Published);  // replaces `checkpointed`; drops switches with at <= built;
+                                                                        // re-cut: the compactor's alone; moves the generation and the
+                                                                        // epoch, notifies, and adds one to Stages::checkpoints
+```
+
+Re-cut 2026-11-22, the published event (`history/built.rs`; `Checkpointed` re-exported from `tree_actor` beside `History`):
+
+```rust
+/// A checkpoint History has counted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Checkpointed {
+    /// Checkpoints this open's compactor has published: 0 for the one `Journal::open` read.
+    pub generation: u64,
+    /// Its built point B.
+    pub built: RecordNo,
+}
+impl History {
+    /// `opened` is the checkpoint `Journal::open` read: generation 0, and the
+    /// redo start `checkpointed_through` reports until the first publish.
+    pub(in crate::tree_actor) fn new(repo: TreeGit, built: RecordNo, pointers: Pointers, owners: Owners, objects: BuiltObjects, opened: &Published) -> std::io::Result<Self>; // changed
+    /// The last checkpoint counted. O(1).
+    pub fn checkpointed(&self) -> Checkpointed;
+    /// Returns once a checkpoint of a generation after `after` is published, with it.
+    ///
+    /// # Errors
+    ///
+    /// [`WaitError::Stopped`] at shutdown, or once a compaction stopped the actor
+    /// (a failed fsync, which `Durability` reports first); [`WaitError::Failed`] at a
+    /// failed built event after the call, as `wait_built`. A compaction that failed
+    /// and will be retried (`NotPublished`, `NotDropped`) does not end the wait.
+    pub fn wait_checkpointed(&self, after: u64) -> Result<Checkpointed, WaitError>;
+    /// A compaction ended in `Stopped`: every `wait_checkpointed` ends, and the compactor thread with it.
+    pub(in crate::tree_actor) fn compaction_stopped(&self);
+}
+```
+
+Re-cut 2026-11-22, the volume's upkeep (`tree_actor/mod.rs`, `tree_actor/call_path.rs`, `state_area.rs`; `Upkeep` re-exported from `tree_actor`):
+
+```rust
+/// How one open volume keeps its journal. Fixed for the life of the open;
+/// nothing of it is stored in the state area.
+#[derive(Clone)]
+pub struct Upkeep {
+    /// The next frame starts a new segment once the current one has a record
+    /// and the frame would take it past this. Default `SEGMENT_BYTES` (64 MiB).
+    pub segment_bytes: u64,
+    /// The floor of compaction's due length, `compact_at`'s `from`. Default
+    /// `COMPACT_FROM` (64 MiB). Unread when `gate` is set.
+    pub compact_from: u64,
+    /// Parks the compactor at each gap; with one, the compactor compacts at
+    /// every built event. Default none.
+    pub gate: Option<Arc<dyn CompactGate>>,
+}
+impl Default for Upkeep { fn default() -> Self; }
+impl std::fmt::Debug for Upkeep { /* the gate as `Some(..)` or `None` */ }
+impl Upkeep {
+    /// One frame per segment (`segment_bytes: 1`), `compact_from` as default, and
+    /// `gate`: what `AGENTFS_COMPACT_GATE` sets, and the tests' `compacting()`.
+    pub fn gated(gate: Arc<dyn CompactGate>) -> Self;
+}
+impl TreeActor {
+    // `create` and `open` are these with `Upkeep::default()`; one body each.
+    pub fn create_with(root: &Path, identity: &VolumeIdentity, root_owner: Option<FileOwner>, service: &PodContext, upkeep: Upkeep) -> Result<Self>;
+    pub fn open_with(root: &Path, service: &PodContext, upkeep: Upkeep) -> Result<Self>;
+}
+impl Recording {
+    pub fn create_with(root: &Path, identity: &VolumeIdentity, root_owner: Option<FileOwner>, service: &PodContext, upkeep: Upkeep) -> Result<Arc<Self>, Error>;
+    pub fn open_with(root: &Path, service: &PodContext, upkeep: Upkeep) -> Result<Arc<Self>, Error>;
+}
+impl TreeStateArea {
+    /// The upkeep `create` and `open` pass on; `at` starts with `Upkeep::default()`.
+    pub fn with_upkeep(self, upkeep: Upkeep) -> Self;
+}
+// journal/mod.rs: `Journal::create` and `Journal::open` each gain `segment_bytes: u64` as
+// their last parameter; `roll` compares against it in place of `SEGMENT_BYTES`.
+```
+
+Re-cut 2026-11-22, the journal's figures and segment identity (`journal/durable.rs`, `journal/segment.rs`):
+
+```rust
+impl Durability {
+    pub(in crate::tree_actor) fn len(&self) -> u64;      // JournalCompaction::len's figure; Metrics::journal_bytes. O(1)
+    pub(in crate::tree_actor) fn removed(&self) -> u64;  // segments removed from the table since open; Metrics::journal_dropped. O(1)
+    pub(in crate::tree_actor) fn carried(&self) -> u64;  // bytes written to carry files since open; Metrics::journal_carried_bytes. O(1)
+}
+impl Segment {
+    /// The same file: paths equal. Carry files all have `first == RecordNo::ZERO`.
+    pub(in crate::tree_actor) fn same_file(&self, other: &Segment) -> bool;
+}
+```
+
+Re-cut 2026-11-22, telemetry and the binary's edge (`stages.rs`, `telemetry.rs`, `failpoints.rs`, `crates/agentfs/src/launcher/mod.rs`):
+
+```rust
+pub struct Stages { /* ... */ pub checkpoints: u64 }                // checkpoints published, process-wide
+pub(in crate::tree_actor) fn checkpointed();                         // stages.rs: adds one; History::published's alone
+pub const JOURNAL_CHECKPOINTS: &str = "agentfs.journal.checkpoints"; // telemetry::names; a u64 observable counter,
+                                                                     // unit `{checkpoint}`, registered by `observe_latency`
+
+pub const COMPACT_GATE_VAR: &str = "AGENTFS_COMPACT_GATE";           // failpoints.rs, every build (as ENV_VAR); read only by the binary
+/// `AGENTFS_COMPACT_GATE=<dir>`'s gate: FIFOs `at` and `go` in `dir`, both opened
+/// read and write so neither end blocks or sees end of file. At each gap it writes
+/// `gap.name()` and a newline to `at`, then reads one line from `go`: `go` goes on,
+/// `fail` returns an EIO error (`Gap::fault`), and an empty line or end of file
+/// ends the gate, after which every gap passes without a line.
+#[cfg(feature = "failpoints")]
+pub struct FifoGate { at: std::sync::Mutex<File>, go: std::sync::Mutex<BufReader<File>>, ended: AtomicBool }
+#[cfg(feature = "failpoints")]
+impl FifoGate { pub fn open(dir: &Path) -> std::io::Result<Self>; }
+#[cfg(feature = "failpoints")]
+impl CompactGate for FifoGate { fn at(&self, gap: Gap) -> std::io::Result<()>; }
+
+/// launcher/mod.rs. A failpoints build with `AGENTFS_COMPACT_GATE` set:
+/// `Upkeep::gated` over `FifoGate::open` of that directory (one that cannot open
+/// aborts with its error, as the take gate's does). Otherwise `Upkeep::default()`.
+pub(crate) fn upkeep() -> Upkeep;
 ```
 
 The actor (`journal/commit_point.rs`) and the segment table (`journal/segment.rs`):
@@ -486,36 +663,72 @@ So the journal opens in C7's two power-loss cases, where nothing after B was dur
 
 | # | Criterion | Test that proves it | Mutation probe |
 |---|---|---|---|
-| 2.1 | A kill at any gap of a compaction loses nothing returned, and the volume opens with the same reads (C1 to C5) | `compactor.rs::tests::a_kill_at_each_gap_keeps_every_returned_call`: for each `Gap`, park the compactor. While it is parked, append a step that sets a pointer and wait for its built event, so a builder batch runs and trims `built.log` at its start (`builder.rs:1493-1500`). Then copy the state area, release, open the copy and compare every read with the uninterrupted volume | **P2.1** call `History::published` before `publish`: the copy taken at `Written` fails to open (`Format` in `resolve_pointers`) |
-| 2.2 | A segment is unlinked only once the next segment starts at or before B + 1 (C2, C2a) | `compactor.rs::tests::an_append_during_the_coverage_gap_survives_a_kill`: park at `Covered` while the actor's newest segment starts at or before B, append one call and return it, release, kill, reopen, read the call | **P2.2** judge a segment covered by its own first record: the returned call is gone after the reopen |
+| 2.1 | A kill at any gap of a compaction loses nothing returned, and the volume opens with the same reads (C1 to C5) | `compactor.rs::tests::a_kill_at_each_gap_keeps_every_returned_call`: for each `Gap`, park the compactor through its volume's `ChannelGate`. While it is parked, append a step that sets a pointer and wait for its built event, so a builder batch runs and trims `built.log` at its start (`builder.rs:1493-1500`). Then copy the state area, release, open the copy and compare every read with the uninterrupted volume | **P2.1** call `History::published` before `publish`: the copy taken at `Written` fails to open (`Format` in `resolve_pointers`) |
+| 2.2 | A segment is unlinked only once the next segment starts at or before B + 1 (C2, C2a) | `compactor.rs::tests::an_append_during_the_coverage_gap_survives_a_kill`: on a volume whose `segment_bytes` is larger than its frames (so the call lands in the segment that starts at or before B; not `Upkeep::gated`), park at `Covered` while the actor's newest segment starts at or before B, append one call and return it, release, kill, reopen, read the call | **P2.2** judge a segment covered by its own first record: the returned call is gone after the reopen |
 | 2.3 | The journal opens when nothing after B was durable (C7) | power-loss marks "covered segments unlinked, next segment's first frame not durable" and "no segment left" (2.6), and `compactor.rs::tests::a_checkpoint_with_no_segment_after_it_opens` | **P2.3** treat a missing segment after `built` as corruption: the "no segment left" case refuses to open |
 | 2.4 | A record after B that names a step at or below B folds the same on the old and the new checkpoint (C3, C4) | `compactor.rs::tests::a_step_named_after_the_checkpoint_folds_on_both`: a pointer set at step s, built through B ≥ s, compacted before the actor's built event switches it, then one more step naming `Step(s)`; reopen at each of the two checkpoints. Run once with a branch pointer and once with a row chain | **P2.4** leave the head out of `step_heads` when the fold gives `Target::Step`: the reopen fails with `PointerMoved` or `Format` |
 | 2.5 | No lock the actor takes is held across I/O or a wait (C9) | `compactor.rs::tests::calls_run_while_the_compactor_is_parked`: parked at each `Gap`, another thread appends a call, runs `durable_all` and catches up, each finishing (a 10-second bound fails the test rather than hanging it) | **P2.5** hold Durability's state lock across `unlink_covered`'s unlink: the append blocks at `BeforeUnlink` |
-| 2.6 | Power loss at each step of a compaction, with records after B not yet durable, keeps the journal a prefix of what was appended and every record up to the last returned fsync | `ci/power-loss-trees.sh`: new marks at `Written`, `Renamed`, `DirSynced`, `BeforeUnlink` and after the unlink, plus the two C7 marks, driven through the compaction gate; each replayed from an empty device and checked by `power-loss-trees-check.sh` | **P2.6** skip the directory fsync in `publish`: the mark after `Renamed` replays with no checkpoint (run locally under root with dm-log-writes, or on CI) |
-| 2.7 | Phase-1 coverage of compaction across model steps and reopens | the conformance leg: `phase1-replay library` and the mounted replay at the regression seeds with `AGENTFS_COMPACT_GATE` set, compacting at every built event and parking at each gap in turn while the replay goes on | **P2.7** the same plant as P2.4: the leg reports the seed and call where the library left the model |
-| 2.8 | New work is admitted while history trails past twice the due length (the overdue stop is gone) | `lag.rs` unit test `a_long_journal_holds_no_tree`, and `compactor.rs::tests::creates_go_on_while_history_trails` with the builder held at its batch start (`History::batch_read` hook) and the journal past `2 × compact_at(0)` | **P2.8** restore the overdue term in `LagGate::admits`: both tests fail |
+| 2.6 | Power loss at each step of a compaction, with records after B not yet durable, keeps the journal a prefix of what was appended and every record up to the last returned fsync | `ci/power-loss-trees.sh`: new marks at `Written`, `Renamed`, `DirSynced`, `BeforeUnlink` and after the unlink, plus the two C7 marks, driven through the compaction gate in a mount of their own (`AGENTFS_COMPACT_GATE` set), after the existing legs' mount has unmounted so their marks keep today's segment size; the driver marks the log device while the compactor is parked, then answers `go`. Each mark is replayed from an empty device and checked by `power-loss-trees-check.sh` | **P2.6** skip the directory fsync in `publish`: the mark after `Renamed` replays with no checkpoint (run locally under root with dm-log-writes, or on CI) |
+| 2.7 | Phase-1 coverage of compaction across model steps and reopens | the conformance leg: `phase1-replay library` with `TreeActor::{create_with, open_with}(.., Upkeep::gated(ChannelGate))` and the mounted replay with `AGENTFS_COMPACT_GATE` set (`mounted.rs`), at the regression seeds, compacting at every built event and parking for one replayed call at each gap in turn while the replay goes on. Each leg ends its gate (drops the verdict sender, or writes an empty line to `go`) before it drops the volume or unmounts, so the shutdown's join of the compactor never waits on it | **P2.7** the same plant as P2.4: the leg reports the seed and call where the library left the model |
+| 2.8 | New work is admitted while history trails past twice the due length (the overdue stop is gone) | `lag.rs` unit test `a_long_journal_holds_no_tree`, and `compactor.rs::tests::creates_go_on_while_history_trails` with the builder held at its batch start (`History::batch_read` hook) on a volume whose `Upkeep` has a small `compact_from` and `segment_bytes` and no gate, with the journal past `2 × compact_at(compact_from, 0)`: no 128 MiB fill | **P2.8** restore the overdue term in `LagGate::admits`: both tests fail |
 | 2.9 | A call never waits for compaction (the purpose), and the walk left under the lock is measured | figures (warn only), local release build on ext4. `close_1g` and `write_1m` with `--metrics --probe --probe-view`: the other view's longest probe call under 50 ms (slice 0: 1,244 and 1,166 ms). A new `held_open` workload, shaped like the power-loss HC leg, so the compactor carries frames and `relocate_if_moved` runs: report `lock_hold.compaction`'s longest hold, and file a residual bead if it is over 10 ms | none: figures. Read in the report. |
 | 2.10 | The guard holds | the whole workspace test run in debug, `tests/tree_pages.rs:291` `a_fill_reads_every_opens_calls` included: `assert_unlocked` panics on any fsync, journal read or unlink under the lock outside the named holds | **P2.10a** add a `Segment::sync` call inside `relocate_if_moved`: 2.14's test panics in the guard. **P2.10b** remove the `Hold::PageImage` section: the page tests panic |
 | 2.11 | A head goes once a published checkpoint has counted its switch, and the built log is trimmed past it (C3, C4) | `compactor.rs::tests::a_switched_head_is_let_go`: the 2.4 scenario, then records so the switch lands at r > B + 1, then a build and a compaction at B2 ≥ r with no step on the pointer since. `step_heads` lacks it, `oldest_head()` is `None`, `checkpointed_through()` is B2, and the next batch trims `built.log`. Then the 2.4 scenario again on the same pointer at a later step, with no compaction between the first switch and that step: the reopen folds | **P2.11a** drop a switch at the built event once built ≥ `at`: the head stays and `checkpointed_through()` stays below s. **P2.11b** key `switched` by pointer alone: the second reopen fails |
 | 2.12 | No checkpoint is published without History's trees at B (C8) | `compactor.rs::tests::a_compaction_after_reopen_keeps_dir_and_file_times`: directories and files with distinct times; reopen; one step; compact at its built event; reopen again. Every directory's number and time and every file's time equal the uninterrupted volume's | **P2.12** have `at_built` return `Some` with empty trees before the first built event, and compact once at start: the second reopen fails with `Format` (`restore_locals`, `mod.rs:528-535`) |
 | 2.13 | A lost segment after B that held a record proven durable refuses to open (C7) | `journal/mod.rs` test `a_lost_durable_segment_refuses_to_open`, two cases. First: durable records after B, a roll, one more durable record, then the middle segment unlinked by hand. Second: the built log past the lost records, with no later segment. Both refuse to open | **P2.13** treat a missing segment after `built` as a torn tail without the two checks: both open |
-| 2.14 | A carried open survives every gap, and the actor moves to the carry (C6) | `compactor.rs::tests::a_carried_open_survives_each_gap`: an open with a few calls is held while another file's saved calls outweigh them in its segment and the journal rolls. Build, then compact so that its frames are carried. For each `Gap`, park, copy, release, open the copy and close the open: every byte is read once. Repeat with the unlink failing (`NotDropped`, through a failpoint). After the next built event, `relocate_if_moved` has run, and once the builder has moved, `len()` no longer counts the unlinked segment | **P2.14** read a carried frame and its surviving original both: the copy after `NotDropped` saves the bytes twice or fails with `Format` |
+| 2.14 | A carried open survives every gap, and the actor moves to the carry (C6) | `compactor.rs::tests::a_carried_open_survives_each_gap`: an open with a few calls is held while another file's saved calls outweigh them in its segment and the journal rolls. Build, then compact so that its frames are carried. For each `Gap`, park, copy, release, open the copy and close the open: every byte is read once. Repeat with the unlink failing (`NotDropped`: the gate returns `Err` at `BeforeUnlink`). After the next built event, `relocate_if_moved` has run, and once the builder has moved, `len()` no longer counts the unlinked segment | **P2.14** read a carried frame and its surviving original both: the copy after `NotDropped` saves the bytes twice or fails with `Format` |
 
-**The test hook, unit tests only.** The tests of 2.1, 2.2, 2.4, 2.5, 2.8, 2.11, 2.12 and 2.14 are unit tests in `history/compactor.rs`: they open a `TreeActor` and copy its state area, which integration tests cannot reach. They park the compactor through a hook on History, stored beside today's `batch_read` hook in `history/built.rs`, which runs at each `Gap` before the compactor's next step:
+**How the tests park the compactor (re-cut 2026-11-22; replaces "The test hook" and the process-wide gate).** There is no hook on History and no `hold_compactor_with`. The tests of 2.1, 2.2, 2.4, 2.5, 2.8, 2.11, 2.12 and 2.14 are unit tests in `history/compactor.rs`: they open a `TreeActor` with `TreeActor::create_with(.., upkeep)` and copy its state area, which integration tests cannot reach. Each test's `Upkeep` carries its own `ChannelGate`: the test receives each gap the compactor reaches and answers it with `Ok(())` or an error. Integration tests do the same through the public `Upkeep`, `ChannelGate` and `History::wait_checkpointed`. Tests that run in parallel in one binary never share a gate. A bound on a wait (`recv_timeout`) only fails a test that would hang; it never stands in for an event.
 
-```rust
-#[cfg(test)]
-pub(in crate::tree_actor) fn hold_compactor_with(&self, hook: impl Fn(Gap) + Send + Sync + 'static);
-```
+**The compaction gate in the binary, failpoints builds only.** `AGENTFS_COMPACT_GATE=<dir>`, read by `launcher::upkeep()` only, gives every tree volume the binary opens `Upkeep::gated(FifoGate::open(dir))`. The FIFOs `at` and `go` work the way `AGENTFS_TAKE_GATE`'s do (the protocol is on `FifoGate`). The e2e script, the conformance leg's mounted replay and the power-loss driver use it. It is event-driven and has no sleeps. `docs/configuration.md` gets its row under "Test builds only".
 
-**The compaction gate, failpoints builds only.** `AGENTFS_COMPACT_GATE=<dir>` holds FIFOs `at` and `go`, the way `AGENTFS_TAKE_GATE` does. With it set, the compactor compacts at every built event and ignores `compact_at`. At each `Gap` it writes the gap's name to `at` and waits for a line on `go`. The integration tests, the conformance leg and the power-loss driver all use this one mechanism, which is event-driven and has no sleeps. `docs/configuration.md` gets its row.
+**Test helpers.** `tests/support/trees.rs` gains `new_actor_with(dir, upkeep)`, `reopen_with(dir, upkeep)`, `compacting()` (`Upkeep::gated` over a `ChannelGate` pair with both ends dropped: a compaction at every built event, never parked) and `compacted_through(v, through) -> Checkpointed`. That last one reads `history().checkpointed()` and, while its `built` is below `through`, calls `wait_checkpointed` past its generation. The in-crate tests' `tree_actor::test_support` gains the same `compacting()` and `compacted_through`, plus `never_due()` (`Upkeep { segment_bytes: 1, compact_from: u64::MAX, gate: None }`, so the thread never compacts) and `compact_now(&v)`. `compact_now` runs `settle`, then `compact_once(v.history(), &JournalCompaction::new(<journal dir>, Arc::clone(v.durability()), None))`, on a `never_due()` volume. The two copies of `compacting` and `compacted_through` sit on each side of the crate boundary, because integration tests cannot see `cfg(test)` items. Each is a few lines.
+
+**Tests and scripts that assumed a compaction at open or at a call.** Each becomes the following. Nothing else in the workspace depends on open or a call compacting. Checked with `grep -rn -i compact` over `crates/*/tests`, `crates/agentfs-core/src`, `crates/agentfs-conformance`, `crates/agentfs-fuse/src`, `crates/agentfs/src` and `ci/`.
+
+| Where (at b60dcc4) | What it assumed | What it becomes |
+|---|---|---|
+| `tests/tree_actor.rs:1255` `open_numbers_never_repeat_across_compaction` | every open compacts; the journal is then checkpoint frames in one segment | `new_actor_with(compacting())`; after the put, `compacted_through(&v, v.settle())`. No segment holds a `Checkpoint` frame, and none but the newest holds a record at or below `checkpointed().built`. Then the reopens, as now: open numbers still increase |
+| `tests/tree_actor.rs:1283` `fill_journal` | the poke open after `settle` is the first call after catch-up, so it compacts | reads `history().checkpointed().generation` at its start; after the close and `settle`, `wait_checkpointed(generation)`. The poke goes. Sizes stay (default `Upkeep`, due at 64 MiB). Its users at `:1306`, `:1331` (first half) and `:1380` change no further |
+| `tests/tree_actor.rs:1331` `a_held_open_pins_only_its_own_bytes`, second half (the poke at `:1366`) | the poke after `settle` compacts: "a checkpoint in a third segment, the two before it kept" | the poke becomes `wait_checkpointed` past the generation read before the 70 writes. `segments().len()` is 2, because the checkpoint is a file now; carried bytes stay 0 |
+| `tests/tree_actor.rs:1380` `carried_frames_free_their_old_segments` | through `fill_journal` | unchanged beyond `fill_journal`. `journal_blocks` counts carry files, so the bound now covers the carried frames |
+| `tests/tree_actor.rs:1532` `compact_worker`, `:1745` `a_kill_at_either_compact_failpoint_loses_nothing` | kills at the deleted failpoints, the first hit at open | **deleted**. Covered by 2.1 (the state area copied at each gap) and by the e2e script's SIGKILL at each gap |
+| `tests/tree_actor.rs:1793` `a_fork_right_after_a_compaction_reopens_after_a_kill`, `:1808` `fork_after_compaction_worker` | "The first record after history caught up: it compacts, then records" | the worker reads the generation before its writes; after the close and `settle`, `wait_checkpointed(generation)`, then the fork. `tree.build_after_pack=kill@3` is unchanged, because a compaction is not a builder batch |
+| `tests/tree_actor.rs:1889` `a_failure_before_the_drop_keeps_serving_and_the_next_compaction_drops` | `tree.compact_before_drop=error`; "Open compacts: the old segments go" (`:1904`) | `new_actor_with(Upkeep::gated(gate))` with a `ChannelGate` that answers `Err` at the first `BeforeUnlink` and `Ok` elsewhere; no fill, a put is enough. The checkpoint is published (`wait_checkpointed`), the covered segments stay, the actor serves, and the reads hold. Then `reopen_with(dir, compacting())`: the old segments are **still there**, because open does not compact. After one put, `compacted_through`, they are gone |
+| `tests/tree_actor.rs:1912` `a_failure_before_the_checkpoint_is_retried_at_the_next_step` | `tree.compact_before_checkpoint=error@*`; the next step compacts | a `ChannelGate` that answers `Err` at `Covered` while armed (`NotPublished`; the test sees the `Covered` report as its event). Disarmed: one put, `settle`, then `wait_checkpointed` past the generation read at the start returns, and no record below its `built` survives outside the newest segment |
+| `tests/tree_actor.rs:1932` `a_failed_compaction_fsync_stops_the_actor` | `tree.compact_before_fsync=error`, hit by the last open (`:1937`) | a `ChannelGate` that answers `Err` at `Renamed` (the directory's fsync, `Stopped`). `wait_checkpointed` returns `Err(WaitError::Stopped)`; then the next call fails and `is_stopped()` holds. The reopen half is unchanged |
+| `tests/tree_dirs.rs:609` `directory_numbers_and_times_survive_compaction_and_reopen` | "A reopen with every step built compacts at once" (`:620`); its `segments().len() == 1` passes only because a small volume never rolls | `new_actor_with(compacting())` and `reopen_with(dir, compacting())`. Before each drop, `compacted_through(&v, v.settle())`. The segment count becomes `checkpointed().built` equal to the settled point. 2.12 stays the definitive test |
+| `tests/tree_stages.rs:298-394` `each_kind_of_hold_is_recorded_when_its_work_runs` | "the first call after history built every step compacts" (`:373`); one `compaction` hold | the generation is read before the big writes; `holds_during` wraps the close, `settle` and `wait_checkpointed`. `compaction` is 0 and `Stages::checkpoints` grew. The doc comment says compaction runs off the lock and `compaction` counts only `relocate_if_moved`'s walk. The kinds vectors (`:107`, `:320`) gain `("page_image", 0)` |
+| `tests/tree_stages.rs:433` | `after.overdue.count` | removed with `GateCause::Overdue` |
+| `src/store.rs:548` `created_survives_a_change_and_a_compaction` | "Every step built: the reopen compacts to one checkpoint" (`:577`); one segment | `Recording::create_with(.., compacting())`; after the change, `compacted_through`. The reopen asserts the reads, and the checkpoint's `built` read before the drop is at or past the change's step |
+| `src/tree_actor/mod.rs` tests `compaction_keeps_the_fold` (`:1817`), `a_compaction_keeps_a_closed_opens_page_write_out_of_recovery` (`:1894`), `reopen_with` (`:1918`), `restart_worker` (`:2103`), `a_restart_after_a_kill_reads_each_tree_once` (`:2212`), `restart_replays_from_the_checkpoint` (`:2247`) | `v.compact()`; the checkpoint as `frames[0]` | `test_support::compact_now(&v)` on a `never_due()` volume. The checkpoint is read from `journal/checkpoint`. `reopen_with` edits that file and writes it back, where it rebuilt the journal with `Journal::create` |
+| `src/tree_actor/mod.rs:2090` `a_compaction_threshold_is_constants` | `compact_at(len)` | moves to `compactor.rs`'s tests as `compact_at(COMPACT_FROM, len)` with the same figures, plus one small `from` |
+| `src/tree_actor/mod.rs:2295` `compaction_progresses_under_constant_writes_to_one_file` | "the next write compacts, though history is not built through it" | the generation is read before the writes; after `wait_built(step)`, `wait_checkpointed(generation)`. Then `journal_dropped >= 1` and the length fell. The log's later write is no longer the trigger |
+| `src/tree_actor/journal/readback.rs:261` | `v.compact()` | `test_support::compact_now(&v)` on a `never_due()` volume |
+| `journal/commit_point.rs` and `journal/mod.rs` tests of the checkpoint as a segment's first frame | the deleted functions | deleted, or rewritten for the checkpoint file (C5), as above |
+| `ci/e2e-tree-recording-faults.sh:144-165` | "each opening of the state area passes them": `init` killed at `tree.compact_before_checkpoint` and `tree.compact_before_drop` | the opening loop keeps `tree.after_ref_rebuild` alone, and its comment says "the failpoint". A new loop follows it, below |
+| `ci/power-loss-trees.sh:120-151`, the HC leg | "the next call compacts" (the `poke`); waits on `journal_dropped` | no poke. It reads `stages.checkpoints` before the big writes, then waits through the metrics file's renames until `stages.checkpoints` has grown and `journal_carried_bytes > 0`. The file is rewritten at each published checkpoint, an event. The leg keeps its default upkeep (no gate) |
+| `ci/trees-figures.py` `nudge` (`:891`, `:1066-1081`, the docstring at `:104-110`) | the first call after catch-up runs the compaction then due | the fig-nudge save goes. When the workload's journal reached 64 MiB (its `journal_bytes` in the metrics file), it waits through the metrics file until `stages.checkpoints` passes its value at the workload's start, so the probe still covers the compaction. `GATE_CAUSES` loses `overdue`; `LOCK_KINDS` gains `page_image` |
+| `ci/measure-trees.py:158` `journal_size`, `:518` `compactions` | only `*.seg`; `stages.compaction.count` | `*.seg` and `carry-*`; `stages.checkpoints` |
+
+**The e2e script's compaction kills.** They are driven in the script, which can make a volume due cheaply through the gate. After the opening loop, for each gap in `covered written renamed dir_synced before_unlink`:
+1. Start from a fresh state area, `init --volume t`, and `mkfifo` `at` and `go` in a gate directory.
+2. Run `start '' root` with `AGENTFS_COMPACT_GATE` set to that directory: one frame per segment, and a compaction at every built event.
+3. Write `kept`, then open both FIFOs read and write. Read lines from `at` with a bound (`read -t`), answering `go` to each, until the line is the gap.
+4. `kill -9` the mount while its compactor is parked there, wait for it to exit, and `fusermount3 -uz`.
+5. `init --volume t` again: `kept` reads `saved`, `git fsck --full --strict` passes, `tree_git_no_duplicate_opens` holds, and a second `init` leaves `root` where it was.
+6. Write `PASS compact:<gap>` to `results.tsv`.
+
+`kept` was returned before the kill, so it must survive whichever compaction the kill met. This is the real-process half of 2.1, at about five mounts. The `phase-1.yml` step "kill at recording boundaries" runs it unchanged.
+
+**The partial work of the second attempt: apply it.** `slice2-partial.patch` (in the session scratchpad named in `.claude/errata.md`, 2026-11-22) applies cleanly to b60dcc4 with `git apply`. It matches this page: `lag.rs` without the overdue stop and with 2.8's `a_long_journal_holds_no_tree`; `GateCause::Overdue` removed; `Hold::PageImage`, `Unlocked` and `assert_unlocked` in `stages.rs`; the `telemetry.rs` latency test without `overdue` and with `page_image`; and the one `section(Hold::PageImage)` line in `pages.rs`. It does not compile alone. In the same commit, delete `History::compaction_overdue` (`built.rs:476`) and its caller (`commit_point.rs:259`), and `tree_stages.rs:433`. If the file is gone, this page describes the same edits.
 
 **Gates (durability changes):**
 1. **The model-verification regression tier.** `cargo test --workspace` runs the model's scenarios, the regression seeds and conformance's replays, and `phase-1.yml` runs on the PR. Not the full sweep (owner, 2026-11-13), because no rule of the model changes: the model has the journal only as rule 12. git-model §3's compaction paragraph and §12's journal row are amended through `crates/agentfs-model/VERIFYING.md` "The procedure".
-2. **The power-loss runs.** `ci/power-loss-trees.sh` with the marks of 2.6, in the `ci.yml` crash-injection job. Run them locally under root with dm-log-writes if the container allows it. Otherwise mark them NOT RUN locally and let CI judge.
+2. **The power-loss runs.** `ci/power-loss-trees.sh` with the marks of 2.6, in the `ci.yml` crash-injection job. Run them locally under root with dm-log-writes if the container allows it. Otherwise mark them NOT RUN locally and let CI judge. **The kills:** `ci/e2e-tree-recording-faults.sh` with its gap loop (`phase-1.yml`, "kill at recording boundaries"), run locally against a failpoints build (it needs `/dev/fuse`).
 3. fmt, clippy `-D warnings`, and `cargo test --workspace`. CI `ci` and `image` green on the pushed SHA.
 
-**Docs in the same commit:** `docs/trees.md` (the journal, compaction, the lag gate without the overdue stop, state format 14), `docs/telemetry.md` (no `overdue` cause, the `page_image` hold, and what `lock_hold.compaction` now measures), `docs/architecture.md` (the `commit_point.rs`, `compactor.rs`, `compaction.rs`, `journal/mod.rs` and `lag.rs` rows), `docs/configuration.md` (`AGENTFS_COMPACT_GATE`), `docs/runbooks/upgrading-the-sidecar.md` (format 14), and git-model §3 and §12.
+**Docs in the same commit:** `docs/trees.md` (the journal, compaction, the lag gate without the overdue stop, state format 14), `docs/telemetry.md` (no `overdue` cause, the `page_image` hold, and what `lock_hold.compaction` now measures, and `agentfs.journal.checkpoints`), `docs/architecture.md` (the `commit_point.rs`, `compactor.rs`, `compaction.rs`, `journal/mod.rs`, `lag.rs`, `state_area.rs` and `failpoints.rs` rows), `docs/configuration.md` (`AGENTFS_COMPACT_GATE` under "Test builds only"; the three deleted failpoints have no rows to remove), `docs/library/core.md` (`Upkeep`, `ChannelGate` and the published event, under "Git-backed tree views"), `docs/runbooks/upgrading-the-sidecar.md` (format 14), and git-model §3 and §12.
 
 **Costs this slice states in trees.md:**
 - Restarts replay from B, so they take longer while history trails.
@@ -539,6 +752,16 @@ pub(in crate::tree_actor) fn hold_compactor_with(&self, hook: impl Fn(Gap) + Sen
 - Low, `Folded` lacked the old heads: the fold seeds `pointers` from `step_heads`, so `Folded` needs no new field.
 - Low, three deciders: open's compaction is deleted. The gate is the one stated exception, for tests.
 - Low, the brief described the CSI host channel: not this page, so no change.
+
+**Re-cut responses (slice 2), second implementer block of 2026-11-22:**
+- The e2e script killed `init` at compaction failpoints that only an opening compaction reached: the three compaction failpoints are deleted, and the script kills a gated mount at each gap. The script is now in lane A's paths.
+- `tree_dirs.rs:609`, `store.rs:548` and the "first call after catch-up compacts" tests were not listed: every one is in the table above, with what it becomes.
+- A process-wide gate would park every volume that in-process tests open in parallel: the gate is an `Upkeep` option of each open. Only the binary reads `AGENTFS_COMPACT_GATE`, at its edge. Tests wait on History's published event, not on `journal_dropped`.
+- `ci/measure-trees.py` undercounted carry files: it counts them, and so do the tests' `journal_len` and `journal_blocks`.
+- `Relocations::dropped` and `FramePos::relocated` compared by `first`, and every carry file has `first` 0: they compare by path (`Segment::same_file`).
+- Error injection for `NotPublished`, `NotDropped` and `Stopped` used the deleted failpoints: a gate's `Err` at a gap, classed by `Gap::fault`.
+- `compact_once` returned `None` when nothing was covered, so a gated small volume would never publish: it now returns `None` only when B has not moved past the last checkpoint.
+- The partial patch is applied first.
 
 ### Slice 6: a close returns once its change is in the journal
 
