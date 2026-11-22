@@ -20,7 +20,10 @@ impl TreeActor {
     /// [`History::switched`]: crate::tree_actor::History::switched
     pub(in crate::tree_actor) fn switch_built(&mut self) {
         let snapshot = self.history.snapshot();
-        let built = snapshot.at();
+        // EXPERIMENT (erratum 2026-11-22): only steps a published checkpoint
+        // keeps the head of, whose oid a fold from it knows.
+        let built = snapshot.at().min(self.history.checkpointed().built);
+
         let at = RecordNo::new(self.next);
         let switched: Vec<(String, RecordNo, String)> = self
             .pointers

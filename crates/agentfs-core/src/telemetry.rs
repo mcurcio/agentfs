@@ -1888,7 +1888,6 @@ mod tests {
         h.telemetry.observe_latency();
         assert!(h.sum(names::JOURNAL_CHECKPOINTS, &[]).is_some());
         for cause in ["lag", "overlay"] {
-
             assert!(
                 h.sum(names::GATE_WAITS, &[("cause", cause)]).is_some(),
                 "{cause}"

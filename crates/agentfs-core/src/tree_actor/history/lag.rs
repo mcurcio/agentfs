@@ -175,8 +175,7 @@ impl LagGate {
     /// journal's length holds nothing: compaction runs behind the call path
     /// at history's built point (docs/trees.md, "History trails the files").
     pub(in crate::tree_actor) fn admits(&self, tree: TreeId) -> bool {
-        self.failed
-            || (self.lag(tree) <= self.limit && self.overlay_of(tree) <= self.overlay_limit)
+        self.failed || (self.lag(tree) <= self.limit && self.overlay_of(tree) <= self.overlay_limit)
     }
 
     /// Why `tree`'s new work waits now, or None when it may start: the

@@ -199,10 +199,13 @@ impl Recording {
     /// # Errors
     ///
     /// As [`TreeActor::open`].
-    pub fn open_with(root: &Path, service: &PodContext, upkeep: Upkeep) -> Result<Arc<Self>, Error> {
+    pub fn open_with(
+        root: &Path,
+        service: &PodContext,
+        upkeep: Upkeep,
+    ) -> Result<Arc<Self>, Error> {
         Self::serve(TreeActor::open_with(root, service, upkeep)?)
     }
-
 
     /// The operator's rules, read when the volume opened: where each new
     /// name of a tree lives (docs/trees.md, "Rules and the untracked area").

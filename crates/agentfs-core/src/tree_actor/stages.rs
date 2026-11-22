@@ -521,7 +521,6 @@ impl Stages {
             bytes_compared: COMPARED.load(Ordering::Relaxed),
             checkpoints: CHECKPOINTS.load(Ordering::Relaxed),
         }
-
     }
 }
 

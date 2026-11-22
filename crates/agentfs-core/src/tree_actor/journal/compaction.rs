@@ -437,11 +437,7 @@ impl ChannelGate {
     /// The gate, the receiver of each gap it reaches, and the sender of
     /// verdicts.
     #[must_use]
-    pub fn pair() -> (
-        Arc<Self>,
-        mpsc::Receiver<Gap>,
-        mpsc::Sender<io::Result<()>>,
-    ) {
+    pub fn pair() -> (Arc<Self>, mpsc::Receiver<Gap>, mpsc::Sender<io::Result<()>>) {
         let (reached, gaps) = mpsc::channel();
         let (verdict, verdicts) = mpsc::channel();
         (

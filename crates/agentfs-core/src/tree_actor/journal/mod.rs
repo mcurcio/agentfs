@@ -987,7 +987,10 @@ impl Journal {
             .chain(before.into_values())
             .chain(after)
             .collect();
-        let current = segments.last().map(Arc::clone).ok_or(Error::CorruptJournal(0))?;
+        let current = segments
+            .last()
+            .map(Arc::clone)
+            .ok_or(Error::CorruptJournal(0))?;
         let durability = Durability::new(segments, File::open(dir)?, covered, mark);
         for carry in carries {
             durability.add_carry(carry, 0);
@@ -1092,7 +1095,6 @@ impl Journal {
     /// The journal's directory.
     #[cfg(test)]
     pub fn dir(&self) -> &Path {
-
         &self.dir
     }
 
