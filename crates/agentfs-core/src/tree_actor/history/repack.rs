@@ -844,7 +844,6 @@ fn kill_group(child: &Child) {
 #[cfg(test)]
 pub(in crate::tree_actor) mod tests {
     use std::collections::BTreeSet;
-    use std::os::unix::fs::PermissionsExt;
     use std::sync::mpsc;
     use std::time::Duration;
 
@@ -876,10 +875,24 @@ pub(in crate::tree_actor) mod tests {
 esac
 exec git "$@""#;
 
+    /// An executable script at `path`, written by a child process and
+    /// renamed into place. Never through a descriptor of this process: a
+    /// child any other test's thread forks shares every descriptor open
+    /// here until its exec, and a file some process holds open for writing
+    /// cannot be run (`ETXTBSY`), so a wrapper written here could fail to
+    /// spawn for as long as such a child had not yet reached its exec.
     fn script(path: &Path, body: &str) {
         let tmp = path.with_extension("tmp");
-        std::fs::write(&tmp, format!("#!/bin/sh\n{body}\n")).unwrap();
-        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut writer = std::process::Command::new("sh")
+            .args(["-c", r#"cat > "$1" && chmod 755 "$1""#, "sh"])
+            .arg(&tmp)
+            .stdin(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut stdin = writer.stdin.take().unwrap();
+        write!(stdin, "#!/bin/sh\n{body}\n").unwrap();
+        drop(stdin);
+        assert!(writer.wait().unwrap().success());
         std::fs::rename(&tmp, path).unwrap();
     }
 
