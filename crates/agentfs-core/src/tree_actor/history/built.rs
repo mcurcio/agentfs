@@ -138,6 +138,10 @@ pub(in crate::tree_actor) struct Inner {
     /// builds through ([`History::batch_read`]).
     #[cfg(test)]
     batch_read: Mutex<Option<BatchRead>>,
+    /// Tests: runs once a step's record is appended and applied
+    /// ([`History::step_recorded`]).
+    #[cfg(test)]
+    step_recorded: Mutex<Option<Box<dyn FnMut(RecordNo) + Send>>>,
 }
 
 /// Tests: a hook given `None` at each batch's start and the record it
@@ -349,6 +353,8 @@ impl History {
                 drops: DeferredDrops::start()?,
                 #[cfg(test)]
                 batch_read: Mutex::new(None),
+                #[cfg(test)]
+                step_recorded: Mutex::new(None),
             }),
         })
     }
@@ -478,6 +484,41 @@ impl History {
             hook(through);
             self.inner
                 .batch_read
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .get_or_insert(hook);
+        }
+    }
+
+    /// Tests: `hook` runs under the actor's lock once a step's record is
+    /// appended and applied, before the switch record that may follow it and
+    /// before the builder is told of the step.
+    #[cfg(test)]
+    pub(in crate::tree_actor) fn on_step_recorded(
+        &self,
+        hook: impl FnMut(RecordNo) + Send + 'static,
+    ) {
+        *self
+            .inner
+            .step_recorded
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(Box::new(hook));
+    }
+
+    /// Tests: step `step`'s record is appended and applied
+    /// ([`History::on_step_recorded`]).
+    #[cfg(test)]
+    pub(in crate::tree_actor) fn step_recorded(&self, step: RecordNo) {
+        let hook = self
+            .inner
+            .step_recorded
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        if let Some(mut hook) = hook {
+            hook(step);
+            self.inner
+                .step_recorded
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
                 .get_or_insert(hook);

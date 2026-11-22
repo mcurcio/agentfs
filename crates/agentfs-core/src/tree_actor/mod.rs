@@ -1700,6 +1700,8 @@ impl TreeActor {
         // Each chain was checked before the record: this cannot fail.
         self.rows.apply(&rows)?;
         apply_sources(&mut self.sources, sources);
+        #[cfg(test)]
+        self.history.step_recorded(RecordNo::new(seq));
         // The actor acts on the built point here: the switch record comes
         // right behind the step's, never between a step's records.
         let switched = self.switch_built();
@@ -1863,6 +1865,8 @@ pub(crate) mod test_support {
 
     use std::sync::Arc;
 
+    use super::journal::Target;
+    use super::pointers::Pointers;
     use super::{Attrs, ChannelGate, Checkpointed, Perm, RecordNo, TreeActor, TreeId, Upkeep};
     use super::{JournalCompaction, history::compactor::compact_once};
 
@@ -1903,6 +1907,26 @@ pub(crate) mod test_support {
         let journal =
             JournalCompaction::new(v.journal.dir().to_owned(), Arc::clone(v.durability()), None);
         compact_once(v.history(), &journal).expect("compacts");
+    }
+
+    /// The pointers a fold of the journal gives are exactly the actor's:
+    /// every change of the actor's pointers is a record's, a step's or a
+    /// switch's.
+    pub(in crate::tree_actor) fn same_pointers(folded: &Pointers<Target>, v: &TreeActor) {
+        let all = |p: &Pointers<Target>| -> Vec<(String, Target)> {
+            p.iter().map(|(n, t)| (n.clone(), t.clone())).collect()
+        };
+        assert_eq!(all(folded), all(&v.pointers));
+        let at_steps: Vec<(String, Target)> = v
+            .at_steps
+            .iter()
+            .map(|(name, step)| (name.clone(), Target::Step(*step)))
+            .collect();
+        let steps: Vec<(String, Target)> = all(&v.pointers)
+            .into_iter()
+            .filter(|(_, target)| matches!(target, Target::Step(_)))
+            .collect();
+        assert_eq!(at_steps, steps, "the pointers at a step");
     }
 
     /// A new volume `test` served with `upkeep`.
@@ -1965,26 +1989,10 @@ mod tests {
     use super::journal::Frame;
     use super::journal::compaction::{checkpoint_in, rewrite_checkpoint};
     use super::test_support::{
-        ATTRS, compact_now, never_due, new_actor, new_actor_with, reopen, rowless_fork, writer,
+        ATTRS, compact_now, never_due, new_actor, new_actor_with, reopen, rowless_fork,
+        same_pointers, writer,
     };
     use super::*;
-
-    /// The pointers a fold of the journal gives and the actor's: the same
-    /// names, and the same values but where the actor switched a step to
-    /// the oid it was built as ([`TreeActor::switch_built`]).
-    fn same_pointers(folded: &Pointers<Target>, v: &TreeActor) {
-        let names =
-            |p: &Pointers<Target>| -> Vec<String> { p.iter().map(|(n, _)| n.clone()).collect() };
-        assert_eq!(names(folded), names(&v.pointers));
-        for (name, value) in folded.iter() {
-            let actor = v.pointers.get(name);
-            assert!(
-                actor.as_ref() == Some(value)
-                    || matches!((value, &actor), (Target::Step(_), Some(Target::Oid(_)))),
-                "{name}: {value:?} folded, {actor:?} served"
-            );
-        }
-    }
 
     const ROOT: TreeId = TreeId::Root;
 
