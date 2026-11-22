@@ -52,6 +52,33 @@ tree_git_wait_root_attached() {
   echo 'the mount did not attach its root client' >&2; return 1
 }
 
+# tree_at_rest METRICS: waits until the mount writing METRICS (its
+# `--metrics-output`) is at rest: a metrics file written after this call began
+# shows history built through every record and no pointer left at a step. Each
+# built event that leaves a pointer at a built step makes the mount append one
+# switch record, which costs one journal fsync and one builder batch; at rest,
+# no built event is left to append anything, so a failpoint counted from here
+# meets only the client's calls.
+tree_at_rest() {
+  python3 - "$1" <<'PY'
+import json, sys, time
+def read():
+    try:
+        with open(sys.argv[1]) as f: return json.load(f)
+    except (OSError, ValueError): return {}
+# A file numbered two past the one seen now was written after this began.
+floor = read().get('seq', 0) + 2
+limit = time.monotonic() + 60
+while time.monotonic() < limit:
+    m = read()
+    h = m.get('history', {})
+    if m.get('seq', 0) >= floor and h['built_through'] >= h['appended'] and h['pointers_at_steps'] == 0:
+        sys.exit(0)
+    time.sleep(.05)
+sys.exit(f'the mount did not come to rest: {read().get("history")}')
+PY
+}
+
 # tree_wait_exit PID [SECONDS]: waits for PID, a child of this shell, to exit
 # and returns its status. A process that never exits (a drain that never
 # releases) is a failure, not a hang: past the bound (default 120 s) it is

@@ -57,33 +57,8 @@ drain_queue() {
   done
   echo 'queue did not drain' >&2; return 1
 }
-# Waits until the mount is at rest: a metrics file written after this call
-# began shows history built through every record and no pointer left at a
-# step. Each built event that leaves a pointer at a built step makes the mount
-# append one switch record, which costs one journal fsync and one builder
-# batch; at rest, no built event is left to append anything, so a failpoint
-# counted from here meets only the client's calls.
-at_rest() {
-  python3 - "$work/metrics.json" <<'PY'
-import json, sys, time
-def read():
-    try:
-        with open(sys.argv[1]) as f: return json.load(f)
-    except (OSError, ValueError): return {}
-# A file numbered two past the one seen now was written after this began.
-floor = read().get('seq', 0) + 2
-limit = time.monotonic() + 60
-while time.monotonic() < limit:
-    m = read()
-    h = m.get('history', {})
-    if m.get('seq', 0) >= floor and h['built_through'] >= h['appended'] and h['pointers_at_steps'] == 0:
-        sys.exit(0)
-    time.sleep(.05)
-sys.exit(f'the mount did not come to rest: {read().get("history")}')
-PY
-}
 # A mount of the root alone, killed once its client's attach is built and the
-# mount is at rest: the volume stays staged (a stage then writes nothing), the
+# mount is at rest (`tree_at_rest`): the volume stays staged (a stage then writes nothing), the
 # client attached (a mount then rebinds it) and every pointer switched (a mount
 # then appends no switch record before its own first step is built). Returns
 # once the killed process's lease is free.
@@ -92,7 +67,7 @@ leave_root_attached() {
   before=$(tree_git_root_clients "$work/state/history.git")
   start '' root
   tree_git_wait_root_attached "$work/state/history.git" "$before"
-  at_rest
+  tree_at_rest "$work/metrics.json"
   kill -KILL "$pid"; tree_wait_exit "$pid" 2>/dev/null || true; pid=
   fusermount3 -uz "$work/main"
   flock "$work/state/actor.lock" true
@@ -127,7 +102,7 @@ PY
   leave_root_attached
   # So the mount records one step of its own first, the root client's rebind,
   # and once that step is built, the switch record for the pointers it set.
-  # Before its client's first call the mount is at rest (`at_rest`) with:
+  # Before its client's first call the mount is at rest (`tree_at_rest`) with:
   #   appends   2  the rebind's record, the switch record
   #   fsyncs    3  the rebind's own, and the builder's before each of its
   #                two batches
@@ -150,7 +125,7 @@ PY
   # The rebind's batch and the switch record's are built before the client's
   # first record: else a counted hit would come at another record, or never.
   tree_git_wait_root_attached "$work/state/history.git" "$before"
-  at_rest
+  tree_at_rest "$work/metrics.json"
   : > "$work/receipt"
   python3 - "$work/main/candidate" "$work/receipt" <<'PY' >"$work/client.log" 2>&1 & client=$!
 import os, sys
