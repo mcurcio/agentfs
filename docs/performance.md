@@ -703,17 +703,25 @@ The same pair of runs, for what a save costs:
   A write to another file of the same tree would wait at the gate too; the
   probe does not measure that.
 
-Two figures of the image run got worse with the change and warn there
-(the tree views tracer job on ext4, one run before and one after):
+One figure of the image run warns after the change, and one warned until
+the compaction rule was corrected (the tree views tracer job, one run
+each):
 
-- **`restart`'s peak memory is 704 MiB** against its bar of 256 MiB, with
-  the view mounted in 11.3 s; before, 225 MiB and 8.7 s. `restart` mounts
-  on the state the figures left. Read from the code and not measured: that
-  journal is longer than it was. A compaction that runs while a large file
-  is being written counts the bytes the file appends after the
-  compaction's built point as kept, so the save that ends them is not due,
-  and they stay linked until the journal doubles or the volume is mounted
-  again. The mount then reads them.
+- **`restart`'s peak memory is back under its bar: 193 to 224 MiB** on
+  ext4 and XFS, against 256 MiB (225 MiB before the change). It read 704
+  to 740 MiB for the commits in between, while a compaction that ran
+  during a large write left that file's bytes linked after its save, so
+  the journal the figure restarts on was 1.45 GB long, not 62 MB.
+- **A restart's memory still grows with the journal it reads, not with
+  what is live in it.** Mounting reads every linked record after the
+  checkpoint into memory before folding it, about 320 bytes a record,
+  built or not. Measured locally on ext4, one run each: a 1.45 GB journal
+  whose records were all built peaks at 726 to 745 MiB before the mount
+  answers and takes about 5 s longer to mount than the 62 MB one; an
+  empty tree with one open of 200,000 small appends, all built and under
+  the 64 MiB at which a compaction is first due, peaks at 111 MiB where
+  the same state compacted peaks at 2.4 MiB. This was so before the change
+  as well. The compactor's fold reads the same way.
 - **`long_history`'s ratio is 1.30** against 1.2 (0.81 before), and its
   own figure is better: 0.129 ms a create against 0.327. The bar divides
   by `create`'s first 2,000 creates, which fell from 0.406 to 0.099 ms once

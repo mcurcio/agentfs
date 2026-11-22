@@ -2399,3 +2399,13 @@ One fix agent, the review's findings. Local runs as root with FUSE, debug builds
 - A published checkpoint whose unlink fails (`NotDropped`) still takes the journal's whole length as the baseline, with no opens pinned: the retry waits for the journal to double.
 - While a file is written faster than history is built, the bytes appended after B can outweigh what the last compaction kept, and each built event then compacts and frees nothing of that file. Not measured. The earlier entry's question (how often a fruitless fold may run while B moves) has this answer and no bound.
 - `git-model.md`'s "twice their length after the last compaction" is still as written.
+
+## 2026-11-22, PR #41 at 688c1fc: the `restart` memory regression was measured on an older commit; the class behind it is open, on main too
+
+**What was reported wrong.** The 704 MiB `restart` peak (image run 45007487663) was at f938485. Since 225a878 corrected the compactor's baseline, CI reads 193 to 224 MiB (bar 256 MiB; main 225 MiB). `docs/performance.md` said 704 MiB at the tip; corrected.
+
+**The class (measured locally, ext4, one run each).** `Journal::open_with` pushes every linked record after the checkpoint into a `Vec<Frame>` (320 bytes each) before folding, built or not, and holds it through `start_history`; the compactor's `fold_through` builds the same vector. On a 1.45 GB journal whose records were all built: 1,202,294 frames, 367 MiB held, 726 to 745 MiB peak, and about 5 s more to mount. Main does the same on the same journal (735 MiB). At the tip, an empty tree with one open of 200,000 64-byte appends, all built, journal 45.6 MB (no compaction due under 64 MiB): 110.7 MiB against 2.4 MiB compacted. So the due rule bounds linked bytes, not restart memory.
+
+**The bound to state and enforce:** restart memory is the tree state, plus the calls of opens live at the built point, plus records after it. Not the linked journal's length.
+
+**Fix to build (not built; its own piece of work):** fold while reading. `open_with` feeds each record at or below the built log's point into an incremental fold and returns only the frames after it; `fold_through` likewise. Red test: after N built small records and no compaction, `open_with` returns 1 + live + after-built frames (today 200,013). Add the 200,000-append restart to `ci/trees-figures.py` (expected under 10 MiB), and have the tracer report `journal_bytes` at stop so `restart` can be explained. Unchecked: what `serve` uses its second whole-journal fold for.
