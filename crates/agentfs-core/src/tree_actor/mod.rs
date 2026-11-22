@@ -1022,7 +1022,7 @@ impl TreeActor {
         // volume (`Error::Rules`, carried by Volume as `RulesRefused`).
         let rules = Arc::new(read_rules(&root)?);
         let (built_log, entries) = BuiltLog::open(&root.join(BUILT_LOG))?;
-        let (journal, frames, opened) = Journal::open(
+        let (journal, frames, opened) = Journal::open_with(
             &root.join(JOURNAL),
             built_log::built_through(&entries),
             upkeep.segment_bytes,
@@ -1911,8 +1911,27 @@ pub(crate) mod test_support {
 #[cfg(test)]
 mod tests {
     use super::journal::Frame;
-    use super::test_support::{ATTRS, new_actor, reopen, rowless_fork, writer};
+    use super::journal::compaction::{checkpoint_in, rewrite_checkpoint};
+    use super::test_support::{
+        ATTRS, compact_now, never_due, new_actor, new_actor_with, reopen, rowless_fork, writer,
+    };
     use super::*;
+
+    /// The pointers a fold of the journal gives and the actor's: the same
+    /// names, and the same values but where the actor switched a step to
+    /// the oid it was built as ([`TreeActor::switch_built`]).
+    fn same_pointers(folded: &Pointers<Target>, v: &TreeActor) {
+        let names = |p: &Pointers<Target>| -> Vec<String> { p.iter().map(|(n, _)| n.clone()).collect() };
+        assert_eq!(names(folded), names(&v.pointers));
+        for (name, value) in folded.iter() {
+            let actor = v.pointers.get(name);
+            assert!(
+                actor.as_ref() == Some(value)
+                    || matches!((value, &actor), (Target::Step(_), Some(Target::Oid(_)))),
+                "{name}: {value:?} folded, {actor:?} served"
+            );
+        }
+    }
 
     const ROOT: TreeId = TreeId::Root;
 
@@ -1969,7 +1988,7 @@ mod tests {
     #[test]
     fn compaction_keeps_the_fold() {
         let tmp = tempfile::tempdir().unwrap();
-        let mut v = new_actor(tmp.path());
+        let mut v = new_actor_with(tmp.path(), never_due());
         let w = writer("w");
         // Both kinds of live open with calls and page writes, closed opens with
         // both, a fork and a queue entry.
@@ -2010,16 +2029,15 @@ mod tests {
         assert!(folded.saved_through.contains_key(&(ROOT, object)));
         assert!(!folded.page_writes.contains_key(&(ROOT, closed_object)));
         assert_eq!(folded.next_seq, v.next);
-        assert_eq!(folded.pointers, v.pointers);
+        same_pointers(&folded.pointers, &v);
 
-        v.settle().unwrap();
-        v.compact().unwrap();
+        compact_now(&v);
         let compacted = frames_of(tmp.path());
         assert!(compacted.len() < whole.len());
         same_fold(&fold(&compacted).unwrap(), &folded);
 
-        // What follows lands on the checkpoint: its records name the values
-        // the checkpoint covers as oids, so they fold only on top of it.
+        // What follows lands on the checkpoint and folds there: a record
+        // that names a step the checkpoint covers finds its head (C4).
         v.write(held, 0, b"held-2", false).unwrap();
         v.write(shared, 0, b"!", true).unwrap();
         let again = v.write_open(ROOT, "again", &w, Some(ATTRS)).unwrap();
@@ -2029,14 +2047,10 @@ mod tests {
         while v.progress().unwrap() {}
         let now = frames_of(tmp.path());
         whole.extend_from_slice(&now[compacted.len()..]);
-        assert!(
-            matches!(fold(&whole), Err(Error::PointerMoved { .. })),
-            "a record after the checkpoint never folds on the journal before it"
-        );
         let folded = fold(&now).unwrap();
         assert!(!folded.opens[&anonymous].open.anonymous);
         assert_eq!(folded.opens[&held].calls.len(), 2);
-        assert_eq!(folded.pointers, v.pointers);
+        same_pointers(&folded.pointers, &v);
         assert_eq!(folded.next_seq, v.next);
     }
 
@@ -2046,7 +2060,7 @@ mod tests {
     #[test]
     fn a_compaction_keeps_a_closed_opens_page_write_out_of_recovery() {
         let tmp = tempfile::tempdir().unwrap();
-        let mut v = new_actor(tmp.path());
+        let mut v = new_actor_with(tmp.path(), never_due());
         let w = writer("w");
         let first = v.write_open(ROOT, "f", &w, Some(ATTRS)).unwrap();
         v.page_writeback(first, 0, b"XXXX").unwrap();
@@ -2056,8 +2070,7 @@ mod tests {
         v.close(second).unwrap();
         // Held open across the compaction, as a long-lived log is.
         let _held = v.write_open(ROOT, "f", &w, None).unwrap();
-        v.settle().unwrap();
-        v.compact().unwrap();
+        compact_now(&v);
         drop(v);
         let v = reopen(tmp.path());
         assert_eq!(v.read(ROOT, "f").unwrap(), b"YYYY");
@@ -2070,29 +2083,19 @@ mod tests {
     /// `edit` applied to that checkpoint's pointers and upstreams.
     fn reopen_with(edit: CheckpointEdit) -> Result<TreeActor> {
         let tmp = tempfile::tempdir().unwrap();
-        let mut v = new_actor(tmp.path());
+        let mut v = new_actor_with(tmp.path(), never_due());
         rowless_fork(&mut v);
-        v.settle().unwrap();
-        v.compact().unwrap();
+        compact_now(&v);
         drop(v);
-        let mut frames = frames_of(tmp.path());
         assert_eq!(
-            frames.len(),
+            frames_of(tmp.path()).len(),
             1,
             "a compacted volume with no open is its checkpoint"
         );
-        let (mut first, _) = frames.remove(0);
-        let Entry::Checkpoint {
-            pointers,
-            upstreams,
-            ..
-        } = &mut first.entry
-        else {
-            panic!("the first frame is a checkpoint");
-        };
-        edit(pointers, upstreams);
-        fs::remove_dir_all(tmp.path().join(JOURNAL)).unwrap();
-        Journal::create(&tmp.path().join(JOURNAL), &first).unwrap();
+        let dir = tmp.path().join(JOURNAL);
+        let mut checkpoint = checkpoint_in(&dir);
+        edit(&mut checkpoint.pointers, &mut checkpoint.upstreams);
+        rewrite_checkpoint(&dir, &checkpoint);
         TreeActor::open(tmp.path(), &PodContext::default())
     }
 
@@ -2145,6 +2148,7 @@ mod tests {
             "agentfs-trees-10\n",
             "agentfs-trees-11\n",
             "agentfs-trees-12\n",
+            "agentfs-trees-13\n",
         ] {
             let tmp = tempfile::tempdir().unwrap();
             drop(new_actor(tmp.path()));
@@ -2239,12 +2243,6 @@ mod tests {
         assert_eq!(v.row(Chain::Volume).as_deref(), Some("v"));
     }
 
-    #[test]
-    fn a_compaction_threshold_is_constants() {
-        assert_eq!(compact_at(0), 64 << 20);
-        assert_eq!(compact_at(1 << 20), 64 << 20);
-        assert_eq!(compact_at(100 << 20), 200 << 20);
-    }
 
     /// Files the restart test's volume holds at its checkpoint, and after it.
     const RESTART_FILES: (usize, usize) = (500, 100);
@@ -2257,7 +2255,12 @@ mod tests {
         let Some(root) = std::env::var_os(RESTART_WORKER) else {
             return;
         };
-        let mut v = new_actor(Path::new(&root));
+        // Never due on its own: one compaction, run here.
+        let upkeep = Upkeep {
+            compact_from: u64::MAX,
+            ..Upkeep::default()
+        };
+        let mut v = new_actor_with(Path::new(&root), upkeep);
         let put = |v: &mut TreeActor, n: usize| {
             let h = v
                 .write_open(TreeId::Root, &format!("f{n}"), &writer("w"), Some(ATTRS))
@@ -2268,8 +2271,7 @@ mod tests {
         for n in 0..RESTART_FILES.0 {
             put(&mut v, n);
         }
-        v.settle().unwrap();
-        v.compact().unwrap();
+        compact_now(&v);
         for n in RESTART_FILES.0..RESTART_FILES.0 + RESTART_FILES.1 {
             put(&mut v, n);
         }
@@ -2364,10 +2366,9 @@ mod tests {
     )]
     fn a_restart_after_a_kill_reads_each_tree_once() {
         let tmp = tempfile::tempdir().unwrap();
-        let mut v = new_actor(tmp.path());
+        let mut v = new_actor_with(tmp.path(), never_due());
         let first = one_of_each(&mut v, "one");
-        v.settle().unwrap();
-        v.compact().unwrap();
+        compact_now(&v);
         let second = one_of_each(&mut v, "two");
         put(&mut v, second, "kept-in-fork");
         v.set_times(ROOT, "one-b", Some(SetTime::At(13_000)), None, &writer("w"))
@@ -2381,9 +2382,7 @@ mod tests {
         assert!(!before.keys().any(|(tree, _)| *tree == first));
         // No compaction at the stop: the built point is past the checkpoint.
         drop(v);
-        let Entry::Checkpoint { built, .. } = frames_of(tmp.path())[0].0.entry else {
-            panic!("the journal starts at the checkpoint");
-        };
+        let built = checkpoint_in(&tmp.path().join(JOURNAL)).built;
         let (_, entries) = BuiltLog::open(&tmp.path().join("built.log")).unwrap();
         assert!(built_log::built_through(&entries) > built);
         history::TREE_READS.with(|n| n.set(0));
@@ -2450,6 +2449,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let mut v = new_actor(tmp.path());
         let w = writer("w");
+        let generation = v.history().checkpointed().generation;
         let log = v.write_open(ROOT, "log", &w, Some(ATTRS)).unwrap();
         let big = v.write_open(ROOT, "big", &w, Some(ATTRS)).unwrap();
         v.settle().unwrap();
@@ -2475,17 +2475,16 @@ mod tests {
         release.send(()).unwrap();
         drop((release, inside));
         v.history().wait_built(step).unwrap();
-        let before = v.journal.len();
-        assert!(before > 64 << 20);
-        // Every step is built: the next write compacts, though history is not
-        // built through it.
-        v.write(log, 0, b"line\n", true).unwrap();
+        // The built event of the close's batch compacts, on history's
+        // thread: the log's writes after it hold nothing back.
+        v.history().wait_checkpointed(generation).unwrap();
         assert!(v.metrics().journal_dropped >= 1);
         assert!(
-            v.journal.len() < before - (32 << 20),
+            v.durability().len() < (66 << 20) - (32 << 20),
             "{} bytes",
-            v.journal.len()
+            v.durability().len()
         );
+
         v.close(log).unwrap();
         drop(v);
         let v = reopen(tmp.path());
