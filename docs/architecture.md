@@ -300,6 +300,7 @@ missing from these tables or a row names a module that no longer exists;
 | Module | Role |
 |---|---|
 | `lib.rs` | Crate root, one call per kind of replay, each recording what the system did into a sink; which traces fit a real mount |
+| `compact_turns.rs` | Compaction under a replay: the volume compacts at every built event, and its compactor is parked at each gap of a compaction in turn while one whole replayed call runs. The library replay's compaction gate, and the thread that answers a mount's FIFO gate |
 | `engine_names.rs` | `EngineNames`: the engine's `TreeId` of each tree of a trace, the root as `root`, fork n as the n-th fork made |
 | `git_history.rs` | Its own reader of the engine's commits (`git cat-file`, `git hash-object` for the hashed folders, `lines/` and `names/`), and `EngineHistory`: the collisions and heads a replay compares, read from git |
 | `library.rs` | `Library`: the shared calls on `Volume`, seeded as the model's first commit |

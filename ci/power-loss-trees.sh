@@ -27,7 +27,7 @@ notrun() { printf 'NOTRUN\t%s\tsetup\t%s\n' "$fs" "$*" | tee -a "$results" >&2; 
 [ -c /dev/fuse ] || notrun 'missing /dev/fuse'
 # The compaction marks park the mount's compactor through AGENTFS_COMPACT_GATE,
 # which only a failpoints build reads.
-"$AGENTFS_BIN" --version | grep -q failpoints || notrun 'agentfs is not a failpoints build'
+"$AGENTFS_BIN" --version | grep failpoints >/dev/null || notrun 'agentfs is not a failpoints build'
 for cmd in dmsetup losetup blockdev mount umount fusermount3 git python3 modprobe "mkfs.$fs"; do command -v "$cmd" >/dev/null || notrun "missing $cmd"; done
 for mod in dm_log_writes dm_snapshot; do modprobe "$mod" || notrun "missing kernel module $mod"; done
 suffix=$$
