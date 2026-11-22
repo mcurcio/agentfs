@@ -57,6 +57,17 @@ pub(in crate::tree_actor) struct FoldedOpen {
     pub(in crate::tree_actor) calls: Vec<(u64, Call, FramePos)>,
 }
 
+impl FoldedOpen {
+    /// The bytes the open's call frames hold in the journal: each call's
+    /// header and tail. A frame's head (a few dozen bytes) is not counted.
+    pub(in crate::tree_actor) fn frame_bytes(&self) -> u64 {
+        self.calls
+            .iter()
+            .map(|(_, call, _)| (super::HEADER as u64).saturating_add(call.carried()))
+            .sum()
+    }
+}
+
 /// What a journal's frames add up to (git-model §12).
 #[derive(Debug, PartialEq, Eq)]
 pub(in crate::tree_actor) struct Folded {

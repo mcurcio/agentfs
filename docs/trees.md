@@ -703,8 +703,12 @@ appends it and applies it to the saved state the views serve; it runs no git.
   nothing outside a first init's own marker.
 - **Compaction runs on history's own thread, the compactor, and no call waits
   for it.** At a built event, once the linked files (segments and carry files)
-  pass `max(64 MiB, twice their length after the last compaction)`, it compacts
-  at the built point B, in this order:
+  pass `max(64 MiB, twice their baseline)`, it compacts at the built point B.
+  The baseline is their length after the last compaction, less the call
+  frames that compaction kept for opens whose saves are built since: those
+  bytes are dead, so a compaction that ran while a large file was open and
+  freed nothing does not hold the next one off until the journal doubles. In
+  this order:
   1. It waits until every record at or below B is durable.
   2. It folds the records from the last checkpoint through B, as recovery does,
      and writes a checkpoint at B to `checkpoint.tmp`: the built pointers,
@@ -722,8 +726,12 @@ appends it and applies it to the saved state the views serve; it runs no git.
   actor has rolled past it, and every record in it is at or below B. The newest
   segment is never covered, so a quiet volume keeps up to one segment of
   records the checkpoint covers until its journal rolls. A held file pins only
-  its own frames, so the linked files stay under about twice the live opens'
-  bytes plus a segment. A frame is named by its record and an offset into it,
+  its own frames, so at the built event of a save, once the linked files are
+  at least 64 MiB, they are back under about twice the live opens' bytes plus
+  a segment. Two things sit outside that count: a frame's head (a few dozen
+  bytes a call, which matters only for many tiny writes), and a held page
+  write, which is kept by file while any write-open of the file lives and
+  leaves the baseline only at the next compaction. A frame is named by its record and an offset into it,
   wherever it is carried, so a save's digest does not change when it moves.
   The journal records where each carried frame went. The actor moves its live
   opens, held page writes and saved maps there at its next built event, a walk

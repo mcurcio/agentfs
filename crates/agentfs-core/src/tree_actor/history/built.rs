@@ -183,6 +183,9 @@ struct State {
     oldest_unbuilt: Option<Instant>,
     /// Steps appended past the built point, with when each was appended.
     unbuilt: std::collections::VecDeque<(RecordNo, Instant)>,
+    /// Saves appended and not yet given to the compactor: each step with
+    /// the open it ends ([`History::take_ended`]).
+    ended: std::collections::VecDeque<(RecordNo, u64)>,
     /// The volume is shutting down: build what is wanted, then stop.
     stopping: bool,
     /// The builder has exited.
@@ -349,6 +352,7 @@ impl History {
                     ends: Ends::default(),
                     oldest_unbuilt: None,
                     unbuilt: std::collections::VecDeque::new(),
+                    ended: std::collections::VecDeque::new(),
                     stopping: false,
                     stopped: false,
                     #[cfg(test)]
@@ -489,6 +493,41 @@ impl History {
         }
     }
 
+    /// Returns once the compactor is done with a built event at or past
+    /// `through` ([`History::compactor_through`]): whatever compaction a
+    /// build through it made due has ended. A checkpoint published before
+    /// that event does not end the wait.
+    ///
+    /// # Errors
+    ///
+    /// [`WaitError::Stopped`] at shutdown, or once a compaction stopped the
+    /// actor.
+    pub fn wait_compactor(&self, through: RecordNo) -> Result<(), WaitError> {
+        let mut state = self.state();
+        loop {
+            if state.compactor_through >= through {
+                return Ok(());
+            }
+            if state.compaction_stopped || state.stopped || state.stopping {
+                return Err(WaitError::Stopped);
+            }
+            state = self.wait(state);
+        }
+    }
+
+    /// The write-opens whose saves are at or below `through`, each given
+    /// once: with `through` a built point, the opens whose frames no later
+    /// fold keeps. The compactor thread's alone.
+    pub(in crate::tree_actor) fn take_ended(&self, through: RecordNo) -> Vec<u64> {
+        let mut state = self.state();
+        let mut ended = Vec::new();
+        while let Some((_, handle)) = state.ended.front().filter(|(step, _)| *step <= through) {
+            ended.push(*handle);
+            state.ended.pop_front();
+        }
+        ended
+    }
+
     /// How many times the builder was asked: a test's sign that a waiter
     /// has asked and waits.
     #[cfg(all(test, feature = "failpoints"))]
@@ -498,11 +537,21 @@ impl History {
 
     /// The actor appended step `step`, with `cost` its tree and about the
     /// bytes it adds for the builder to write: the builder's event, and the
-    /// gate's count. `None` (rows alone) adds to no tree's lag.
-    pub(in crate::tree_actor) fn appended_step(&self, step: RecordNo, cost: Option<(TreeId, u64)>) {
+    /// gate's count. `None` (rows alone) adds to no tree's lag. `ends` is
+    /// the write-open the step ends (`Change::saved_open`), kept for the
+    /// compactor until the step is built.
+    pub(in crate::tree_actor) fn appended_step(
+        &self,
+        step: RecordNo,
+        cost: Option<(TreeId, u64)>,
+        ends: Option<u64>,
+    ) {
         let mut state = self.state();
         if let Some((tree, bytes)) = cost {
             state.gate.appended(tree, step, bytes);
+        }
+        if let Some(handle) = ends {
+            state.ended.push_back((step, handle));
         }
         let now = Instant::now();
         state.oldest_unbuilt.get_or_insert(now);

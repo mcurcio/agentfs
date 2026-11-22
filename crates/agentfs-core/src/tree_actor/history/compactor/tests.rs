@@ -16,16 +16,14 @@ use std::time::Duration;
 use agentfs_contracts::pod::PodContext;
 use git2::Oid;
 
-use super::{COMPACT_FROM, compact_at, compact_once};
+use super::{Baseline, COMPACT_FROM, Compacted, compact_at, compact_once};
 use crate::tree_actor::history::built_log::{self, BuiltLog};
 use crate::tree_actor::history::refs;
 use crate::tree_actor::journal::compaction::{
     ChannelGate, CompactionError, Gap, JournalCompaction, checkpoint_in,
 };
 use crate::tree_actor::journal::durable::RecordNo;
-use crate::tree_actor::journal::{
-    Change, DropStats, Entry, Frame, Journal, Switched, Target, fold, segment,
-};
+use crate::tree_actor::journal::{Change, Entry, Frame, Journal, Switched, Target, fold, segment};
 use crate::tree_actor::meta::{SetTime, Times};
 use crate::tree_actor::rows::{Chain, RowEvent, RowWrite};
 use crate::tree_actor::test_support::{
@@ -258,7 +256,7 @@ impl Held {
 fn compaction(
     v: &TreeActor,
     gate: Arc<ChannelGate>,
-) -> std::thread::JoinHandle<Result<Option<DropStats>, CompactionError>> {
+) -> std::thread::JoinHandle<Result<Option<Compacted>, CompactionError>> {
     let journal = JournalCompaction::new(
         v.journal.dir().to_owned(),
         Arc::clone(v.durability()),
@@ -275,6 +273,72 @@ fn a_compaction_threshold_is_constants() {
     assert_eq!(compact_at(COMPACT_FROM, 100 << 20), 200 << 20);
     assert_eq!(compact_at(4096, 0), 4096);
     assert_eq!(compact_at(4096, 4096), 8192);
+}
+
+/// The bytes of opens that ended come off the baseline: a journal mostly
+/// one ended open's calls is due at once, and one whose pinned opens all
+/// live waits to double.
+#[test]
+fn a_due_length_drops_the_ended_opens_bytes() {
+    let pinned = BTreeMap::from([(7, 60 << 20), (9, 8 << 20)]);
+    let mut baseline = Baseline::new(74 << 20, pinned);
+    assert_eq!(baseline.due_at(COMPACT_FROM), 148 << 20);
+    baseline.ended(&[3]);
+    assert_eq!(
+        baseline.due_at(COMPACT_FROM),
+        148 << 20,
+        "an open not pinned"
+    );
+    baseline.ended(&[7]);
+    assert_eq!(baseline.due_at(COMPACT_FROM), 64 << 20);
+    baseline.ended(&[7, 9]);
+    assert_eq!(baseline.due_at(4096), 12 << 20, "an open ends once");
+    assert_eq!(Baseline::default().due_at(4096), 4096);
+}
+
+/// A compaction that ran while a large open was live dropped none of its
+/// bytes, and the journal's whole length became the baseline. The open's
+/// save takes its bytes off it, so the built event of that save is due and
+/// the chunk's segment goes: no dead bytes wait for the journal to double.
+#[test]
+fn a_save_after_a_fruitless_compaction_is_due() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut v = new_actor_with(
+        tmp.path(),
+        Upkeep {
+            segment_bytes: 1,
+            compact_from: 4096,
+            gate: None,
+        },
+    );
+    let history = v.history().clone();
+    let big = v
+        .write_open(ROOT, "big", &writer("w"), Some(ATTRS))
+        .unwrap();
+    let created = v.settle().unwrap();
+    history.wait_compactor(created).unwrap();
+    v.write(big, 0, &[b'x'; 64 << 10], true).unwrap();
+    let chunk = v.durability().appended();
+    let generation = history.checkpointed().generation;
+    put(&mut v, ROOT, "other", b"an unrelated step");
+    let settled = v.settle().unwrap();
+    history.wait_compactor(settled).unwrap();
+    assert!(
+        history.checkpointed().generation > generation,
+        "the unrelated step's built event compacted"
+    );
+    assert!(
+        v.journal.segment_firsts().contains(&chunk),
+        "a live open's chunk was dropped"
+    );
+    v.close(big).unwrap();
+    let settled = v.settle().unwrap();
+    history.wait_compactor(settled).unwrap();
+    assert!(
+        !v.journal.segment_firsts().contains(&chunk),
+        "the saved open's chunk is still linked"
+    );
+    assert_eq!(v.read(ROOT, "big").unwrap(), vec![b'x'; 64 << 10]);
 }
 
 /// 2.1: a kill at any gap of a compaction loses nothing returned, and the
@@ -759,7 +823,7 @@ fn a_carried_open_survives_each_gap() {
         parked.until(gap);
         let copy = killed_at_rest(&v, tmp.path());
         parked.end();
-        let stats = compacting.join().unwrap().unwrap().expect("compacts");
+        let (stats, _) = compacting.join().unwrap().unwrap().expect("compacts");
         assert!(stats.carried_bytes > 0, "{gap:?}: nothing was carried");
         assert!(stats.segments > 0, "{gap:?}: no segment was let go");
         once(copy.path());

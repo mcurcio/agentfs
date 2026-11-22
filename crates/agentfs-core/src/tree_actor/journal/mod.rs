@@ -362,6 +362,16 @@ impl Change {
         let tree = tree.parse().map_err(|_| Error::Format)?;
         Ok(Some((tree, bytes.saturating_add(STEP_LISTINGS))))
     }
+
+    /// The write-open this step ends: a save's, whatever its outcome. No
+    /// other record ends an open, so the open's own frames are dead once
+    /// this step is built (the compactor's due rule counts them).
+    pub fn saved_open(&self) -> Option<u64> {
+        match self {
+            Self::Save { handle, .. } => Some(*handle),
+            _ => None,
+        }
+    }
 }
 
 /// A page write's run that a close applies, by reference (the open's own

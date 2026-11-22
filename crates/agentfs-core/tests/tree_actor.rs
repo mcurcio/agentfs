@@ -1295,23 +1295,26 @@ fn open_numbers_never_repeat_across_compaction() {
 
 /// Takes the journal past the compaction threshold through real calls, leaving
 /// `FILLED` in the file so its save stays cheap, and returns once the
-/// compaction its built event starts has ended: history's compactor runs it,
-/// off the call path.
+/// compactor is done with the save's built event: history's compactor runs
+/// the compaction, off the call path. The compactor is done with the
+/// create's built event before the first chunk, so no built event comes
+/// while the chunks are a live open's; a checkpoint of some earlier event
+/// is not what this waits for.
 const FILLED: &[u8] = b"xxxxxx";
 fn fill_journal(v: &mut TreeActor, path: &str) {
-    let generation = v.history().checkpointed().generation;
     let h = v
         .write_open(ROOT, path, &writer("filler"), Some(ATTRS))
         .unwrap();
+    let created = v.settle().unwrap();
+    v.history().wait_compactor(created).unwrap();
     let chunk = vec![b'x'; 33 << 20];
     for _ in 0..2 {
         v.write(h, 0, &chunk, true).unwrap();
     }
     v.truncate(h, FILLED.len() as u64).unwrap();
     v.close(h).unwrap();
-    v.settle().unwrap();
-    let published = v.history().wait_checkpointed(generation).unwrap();
-    v.history().wait_compacted(published.generation).unwrap();
+    let saved = v.settle().unwrap();
+    v.history().wait_compactor(saved).unwrap();
 }
 
 #[test]

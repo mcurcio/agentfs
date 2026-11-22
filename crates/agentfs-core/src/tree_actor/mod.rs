@@ -92,8 +92,9 @@ pub struct Upkeep {
     /// and the frame would take it past this. Default 64 MiB.
     pub segment_bytes: u64,
     /// The floor of compaction's due length: the journal compacts at a
-    /// built event once it is twice its length after the last compaction,
-    /// and at least this long. Default 64 MiB. Unread when `gate` is set.
+    /// built event once it is twice its baseline (its length after the last
+    /// compaction, less the frames of opens saved since), and at least this
+    /// long. Default 64 MiB. Unread when `gate` is set.
     pub compact_from: u64,
     /// Parks the compactor at each gap; with one, the compactor compacts at
     /// every built event. Default none.
@@ -921,7 +922,7 @@ impl TreeActor {
         // and the lag gate's to count, as at their call.
         for (record, _) in &frames[upto..] {
             if let Entry::Step { change, .. } = &record.entry {
-                history.appended_step(record.seq, change.build_cost()?);
+                history.appended_step(record.seq, change.build_cost()?, change.saved_open());
             }
         }
         // A switch record past the last step is no step: the builder is
@@ -1640,6 +1641,7 @@ impl TreeActor {
             return Err(Error::Stopped);
         }
         let cost = change.build_cost()?;
+        let ends = change.saved_open();
         let rows: Vec<RowRecord> = rows.into_iter().map(RowWrite::record).collect();
         // A take's step, and a save's, comes after its chunk records.
         let ahead = match &change {
@@ -1717,7 +1719,7 @@ impl TreeActor {
         // The actor acts on the built point here: the switch record comes
         // right behind the step's, never between a step's records.
         let switched = self.switch_built();
-        self.history.appended_step(RecordNo::new(seq), cost);
+        self.history.appended_step(RecordNo::new(seq), cost, ends);
         // A batch already running may end one record short of the switch
         // record: the want makes the next one follow.
         if let Some(switched) = switched {
@@ -1921,7 +1923,7 @@ pub(crate) mod test_support {
         v.settle().expect("settles");
         let journal =
             JournalCompaction::new(v.journal.dir().to_owned(), Arc::clone(v.durability()), None);
-        compact_once(v.history(), &journal).expect("compacts");
+        let _ = compact_once(v.history(), &journal).expect("compacts");
     }
 
     /// The pointers a fold of the journal gives are exactly the actor's:

@@ -42,10 +42,59 @@ pub(in crate::tree_actor) const COMPACT_FROM: u64 = 64 << 20;
 
 /// When a journal `len_after_last` long after its last compaction compacts
 /// again: at twice that, and at least `from`. The due rule's one home, read
-/// only by the compactor. Restart memory is at most this plus live calls.
+/// only by the compactor through [`Baseline::due_at`]. Restart memory is at
+/// most this plus live calls.
 pub(in crate::tree_actor) fn compact_at(from: u64, len_after_last: u64) -> u64 {
     from.max(len_after_last.saturating_mul(2))
 }
+
+/// What the last compaction left, less what has died since for certain: the
+/// length [`compact_at`] doubles. A compaction keeps a live open's frames,
+/// and may run while a large open is in flight and free nothing; counted
+/// whole, that length would hold the next compaction off until the journal
+/// doubled, with the open's bytes dead in it once its save was built. The
+/// compactor's alone.
+#[derive(Default)]
+pub(in crate::tree_actor) struct Baseline {
+    /// The linked files' length after the last compaction.
+    len: u64,
+    /// Each open live at that compaction, with its call frames' bytes then.
+    pinned: BTreeMap<u64, u64>,
+    /// The bytes of the pinned opens whose saves are built since.
+    released: u64,
+}
+
+impl Baseline {
+    /// After a compaction that left `len` bytes linked, `pinned` of them
+    /// the call frames of each open live at its built point.
+    pub(in crate::tree_actor) fn new(len: u64, pinned: BTreeMap<u64, u64>) -> Self {
+        Self {
+            len,
+            pinned,
+            released: 0,
+        }
+    }
+
+    /// The saves of `opens` are built: the frames each had at the last
+    /// compaction are dead.
+    pub(in crate::tree_actor) fn ended(&mut self, opens: &[u64]) {
+        for open in opens {
+            if let Some(bytes) = self.pinned.remove(open) {
+                self.released = self.released.saturating_add(bytes);
+            }
+        }
+    }
+
+    /// The journal length the next compaction is due at, with floor `from`.
+    pub(in crate::tree_actor) fn due_at(&self, from: u64) -> u64 {
+        compact_at(from, self.len.saturating_sub(self.released))
+    }
+}
+
+/// What one compaction did: what it carried and let go, and each open live
+/// at its built point with its call frames' bytes
+/// (`FoldedOpen::frame_bytes`), which the next [`Baseline`] pins.
+pub(in crate::tree_actor) type Compacted = (DropStats, BTreeMap<u64, u64>);
 
 /// The compactor thread of one volume, owned by the actor beside the builder
 /// and joined by its shutdown before the builder's join and before the state
@@ -57,8 +106,10 @@ pub(in crate::tree_actor) struct Compactor {
 impl Compactor {
     /// Starts the thread: at each built event, with a gate
     /// (`journal.gated()`), compacts; without, compacts once
-    /// `journal.len() >= compact_at(compact_from, len after the last
-    /// compaction)`. Ends once History is stopping. A failure is logged
+    /// `journal.len()` reaches [`Baseline::due_at`]: `compact_at` of
+    /// `compact_from` and the length after the last compaction, less the
+    /// bytes of the opens live then whose saves are built since. Ends once
+    /// History is stopping. A failure is logged
     /// (`tree CompactionFailed`) and retried at the next built event, except
     /// [`CompactionError::Stopped`]: recorded through
     /// `Durability::fsync_failed`, so the actor stops, then
@@ -97,7 +148,7 @@ impl Compactor {
 /// History is told the compactor is done with that event.
 fn run(history: &History, journal: &JournalCompaction, compact_from: u64) {
     let mut seen = history.ends();
-    let mut len_after_last = 0;
+    let mut baseline = Baseline::default();
     while let Some(ends) = history.wait_batch_end(seen.ended) {
         let built = ends.built > seen.built;
         seen = ends;
@@ -105,16 +156,19 @@ fn run(history: &History, journal: &JournalCompaction, compact_from: u64) {
             continue;
         }
         let through = history.built_through();
-        if journal.gated() || journal.len() >= compact_at(compact_from, len_after_last) {
+        baseline.ended(&history.take_ended(through));
+        if journal.gated() || journal.len() >= baseline.due_at(compact_from) {
             match compact_once(history, journal) {
-                Ok(Some(_)) => len_after_last = journal.len(),
+                Ok(Some((_, pinned))) => baseline = Baseline::new(journal.len(), pinned),
                 Ok(None) => {}
                 Err(e @ CompactionError::NotPublished(_)) => {
                     eprintln!("tree CompactionFailed: {e}");
                 }
+                // The checkpoint is published and its unlink failed: what it
+                // covers is still linked, and nothing says what it pins.
                 Err(e @ CompactionError::NotDropped(_)) => {
                     eprintln!("tree CompactionFailed: {e}");
-                    len_after_last = journal.len();
+                    baseline = Baseline::new(journal.len(), BTreeMap::new());
                 }
                 Err(e @ CompactionError::Stopped(_)) => {
                     eprintln!("tree CompactionFailed: {e}");
@@ -200,7 +254,8 @@ fn checkpoint_at(at: &AtBuilt, folded: &Folded) -> Checkpoint {
 /// publish the checkpoint (the gate at [`Gap::Written`] and
 /// [`Gap::Renamed`]); the gate at [`Gap::DirSynced`]; tell History it is
 /// published (only then may it forget what it covers, C3); the gate at
-/// [`Gap::BeforeUnlink`]; unlink what it covers (C2, C2a). `None` before
+/// [`Gap::BeforeUnlink`]; unlink what it covers (C2, C2a). With what it
+/// dropped, each open the fold left live and its call frames' bytes. `None` before
 /// History's first built event since open, or when B is not past the last
 /// published checkpoint's `built`.
 ///
@@ -210,7 +265,7 @@ fn checkpoint_at(at: &AtBuilt, folded: &Folded) -> Checkpoint {
 pub(in crate::tree_actor) fn compact_once(
     history: &History,
     journal: &JournalCompaction,
-) -> Result<Option<DropStats>, CompactionError> {
+) -> Result<Option<Compacted>, CompactionError> {
     let Some(at) = history.at_built() else {
         return Ok(None);
     };
@@ -222,6 +277,11 @@ pub(in crate::tree_actor) fn compact_once(
     let durable = journal.wait_durable(at.built)?;
     let folded = journal.fold_through(&durable)?;
     let checkpoint = checkpoint_at(&at, &folded);
+    let pinned = folded
+        .opens
+        .iter()
+        .map(|(handle, open)| (*handle, open.frame_bytes()))
+        .collect();
     drop(folded);
     let carried = journal.carry(&checkpoint)?;
     let sealed = Sealed::new(checkpoint, durable, carried)?;
@@ -230,7 +290,8 @@ pub(in crate::tree_actor) fn compact_once(
     history.published(&published);
     dir_synced?;
     journal.gate(Gap::BeforeUnlink)?;
-    journal.unlink_covered(&published).map(Some)
+    let stats = journal.unlink_covered(&published)?;
+    Ok(Some((stats, pinned)))
 }
 
 #[cfg(test)]
