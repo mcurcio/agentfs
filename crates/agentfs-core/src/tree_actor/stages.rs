@@ -663,9 +663,94 @@ pub(in crate::tree_actor) enum Unlocked {
     Unlink,
 }
 
+thread_local! {
+    /// How many [`InnerLock`] guards this thread holds.
+    static INNER: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// The guard of a lock the actor takes inside its own (Durability's state,
+/// History's state, the relocations): counted per thread, so
+/// [`assert_unlocked`] sees it. None is held across I/O (design rule 1 of
+/// docs/trees.md, "Recording and durability"); a wait on its condition
+/// variable lets the lock go.
+pub(in crate::tree_actor) struct InnerLock<'a, T> {
+    guard: std::sync::MutexGuard<'a, T>,
+    counted: Counted,
+}
+
+/// One [`InnerLock`] guard in this thread's count, until dropped.
+struct Counted(());
+
+impl Counted {
+    fn new() -> Self {
+        INNER.with(|held| held.set(held.get() + 1));
+        Self(())
+    }
+}
+
+impl Drop for Counted {
+    fn drop(&mut self) {
+        INNER.with(|held| held.set(held.get() - 1));
+    }
+}
+
+impl<'a, T> InnerLock<'a, T> {
+    /// `lock` taken; a poisoned lock is still sound, as every holder leaves
+    /// its state whole.
+    pub(in crate::tree_actor) fn lock(lock: &'a std::sync::Mutex<T>) -> Self {
+        let guard = lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Self {
+            guard,
+            counted: Counted::new(),
+        }
+    }
+
+    /// Waits on `changed` with the lock let go.
+    pub(in crate::tree_actor) fn wait(self, changed: &std::sync::Condvar) -> Self {
+        let Self { guard, counted } = self;
+        let guard = changed
+            .wait(guard)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Self { guard, counted }
+    }
+
+    /// [`InnerLock::wait`] for at most `left`.
+    pub(in crate::tree_actor) fn wait_for(
+        self,
+        changed: &std::sync::Condvar,
+        left: std::time::Duration,
+    ) -> Self {
+        let Self { guard, counted } = self;
+        let (guard, _) = changed
+            .wait_timeout(guard, left)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Self { guard, counted }
+    }
+}
+
+impl<T> std::ops::Deref for InnerLock<'_, T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        &self.guard
+    }
+}
+
+impl<T> std::ops::DerefMut for InnerLock<'_, T> {
+    fn deref_mut(&mut self) -> &mut T {
+        &mut self.guard
+    }
+}
+
 /// Debug builds: panics when this thread holds the actor's lock in a hold
-/// that is not a named exemption. Release builds: nothing.
+/// that is not a named exemption, or any [`InnerLock`] lock. Release builds:
+/// nothing.
 pub(in crate::tree_actor) fn assert_unlocked(work: Unlocked) {
+    #[cfg(debug_assertions)]
+    INNER.with(|held| {
+        assert_eq!(held.get(), 0, "{work:?} under a lock the actor takes");
+    });
     #[cfg(debug_assertions)]
     HELD.with(|held| {
         if let Some(attribution) = held.borrow().as_ref() {
@@ -681,4 +766,28 @@ pub(in crate::tree_actor) fn assert_unlocked(work: Unlocked) {
     });
     #[cfg(not(debug_assertions))]
     let _ = work;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{InnerLock, Unlocked, assert_unlocked};
+
+    /// Unlinks, fsyncs and journal reads refuse to run under a lock the
+    /// actor takes inside its own, and run once it is let go; a wait on its
+    /// condition variable keeps the guard counted.
+    #[test]
+    #[cfg(debug_assertions)]
+    fn work_under_an_inner_lock_panics() {
+        let lock = std::sync::Mutex::new(());
+        let changed = std::sync::Condvar::new();
+        let refused = |work| std::panic::catch_unwind(|| assert_unlocked(work)).is_err();
+        let held = InnerLock::lock(&lock);
+        for work in [Unlocked::Fsync, Unlocked::JournalRead, Unlocked::Unlink] {
+            assert!(refused(work), "{work:?}");
+        }
+        let held = held.wait_for(&changed, std::time::Duration::ZERO);
+        assert!(refused(Unlocked::Unlink));
+        drop(held);
+        assert!(!refused(Unlocked::Unlink));
+    }
 }

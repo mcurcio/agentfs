@@ -5,7 +5,9 @@
 //! "History trails the files").
 //!
 use std::io;
-use std::sync::{Arc, Condvar, LazyLock, Mutex, MutexGuard, PoisonError};
+#[cfg(test)]
+use std::sync::PoisonError;
+use std::sync::{Arc, Condvar, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
 use git2::Oid;
@@ -18,6 +20,7 @@ use crate::tree_actor::call_path::Then;
 use crate::tree_actor::journal::compaction::Published;
 use crate::tree_actor::pointers::Pointers;
 use crate::tree_actor::recording::FileMap;
+use crate::tree_actor::stages::InnerLock;
 use crate::tree_actor::tree::{EventNumber, Tree};
 use crate::tree_git::TreeGit;
 
@@ -379,19 +382,12 @@ impl History {
         })
     }
 
-    fn state(&self) -> MutexGuard<'_, State> {
-        // Every holder leaves the state whole: a poisoned lock is still sound.
-        self.inner
-            .state
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
+    fn state(&self) -> InnerLock<'_, State> {
+        InnerLock::lock(&self.inner.state)
     }
 
-    fn wait<'a>(&self, state: MutexGuard<'a, State>) -> MutexGuard<'a, State> {
-        self.inner
-            .changed
-            .wait(state)
-            .unwrap_or_else(PoisonError::into_inner)
+    fn wait<'a>(&self, state: InnerLock<'a, State>) -> InnerLock<'a, State> {
+        state.wait(&self.inner.changed)
     }
 
     fn notify(&self) {
@@ -867,12 +863,7 @@ impl History {
             if left.is_zero() {
                 break;
             }
-            state = self
-                .inner
-                .changed
-                .wait_timeout(state, left)
-                .unwrap_or_else(PoisonError::into_inner)
-                .0;
+            state = state.wait_for(&self.inner.changed, left);
         }
         state.epoch
     }

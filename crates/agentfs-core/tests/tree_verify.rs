@@ -171,14 +171,14 @@ fn a_save_the_builder_cannot_reproduce_keeps_the_saved_bytes() {
 fn a_batch_built_again_writes_evidence_once() {
     let tmp = tempfile::tempdir().unwrap();
     // Nothing built until the save is recorded: one batch holds it.
-    let unbuilt = agentfs_core::failpoints::configure("tree.build_before_batch=error@*").unwrap();
+    let points = agentfs_core::failpoints::configure("tree.build_before_batch=error@*").unwrap();
     let mut v = new_actor(tmp.path());
     save_twice(&mut v, "a");
-    drop(unbuilt);
-    let _points = agentfs_core::failpoints::configure(
-        "tree.build_replay_skew=error@*;tree.build_after_pack=error@1",
-    )
-    .unwrap();
+    // In one step: the close asked for a build, and an attempt that started
+    // with no spec in force would build the batch once, unskewed.
+    points
+        .set("tree.build_replay_skew=error@*;tree.build_after_pack=error@1")
+        .unwrap();
     // The first attempt fails past its pack, wherever a request finds it.
     if v.settle().is_err() {
         v.settle().unwrap();

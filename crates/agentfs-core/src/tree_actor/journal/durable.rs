@@ -7,9 +7,9 @@
 use std::fs::File;
 use std::io;
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, Weak};
+use std::sync::{Arc, Condvar, Mutex, PoisonError, Weak};
 
-use crate::tree_actor::stages::{Unlocked, assert_unlocked};
+use crate::tree_actor::stages::{InnerLock, Unlocked, assert_unlocked};
 
 use serde::{Deserialize, Serialize};
 
@@ -188,9 +188,8 @@ impl Durability {
         &self.relocations
     }
 
-    fn state(&self) -> MutexGuard<'_, State> {
-        // Every holder leaves the state whole: a poisoned lock is still sound.
-        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    fn state(&self) -> InnerLock<'_, State> {
+        InnerLock::lock(&self.state)
     }
 
     /// The highest record every finished fsync covers: the durable mark.
@@ -296,10 +295,7 @@ impl Durability {
             if !state.leading {
                 break;
             }
-            state = self
-                .ended
-                .wait(state)
-                .unwrap_or_else(PoisonError::into_inner);
+            state = state.wait(&self.ended);
         }
         state.leading = true;
         let target = state.appended;
@@ -397,8 +393,8 @@ impl Durability {
         Some(segment)
     }
 
-    /// A carry file no published checkpoint names leaves the list, once
-    /// the compactor has unlinked it: whether the list had it.
+    /// A carry file no published checkpoint names leaves the list, at the
+    /// compactor's unlink of it: whether the list had it.
     pub(in crate::tree_actor) fn remove_carry(&self, carry: &Segment) -> bool {
         let mut state = self.state();
         let Some(at) = state.carries.iter().position(|c| c.same_file(carry)) else {

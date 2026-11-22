@@ -17,7 +17,7 @@ use std::io;
 use std::os::unix::fs::{FileExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex};
 
 use super::durable::RecordNo;
 
@@ -318,17 +318,20 @@ impl std::fmt::Debug for FramePos {
 #[derive(Clone, Default)]
 pub(in crate::tree_actor) struct Relocations(Arc<Mutex<Moved>>);
 
+/// Where a carried frame is: its carry file and its tail there.
+pub(in crate::tree_actor) type Place = (Arc<Segment>, u64);
+
 /// Each carried record's file and tail now, and how many times that table
 /// changed.
 #[derive(Default)]
 struct Moved {
-    table: BTreeMap<RecordNo, (Arc<Segment>, u64)>,
+    table: BTreeMap<RecordNo, Place>,
     generation: u64,
 }
 
 impl Relocations {
-    fn moved_table(&self) -> std::sync::MutexGuard<'_, Moved> {
-        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    fn moved_table(&self) -> crate::tree_actor::stages::InnerLock<'_, Moved> {
+        crate::tree_actor::stages::InnerLock::lock(&self.0)
     }
 
     /// `record`'s frame is now at `tail` of `segment`.
@@ -338,7 +341,7 @@ impl Relocations {
         record: RecordNo,
         segment: &Arc<Segment>,
         tail: u64,
-    ) -> Option<(Arc<Segment>, u64)> {
+    ) -> Option<Place> {
         let mut moved = self.moved_table();
         moved.generation += 1;
         moved.table.insert(record, (Arc::clone(segment), tail))
@@ -347,7 +350,7 @@ impl Relocations {
     /// `record`'s copy in a carry file no checkpoint came to name is let
     /// go: its frame is where it was before that copy, `earlier` (an older
     /// carry file) or its own segment.
-    pub(super) fn put_back(&self, record: RecordNo, earlier: Option<(Arc<Segment>, u64)>) {
+    pub(super) fn put_back(&self, record: RecordNo, earlier: Option<Place>) {
         let mut moved = self.moved_table();
         moved.generation += 1;
         match earlier {
@@ -369,7 +372,7 @@ impl Relocations {
     }
 
     /// Where `record`'s frame was carried, if it was.
-    pub fn find(&self, record: RecordNo) -> Option<(Arc<Segment>, u64)> {
+    pub fn find(&self, record: RecordNo) -> Option<Place> {
         self.moved_table().table.get(&record).cloned()
     }
 

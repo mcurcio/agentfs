@@ -703,6 +703,23 @@ The same pair of runs, for what a save costs:
   A write to another file of the same tree would wait at the gate too; the
   probe does not measure that.
 
+Two figures of the image run got worse with the change and warn there
+(the tree views tracer job on ext4, one run before and one after):
+
+- **`restart`'s peak memory is 704 MiB** against its bar of 256 MiB, with
+  the view mounted in 11.3 s; before, 225 MiB and 8.7 s. `restart` mounts
+  on the state the figures left. Read from the code and not measured: that
+  journal is longer than it was. A compaction that runs while a large file
+  is being written counts the bytes the file appends after the
+  compaction's built point as kept, so the save that ends them is not due,
+  and they stay linked until the journal doubles or the volume is mounted
+  again. The mount then reads them.
+- **`long_history`'s ratio is 1.30** against 1.2 (0.81 before), and its
+  own figure is better: 0.129 ms a create against 0.327. The bar divides
+  by `create`'s first 2,000 creates, which fell from 0.406 to 0.099 ms once
+  a close stopped waiting for the disk, so the ratio no longer says
+  whether a long history slows a create.
+
 ## Performance budget
 
 The recording engine's budget is

@@ -1888,8 +1888,9 @@ fn covered(root: &std::path::Path, built: RecordNo) -> Vec<u64> {
         .collect()
 }
 
-/// A compaction whose unlink fails: the checkpoint stands, the covered
-/// segments stay and the actor serves. Open does not compact, so a reopen
+/// A compaction that fails after its checkpoint and before any unlink (an
+/// unlink that itself fails is in the compactor's own tests): the checkpoint
+/// stands, the covered segments stay and the actor serves. Open does not compact, so a reopen
 /// leaves them; the next compaction lets them go.
 #[test]
 fn a_failure_before_the_drop_keeps_serving_and_the_next_compaction_drops() {

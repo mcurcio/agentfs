@@ -728,10 +728,13 @@ appends it and applies it to the saved state the views serve; it runs no git.
   records the checkpoint covers until its journal rolls. A held file pins only
   its own frames, so at the built event of a save, once the linked files are
   at least 64 MiB, they are back under about twice the live opens' bytes plus
-  a segment. Two things sit outside that count: a frame's head (a few dozen
-  bytes a call, which matters only for many tiny writes), and a held page
+  a segment. Three things sit outside that count: a frame's head (a few dozen
+  bytes a call, which matters only for many tiny writes); a held page
   write, which is kept by file while any write-open of the file lives and
-  leaves the baseline only at the next compaction. A frame is named by its record and an offset into it,
+  leaves the baseline only at the next compaction; and the bytes a file
+  appends after the built point of a compaction that runs while it is open,
+  which stay linked after its save until the journal doubles or the volume
+  is mounted again. A frame is named by its record and an offset into it,
   wherever it is carried, so a save's digest does not change when it moves.
   The journal records where each carried frame went. The actor moves its live
   opens, held page writes and saved maps there at its next built event, a walk
@@ -741,13 +744,16 @@ appends it and applies it to the saved state the views serve; it runs no git.
   most 96 MiB; a take's bytes are in records of at most 16 MiB. The constants
   are not settings.
 - A compaction that fails before its checkpoint is renamed changes nothing and
-  is retried at the next built event (`tree CompactionFailed`). One whose
-  unlink fails leaves the checkpoint in place and the segments for the next
-  compaction. Only the directory fsync after the rename stops the actor when
-  it fails, as a leader's fsync does. A kill or a power cut at any point leaves
-  a journal that opens: `checkpoint.tmp` is ignored, a frame present both in a
-  segment and in a carry file is read once, and a carry file no checkpoint
-  names is ignored.
+  is retried at the next built event (`tree CompactionFailed`): the carry file
+  it wrote is removed, so a failure that repeats leaves no files behind. One
+  whose unlink fails leaves the checkpoint in place, and the file that was not
+  unlinked stays in the journal's list for the next compaction to try again.
+  A failed fsync stops the actor, as a leader's fsync does: of the records at
+  or below B before the fold, of the directory after the rename, or of the
+  directory after the unlinks. A kill or a power cut at any point leaves a
+  journal that opens: `checkpoint.tmp` is ignored, a frame present both in a
+  segment and in a carry file is read once, and a carry file the checkpoint
+  does not name is removed at open, once the checkpoint's own name is durable.
 - **The switch record.** A step sets a pointer to "what step `n`'s build
   gives". Once `n` is built, the actor appends a switch record that names the
   pointer, the step and the commit built for it, and from that record on the

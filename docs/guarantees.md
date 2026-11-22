@@ -281,8 +281,14 @@ What a power cut can lose in a tree view:
 
 - **Every change since the last such call.** That is every change since the
   last `fsync`, FSYNCDIR or `O_SYNC` write that returned, or since history's
-  builder last ran. It can be many saves, not one. What survives is always
-  everything up to some point: never a later change without the earlier ones.
+  builder last ran. It can be many saves, not one. Of the recorded changes,
+  what survives is always everything up to some point: never a later change
+  without the earlier ones.
+- **An untracked file's `fsync` covers that file alone.** Untracked files are
+  written straight to their area, outside the journal, so they are not in that
+  order: one can survive a power cut that loses an earlier recorded save. To
+  make recorded saves durable, call `fsync` on a recorded file or on a
+  directory of the view.
 - **`sync(1)` and `syncfs(2)` do not help.** The kernel sends a FUSE mount no
   request for them, so they make no closed save durable. A program that needs a
   save to survive a power cut calls `fsync`.

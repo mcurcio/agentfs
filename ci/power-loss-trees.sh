@@ -271,7 +271,14 @@ wait "$pid"; pid=
 # segment and compacts at every built event; this driver marks the log device
 # while the compactor is parked at a gap, then answers `go`:
 #   CP 1  the checkpoint written to checkpoint.tmp and fsynced, not renamed
-#   CP 2  renamed into place, its directory not yet fsynced
+#   CP 2  renamed into place, the compactor's own fsync of the directory not
+#         yet run. c2's fsync leads a group commit that fsyncs that directory
+#         (every record is a new segment under the gate), so the rename is
+#         durable at this mark: no mark here holds an unsynced rename, and
+#         nothing in this script fails when that fsync is removed. What the
+#         fsync protects (the builder trims the built log only by a durable
+#         checkpoint) rests on the order in compact_once and on open's own
+#         directory fsync, with no power-cut test.
 #   CP 3  its directory fsynced, History not yet told
 #   CP 4  History told, the segments it covers still linked
 #   CP 5  those segments unlinked (the next compaction has started)

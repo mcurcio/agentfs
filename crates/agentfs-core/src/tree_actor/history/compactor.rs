@@ -42,8 +42,7 @@ pub(in crate::tree_actor) const COMPACT_FROM: u64 = 64 << 20;
 
 /// When a journal `len_after_last` long after its last compaction compacts
 /// again: at twice that, and at least `from`. The due rule's one home, read
-/// only by the compactor through [`Baseline::due_at`]. Restart memory is at
-/// most this plus live calls.
+/// only by the compactor through [`Baseline::due_at`].
 pub(in crate::tree_actor) fn compact_at(from: u64, len_after_last: u64) -> u64 {
     from.max(len_after_last.saturating_mul(2))
 }

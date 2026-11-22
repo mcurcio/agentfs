@@ -254,7 +254,7 @@ pub(in crate::tree_actor) struct Carried {
 #[derive(Clone, Debug)]
 pub(in crate::tree_actor) struct Made {
     carry: Arc<Segment>,
-    earlier: Vec<(RecordNo, Option<(Arc<Segment>, u64)>)>,
+    earlier: Vec<(RecordNo, Option<super::segment::Place>)>,
 }
 
 impl Carried {

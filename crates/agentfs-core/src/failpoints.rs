@@ -196,6 +196,48 @@ mod compact_gate {
             }
         }
     }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// Each line a script answers: `go` passes the gap, `fail` fails it
+        /// with EIO, and an empty line ends the gate, which then writes and
+        /// reads nothing.
+        #[test]
+        fn a_script_passes_fails_and_ends_the_gate() {
+            let dir = tempfile::tempdir().unwrap();
+            for name in ["at", "go"] {
+                rustix::fs::mknodat(
+                    rustix::fs::CWD,
+                    dir.path().join(name),
+                    rustix::fs::FileType::Fifo,
+                    rustix::fs::Mode::from_raw_mode(0o600),
+                    0,
+                )
+                .unwrap();
+            }
+            let gate = FifoGate::open(dir.path()).unwrap();
+            let both = |name: &str| {
+                let mut options = OpenOptions::new();
+                options.read(true).write(true);
+                options.open(dir.path().join(name)).unwrap()
+            };
+            both("go").write_all(b"go\nfail\n\n").unwrap();
+            gate.at(Gap::Covered).unwrap();
+            let failed = gate.at(Gap::Written).unwrap_err();
+            assert_eq!(failed.raw_os_error(), Some(libc::EIO));
+            gate.at(Gap::Renamed).unwrap();
+            gate.at(Gap::DirSynced).unwrap();
+            let mut reached = BufReader::new(both("at")).lines();
+            for gap in [Gap::Covered, Gap::Written, Gap::Renamed] {
+                assert_eq!(reached.next().unwrap().unwrap(), gap.name());
+            }
+            // Nothing after the gate ended: a line written now is the next.
+            writeln!(both("at"), "end").unwrap();
+            assert_eq!(reached.next().unwrap().unwrap(), "end");
+        }
+    }
 }
 
 /// Takes at a test's points, not the queue worker's (git-model §18's replay).
@@ -494,6 +536,29 @@ mod imp {
         _lock: MutexGuard<'static, ()>,
     }
 
+    impl Guard {
+        /// Puts `spec` in force in place of the guard's own, for the same
+        /// thread, with the hits counted from here. One step: no hit falls
+        /// between the two specs with none in force, as one would between
+        /// a dropped guard and the next [`configure`].
+        ///
+        /// # Errors
+        ///
+        /// [`FailpointError`] for a spec that cannot be used; the guard's
+        /// own stays in force.
+        pub fn set(&self, spec: &str) -> Result<(), FailpointError> {
+            let actions = parse(spec)?;
+            let mut state = state();
+            let thread = state.as_ref().and_then(|st| st.thread);
+            *state = Some(State {
+                actions,
+                thread,
+                ..State::default()
+            });
+            Ok(())
+        }
+    }
+
     impl Drop for Guard {
         fn drop(&mut self) {
             ACTIVE.store(false, Ordering::Release);
@@ -553,6 +618,24 @@ mod imp {
                     "commit.after_ref"
                 ]
             );
+        }
+
+        #[test]
+        fn a_guard_changes_its_spec_in_one_step() {
+            let guard = configure("commit.after_ref=error@*").unwrap();
+            assert!(hit("commit.after_ref").is_err());
+            assert!(guard.set("nope=error").is_err());
+            assert!(hit("commit.after_ref").is_err(), "the old spec stands");
+            guard.set("journal.after_fsync=error@2").unwrap();
+            assert!(hit("commit.after_ref").is_ok());
+            assert_eq!(hits("commit.after_ref"), 1, "counted from the change");
+            assert!(hit("journal.after_fsync").is_ok());
+            assert!(hit("journal.after_fsync").is_err());
+            // Still this thread's alone.
+            std::thread::spawn(|| assert!(hit("journal.after_fsync").is_ok()))
+                .join()
+                .unwrap();
+            assert_eq!(hits("journal.after_fsync"), 2);
         }
 
         #[test]
