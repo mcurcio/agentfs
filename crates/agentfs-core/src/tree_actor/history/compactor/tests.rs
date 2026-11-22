@@ -100,6 +100,7 @@ fn row(chain: Chain, text: &str) -> RowWrite {
 }
 
 /// One rows-only step on the volume's chain.
+#[allow(clippy::disallowed_methods, reason = "the actor's own rows step")]
 fn put_row(v: &mut TreeActor, text: &str) -> RecordNo {
     v.record_rows(|_| Ok(vec![row(Chain::Volume, text)]))
         .unwrap()
@@ -1128,9 +1129,7 @@ fn a_batch_one_record_short_of_a_switch_record_is_followed() {
         asking.want_through(step);
         assert_eq!(was_read.recv_timeout(BOUND), Ok(step), "the batch's read");
     });
-    let step = v
-        .record_rows(|_| Ok(vec![row(Chain::Volume, "a step")]))
-        .unwrap();
+    let step = put_row(&mut v, "a step");
     history.on_step_recorded(|_| {});
     let (at, _) = switches(tmp.path()).pop().expect("a switch record");
     assert_eq!(at, step.next(), "the switch record follows the step");

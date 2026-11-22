@@ -141,8 +141,12 @@ pub(in crate::tree_actor) struct Inner {
     /// Tests: runs once a step's record is appended and applied
     /// ([`History::step_recorded`]).
     #[cfg(test)]
-    step_recorded: Mutex<Option<Box<dyn FnMut(RecordNo) + Send>>>,
+    step_recorded: Mutex<Option<StepRecorded>>,
 }
+
+/// Tests: a hook given each step once its record is appended and applied.
+#[cfg(test)]
+type StepRecorded = Box<dyn FnMut(RecordNo) + Send>;
 
 /// Tests: a hook given `None` at each batch's start and the record it
 /// builds through once read.

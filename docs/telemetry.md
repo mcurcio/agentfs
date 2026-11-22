@@ -57,6 +57,7 @@ exporter.
 | `agentfs.record.duration` | histogram | Cost of the synchronous step, by trigger |
 | `agentfs.record.failures` | counter | Recording errors, by trigger |
 | `agentfs.journal.backlog` | gauge | Entries recorded but not committed |
+| `agentfs.journal.checkpoints` | counter | Journal checkpoints the tree volumes' compactors published since the process started ([trees](trees.md#the-journal)) |
 | `agentfs.commit.count` | counter | Commits made |
 | `agentfs.commit.failures` | counter | Commit passes that failed; the records stay journaled |
 | `agentfs.repack.failures` | counter | Periodic repacks that failed |
@@ -94,7 +95,7 @@ exporter.
 | `agentfs.lock.wait` | counter | Seconds callers waited to take the volume's lock |
 | `agentfs.lock.waits` | counter | Waits to take the volume's lock, one per hold |
 | `agentfs.lock.wait.longest` | gauge | Seconds of the longest wait to take the volume's lock, since the process started |
-| `agentfs.gate.wait` | counter, by `cause` | Seconds calls waited at the lag gate before starting new work, by why they waited (`lag`, `overlay`, `overdue`: [below](#the-volume-lock)) |
+| `agentfs.gate.wait` | counter, by `cause` | Seconds calls waited at the lag gate before starting new work, by why they waited (`lag`, `overlay`: [below](#the-volume-lock)) |
 | `agentfs.gate.waits` | counter, by `cause` | Calls held at the lag gate |
 | `agentfs.gate.wait.longest` | gauge, by `cause` | Seconds of the longest wait at the lag gate, since the process started |
 | `agentfs.request.time` | counter, by `op` | Seconds the tree views spent answering FUSE requests, by op (`lookup`, `getattr`, `open`, `create`, `read`, `write`, `flush`, `release`, `readdir`, `other`) |
@@ -152,21 +153,21 @@ history inside a close) counts to the inner kind only. Every hold is one
 
 | `kind` | The work |
 |---|---|
-| `compaction` | The journal's compaction: a checkpoint, its fsyncs, and dropping the segments behind it |
+| `compaction` | The actor's walk onto the frames a compaction carried, at a built event. The compaction itself runs on history's compactor and holds no call ([trees](trees.md#the-journal)); its time is the `compaction` stage |
 | `catch_up` | Moving the saved trees onto history's built point, at a step or a built event |
 | `drops` | Dropping the maps and shapes catching up let go: the last drop of a large file map |
 | `close` | A close's first half and its land, a close decided under the lock, and pending closes saved again |
 | `take` | A take's inputs, the entries it leaves waiting, and its land |
 | `fork_copy` | A fork's step, its untracked area's copy included |
+| `page_image` | A page fill or writeback building a file's image from every live open's calls |
 | `other` | Everything else: the call's own work |
 
 Two more waits stall a request without the lock. A call that starts new
 work waits at the lag gate while history trails
 ([trees](trees.md#history-trails-the-files)); each wait is counted from
 the call held to the event that admits it, under the first `cause` that
-held it: `overdue` (a compaction waits for every step to be built),
-`overlay` (the tree's overlay is over its limit) or `lag` (the lag
-limit). In the metrics file these are `gate_wait.<cause>`. And a tree
+held it: `overlay` (the tree's overlay is over its limit) or `lag` (the
+lag limit). In the metrics file these are `gate_wait.<cause>`. And a tree
 view answers its FUSE requests on one thread, so a request waits behind
 every earlier one of that view: each request is timed from the handler's
 start to its return, by `op`, which is how long it held that thread. A
