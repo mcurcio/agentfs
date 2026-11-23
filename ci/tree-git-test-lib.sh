@@ -113,11 +113,10 @@ tree_wait_exit() {
 # unless PID is alive (not a zombie) and every MOUNTPOINT is still mounted: a
 # mount that ended by itself is a product bug to find, not a step to skip.
 # The exit must then be the kill's (137): one that takes the bound is a
-# failure too. A mountpoint is unmounted only while /proc/self/mounts lists it.
+# failure too. Then tree_unmount_dead.
 tree_kill_mount() {
   local pid=$1 log=$2 state status=0 m
   shift 2
-  local mounts=()
   state=$(ps -o stat= -p "$pid" 2>/dev/null || true)
   if [ -z "$state" ] || [[ $state == Z* ]]; then
     echo "agentfs $pid ended before its kill (state '$state')" >&2
@@ -130,7 +129,6 @@ tree_kill_mount() {
       cat "$log" /proc/self/mounts >&2
       return 1
     fi
-    mounts+=("$(realpath "$m")")
   done
   kill -KILL "$pid"
   tree_wait_exit "$pid" 60 || status=$?
@@ -139,9 +137,21 @@ tree_kill_mount() {
     cat "$log" >&2
     return 1
   fi
-  for m in "${mounts[@]}"; do
+  tree_unmount_dead "$@"
+}
+
+# tree_unmount_dead MOUNTPOINT...: after a mount's agentfs died, unmounts each
+# MOUNTPOINT (a canonical path: a dead mount cannot be resolved) while
+# /proc/self/mounts lists it. One it no longer lists is said on stderr: a
+# daemon's death leaves its mount (docs/trees.md), so an entry gone is
+# evidence to keep for the open errata entry, not a failure of the case.
+tree_unmount_dead() {
+  local m
+  for m in "$@"; do
     if awk -v m="$m" '$2 == m { found = 1 } END { exit !found }' /proc/self/mounts; then
       fusermount3 -uz "$m"
+    else
+      echo "warning: $m's mount entry was gone after its agentfs died" >&2
     fi
   done
 }

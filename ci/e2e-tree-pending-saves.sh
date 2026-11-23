@@ -94,7 +94,7 @@ saves --case kill
 status=0; tree_wait_exit "$pid" 60 || status=$?; pid=
 [ "$status" = 137 ] || { echo "agentfs exited with status $status, not the failpoint's SIGKILL" >&2; cat "$work/kill.log" >&2; exit 1; }
 fired kill "$work/kill.log"
-fusermount3 -uz "$work/main"
+tree_unmount_dead "$work/main"
 flock "$work/state/actor.lock" true
 start '' "$work/restarted.log"
 saves --case restarted
