@@ -10,8 +10,11 @@ Barriers and pipes order everything. No step waits on a timer.
 Then pending saves: after a slow close (a 64 MiB file overwritten in place) a
 stat and a read from this process and another give the new size and bytes;
 after write tmp, close, rename over the real file, the real file reads the new
-bytes; a close and an unlink at once leave history with the save before the
-delete, which ci/e2e-tree-pagecache.sh checks after the clean unmount.
+bytes; a rename onto a file, a path truncate, a time set and a move out of
+the tree (to a name info/exclude places in the untracked area) each wait for
+the file's pending save and then act on its new content; a close and an
+unlink at once leave history with the save before the delete, which
+ci/e2e-tree-pagecache.sh checks after the clean unmount.
 
 The mappings live in processes of their own: CPython holds its lock through
 mmap.flush, and one msync behind a busy view would pace every close to one per
@@ -246,6 +249,40 @@ def pending_saves(root):
     os.rename(tmp, real)
     check(errors, "rename over", real, new)
 
+    # A rename onto a file whose save is pending waits for it, then replaces it.
+    onto, small = root / "renamed-onto", root / "renamed-onto.small"
+    write_file(onto, old)
+    write_file(small, b"small")
+    write_file(onto, new, os.O_WRONLY)
+    os.rename(small, onto)
+    check(errors, "rename onto", onto, b"small")
+
+    # A path truncate waits for the save, then cuts its content.
+    cut = root / "truncated"
+    write_file(cut, old)
+    write_file(cut, new, os.O_WRONLY)
+    os.truncate(cut, 10)
+    check(errors, "path truncate", cut, new[:10])
+
+    # A time set waits for the save, whose landing moves the modification
+    # time, so the time set is what stays.
+    timed = root / "timed"
+    write_file(timed, old)
+    write_file(timed, new, os.O_WRONLY)
+    os.utime(timed, ns=(1_000_000_000_000_000_005, 2_000_000_000_000_000_007))
+    check(errors, "time set", timed, new)
+    if os.stat(timed).st_mtime_ns != 2_000_000_000_000_000_007:
+        errors.append(f"time set: mtime {os.stat(timed).st_mtime_ns}")
+
+    # A move out of the tree waits for the save, then moves its content.
+    out = root / "moved-out"
+    write_file(out, old)
+    write_file(out, new, os.O_WRONLY)
+    os.rename(out, root / MOVED_OUT)
+    check(errors, "move out", root / MOVED_OUT, new)
+    if out.exists():
+        errors.append("move out: the tracked name is still there")
+
     gone = root / UNLINKED
     write_file(gone, old)
     write_file(gone, new, os.O_WRONLY)
@@ -262,6 +299,8 @@ def pending_saves(root):
 # bytes compares them all. ci/e2e-tree-pagecache.sh names the same size.
 SLOW = 64 << 20
 UNLINKED = "unlinked-at-once"
+# ci/e2e-tree-pagecache.sh writes *.out to the volume's info/exclude.
+MOVED_OUT = "moved-out.out"
 
 
 def main():

@@ -38,6 +38,10 @@ git --git-dir="$work/state/history.git" fsck --strict
 
 # A fork's takes would hold the actor too: this runs against the saves alone.
 "$bin" --state "$work/close-open" init --volume t
+# trees-close-open.py moves a file out of the tree to a name this places in
+# the untracked area.
+mkdir -p "$work/close-open/history.git/info"
+printf '*.out\n' >"$work/close-open/history.git/info/exclude"
 "$bin" --state "$work/close-open" mount "$work/main" >>"$work/mount.log" 2>&1 & pid=$!
 wait_mounted "$work/main"
 python3 ci/trees-close-open.py "$work/main" || result=$?

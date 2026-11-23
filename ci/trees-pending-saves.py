@@ -9,9 +9,9 @@ AGENTFS_FAILPOINTS=tree.close_decide=<action>, HISTORY_GIT its volume's
 history.git, METRICS its --metrics-output file. ci/e2e-tree-pending-saves.sh
 starts a fresh volume for each case and runs this once per case:
 
-    error      (with --fork, the fork's view, and --fork-ref, its branch) the
-               fork's client overwrites f in place and closes it; the decision
-               fails. The client reads its new content; the metrics file says
+    error      (with --fork, the fork's view, and --fork-ref, its branch) once
+               the fork has taken every root entry, the fork's client
+               overwrites f in place and closes it; the decision fails. The client reads its new content; the metrics file says
                failed_saves 1 and pending_saves 1; the root's append to f syncs
                into the fork as the fork tree's next step, which saves the
                failed close first: the fork's history has the save, then the
@@ -148,6 +148,12 @@ def parents_of(git, ref, name):
 def case_error(root, git, metrics, fork, fork_ref):
     write_new(root / "f", SEED)
     view_until(fork / "f", SEED, "error: f synced into the fork")
+    # A sync takes the root as built, so the create's sync can show SEED
+    # while the save's sync is still queued. Every take is a step of the
+    # fork tree, which saves a failed close first: the failed save stays
+    # pending only while no take is queued.
+    metrics_until(metrics, "error: the fork took every root entry",
+                  lambda m: m["queued"] == 0 and built(m))
     overwrite(fork / "f", b"LINE1")
     check("error: the fork's client reads its new content", read_all(fork / "f"), FORKED)
     metrics_until(metrics, "error: failed_saves 1 and pending_saves 1",
