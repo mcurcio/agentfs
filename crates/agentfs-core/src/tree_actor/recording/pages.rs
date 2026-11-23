@@ -494,7 +494,11 @@ impl TreeActor {
     ///
     /// [`Error::NotFound`] with no write-open of the file; a failed read of
     /// the journal.
-    pub(in crate::tree_actor) fn pages_image(&mut self, tree: TreeId, object: u64) -> Result<FileMap> {
+    pub(in crate::tree_actor) fn pages_image(
+        &mut self,
+        tree: TreeId,
+        object: u64,
+    ) -> Result<FileMap> {
         let key = (tree, object);
         self.pages_build_image(&key)?;
         self.pages

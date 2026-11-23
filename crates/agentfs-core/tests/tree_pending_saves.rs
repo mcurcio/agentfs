@@ -197,7 +197,10 @@ fn an_unlink_of_a_pending_file_waits_for_its_save() {
     };
     let (then, heard) = noted();
     a.when_saved_then(waiting, then);
-    assert!(heard.try_recv().is_err(), "the callback ran before the save");
+    assert!(
+        heard.try_recv().is_err(),
+        "the callback ran before the save"
+    );
     save.finish().unwrap();
     assert_eq!(heard.try_recv(), Ok(true), "the landing ran the callback");
     let retried = a.lock().unwrap().unlink("f").unwrap();
@@ -344,7 +347,10 @@ fn settle_waits_for_a_pending_save() {
     starting.recv().unwrap();
     let step = commit(save.finish().unwrap());
     let settled = settling.join().unwrap().unwrap();
-    assert!(settled.get() >= step, "settled at {settled:?}, saved at {step}");
+    assert!(
+        settled.get() >= step,
+        "settled at {settled:?}, saved at {step}"
+    );
 }
 
 /// Rule 9: a pending save holds its file for takes. A sync into it waits
