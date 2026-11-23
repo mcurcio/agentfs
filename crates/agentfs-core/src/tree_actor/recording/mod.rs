@@ -232,7 +232,8 @@ pub(in crate::tree_actor) struct Handle {
     /// begun: the record's number is the close's order, the one a file's
     /// saves land in, live and at restart ([`close_rank`]). None only
     /// before a close begins, or for a failed close whose record could not
-    /// be appended: its retry appends it first.
+    /// be appended: the next close record appended, its retry's or a later
+    /// close's, appends it first ([`TreeActor::record_close_begun`]).
     pub(in crate::tree_actor) close_order: Option<RecordNo>,
     /// When its save became pending: the age the metrics give.
     pub(in crate::tree_actor) pending_since: Option<std::time::Instant>,
@@ -282,8 +283,11 @@ impl Handle {
 }
 
 /// The one order a file's saves land in, live and at restart: opens with a
-/// close record in its order, then those without (an open whose record
-/// could not be appended) in open order. Sorts recovery's closes, a step's
+/// close record in its order, then those without in open order. A close
+/// without one began after every close with one: its append failed, and
+/// the next record appended would have given it one first
+/// ([`TreeActor::record_close_begun`]); at restart, an open whose close
+/// never began closes last, as its client's end. Sorts recovery's closes, a step's
 /// pending closes, and the saves an open of its own client reads
 /// ([`TreeActor::open_content`], [`PendingFold`]).
 pub(in crate::tree_actor) fn close_rank(handle: u64, h: &Handle) -> (bool, Option<RecordNo>, u64) {
@@ -1405,8 +1409,9 @@ impl TreeActor {
 
     /// A close's first half, under the lock, O(1) plus the file's page
     /// writes. First its close record ([`TreeActor::record_close_begun`]):
-    /// a failed append is a failed close, pending and counted, its retry
-    /// appending the record first. Saved here: an anonymous or orphaned file's, any close in a
+    /// a failed append is a failed close, pending and counted, its record
+    /// appended first by the next close record appended, so it keeps its
+    /// client's order. Saved here: an anonymous or orphaned file's, any close in a
     /// tree with failed closes pending (after them, in order), an open with
     /// no call and no page write (unchanged), and an open whose saved map
     /// has not moved, whose file has no page writes and whose length changed,
@@ -1607,14 +1612,32 @@ impl TreeActor {
     /// before any save), by recovery through [`TreeActor::close`], and by
     /// the one writer of a save for a close that has none yet.
     ///
+    /// Record first: each pending close begun earlier whose own append
+    /// failed gets its record before this one, in the order they failed, so
+    /// a failed append never moves a close behind one its client began
+    /// later, live or at restart.
+    ///
     /// # Errors
     ///
     /// [`Error::NotFound`] for no such open; a failed append, with the
-    /// open unchanged.
+    /// open unchanged (an earlier close given its record keeps it).
     fn record_close_begun(&mut self, handle: u64) -> Result<RecordNo> {
         let h = self.handles.get(&handle).ok_or(Error::NotFound)?;
         if let Some(order) = h.close_order {
             return Ok(order);
+        }
+        let earlier: Vec<u64> = self
+            .pending_closes
+            .iter()
+            .copied()
+            .filter(|p| *p != handle)
+            .filter(|p| self.handles.get(p).is_some_and(|o| o.close_order.is_none()))
+            .collect();
+        for p in earlier {
+            let (seq, _) = self.journal_record(Entry::CloseBegun { handle: p }, &[])?;
+            if let Some(o) = self.handles.get_mut(&p) {
+                o.close_order = Some(RecordNo::new(seq));
+            }
         }
         let (seq, _) = self.journal_record(Entry::CloseBegun { handle }, &[])?;
         let order = RecordNo::new(seq);
