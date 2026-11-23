@@ -397,3 +397,42 @@ fn a_take_waits_for_a_pending_save_and_lands_at_its_built_event() {
     assert_eq!(rec.take_next(fork).unwrap(), Took::Taken);
     assert_eq!(read(&rec, fork, "f"), b"BASE\nmore\n");
 }
+
+/// Close-to-open with a second live writer (ledger R1.1, R1.4; the case of
+/// `ci/trees-pagecache.py`'s `map-fd-overlap`): A is a mapped writer whose
+/// save takes page writes, B a descriptor writer of the same client still
+/// open. While A's save is pending, a fresh open by that client reads the
+/// exact fold of A's save: A's page writes on the saved map, not B's
+/// unsaved calls. It reads the same once A's save has landed.
+#[test]
+fn an_open_of_a_pending_mapped_save_reads_it_without_another_writers_calls() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (rec, mut sessions) = serve(tmp.path());
+    let a = client(&mut sessions, "a");
+    save(&a, "f", b"abcdefgh");
+    let (mapped, descriptor) = {
+        let mut guard = a.lock().unwrap();
+        let mapped = guard.write_open("f", None).unwrap();
+        let descriptor = guard.write_open("f", None).unwrap();
+        let object = guard.object_at("f").unwrap();
+        assert_eq!(guard.page_fill(object, 0, 8).unwrap(), b"abcdefgh");
+        guard.write(descriptor, 2, b"1234", false).unwrap();
+        guard.page_writeback(mapped, 0, b"WXYZefgh").unwrap();
+        (mapped, descriptor)
+    };
+    let Closing::Decide(save) = a.start_close(mapped).unwrap() else {
+        panic!("a close with page writes saved at its start");
+    };
+    assert_eq!(opened(&a, "f"), b"WXYZefgh");
+    let reopened = {
+        let mut guard = a.lock().unwrap();
+        let g = guard.write_open("f", None).unwrap();
+        assert_eq!(guard.read_open(g).unwrap().to_vec().unwrap(), b"WXYZefgh");
+        g
+    };
+    save.finish().unwrap();
+    assert_eq!(a.close(reopened).unwrap(), Saved::Unchanged);
+    assert_eq!(read(&rec, ROOT, "f"), b"WXYZefgh");
+    assert_eq!(opened(&a, "f"), b"WXYZefgh");
+    a.close(descriptor).unwrap();
+}

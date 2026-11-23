@@ -485,26 +485,50 @@ impl TreeActor {
         std::mem::take(&mut self.changed)
     }
 
-    /// The file's image, a clone (O(1) once built): what an open by the
-    /// client of a pending save reads when its open's own map will not do
-    /// (`TreeActor::open_map`). Every open's calls are in it, a pending
-    /// save's included, because its handle lives until the save lands.
+    /// The saved map of `object` in `tree` as the pending saves of `closes`
+    /// leave it, in the order given (their close order): each one's own
+    /// calls, read back from the journal, and the page-write pieces its save
+    /// takes, replayed by [`calls_for_close`] as the save will be. The first
+    /// takes pieces against the file's `saved_through`; each later one lands
+    /// after a step past every page write so far, so it takes only the
+    /// pieces over bytes its own earlier calls touched. Another open's
+    /// unsaved calls are never in it (ledger R1.1): what an open by the
+    /// client of those saves reads (`TreeActor::open_map`). Never waits.
     ///
     /// # Errors
     ///
-    /// [`Error::NotFound`] with no write-open of the file; a failed read of
-    /// the journal.
-    pub(in crate::tree_actor) fn pages_image(
-        &mut self,
+    /// [`Error::NotFound`] when `tree` holds no such object; a failed read
+    /// of the journal; a call that does not apply.
+    pub(in crate::tree_actor) fn pages_fold_saves(
+        &self,
         tree: TreeId,
         object: u64,
+        closes: &[u64],
     ) -> Result<FileMap> {
-        let key = (tree, object);
-        self.pages_build_image(&key)?;
-        self.pages
-            .get(&key)
-            .and_then(|state| state.image.clone())
-            .ok_or(Error::NotFound)
+        let _kind = crate::tree_actor::stages::section(crate::tree_actor::stages::Hold::PageImage);
+        let mut map = self
+            .tree(tree)?
+            .bytes
+            .get(&object)
+            .ok_or(Error::NotFound)?
+            .clone();
+        let state = self.pages.get(&(tree, object));
+        let writes = state.map_or(&[][..], |state| state.writes.as_slice());
+        let mut through = state.map_or(0, |state| state.saved_through);
+        let reader = self.journal.call_reader();
+        for handle in closes {
+            let h = self.handles.get(handle).ok_or(Error::NotFound)?;
+            let own = if h.call_count > 0 {
+                reader.calls(*handle)?
+            } else {
+                Vec::new()
+            };
+            for call in calls_for_close(map.len(), &own, writes, through) {
+                map.apply(call.call(), call.at())?;
+            }
+            through = u64::MAX;
+        }
+        Ok(map)
     }
 
     /// Builds the image if it has none: the saved map plus every live open's

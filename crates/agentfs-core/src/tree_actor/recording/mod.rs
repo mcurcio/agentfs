@@ -471,16 +471,17 @@ impl TreeActor {
 
     /// The file at `path` as `by`'s pending saves leave it, else its saved
     /// map: what an open by the file's own client reads (close-to-open,
-    /// ledger R1.1). Another client's pending save is not shown. One
-    /// pending save whose base did not move, with no page write of the
-    /// file, gives its open's map, a clone; more, or a moved base, or page
-    /// writes give the file's image, built under the lock as a page fill
-    /// builds it.
+    /// ledger R1.1). Another client's pending save is not shown, nor any
+    /// open's unsaved calls. One pending save whose base did not move, with
+    /// no page write of the file, gives its open's map, a clone; more, or a
+    /// moved base, or page writes give the exact fold of `by`'s pending
+    /// saves on the saved map, in close order
+    /// ([`TreeActor::pages_fold_saves`]), built under the lock. Never waits.
     ///
     /// # Errors
     ///
     /// As [`TreeActor::file_map`]; a failed read of the journal for the
-    /// image.
+    /// fold.
     pub(crate) fn open_map(&mut self, tree: TreeId, path: &str, by: &WriterAt) -> Result<FileMap> {
         let object = *self.tree(tree)?.names.get(path).ok_or(Error::NotFound)?;
         match self.pending_content(tree, object, by)? {
@@ -492,12 +493,12 @@ impl TreeActor {
     /// `object` as `by`'s pending saves leave it, or None when `by` has no
     /// pending save of it (see [`TreeActor::open_map`]).
     fn pending_content(
-        &mut self,
+        &self,
         tree: TreeId,
         object: u64,
         by: &WriterAt,
     ) -> Result<Option<FileMap>> {
-        let mine: Vec<&Handle> = self
+        let mut mine: Vec<(u64, &Handle)> = self
             .handles
             .iter()
             .filter(|(handle, h)| {
@@ -506,9 +507,11 @@ impl TreeActor {
                     && h.by.writer == by.writer
                     && (h.closing || self.pending_closes.contains(handle))
             })
-            .map(|(_, h)| h)
+            .map(|(handle, h)| (*handle, h))
             .collect();
-        let [only, ..] = mine.as_slice() else {
+        // Close order; an ended client's opens, which have none, last.
+        mine.sort_by_key(|(handle, h)| (h.close_order.is_none(), h.close_order, *handle));
+        let [(_, only), ..] = mine.as_slice() else {
             return Ok(None);
         };
         let saved_step = self
@@ -524,7 +527,8 @@ impl TreeActor {
         {
             return Ok(Some(only.bytes.clone()));
         }
-        self.pages_image(tree, object).map(Some)
+        let closes: Vec<u64> = mine.iter().map(|(handle, _)| *handle).collect();
+        self.pages_fold_saves(tree, object, &closes).map(Some)
     }
 
     /// The saved length of `path`.
