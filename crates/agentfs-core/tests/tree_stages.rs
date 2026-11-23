@@ -98,9 +98,9 @@ fn stages_add_up() {
     let mut got = count(&after.stages, &before.stages);
     let (_, syncs) = got.pop().unwrap();
     let expect = [
-        // the open, the truncate, the write, the close's layout chunk, and
-        // the close as a step.
-        ("journal_append", 5 * SAVES),
+        // the open, the truncate, the write, the close's record, its layout
+        // chunk, and the close as a step.
+        ("journal_append", 6 * SAVES),
         // A call is appended with no fsync; the builder makes a batch durable
         // before it reads it.
         ("journal_fsync", SAVES),
@@ -511,8 +511,9 @@ fn a_call_is_not_fsynced_and_flush_fsyncs_once() {
     rec.settle().unwrap();
     let after = Stages::current();
     assert_eq!(after.journal_fsync.count - before.journal_fsync.count, 2);
-    // The truncate, eight writes, the close's layout chunk and its step.
-    assert_eq!(after.journal_append.count - before.journal_append.count, 11);
+    // The truncate, eight writes, the close's record, its layout chunk and
+    // its step.
+    assert_eq!(after.journal_append.count - before.journal_append.count, 12);
 }
 
 /// The distinct objects the store holds, by id. The history's repack runs in

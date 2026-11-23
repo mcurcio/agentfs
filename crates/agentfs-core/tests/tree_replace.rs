@@ -116,10 +116,10 @@ fn a_replace_builds_what_a_truncating_open_write_and_close_build() {
     let mut after = ten_lines();
     after.splice(0..0, b"first\n".iter().copied());
     after.extend_from_slice(b"last");
-    // The twin's save is its fifth record (open, truncate, write, layout
-    // chunk, close): three steps that build no commit put the replace at the
-    // same number.
-    for _ in 0..3 {
+    // The twin's save is its sixth record (open, truncate, write, close
+    // record, layout chunk, close): four steps that build no commit put the
+    // replace at the same number.
+    for _ in 0..4 {
         va.set_times(ROOT, "", None, Some(SetTime::Now), &writer("w"))
             .unwrap();
     }
