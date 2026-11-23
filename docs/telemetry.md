@@ -159,7 +159,7 @@ history inside a close) counts to the inner kind only. Every hold is one
 | `close` | A close's first half and its land, a close decided under the lock, and pending closes saved again |
 | `take` | A take's inputs, the entries it leaves waiting, and its land |
 | `fork_copy` | A fork's step, its untracked area's copy included |
-| `page_image` | A page fill or writeback building a file's image from every live open's calls, and an open by a client with pending saves of the file folding them onto the saved bytes |
+| `page_image` | A page fill or writeback building a file's image from every live open's calls, and the library's one-hold `TreeActor::write_open` (the CLI and tests) folding a client's pending saves of the file onto the saved bytes. A view's open folds them with the lock released, so it holds no `page_image` |
 | `other` | Everything else: the call's own work |
 
 Two more waits stall a request without the lock. A call that starts new

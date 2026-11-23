@@ -796,7 +796,8 @@ cffc114. Two cells for one figure are two runs. All times in ms.
   those saves back from the journal and replays them, at each open; the
   lock is held only for the snapshot ([trees](trees.md#pending-saves)).
   The `pending_open` leg, run alone on a fresh volume with a fork's view
-  (release build, the container above, ext4, two runs each; local
+  (`trees-figures.py --only pending_open --metrics --probe --probe-view
+  FORK`, release build, the container above, ext4, two runs each; local
   observations, not CI). "Before" is commit ae45af8, which folded under
   the lock; "after" is the commit that moved the fold off it. All in ms.
 
@@ -814,6 +815,17 @@ cffc114. Two cells for one figure are two runs. All times in ms.
   another file in that view waits as long as the open. An open of a file
   with one pending save on an unmoved base is its open's view, about
   0.4 ms, with no fold.
+- **A close record costs `create` nothing measurable.** Each close's start
+  is one more journal append, about 100 bytes and one `write(2)` under the
+  lock ([trees](trees.md#the-journal)). The many-file `create` in the
+  `image` workflow's tree views tracer (`ci/e2e-trees-tracer.sh --figures`),
+  50,000 files, total seconds, two runs each on GitHub `ubuntu-24.04`
+  runners: before, commit 4e16030 (`image` runs 45216940719 and
+  45216954610), ext4 23.3 and 23.6, XFS 13.4 and 12.9; after, commit
+  ae45af8 (runs 45230149331 and 45230161224), ext4 33.3 and 13.8, XFS 36.4
+  and 13.9. One run after was faster than both before and one slower, on
+  both filesystems, so the spread is the runners', not the record's; every
+  run met the bar.
 - **Another view still waits for the volume's lock.** When both views close
   a fragmented file at once, the other view's slowest call (a stat) waited
   206 to 832 ms, against 1.2 to 1.3 s before; the lock was held longest by

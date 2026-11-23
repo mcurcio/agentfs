@@ -1406,6 +1406,15 @@ What the tree views do not support:
   are not merged into one piece, so an open of a million small appends holds a
   million pieces (peaks of 774 and 885 MiB in two local runs;
   [performance](performance.md#tree-views-release-build)).
+- **A refused call waits for every save of its file.** An unlink, a rename
+  onto the file, a path truncate, a time set or a move out of the tree waits
+  until no save of the file is in flight, not only the saves begun before it,
+  so a client that keeps closing the file keeps the call waiting
+  ([pending saves](#pending-saves)).
+- **The model replay makes no call over a pending save.** The library
+  replay saves each close before it returns and settles after every call,
+  because its invariants read git after each one; `tree_pending_saves.rs` and
+  `e2e-tree-pending-saves.sh` cover pending saves instead.
 - **A restart copies every checkout.** Each start writes the private checkouts
   of the built point whole, so its time grows with the tree (38 to 39 s for
   100,000 files in one local run).
@@ -1459,7 +1468,9 @@ jobs in [development.md](development.md); the method is in
   view-host death, kills at each failpoint, state exhaustion.
 - `e2e-tree-pending-saves.sh` (`trees-pending-saves.py`): a save worker's
   decision that fails, panics or kills agentfs (failpoint `tree.close_decide`)
-  loses nothing; `e2e-tree-pagecache.sh` also checks that a stat, an open and a
+  loses nothing, and two saves of one file closed in the other order than
+  they were opened land in close order after a `kill -9` (cases `order` and
+  `order-restarted`); `e2e-tree-pagecache.sh` also checks that a stat, an open and a
   rename after a slow close see its save, and that a delete right after a close
   leaves history with the save, then the delete. `tree_pending_saves.rs` holds
   the library's cases.

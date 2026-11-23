@@ -278,7 +278,8 @@ a write on an `O_SYNC` or `O_DSYNC` descriptor, has returned after it
 ([trees.md](trees.md#recording-and-durability)). A file's save, the step its last
 close makes of those calls, may land after the close is answered; until then its
 own client reads it and nothing can delete it, and a restart makes it from the
-journal ([pending saves](trees.md#pending-saves)).
+journal, a file's saves in the order their closes began
+([pending saves](trees.md#pending-saves)).
 
 What a power cut can lose in a tree view:
 
