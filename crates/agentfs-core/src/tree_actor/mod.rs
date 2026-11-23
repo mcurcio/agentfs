@@ -45,6 +45,7 @@ use serde::Serialize;
 use crate::file_lock::{FileLock, Mode};
 use crate::fsutil::sync_dir;
 pub use agentfs_contracts::{NotATree, TreeId};
+pub(crate) use call_path::ActorGuard;
 pub use call_path::{Closing, PathStep, Progress, Recording, SavePending, SaveToDecide, Then};
 use history::builder::{BuildState, Builder, JournalReader, copy_all};
 pub use history::built::{
@@ -75,8 +76,7 @@ pub use recording::file_map::FileMapReader;
 pub use recording::layout::Fingerprint;
 pub use recording::{DirEntry, FileMap, Node, RenameMode};
 use recording::{Handle, pages};
-#[expect(unused_imports, reason = "close-order-2 uses them in session.rs")]
-pub(crate) use recording::{OpenContent, PendingFold, WriteOpenStart};
+pub(crate) use recording::{OpenContent, WriteOpenStart};
 use rows::SavedRows;
 pub use rows::{Chain, RowDomain, RowEvent, RowWrite};
 use stages::Stages;
