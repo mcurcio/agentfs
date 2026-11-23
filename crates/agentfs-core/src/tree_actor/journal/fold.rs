@@ -886,4 +886,24 @@ mod tests {
         drop(v);
         assert_eq!(reopen(tmp.path()).read(TreeId::Root, "f").unwrap(), b"BBBB");
     }
+
+    /// A close whose close record could not be appended keeps its client's
+    /// order: the next close record appended, here the later close's, comes
+    /// after one for it. Its client closed `AAAA` first and `BBBB` second,
+    /// so the file ends `BBBB`, live and after a restart.
+    #[test]
+    fn a_failed_close_record_keeps_its_clients_close_order() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut v = new_actor(tmp.path());
+        let (h1, h2) = two_opens(&mut v);
+        {
+            let _append = crate::failpoints::configure("tree.wal_before_header=error").unwrap();
+            assert!(v.close_begin(h1).is_err());
+        }
+        v.close(h2).unwrap();
+        let live = v.read(TreeId::Root, "f").unwrap();
+        drop(v);
+        let restarted = reopen(tmp.path()).read(TreeId::Root, "f").unwrap();
+        assert_eq!((live, restarted), (b"BBBB".to_vec(), b"BBBB".to_vec()));
+    }
 }
