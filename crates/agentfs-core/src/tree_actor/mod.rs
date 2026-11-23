@@ -359,7 +359,7 @@ pub struct Metrics {
     /// History as built behind the call path.
     pub history: HistoryMetrics,
     /// Saves begun and not landed: being decided, queued, or failed and
-    /// awaiting a retry (docs/trees.md, "Recording and durability").
+    /// awaiting a retry (docs/trees.md, "Pending saves").
     pub pending_saves: u64,
     /// The age of the oldest of them, in nanoseconds; 0 with none.
     pub oldest_pending_save_ns: u64,

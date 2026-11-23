@@ -292,10 +292,14 @@ evidence. CI scripts judge the build:
   `crates/agentfs-conformance/tests/regressions`
   ([VERIFYING.md](../crates/agentfs-model/VERIFYING.md)).
 - `e2e-tree-pagecache.sh`: shared mappings in 21 cases, `trees-mmap`, 64
-  closes reopened.
+  closes reopened, and pending saves (`trees-close-open.py`): a stat, an open
+  and a rename after a slow close, and history's save then delete.
 - `e2e-tree-restart.sh`, `e2e-tree-recording-faults.sh` and
   `e2e-tree-enospc.sh`: view-host death, kills at each failpoint, state
   exhaustion.
+- `e2e-tree-pending-saves.sh` (job `recording-faults`): a save worker's
+  decision failing, panicking or killing agentfs at failpoint
+  `tree.close_decide`, on a failpoints build ([trees](trees.md#pending-saves)).
 - `power-loss-trees.sh`: dm-log-writes replay on ext4 and XFS, on the
   upstream and a fork, each checkpoint also rebuilding the refs from the
   journal alone.

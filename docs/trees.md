@@ -449,7 +449,8 @@ row and counts as released.
   saves can align repeated lines differently. Stored bytes and identities do not
   change.
 
-`fsync` makes the file's calls durable; the final release publishes the file.
+`fsync` makes the file's calls durable; the final release begins the file's save,
+which lands on the view's save worker ([pending saves](#pending-saves)).
 
 ## Recording and durability
 
@@ -1419,6 +1420,12 @@ jobs in [development.md](development.md); the method is in
   reopened.
 - `e2e-tree-restart.sh`, `e2e-tree-recording-faults.sh`, `e2e-tree-enospc.sh`:
   view-host death, kills at each failpoint, state exhaustion.
+- `e2e-tree-pending-saves.sh` (`trees-pending-saves.py`): a save worker's
+  decision that fails, panics or kills agentfs (failpoint `tree.close_decide`)
+  loses nothing; `e2e-tree-pagecache.sh` also checks that a stat, an open and a
+  rename after a slow close see its save, and that a delete right after a close
+  leaves history with the save, then the delete. `tree_pending_saves.rs` holds
+  the library's cases.
 - `power-loss-trees.sh`: `dm-log-writes` replay on ext4 and XFS, on the upstream and
   a fork. At each checkpoint the volume opens, recovery saves what survived, the
   recovered files are a prefix of the calls made that holds every call before the

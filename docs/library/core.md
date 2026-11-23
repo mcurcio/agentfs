@@ -981,7 +981,9 @@ A RELEASE goes in two halves ([pending saves](../trees.md#pending-saves)).
 the lock released and lands it under the lock, after any earlier-begun save of
 the same file; dropped unfinished, a panic included, it stays pending as a failed
 close (counted in `failed_saves`). `close(handle)` and `Recording::close_with` are
-both halves on the caller's thread, for the CLI, tests and recovery.
+both halves on the caller's thread, for the CLI, tests and recovery;
+`Recording::start_close_with(handle, check)` is the first half with a check run
+under the same hold, which `TreeSession::start_close` uses.
 `SessionGuard::open_map(path)` is what an open reads: the file as this client's
 pending saves leave it (their own calls and the page-write pieces their saves
 take, replayed on the saved map in close order), else the saved map; never
@@ -991,10 +993,14 @@ or `WaitFor(SavePending)` with nothing done while the file they would delete or
 replace has a pending save. `SavePending` is made only by the core and must be
 used: hand it and a retry of the whole call to `when_saved_then(pending, then)`,
 which runs `then` once no save of that file is pending (at once when none is, else
-on the thread that lands it, with the lock released). A rename of the pending
+on the thread that lands it, with the lock released; `Error::Stopped` when the
+actor stops first); `Recording::when_saved_then` is the same without a session.
+The retry may be refused again for a save begun meanwhile. A rename of the pending
 file itself goes first. `Recording::settle` waits until no save is pending, then
 until history is built through every record by then; it is never called from a
-thread that finishes saves.
+thread that finishes saves. `TreeActor::metrics()` counts them in
+`pending_saves`, `oldest_pending_save_ns` and `failed_saves`
+([telemetry](../telemetry.md#pending-saves)).
 
 `unbind` removes the binding and, under the same lock,
 `TreeActor::close_writer` closes every open of the client's writer as a save,
