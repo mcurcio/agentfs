@@ -298,7 +298,10 @@ fn two_closes_of_one_file_land_in_close_order() {
     assert!(a_step < b_step, "A's save at {a_step}, B's at {b_step}");
     let mut expected = written;
     expected[..4].copy_from_slice(b"BBBB");
-    assert!(read(&rec, ROOT, "f") == expected, "f holds A's save, then B's");
+    assert!(
+        read(&rec, ROOT, "f") == expected,
+        "f holds A's save, then B's"
+    );
 }
 
 /// A pending save dropped unfinished (a panicking worker) stays pending as
