@@ -2432,3 +2432,11 @@ One fix agent, the review's findings. Local runs as root with FUSE, debug builds
 **Not settled:** whether the daemon unmounted and exited by itself before the kill (a product question) or the entry went after it. The script never checks between `wait_mounted` and the kill that the daemon is alive and still mounted, and `kill -0`/`kill -KILL` succeed on an unreaped zombie.
 
 **For the fix round:** in `leave_root_attached`, before the kill fail loudly (printing `setup-mount.log` and `/proc/self/mounts`) unless `ps -o stat= -p $pid` is not `Z` and `mountpoint -q "$work/main"` succeeds; after the kill run `fusermount3 -uz` only while `/proc/self/mounts` lists main. Never a bare `|| true`. If the check before the kill ever fires, that is a product bug to find (a mount that ends by itself).
+
+## 2026-11-23, PR #42 at 4bab860: `csi_trees::views_at_the_kubelet_target` saw two hosts once
+
+**The red.** ci "e2e (FUSE mount)", `crates/agentfs/tests/csi_trees.rs:747`: `assert_eq!(pids.len(), 1)` failed with `[5269, 5294]`. 4bab860 and a1c6ce1 are docs; 5042934 adds no running code.
+
+**Suspected mechanism (read, not run):** `host_pids` (`csi_trees.rs:437`) counts every process whose cmdline holds `--state <state> host`. A child the host forks (a git child of a builder batch, a take) carries the parent's cmdline until it execs, so a fork caught between fork and exec counts as a second host. Nothing orders the test's scan against the host's background work right after publish.
+
+**For the fix round:** `host_pids` keeps only processes whose parent is not itself a matching process (read `PPid` from `/proc/<pid>/status`), or matches on the executable's own `comm` after exec; then prove it by a test that holds a forked child before exec (or count across 50 scans during a host's first builder batch). Never retry the scan on a timer.
