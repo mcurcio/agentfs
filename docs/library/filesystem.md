@@ -837,8 +837,22 @@ not gated. The kernel judges authority and access (`default_permissions`).
 An open of a link answers `ELOOP`; `mknod` of a FIFO or a socket makes it in
 the untracked area, and of a device answers `EPERM`; extended attributes are
 not served. `RENAME_NOREPLACE` is
-served; `RENAME_EXCHANGE` and `RENAME_WHITEOUT` answer `EINVAL`. A thread joins each view's
-session, then sends `HostEvent::ViewEnded`; `Landed` follows each landed take,
+served; `RENAME_EXCHANGE` and `RENAME_WHITEOUT` answer `EINVAL`.
+
+Each view has two threads of its own. Its request thread answers the kernel in
+order and never waits for a save: a `RELEASE` calls `TreeSession::start_close`,
+is answered, and hands a `Closing::Decide` to the view's save worker
+(`tree_view/save_worker.rs`, thread `tree-saves`), which runs `SaveToDecide::finish`
+for each in the order they were begun and logs `tree SaveFailed` or
+`tree OrphanDropped`. A job that panics is caught and the worker goes on. A
+read-only open and a move out of the tree read `SessionGuard::open_map`, so the
+view's own client sees its pending saves ([trees](../trees.md#pending-saves)). A
+call refused with `PathStep::WaitFor` (`unlink`, a rename onto a pending file, a
+move in onto one, a setattr's path truncate) drops its guard and hands a retry of
+the whole request to `TreeSession::when_saved_then`, replying only from the retry;
+a setattr retries only its size and times, so its metadata step is not made twice.
+A thread joins each view's session, drains its save worker, then sends
+`HostEvent::ViewEnded`; `Landed` follows each landed take,
 after its pages were dropped. `close` is a lazy unmount (`stale::detach`),
 idempotent. `wait`, after every view ended, joins the workers and fails when
 the actor stopped.
@@ -887,9 +901,9 @@ call to one half in `tree_view`, with the untracked half in
   where `RuleSet::place` puts the source's kind; the table in
   [trees](../trees.md#moves-across-the-halves) gives what each move does.
   Every move but one within the untracked half stands behind the lag gate. A
-  tracked file or link moved out is read from a clone of its saved map with the
-  actor unlocked, placed with `UntrackedArea::place`, then unlinked
-  (`SessionGuard::unlink`). An untracked file moved in is one
+  tracked file or link moved out is read from `SessionGuard::open_map` (the
+  client's pending saves, else a clone of the saved map) with the actor unlocked, placed with `UntrackedArea::place`, then unlinked
+  (`SessionGuard::unlink`, which waits for a pending save of the file). An untracked file moved in is one
   `SessionGuard::replace_file` of the source's descriptor (`O_RDONLY |
   O_NOFOLLOW`; mode, uid, gid and size from its `fstat`), then `unlinkat`; the
   view marks every open it has of that file (same `st_dev` and `st_ino`)
@@ -908,7 +922,7 @@ The views use zero entry and attribute TTLs and direct I/O. Read-only
 descriptors keep saved bytes; writable ones read their own calls and the
 file's page writes. A read with no lock owner is a page fill and a write with
 `FUSE_WRITE_CACHE` is a page write, for shared mappings. `fsync` flushes the
-journal and the final release publishes. The code is `agentfs_fuse::tree_view`
+journal and the final release begins the save, which the save worker lands. The code is `agentfs_fuse::tree_view`
 (`Binding`, `serve`, `serve_with_metrics`); the rules are in [trees](../trees.md).
 
 ## What this layer does not do

@@ -43,4 +43,22 @@ wait_mounted "$work/main"
 python3 ci/trees-close-open.py "$work/main" || result=$?
 fusermount3 -u "$work/main"
 tree_wait_exit "$pid"; pid=
+
+# A delete waits for the file's pending save: the commits touching the file
+# unlinked at once after its close are the delete, then that save, whose
+# content is the overwrite (64 MiB of "o" with its last byte "n", as
+# trees-close-open.py writes).
+gitdir=$work/close-open/history.git
+name=unlinked-at-once
+mapfile -t touching < <(git --git-dir="$gitdir" log --format='%H %s' root -- "files/$(tree_git_fanned "$name")")
+if [ "${#touching[@]}" -lt 2 ] || [[ "${touching[0]#* }" != "Unlink by "* ]]; then
+  echo "close then unlink: the newest commit of $name is not its delete: ${touching[*]}" >&2
+  result=1
+elif ! cmp -s <(tree_git_file "$gitdir" "${touching[1]%% *}" "$name") \
+  <(head -c $(((64 << 20) - 1)) /dev/zero | tr '\0' o; printf n); then
+  echo "close then unlink: the commit before the delete is not the save: ${touching[1]}" >&2
+  result=1
+else
+  echo "close then unlink: history has the save, then the delete"
+fi
 exit "$result"

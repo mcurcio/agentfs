@@ -375,8 +375,8 @@ fn a_read_only_session_cannot_write() {
         guard.write_open("g", Some(ATTRS)).map(drop),
         guard.write_open_truncating("f", None).map(drop),
         guard.anonymous_open(ATTRS).map(drop),
-        guard.rename("f", "g", RenameMode::Replace),
-        guard.unlink("f"),
+        guard.rename("f", "g", RenameMode::Replace).map(drop),
+        guard.unlink("f").map(drop),
     ] {
         let error = refused.unwrap_err();
         assert!(matches!(error, Error::ReadOnly), "{error}");

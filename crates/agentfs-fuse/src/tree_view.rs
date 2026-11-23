@@ -21,7 +21,7 @@ mod save_worker;
 mod untracked;
 
 use std::collections::BTreeMap;
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::io;
 use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
@@ -36,11 +36,12 @@ use agentfs_contracts::views::{MountOptions, MountPoint, ViewError, ViewId, View
 use agentfs_core::session::{SessionGuard, Sessions, TreeSession};
 use agentfs_core::tree_actor::stages as measured;
 use agentfs_core::tree_actor::{
-    Attrs, Error, FileMap, Kind, Meta, Node, Perm, Progress, Recording, RenameMode, Saved, SetTime,
-    TreeId,
+    Attrs, Closing, Error, FileMap, Kind, Meta, Node, PathStep, Perm, Progress, Recording,
+    RenameMode, SavePending, Saved, SetTime, TreeId,
 };
 use agentfs_rules::{NewKind, PathFacts, Placement};
 use fuser::*;
+use save_worker::SaveWorker;
 use untracked::{Untracked, is_untracked};
 
 const TTL: Duration = Duration::ZERO;
@@ -336,7 +337,9 @@ impl Views for ViewHost {
             .untracked_area()
             .map_err(|e| ViewError::MountFailed(e.errno()))?;
         let give = crate::privileges::Privileges::current().can_chown_new();
+        let saves = Arc::new(SaveWorker::start(tree).map_err(errno)?);
         let view = View {
+            saves: Arc::clone(&saves),
             session,
             handles: Arc::new(Mutex::new(Handles {
                 next: 1,
@@ -385,6 +388,9 @@ impl Views for ViewHost {
                 if let Err(e) = mounted.join() {
                     eprintln!("tree ViewFailed: tree={tree}: {e}");
                 }
+                // Every RELEASE was begun; their saves land before the
+                // client's end, which `ViewEnded` leads to.
+                saves.drain();
                 if stacked {
                     // The stale layers this view was stacked over.
                     match stale::detach_stale_layers(&at, stale::STALE_LAYERS) {
@@ -556,6 +562,9 @@ fn session_config(options: &MountOptions, read_only: bool, fsname: &str) -> Conf
 #[derive(Clone)]
 struct View {
     session: TreeSession,
+    /// The view's save worker: it decides and lands the saves its RELEASEs
+    /// began, so this view's request thread never waits for a save.
+    saves: Arc<SaveWorker>,
     handles: Arc<Mutex<Handles>>,
     /// The tree's untracked half.
     untracked: Arc<Untracked>,
@@ -607,6 +616,13 @@ fn open_handle(open: &Open) -> Option<u64> {
     }
 }
 
+/// A save of a file no name reached any more: logged, as the core drops it.
+fn orphan_dropped(tree: TreeId, handle: u64, saved: Saved) {
+    if saved == Saved::OrphanDropped {
+        eprintln!("tree OrphanDropped: tree={tree} open={handle}");
+    }
+}
+
 fn errno(error: Error) -> Errno {
     Errno::from_i32(error.errno())
 }
@@ -653,6 +669,26 @@ fn area_kind(kind: FileType) -> NewKind {
 enum Half {
     Tracked,
     Untracked,
+}
+
+/// What a rename did.
+#[derive(Debug, PartialEq, Eq)]
+enum Moved {
+    Done,
+    /// Refused with nothing done: the whole rename is retried once this
+    /// save has landed.
+    Again(SavePending),
+    /// A move out of the tree placed the file in the area, and its unlink
+    /// of the tree's name at this path waits for this save.
+    Unlink(SavePending, String),
+}
+
+/// A reply of an empty answer, given a result.
+fn answer_empty_now(reply: ReplyEmpty) -> Box<dyn FnOnce(Result<()>) + Send> {
+    Box::new(move |result| match result {
+        Ok(()) => reply.ok(),
+        Err(e) => reply.error(e),
+    })
 }
 
 /// What a rename does (docs/trees.md, "Moves across the halves").
@@ -1081,7 +1117,8 @@ impl View {
                 let h = v.write_open(path, create).map_err(errno)?;
                 v.close(h).map_err(errno)?;
             }
-            Open::Read(v.file_map(path).map_err(errno)?)
+            // The client's own pending saves are its newest content.
+            Open::Read(v.open_map(path).map_err(errno)?)
         };
         let fh = handles.next;
         handles.next += 1;
@@ -1090,14 +1127,16 @@ impl View {
     }
     /// A setattr's changes, in one order: the metadata (one `set_meta`),
     /// the size, then the times (one `set_times`, which builds no commit). A
-    /// file no name reaches has no path to record metadata or times at.
+    /// file no name reaches has no path to record metadata or times at. A
+    /// path truncate of a file with a pending save is refused with only the
+    /// metadata done: the caller retries the size and the times.
     fn set_attrs(
         &self,
         v: &mut SessionGuard<'_>,
         ino: INodeNo,
         changes: AttrChanges,
         fh: Option<FileHandle>,
-    ) -> Result<FileAttr> {
+    ) -> Result<PathStep<FileAttr>> {
         let times = (
             changes.atime.map(set_time).transpose()?,
             changes.mtime.map(set_time).transpose()?,
@@ -1117,17 +1156,47 @@ impl View {
                 }
             } else {
                 let path = self.path(v, ino)?;
-                let h = v.write_open(&path, None).map_err(errno)?;
-                let result = v.truncate(h, size).map_err(errno);
-                v.close(h).map_err(errno)?;
-                result?;
+                if let PathStep::WaitFor(pending) = v.truncate_path(&path, size).map_err(errno)? {
+                    return Ok(PathStep::WaitFor(pending));
+                }
             }
         }
         if times.0.is_some() || times.1.is_some() {
             let path = self.path(v, ino).map_err(|_| Errno::EOPNOTSUPP)?;
             v.set_times(&path, times.0, times.1).map_err(errno)?;
         }
-        self.attr(v, ino, fh)
+        self.attr(v, ino, fh).map(PathStep::Done)
+    }
+    /// A setattr, answered by `reply`: retried once a pending save its path
+    /// truncate waits for has landed, with its metadata, made already, left
+    /// out of the retry.
+    fn setattr_then(
+        &self,
+        ino: INodeNo,
+        changes: AttrChanges,
+        fh: Option<FileHandle>,
+        reply: ReplyAttr,
+    ) {
+        let step = self
+            .actor()
+            .and_then(|mut v| self.set_attrs(&mut v, ino, changes, fh));
+        match step {
+            Ok(PathStep::Done(attr)) => reply.attr(&TTL, &attr),
+            Ok(PathStep::WaitFor(pending)) => {
+                let view = self.clone();
+                let rest = AttrChanges {
+                    mode: None,
+                    uid: None,
+                    gid: None,
+                    ..changes
+                };
+                self.when_saved(pending, move |saved| match saved {
+                    Ok(()) => view.setattr_then(ino, rest, fh, reply),
+                    Err(e) => reply.error(e),
+                });
+            }
+            Err(e) => reply.error(e),
+        }
     }
     /// A symbolic link at `path` to `target`, owned by `owner`: its attributes.
     fn make_symlink(
@@ -1269,7 +1338,8 @@ impl View {
             },
         })
     }
-    /// A rename, planned again under the actor's lock and made.
+    /// A rename, planned again under the actor's lock and made, or refused
+    /// with nothing done for a pending save of the file it would replace.
     fn run_move(
         &self,
         parent: INodeNo,
@@ -1277,34 +1347,39 @@ impl View {
         newparent: INodeNo,
         newname: &OsStr,
         mode: RenameMode,
-    ) -> Result<()> {
+    ) -> Result<Moved> {
         let mut v = self.actor()?;
         let (from, from_up, to, to_up) = self.rename_paths(&v, parent, name, newparent, newname)?;
         let no_replace = mode == RenameMode::NoReplace;
         match self.plan_move(&v, &from, from_up, &to, to_up)? {
             Move::Untracked => {
                 let meta_of = &mut |dir: &str| v.node(dir).ok().map(|n| n.meta);
-                self.untracked.rename(&from, &to, no_replace, meta_of)
+                self.untracked
+                    .rename(&from, &to, no_replace, meta_of)
+                    .map(|()| Moved::Done)
             }
             Move::Tracked { dir } => {
                 let dir = dir && from != to;
                 if dir {
                     self.untracked.clear_for_dir(&to)?;
                 }
-                v.rename(&from, &to, mode).map_err(errno)?;
+                if let PathStep::WaitFor(pending) = v.rename(&from, &to, mode).map_err(errno)? {
+                    return Ok(Moved::Again(pending));
+                }
                 // A tracked directory's untracked children move with it.
                 if dir {
                     let meta_of = &mut |dir: &str| v.node(dir).ok().map(|n| n.meta);
                     self.untracked.follow_dir(&from, &to, meta_of)?;
                 }
-                Ok(())
+                Ok(Moved::Done)
             }
             Move::Export => {
                 if no_replace && self.untracked.exists(&to)? {
                     return Err(Errno::EEXIST);
                 }
                 let meta = v.node(&from).map_err(errno)?.meta;
-                let map = v.file_map(&from).map_err(errno)?;
+                // The client's own pending saves are the content it moves.
+                let map = v.open_map(&from).map_err(errno)?;
                 let meta_of = &mut |dir: &str| v.node(dir).ok().map(|n| n.meta);
                 let writing = self.untracked.writing();
                 writing.containers(&to, meta_of).map_err(untracked::io)?;
@@ -1314,9 +1389,14 @@ impl View {
                 // the tracked name's removal is recorded (`AreaWrite::place`).
                 self.untracked
                     .place(&writing, &to, &mut map.reader(), map.len(), meta)?;
-                // The actor's lock is never taken under the area's hold.
+                // The actor's lock is never taken under the area's hold. The
+                // tree's name goes as an unlink does: once the file's pending
+                // save, if any, has landed.
                 drop(writing);
-                self.actor()?.unlink(&from).map_err(errno)
+                Ok(match self.actor()?.unlink(&from).map_err(errno)? {
+                    PathStep::Done(()) => Moved::Done,
+                    PathStep::WaitFor(pending) => Moved::Unlink(pending, from),
+                })
             }
             Move::Import => {
                 if let Ok(node) = v.node(&to) {
@@ -1338,14 +1418,18 @@ impl View {
                 let len = u64::try_from(st.st_size).map_err(|_| Errno::EIO)?;
                 // One step under the actor's lock: the volume's calls wait
                 // while the bytes are copied into the journal.
-                v.replace_file(&to, attrs, &mut file, len).map_err(errno)?;
+                if let PathStep::WaitFor(pending) =
+                    v.replace_file(&to, attrs, &mut file, len).map_err(errno)?
+                {
+                    return Ok(Moved::Again(pending));
+                }
                 let object = v.object_at(&to).map_err(errno)?;
                 drop(v);
                 self.durable_before_unlink()?;
                 self.untracked.unlink(&from)?;
                 self.mark_moved(untracked::file_of(&st))?;
                 self.invalidate(object);
-                Ok(())
+                Ok(Moved::Done)
             }
             Move::ImportLink => {
                 let target = self.untracked.readlink_at(&from)?;
@@ -1358,8 +1442,58 @@ impl View {
                 v.symlink(&to, &target, owner).map_err(errno)?;
                 drop(v);
                 self.durable_before_unlink()?;
-                self.untracked.unlink(&from)
+                self.untracked.unlink(&from).map(|()| Moved::Done)
             }
+        }
+    }
+    /// A rename, answered by `reply`: refused for a pending save of the
+    /// file it would replace, the whole request is retried once that save
+    /// has landed; a move out of the tree waits so only for its unlink.
+    fn rename_then(
+        &self,
+        parent: INodeNo,
+        names: (OsString, OsString),
+        newparent: INodeNo,
+        mode: RenameMode,
+        reply: ReplyEmpty,
+    ) {
+        match self.run_move(parent, &names.0, newparent, &names.1, mode) {
+            Ok(Moved::Done) => reply.ok(),
+            Ok(Moved::Again(pending)) => {
+                let view = self.clone();
+                self.when_saved(pending, move |saved| match saved {
+                    Ok(()) => view.rename_then(parent, names, newparent, mode, reply),
+                    Err(e) => reply.error(e),
+                });
+            }
+            Ok(Moved::Unlink(pending, from)) => {
+                let view = self.clone();
+                self.when_saved(pending, move |saved| match saved {
+                    Ok(()) => view.unlink_then(from, answer_empty_now(reply)),
+                    Err(e) => reply.error(e),
+                });
+            }
+            Err(e) => reply.error(e),
+        }
+    }
+    /// UNLINK of a tracked name, answered by `reply`: a file with a pending
+    /// save waits for it (the owner, 2026-11-23), and the whole request is
+    /// retried from the thread that lands the save.
+    fn unlink_tracked(&self, parent: INodeNo, name: OsString, reply: ReplyEmpty) {
+        let step = self.actor().and_then(|mut v| {
+            let path = child_path(&self.path(&v, parent)?, &name)?;
+            v.unlink(&path).map_err(errno)
+        });
+        match step {
+            Ok(PathStep::Done(())) => reply.ok(),
+            Ok(PathStep::WaitFor(pending)) => {
+                let view = self.clone();
+                self.when_saved(pending, move |saved| match saved {
+                    Ok(()) => view.unlink_tracked(parent, name, reply),
+                    Err(e) => reply.error(e),
+                });
+            }
+            Err(e) => reply.error(e),
         }
     }
     /// Drops the kernel's pages of tracked file `object` in this view, off
@@ -1383,19 +1517,49 @@ impl View {
             self.handles()?.entries.remove(&fh.0);
             return Ok(());
         }
-        // The handles' lock, then the actor's, never both: a close decides
-        // with the actor unlocked (`TreeSession::close`), and this view's
-        // requests stay in order on its one FUSE thread.
+        // The handles' lock, then the actor's, never both. The close is
+        // begun here, under the lock, so this view's later requests find it
+        // begun; its save is decided and landed on the view's save worker.
         let entry = self.handles()?.entries.remove(&fh.0).ok_or(Errno::EBADF)?;
-        if let Open::Write { handle, .. } = entry
-            && self.session.close(handle).map_err(errno)? == Saved::OrphanDropped
-        {
-            eprintln!(
-                "tree OrphanDropped: tree={} open={handle}",
-                self.session.tree()
-            );
+        let Open::Write { handle, .. } = entry else {
+            return Ok(());
+        };
+        let tree = self.session.tree();
+        match self.session.start_close(handle).map_err(errno)? {
+            Closing::Saved(saved) => orphan_dropped(tree, handle, saved),
+            Closing::Decide(save) => self.saves.submit(Box::new(move || match save.finish() {
+                Ok(saved) => orphan_dropped(tree, handle, saved),
+                Err(e) => {
+                    eprintln!("tree SaveFailed: tree={tree} open={handle}: {e}; it stays pending")
+                }
+            })),
         }
         Ok(())
+    }
+    /// An unlink of `path`, retried once the file's pending save has landed
+    /// or failed, with `answer` given its outcome: what a move out of the
+    /// tree does after it placed the file's copy in the area.
+    fn unlink_then(&self, path: String, answer: Box<dyn FnOnce(Result<()>) + Send>) {
+        let step = self
+            .actor()
+            .and_then(|mut v| v.unlink(&path).map_err(errno));
+        match step {
+            Ok(PathStep::Done(())) => answer(Ok(())),
+            Ok(PathStep::WaitFor(pending)) => {
+                let view = self.clone();
+                self.when_saved(pending, move |saved| match saved {
+                    Ok(()) => view.unlink_then(path, answer),
+                    Err(e) => answer(Err(e)),
+                });
+            }
+            Err(e) => answer(Err(e)),
+        }
+    }
+    /// Runs `retry` once `pending`'s save has landed or failed: on this
+    /// thread when it already has, else on the thread that lands it.
+    fn when_saved(&self, pending: SavePending, retry: impl FnOnce(Result<()>) + Send + 'static) {
+        self.session
+            .when_saved_then(pending, Box::new(move |saved| retry(saved.map_err(errno))));
     }
 }
 
@@ -1726,15 +1890,9 @@ impl Filesystem for View {
                 Err(e) => reply.error(e),
             };
         }
-        let setattr = move |view: &View, admitted: Result<()>| {
-            let result = admitted.and_then(|()| {
-                let mut v = view.actor()?;
-                view.set_attrs(&mut v, ino, changes, fh)
-            });
-            match result {
-                Ok(attr) => reply.attr(&TTL, &attr),
-                Err(e) => reply.error(e),
-            }
+        let setattr = move |view: &View, admitted: Result<()>| match admitted {
+            Ok(()) => view.setattr_then(ino, changes, fh, reply),
+            Err(e) => reply.error(e),
         };
         // A path truncate is a write-open, a truncate and a close, and a
         // chmod or chown a step: new work. A utimensat builds no commit.
@@ -1928,18 +2086,9 @@ impl Filesystem for View {
             Err(e) => return reply.error(e),
         }
         let name = name.to_owned();
-        self.gated(move |view, admitted| {
-            let result = admitted.and_then(|()| {
-                (|| {
-                    let mut v = view.actor()?;
-                    let path = child_path(&view.path(&v, parent)?, &name)?;
-                    v.unlink(&path).map_err(errno)
-                })()
-            });
-            match result {
-                Ok(()) => reply.ok(),
-                Err(e) => reply.error(e),
-            }
+        self.gated(move |view, admitted| match admitted {
+            Ok(()) => view.unlink_tracked(parent, name, reply),
+            Err(e) => reply.error(e),
         });
     }
     fn symlink(
@@ -2177,18 +2326,10 @@ impl Filesystem for View {
         })();
         match planned {
             Err(e) => reply.error(e),
-            Ok(Move::Untracked) => match self.run_move(parent, &names.0, newparent, &names.1, mode)
-            {
-                Ok(()) => reply.ok(),
+            Ok(Move::Untracked) => self.rename_then(parent, names, newparent, mode, reply),
+            Ok(_) => self.gated(move |view, admitted| match admitted {
+                Ok(()) => view.rename_then(parent, names, newparent, mode, reply),
                 Err(e) => reply.error(e),
-            },
-            Ok(_) => self.gated(move |view, admitted| {
-                let result = admitted
-                    .and_then(|()| view.run_move(parent, &names.0, newparent, &names.1, mode));
-                match result {
-                    Ok(()) => reply.ok(),
-                    Err(e) => reply.error(e),
-                }
             }),
         }
     }
@@ -2287,6 +2428,7 @@ mod tests {
     fn view(session: TreeSession) -> View {
         let area = session.untracked_area().unwrap();
         View {
+            saves: Arc::new(SaveWorker::start(session.tree()).unwrap()),
             session,
             handles: Arc::new(Mutex::new(Handles {
                 next: 1,
@@ -2477,6 +2619,57 @@ mod tests {
         assert_eq!(volume.read("a").unwrap(), b"new");
     }
 
+    /// RELEASE is answered once its close is begun: with the view's save
+    /// worker busy, the release returns with the save pending, the client's
+    /// read-only open reads the new bytes and a stat of another file
+    /// answers; the drain lands the save.
+    #[test]
+    fn a_release_is_answered_before_its_save_lands() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut sessions = Sessions::new(new_actor(tmp.path()));
+        let view = view(writing(&mut sessions, "client"));
+        let recording = Arc::clone(sessions.recording());
+        let fh = {
+            let mut volume = view.actor().unwrap();
+            for (name, bytes) in [("a", b"old!"), ("b", b"bbbb")] {
+                let h = volume.write_open(name, Some(ATTRS)).unwrap();
+                volume.write(h, 0, bytes, false).unwrap();
+                volume.close(h).unwrap();
+            }
+            let fh = view
+                .open_file(&mut volume, "a", libc::O_RDWR, None)
+                .unwrap();
+            let handle = match &view.handles().unwrap().entries[&fh] {
+                Open::Write { handle, .. } => *handle,
+                _ => panic!("a write-open"),
+            };
+            volume.write(handle, 0, b"new!", false).unwrap();
+            fh
+        };
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        view.saves
+            .submit(Box::new(move || released.recv().unwrap()));
+        assert_eq!(view.finish(FileHandle(fh)), Ok(()));
+        assert_eq!(recording.actor().unwrap().metrics().pending_saves, 1);
+        {
+            let mut volume = view.actor().unwrap();
+            let reader = view
+                .open_file(&mut volume, "a", libc::O_RDONLY, None)
+                .unwrap();
+            match &view.handles().unwrap().entries[&reader] {
+                Open::Read(map) => assert_eq!(map.to_vec().unwrap(), b"new!"),
+                _ => panic!("a read-only open"),
+            }
+            let b = inode(&volume.node("b").unwrap()).unwrap();
+            assert_eq!(view.attr(&volume, b, None).unwrap().size, 4);
+            assert_eq!(volume.read("a").unwrap(), b"old!");
+        }
+        release.send(()).unwrap();
+        view.saves.drain();
+        assert_eq!(recording.actor().unwrap().metrics().pending_saves, 0);
+        assert_eq!(view.actor().unwrap().read("a").unwrap(), b"new!");
+    }
+
     /// A file's attributes carry its recorded owner, whoever mounted.
     #[test]
     fn attr_presents_the_recorded_owner() {
@@ -2511,7 +2704,9 @@ mod tests {
             gid: Some(77),
             ..AttrChanges::default()
         };
-        let attr = view.set_attrs(&mut volume, ino, changes, None).unwrap();
+        let PathStep::Done(attr) = view.set_attrs(&mut volume, ino, changes, None).unwrap() else {
+            panic!("refused");
+        };
         assert_eq!((attr.perm, attr.uid, attr.gid), (0o644, OWNER.uid, 77));
         let meta = volume.node("a").unwrap().meta;
         assert_eq!(
@@ -2541,7 +2736,9 @@ mod tests {
             mtime: Some(TimeOrNow::SpecificTime(at)),
             ..AttrChanges::default()
         };
-        let attr = view.set_attrs(&mut volume, ino, changes, None).unwrap();
+        let PathStep::Done(attr) = view.set_attrs(&mut volume, ino, changes, None).unwrap() else {
+            panic!("refused");
+        };
         assert_eq!(attr.mtime, at);
         let times = volume.node("a").unwrap().times;
         assert_eq!(times.mtime_ns, 1_000_000_000_000_000_005);
@@ -2722,7 +2919,7 @@ mod tests {
                 OsStr::new(to),
                 RenameMode::Replace,
             );
-            assert_eq!(moved, Err(Errno::EIO), "{from}");
+            assert!(matches!(moved, Err(Errno::EIO)), "{from}");
             assert_eq!(*seen.lock().unwrap(), [(true, true)], "{from}");
             assert!(source.symlink_metadata().is_ok(), "{from} stays");
             // The real wait: the move's record durable, then the unlink.
@@ -2844,7 +3041,7 @@ mod tests {
         };
         assert_eq!(rename("d", "e"), Err(Errno::ENOTEMPTY));
         assert!(area.path().join("e/x.log").exists());
-        assert_eq!(rename("d", "f"), Ok(()));
+        assert_eq!(rename("d", "f"), Ok(Moved::Done));
     }
 
     /// New names go where the rules and the built-ins place them.

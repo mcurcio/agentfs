@@ -973,6 +973,29 @@ writer's. `admit_then`, `durable_then` and `durable_all_then` run unlocked.
 once a journal fsync has failed, never that fsync's own error. `durable_all`
 blocks the caller until every record so far is durable: what a view waits for
 before a change outside the journal destroys bytes a record carries.
+
+A RELEASE goes in two halves ([pending saves](../trees.md#pending-saves)).
+`TreeSession::start_close(handle)` begins the close under the lock and gives a
+`tree_actor::Closing`: `Saved(saved)` when it saved at once, or
+`Decide(SaveToDecide)`, a pending save. `SaveToDecide::finish()` decides it with
+the lock released and lands it under the lock, after any earlier-begun save of
+the same file; dropped unfinished, a panic included, it stays pending as a failed
+close (counted in `failed_saves`). `close(handle)` and `Recording::close_with` are
+both halves on the caller's thread, for the CLI, tests and recovery.
+`SessionGuard::open_map(path)` is what an open reads: the file as this client's
+pending saves leave it (their own calls and the page-write pieces their saves
+take, replayed on the saved map in close order), else the saved map; never
+another open's unsaved calls, and it never waits. `unlink`, `rename` (onto `to`),
+`replace_file` and `truncate_path` answer `tree_actor::PathStep`: `Done(value)`,
+or `WaitFor(SavePending)` with nothing done while the file they would delete or
+replace has a pending save. `SavePending` is made only by the core and must be
+used: hand it and a retry of the whole call to `when_saved_then(pending, then)`,
+which runs `then` once no save of that file is pending (at once when none is, else
+on the thread that lands it, with the lock released). A rename of the pending
+file itself goes first. `Recording::settle` waits until no save is pending, then
+until history is built through every record by then; it is never called from a
+thread that finishes saves.
+
 `unbind` removes the binding and, under the same lock,
 `TreeActor::close_writer` closes every open of the client's writer as a save,
 in handle order, with no wait for the disk. A failure is logged and an
