@@ -78,7 +78,7 @@ pub type Then = Box<dyn FnOnce(Result<(), Error>) + Send + 'static>;
 /// How a RELEASE goes on after its first half
 /// ([`Recording::start_close_with`]): saved already, under the one hold, or
 /// a pending save for the view's save worker to decide and land
-/// (docs/target-architecture/future/view-save-worker.md).
+/// (docs/trees.md, "Pending saves").
 #[must_use = "a pending save must be finished or dropped, which leaves it a failed pending save"]
 pub enum Closing {
     /// Saved under the lock: an unchanged open, a quick save, an anonymous
@@ -134,8 +134,8 @@ impl SaveToDecide {
         let (saved, waiters) = match self.land() {
             Ok(landed) => landed,
             // The actor stopped: nothing lands, and every waiter of the
-            // file hears so.
-            Err(e) => (Err(e), recording.take_waiters(self.file)),
+            // file, and of the close epoch, hears so.
+            Err(e) => (Err(e), recording.stopped_settled(self.file)),
         };
         self.done = true;
         recording.run_waiters(waiters);
@@ -205,7 +205,7 @@ impl Drop for SaveToDecide {
                 let _ = actor.close_failed(self.handle, Error::Stopped);
                 recording.settled(&actor, self.file)
             }
-            Err(_) => recording.take_waiters(self.file),
+            Err(_) => recording.stopped_settled(self.file),
         };
         eprintln!(
             "tree SaveFailed: tree={} open={}: dropped unfinished, it stays pending",
@@ -285,6 +285,10 @@ pub struct Recording {
     /// Tests: runs where a close's decision runs, with the lock released.
     #[cfg(test)]
     in_decide: Mutex<Option<Box<dyn Fn() + Send>>>,
+    /// Tests: runs as a close or a settle begins to wait on the close
+    /// epoch, with the epoch's lock held, so no bump is missed.
+    #[cfg(test)]
+    in_wait: Mutex<Option<Box<dyn Fn() + Send>>>,
     /// Each file's [`Recording::when_saved_then`] callbacks, run once no
     /// save of it is in flight. Locked only under the actor's lock.
     waiters: Mutex<BTreeMap<(TreeId, u64), Vec<Then>>>,
@@ -345,6 +349,8 @@ impl Recording {
             gate: Some(gate),
             #[cfg(test)]
             in_decide: Mutex::new(None),
+            #[cfg(test)]
+            in_wait: Mutex::new(None),
             waiters: Mutex::default(),
             epoch: Mutex::new(0),
             epoch_moved: Condvar::new(),
@@ -534,6 +540,16 @@ impl Recording {
         waiters
     }
 
+    /// A save ended with the actor stopped or its lock poisoned: `file`'s
+    /// waiters taken, and the close epoch bumped, so a close queued behind
+    /// it and [`Recording::settle`] wake and hear [`Error::Stopped`] rather
+    /// than wait for a landing that never comes.
+    fn stopped_settled(&self, file: (TreeId, u64)) -> Vec<Then> {
+        let waiters = self.take_waiters(file);
+        self.bump_epoch();
+        waiters
+    }
+
     /// `file`'s waiters, taken.
     fn take_waiters(&self, file: (TreeId, u64)) -> Vec<Then> {
         self.waiters
@@ -571,6 +587,12 @@ impl Recording {
     /// timer.
     fn wait_epoch(&self, seen: u64) {
         let epoch = self.epoch.lock().unwrap_or_else(PoisonError::into_inner);
+        #[cfg(test)]
+        if *epoch == seen
+            && let Some(hook) = &*self.in_wait.lock().unwrap_or_else(PoisonError::into_inner)
+        {
+            hook();
+        }
         drop(
             self.epoch_moved
                 .wait_while(epoch, |now| *now == seen)
@@ -583,6 +605,16 @@ impl Recording {
     pub(in crate::tree_actor) fn hold_decide_with(&self, hook: impl Fn() + Send + 'static) {
         *self
             .in_decide
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Box::new(hook));
+    }
+
+    /// Tests: `hook` runs whenever a close or a settle begins to wait on
+    /// the close epoch.
+    #[cfg(test)]
+    pub(in crate::tree_actor) fn on_wait_with(&self, hook: impl Fn() + Send + 'static) {
+        *self
+            .in_wait
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Box::new(hook));
     }
@@ -1166,6 +1198,102 @@ mod tests {
         assert_eq!(actor.read(TreeId::Root, "b").unwrap(), b"b");
     }
 
+    /// A second open of `a`, by another client, its write `bytes` at 2.
+    fn second_open(rec: &Recording, bytes: &[u8]) -> u64 {
+        let g = rec
+            .actor()
+            .unwrap()
+            .write_open(TreeId::Root, "a", &writer("other"), None)
+            .unwrap();
+        rec.actor().unwrap().write(g, 2, bytes, false).unwrap();
+        g
+    }
+
+    /// Says on the returned receiver whenever a close or a settle begins
+    /// to wait on the close epoch.
+    fn note_waits(rec: &Recording) -> mpsc::Receiver<()> {
+        let (waiting, waits) = mpsc::channel::<()>();
+        let waiting = Mutex::new(waiting);
+        rec.on_wait_with(move || {
+            let _ = waiting.lock().map(|w| w.send(()));
+        });
+        waits
+    }
+
+    /// A close of a file whose earlier-begun save is being decided waits
+    /// for that save's landing, then saves on it: the later close's bytes
+    /// win where the two overlap.
+    #[test]
+    fn a_queued_close_waits_for_the_earlier_landing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rec = Recording::serve(new_actor(tmp.path())).unwrap();
+        let h = held_close(&rec);
+        let g = second_open(&rec, b"zz");
+        let (inside, release) = hold_first_decide(&rec);
+        let waits = note_waits(&rec);
+        let first = {
+            let rec = Arc::clone(&rec);
+            std::thread::spawn(move || rec.close_with(h, |_| Ok(())))
+        };
+        inside.recv_timeout(HANG).unwrap();
+        let second = {
+            let rec = Arc::clone(&rec);
+            std::thread::spawn(move || rec.close_with(g, |_| Ok(())))
+        };
+        waits
+            .recv_timeout(HANG)
+            .expect("the later close waits its turn");
+        release.send(()).unwrap();
+        assert!(matches!(first.join().unwrap(), Ok(Saved::Commit(_))));
+        assert!(matches!(second.join().unwrap(), Ok(Saved::Commit(_))));
+        assert_eq!(
+            rec.actor().unwrap().read(TreeId::Root, "a").unwrap(),
+            b"01zz456789"
+        );
+    }
+
+    /// The actor stops while a save is decided: the close of its file
+    /// queued behind it, and a settle, wake and hear so rather than wait for
+    /// a landing that never comes.
+    #[test]
+    fn a_stop_mid_decision_wakes_a_queued_close_and_settle() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rec = Recording::serve(new_actor(tmp.path())).unwrap();
+        let h = held_close(&rec);
+        let g = second_open(&rec, b"zz");
+        let (inside, release) = hold_first_decide(&rec);
+        let waits = note_waits(&rec);
+        let first = {
+            let rec = Arc::clone(&rec);
+            std::thread::spawn(move || rec.close_with(h, |_| Ok(())))
+        };
+        inside.recv_timeout(HANG).unwrap();
+        let (answer, answered) = mpsc::channel();
+        {
+            let rec = Arc::clone(&rec);
+            let answer = answer.clone();
+            std::thread::spawn(move || answer.send(rec.close_with(g, |_| Ok(())).map(drop)));
+        }
+        waits
+            .recv_timeout(HANG)
+            .expect("the later close waits its turn");
+        {
+            let rec = Arc::clone(&rec);
+            std::thread::spawn(move || answer.send(rec.settle().map(drop)));
+        }
+        waits.recv_timeout(HANG).expect("the settle waits");
+        rec.durability
+            .fsync_failed(&std::io::Error::from_raw_os_error(libc::EIO));
+        release.send(()).unwrap();
+        assert!(matches!(first.join().unwrap(), Err(Error::Stopped)));
+        let mut heard = [
+            answered.recv_timeout(HANG).expect("a waiter woke"),
+            answered.recv_timeout(HANG).expect("both waiters woke"),
+        ];
+        heard.sort_by_key(Result::is_ok);
+        assert!(matches!(heard[0], Err(Error::Stopped)), "{heard:?}");
+    }
+
     /// The overlay is let go once the builder catches up, though the last
     /// record is no step: a batch reads its record to build through after
     /// the last save, and a write to another open is appended before that
@@ -1294,10 +1422,10 @@ mod tests {
         );
     }
 
-    /// A5: another client ends, saving its open of the file, while a close
-    /// is being decided (a client's end does not wait for the file's
+    /// A5: another client's mapping writes the file's pages back while a
+    /// close is being decided (a page write does not wait for the file's
     /// pending save): the decision is stale, the close is redone under the
-    /// lock on the new save, and its save is in the journal before
+    /// lock with the page write, and its save is in the journal before
     /// `close_with` returns.
     #[test]
     fn a_close_whose_file_moved_meanwhile_is_redone_and_recorded() {
@@ -1314,13 +1442,7 @@ mod tests {
                 .unwrap()
                 .write_open(TreeId::Root, "a", &other, None)
                 .unwrap();
-            rec.actor().unwrap().write(g, 0, b"zz", true).unwrap();
-            #[expect(clippy::disallowed_methods, reason = "the client's end, as unbind")]
-            let ended = rec
-                .actor()
-                .unwrap()
-                .close_writer(TreeId::Root, &other.writer);
-            ended.unwrap();
+            rec.actor().unwrap().page_writeback(g, 0, b"zz").unwrap();
             release.send(()).unwrap();
             closing.join().unwrap().unwrap()
         });
@@ -1339,7 +1461,7 @@ mod tests {
                     super::super::journal::Entry::Step {
                         change: super::super::journal::Change::Save {
                             handle,
-                            outcome: super::super::journal::SaveOutcome::Saved { len: 12, .. },
+                            outcome: super::super::journal::SaveOutcome::Saved { len: 10, .. },
                             ..
                         },
                         ..
@@ -1349,7 +1471,7 @@ mod tests {
         assert!(recorded, "the close's save is in the journal");
         assert_eq!(
             rec.actor().unwrap().read(TreeId::Root, "a").unwrap(),
-            b"01AB456789zz"
+            b"zzAB456789"
         );
     }
 

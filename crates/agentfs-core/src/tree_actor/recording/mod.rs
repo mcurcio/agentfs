@@ -948,7 +948,9 @@ impl TreeActor {
     /// Every open and pending close of `writer` in `tree` closes as a save,
     /// in handle order, after the tree's closes already pending (git-model
     /// §6): what an ended client's opens become. Answers each of its saves,
-    /// in that order. A failed save stops here: it and the rest stay pending,
+    /// in that order. An open of a file with a save in flight (another
+    /// client's close, or its own) is saved when that save lands, not
+    /// ahead of it, and is not answered here. A failed save stops here: it and the rest stay pending,
     /// saved at the tree's next step or at restart. The session's alone
     /// (clippy.toml).
     ///
@@ -1273,7 +1275,13 @@ impl TreeActor {
             }
             self.run_pending_closes(work.tree, Some(handle))
         };
-        saved.map_err(|e| self.close_failed(handle, e))
+        let saved = saved.map_err(|e| self.close_failed(handle, e))?;
+        // The landing is the tree's step: the closes it held back (an ended
+        // client's open of the file) are saved after it.
+        if let Err(e) = self.save_pending(work.tree) {
+            eprintln!("tree SaveFailed: tree={}: {e}; it stays pending", work.tree);
+        }
+        Ok(saved)
     }
 
     /// A close that could not save: it stays pending, its handle still
@@ -1504,9 +1512,10 @@ impl TreeActor {
     }
 
     /// Saves this tree's pending closes in arrival order; answers each. A
-    /// failed save of a file whose earlier-begun save is still in flight
-    /// stays pending, for a later step: a file's saves land in the order
-    /// their closes began.
+    /// pending close of a file with a save in flight that began before it
+    /// (any such save, for an ended client's open, whose close began after
+    /// all of them) stays pending until that save lands: a file's saves
+    /// land in the order their closes began.
     fn save_pending(&mut self, tree: TreeId) -> Result<Vec<(u64, Saved)>> {
         let due: Vec<u64> = self
             .pending_closes
@@ -1514,10 +1523,7 @@ impl TreeActor {
             .copied()
             .filter(|handle| {
                 self.handles.get(handle).is_some_and(|h| {
-                    h.tree == tree
-                        && !h
-                            .close_order
-                            .is_some_and(|o| self.save_in_flight(tree, h.object, Some(o)))
+                    h.tree == tree && !self.save_in_flight(tree, h.object, h.close_order)
                 })
             })
             .collect();

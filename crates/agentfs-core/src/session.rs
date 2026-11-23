@@ -273,8 +273,9 @@ impl SessionGuard<'_> {
     /// its client's pending saves leave it, else its saved map. Another
     /// client's pending save is not shown (close-to-open, ledger R1.1, for
     /// the file's own client). O(1) when one pending save whose base did
-    /// not move and no page write is the file's; else the file's image,
-    /// built under the lock as a page fill builds it.
+    /// not move and no page write is the file's; else the fold of its
+    /// client's pending saves on the saved map, in close order, built under
+    /// the lock (`TreeActor::open_map`).
     ///
     /// # Errors
     ///
@@ -330,14 +331,30 @@ impl SessionGuard<'_> {
         self.actor.set_meta(self.tree, path, attrs, by)
     }
 
+    /// `utimensat(2)` ([`TreeActor::set_times`]): refused with nothing done
+    /// while the file at `path` has a pending save, whose landing sets the
+    /// modification time; so a time set after a close is not undone by
+    /// that close's later landing.
     pub fn set_times(
         &mut self,
         path: &str,
         atime: Option<SetTime>,
         mtime: Option<SetTime>,
-    ) -> Result<()> {
+    ) -> Result<PathStep<()>> {
         let by = self.writes_as.as_ref().ok_or(Error::ReadOnly)?;
-        self.actor.set_times(self.tree, path, atime, mtime, by)
+        if let Some(pending) = self.actor.pending_save(self.tree, path) {
+            return Ok(PathStep::WaitFor(pending));
+        }
+        self.actor
+            .set_times(self.tree, path, atime, mtime, by)
+            .map(PathStep::Done)
+    }
+
+    /// The pending save of the file at `path`, if it has one in flight:
+    /// what a call that reads the file's content for another place (a move
+    /// out of the tree) waits for first.
+    pub fn pending_save(&self, path: &str) -> Option<SavePending> {
+        self.actor.pending_save(self.tree, path)
     }
 
     pub fn object_at(&self, path: &str) -> Result<u64> {

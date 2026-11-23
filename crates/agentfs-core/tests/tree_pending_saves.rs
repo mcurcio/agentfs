@@ -15,7 +15,7 @@ use std::process::Command;
 use std::sync::{Arc, mpsc};
 
 use agentfs_contracts::caps::{ClientCap, Minter};
-use agentfs_contracts::clients::{ClientId, Ordinal};
+use agentfs_contracts::clients::{ClientId, Ordinal, SessionId};
 use agentfs_contracts::name::{ClientLabel, LauncherId};
 use agentfs_contracts::pod::{PodContext, WriterAt};
 use agentfs_contracts::ports::{SessionAuthority, SessionBinder};
@@ -39,6 +39,11 @@ fn serve(dir: &Path) -> (Arc<Recording>, Sessions) {
 
 /// A session bound to write the root as client `label`.
 fn client(sessions: &mut Sessions, label: &str) -> TreeSession {
+    bound(sessions, label).1
+}
+
+/// [`client`], with its session's id: what an end of the client unbinds.
+fn bound(sessions: &mut Sessions, label: &str) -> (SessionId, TreeSession) {
     let id = ClientId {
         launcher: LauncherId::parse("cli").unwrap(),
         tree: ROOT,
@@ -52,7 +57,7 @@ fn client(sessions: &mut Sessions, label: &str) -> TreeSession {
     let session = sessions.open();
     let cap = ClientCap::mint(&Minter::new(), id, ROOT, writes_as);
     sessions.bind(session, SessionAuthority::Write(cap));
-    sessions.session(session).unwrap()
+    (session, sessions.session(session).unwrap())
 }
 
 /// `path` written whole as `bytes` and closed by `session`: one save.
@@ -435,4 +440,100 @@ fn an_open_of_a_pending_mapped_save_reads_it_without_another_writers_calls() {
     assert_eq!(read(&rec, ROOT, "f"), b"WXYZefgh");
     assert_eq!(opened(&a, "f"), b"WXYZefgh");
     a.close(descriptor).unwrap();
+}
+
+/// An open of `path` by `session` with `bytes` written at `offset`, not
+/// closed.
+fn written(session: &TreeSession, path: &str, offset: u64, bytes: &[u8]) -> u64 {
+    let mut guard = session.lock().unwrap();
+    let handle = guard.write_open(path, None).unwrap();
+    guard.write(handle, offset, bytes, false).unwrap();
+    handle
+}
+
+/// A client's end saves its open of a file after another client's save of
+/// it already in flight, not ahead of it: the later-closed open's bytes win
+/// where the two overlap, and history has the in-flight save first.
+#[test]
+fn a_client_end_saves_its_open_after_a_save_in_flight() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (rec, mut sessions) = serve(tmp.path());
+    let a = client(&mut sessions, "a");
+    let (b_id, b) = bound(&mut sessions, "b");
+    save(&a, "f", b"0000");
+    let first = pending(&a, "f", 0, b"AA");
+    written(&b, "f", 0, b"BB");
+    drop(b);
+    sessions.unbind(b_id);
+    assert_eq!(read(&rec, ROOT, "f"), b"0000", "the end waits for the save");
+    first.finish().unwrap();
+    assert_eq!(read(&rec, ROOT, "f"), b"BB00");
+    rec.settle().unwrap();
+    let subjects = root_subjects(tmp.path());
+    assert!(subjects[0].contains(" by b"), "{subjects:?}");
+    assert!(subjects[1].contains(" by a"), "{subjects:?}");
+}
+
+/// A failed save of a file is never saved ahead of an earlier-begun save
+/// of it still in flight: the tree's next step leaves it pending, and a
+/// step after that save's landing saves it.
+#[test]
+fn a_failed_save_waits_for_an_earlier_save_in_flight() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (rec, mut sessions) = serve(tmp.path());
+    let a = client(&mut sessions, "a");
+    let b = client(&mut sessions, "b");
+    save(&a, "f", b"0000");
+    let first = pending(&a, "f", 0, b"AA");
+    let second = pending(&b, "f", 0, b"BB");
+    drop(second);
+    a.lock().unwrap().mkdir("d", ATTRS).unwrap();
+    assert_eq!(read(&rec, ROOT, "f"), b"0000", "the failed save waits");
+    first.finish().unwrap();
+    assert_eq!(read(&rec, ROOT, "f"), b"BB00");
+    assert_eq!(rec.actor().unwrap().metrics().pending_saves, 0);
+}
+
+/// An open by a client with two pending saves of one file, written apart,
+/// reads both: the fold of its saves in close order, not its newest open's
+/// view.
+#[test]
+fn an_open_reads_the_fold_of_its_clients_two_pending_saves() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (rec, mut sessions) = serve(tmp.path());
+    let a = client(&mut sessions, "a");
+    save(&a, "f", b"00000000");
+    let one = written(&a, "f", 0, b"AA");
+    let two = written(&a, "f", 4, b"BB");
+    let Closing::Decide(first) = a.start_close(one).unwrap() else {
+        panic!("the first close saved at its start");
+    };
+    let Closing::Decide(second) = a.start_close(two).unwrap() else {
+        panic!("the second close saved at its start");
+    };
+    assert_eq!(opened(&a, "f"), b"AA00BB00");
+    first.finish().unwrap();
+    second.finish().unwrap();
+    assert_eq!(read(&rec, ROOT, "f"), b"AA00BB00");
+}
+
+/// An open by a client whose pending save's base moved (another client's
+/// save landed between its open and its close) reads that save with its
+/// own on it, not its open's stale view.
+#[test]
+fn an_open_reads_its_pending_save_on_a_moved_base() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (rec, mut sessions) = serve(tmp.path());
+    let a = client(&mut sessions, "a");
+    let b = client(&mut sessions, "b");
+    save(&a, "f", b"00000000");
+    let mine = written(&a, "f", 0, b"AA");
+    let theirs = written(&b, "f", 4, b"BB");
+    commit(b.close(theirs).unwrap());
+    let Closing::Decide(save) = a.start_close(mine).unwrap() else {
+        panic!("the close saved at its start");
+    };
+    assert_eq!(opened(&a, "f"), b"AA00BB00");
+    save.finish().unwrap();
+    assert_eq!(read(&rec, ROOT, "f"), b"AA00BB00");
 }

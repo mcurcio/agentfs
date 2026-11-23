@@ -678,17 +678,10 @@ enum Moved {
     /// Refused with nothing done: the whole rename is retried once this
     /// save has landed.
     Again(SavePending),
-    /// A move out of the tree placed the file in the area, and its unlink
-    /// of the tree's name at this path waits for this save.
-    Unlink(SavePending, String),
-}
-
-/// A reply of an empty answer, given a result.
-fn answer_empty_now(reply: ReplyEmpty) -> Box<dyn FnOnce(Result<()>) + Send> {
-    Box::new(move |result| match result {
-        Ok(()) => reply.ok(),
-        Err(e) => reply.error(e),
-    })
+    /// A move out of the tree placed the file in the area, and the tree's
+    /// name was then refused for a save begun meanwhile: the whole rename
+    /// is retried once it has landed, replacing the area's copy.
+    Replaced(SavePending),
 }
 
 /// What a rename does (docs/trees.md, "Moves across the halves").
@@ -1128,13 +1121,14 @@ impl View {
     /// A setattr's changes, in one order: the metadata (one `set_meta`),
     /// the size, then the times (one `set_times`, which builds no commit). A
     /// file no name reaches has no path to record metadata or times at. A
-    /// path truncate of a file with a pending save is refused with only the
-    /// metadata done: the caller retries the size and the times.
+    /// path truncate or a time set of a file with a pending save is refused:
+    /// `changes` is left holding what is not done, for the caller to retry
+    /// once that save has landed, so its landing does not undo a time set.
     fn set_attrs(
         &self,
         v: &mut SessionGuard<'_>,
         ino: INodeNo,
-        changes: AttrChanges,
+        changes: &mut AttrChanges,
         fh: Option<FileHandle>,
     ) -> Result<PathStep<FileAttr>> {
         let times = (
@@ -1146,6 +1140,7 @@ impl View {
             let meta = v.node(&path).map_err(errno)?.meta;
             let attrs = changed_attrs(&meta, changes.mode, changes.uid, changes.gid);
             v.set_meta(&path, attrs).map_err(errno)?;
+            (changes.mode, changes.uid, changes.gid) = (None, None, None);
         }
         if let Some(size) = changes.size {
             if let Some(fh) = fh {
@@ -1160,16 +1155,21 @@ impl View {
                     return Ok(PathStep::WaitFor(pending));
                 }
             }
+            changes.size = None;
         }
         if times.0.is_some() || times.1.is_some() {
             let path = self.path(v, ino).map_err(|_| Errno::EOPNOTSUPP)?;
-            v.set_times(&path, times.0, times.1).map_err(errno)?;
+            if let PathStep::WaitFor(pending) =
+                v.set_times(&path, times.0, times.1).map_err(errno)?
+            {
+                return Ok(PathStep::WaitFor(pending));
+            }
         }
         self.attr(v, ino, fh).map(PathStep::Done)
     }
     /// A setattr, answered by `reply`: retried once a pending save its path
-    /// truncate waits for has landed, with its metadata, made already, left
-    /// out of the retry.
+    /// truncate or time set waits for has landed, with what it did already
+    /// left out of the retry.
     fn setattr_then(
         &self,
         ino: INodeNo,
@@ -1177,19 +1177,14 @@ impl View {
         fh: Option<FileHandle>,
         reply: ReplyAttr,
     ) {
+        let mut rest = changes;
         let step = self
             .actor()
-            .and_then(|mut v| self.set_attrs(&mut v, ino, changes, fh));
+            .and_then(|mut v| self.set_attrs(&mut v, ino, &mut rest, fh));
         match step {
             Ok(PathStep::Done(attr)) => reply.attr(&TTL, &attr),
             Ok(PathStep::WaitFor(pending)) => {
                 let view = self.clone();
-                let rest = AttrChanges {
-                    mode: None,
-                    uid: None,
-                    gid: None,
-                    ..changes
-                };
                 self.when_saved(pending, move |saved| match saved {
                     Ok(()) => view.setattr_then(ino, rest, fh, reply),
                     Err(e) => reply.error(e),
@@ -1377,8 +1372,13 @@ impl View {
                 if no_replace && self.untracked.exists(&to)? {
                     return Err(Errno::EEXIST);
                 }
+                // The content it moves is the file's once every pending save
+                // of it, any client's, has landed.
+                if let Some(pending) = v.pending_save(&from) {
+                    return Ok(Moved::Again(pending));
+                }
                 let meta = v.node(&from).map_err(errno)?.meta;
-                // The client's own pending saves are the content it moves.
+                // The client's own failed saves are its newest content.
                 let map = v.open_map(&from).map_err(errno)?;
                 let meta_of = &mut |dir: &str| v.node(dir).ok().map(|n| n.meta);
                 let writing = self.untracked.writing();
@@ -1389,13 +1389,13 @@ impl View {
                 // the tracked name's removal is recorded (`AreaWrite::place`).
                 self.untracked
                     .place(&writing, &to, &mut map.reader(), map.len(), meta)?;
-                // The actor's lock is never taken under the area's hold. The
-                // tree's name goes as an unlink does: once the file's pending
-                // save, if any, has landed.
+                // The actor's lock is never taken under the area's hold. A
+                // save of the file begun while the copy was made refuses the
+                // unlink: the copy is stale, and the whole move is retried.
                 drop(writing);
                 Ok(match self.actor()?.unlink(&from).map_err(errno)? {
                     PathStep::Done(()) => Moved::Done,
-                    PathStep::WaitFor(pending) => Moved::Unlink(pending, from),
+                    PathStep::WaitFor(pending) => Moved::Replaced(pending),
                 })
             }
             Move::Import => {
@@ -1447,8 +1447,9 @@ impl View {
         }
     }
     /// A rename, answered by `reply`: refused for a pending save of the
-    /// file it would replace, the whole request is retried once that save
-    /// has landed; a move out of the tree waits so only for its unlink.
+    /// file it would replace or move out of the tree, the whole request is
+    /// retried once that save has landed. A retry after a move out placed
+    /// its copy may replace that copy.
     fn rename_then(
         &self,
         parent: INodeNo,
@@ -1466,10 +1467,12 @@ impl View {
                     Err(e) => reply.error(e),
                 });
             }
-            Ok(Moved::Unlink(pending, from)) => {
+            Ok(Moved::Replaced(pending)) => {
                 let view = self.clone();
                 self.when_saved(pending, move |saved| match saved {
-                    Ok(()) => view.unlink_then(from, answer_empty_now(reply)),
+                    Ok(()) => {
+                        view.rename_then(parent, names, newparent, RenameMode::Replace, reply)
+                    }
                     Err(e) => reply.error(e),
                 });
             }
@@ -1535,25 +1538,6 @@ impl View {
             })),
         }
         Ok(())
-    }
-    /// An unlink of `path`, retried once the file's pending save has landed
-    /// or failed, with `answer` given its outcome: what a move out of the
-    /// tree does after it placed the file's copy in the area.
-    fn unlink_then(&self, path: String, answer: Box<dyn FnOnce(Result<()>) + Send>) {
-        let step = self
-            .actor()
-            .and_then(|mut v| v.unlink(&path).map_err(errno));
-        match step {
-            Ok(PathStep::Done(())) => answer(Ok(())),
-            Ok(PathStep::WaitFor(pending)) => {
-                let view = self.clone();
-                self.when_saved(pending, move |saved| match saved {
-                    Ok(()) => view.unlink_then(path, answer),
-                    Err(e) => answer(Err(e)),
-                });
-            }
-            Err(e) => answer(Err(e)),
-        }
     }
     /// Runs `retry` once `pending`'s save has landed or failed: on this
     /// thread when it already has, else on the thread that lands it.
@@ -2369,6 +2353,7 @@ mod tests {
     use agentfs_contracts::pod::{PodContext, WriterAt};
     use agentfs_contracts::ports::{SessionAuthority, SessionBinder};
     use agentfs_contracts::volume::{VolumeId, VolumeIdentity};
+    use agentfs_core::tree_actor::SaveToDecide;
 
     fn new_actor(dir: &Path) -> Arc<Recording> {
         new_named(dir, "test")
@@ -2700,11 +2685,14 @@ mod tests {
         let h = volume.write_open("a", Some(ATTRS)).unwrap();
         volume.close(h).unwrap();
         let ino = inode(&volume.node("a").unwrap()).unwrap();
-        let changes = AttrChanges {
+        let mut changes = AttrChanges {
             gid: Some(77),
             ..AttrChanges::default()
         };
-        let PathStep::Done(attr) = view.set_attrs(&mut volume, ino, changes, None).unwrap() else {
+        let PathStep::Done(attr) = view
+            .set_attrs(&mut volume, ino, &mut changes, None)
+            .unwrap()
+        else {
             panic!("refused");
         };
         assert_eq!((attr.perm, attr.uid, attr.gid), (0o644, OWNER.uid, 77));
@@ -2713,6 +2701,101 @@ mod tests {
             (meta.mode.bits(), meta.uid, meta.gid),
             (0o644, OWNER.uid, 77)
         );
+    }
+
+    /// `path` saved as `old`, then overwritten in place as `new` by
+    /// `session` and its close begun: a pending save, held until finished.
+    fn pending_save(session: &TreeSession, path: &str, old: &[u8], new: &[u8]) -> SaveToDecide {
+        let handle = {
+            let mut v = session.lock().unwrap();
+            let h = v.write_open(path, Some(ATTRS)).unwrap();
+            v.write(h, 0, old, false).unwrap();
+            v.close(h).unwrap();
+            let h = v.write_open(path, None).unwrap();
+            v.write(h, 0, new, false).unwrap();
+            h
+        };
+        match session.start_close(handle).unwrap() {
+            Closing::Decide(save) => save,
+            Closing::Saved(saved) => panic!("saved at its start: {saved:?}"),
+        }
+    }
+
+    /// A time set of a file with a pending save waits for it, with nothing
+    /// done and the times left to retry: the save's landing, which moves
+    /// the modification time, does not undo it.
+    #[test]
+    fn a_time_set_of_a_pending_file_waits_for_its_save() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut sessions = Sessions::new(new_actor(tmp.path()));
+        let view = view(writing(&mut sessions, "client"));
+        let save = pending_save(&view.session, "a", b"old!", b"new!");
+        let ino = inode(&view.actor().unwrap().node("a").unwrap()).unwrap();
+        let at = UNIX_EPOCH + Duration::new(1_000_000_000, 5);
+        let mut changes = AttrChanges {
+            mode: Some(0o600),
+            mtime: Some(TimeOrNow::SpecificTime(at)),
+            ..AttrChanges::default()
+        };
+        {
+            let mut volume = view.actor().unwrap();
+            let step = view
+                .set_attrs(&mut volume, ino, &mut changes, None)
+                .unwrap();
+            assert!(matches!(step, PathStep::WaitFor(_)), "the time set ran");
+        }
+        assert!(changes.mode.is_none(), "the mode, done, is not retried");
+        assert!(changes.mtime.is_some(), "the time is retried");
+        save.finish().unwrap();
+        let mut volume = view.actor().unwrap();
+        let PathStep::Done(attr) = view
+            .set_attrs(&mut volume, ino, &mut changes, None)
+            .unwrap()
+        else {
+            panic!("refused after the landing");
+        };
+        assert_eq!(attr.mtime, at);
+        assert_eq!(
+            volume.node("a").unwrap().times.mtime_ns,
+            1_000_000_000_000_000_005
+        );
+        assert_eq!(volume.read("a").unwrap(), b"new!");
+    }
+
+    /// A move out of the tree of a file another client has a pending save
+    /// of waits for that save, with nothing placed, and then moves its
+    /// content: the newest closed content is never left only in history.
+    #[test]
+    fn a_move_out_of_a_pending_file_waits_and_moves_its_saved_content() {
+        let tmp = tempfile::tempdir().unwrap();
+        drop(new_actor(tmp.path()));
+        let info = tmp.path().join("history.git/info");
+        std::fs::create_dir_all(&info).unwrap();
+        std::fs::write(info.join("exclude"), "*.log\n").unwrap();
+        let recording = Recording::open(tmp.path(), &PodContext::default()).unwrap();
+        let mut sessions = Sessions::new(recording);
+        let other = writing(&mut sessions, "other");
+        let view = view(writing(&mut sessions, "client"));
+        let area = view.session.untracked_area().unwrap();
+        let save = pending_save(&other, "notes.md", b"old\n", b"new\n");
+        let root = INodeNo(1);
+        let (from, to) = (OsStr::new("notes.md"), OsStr::new("kept.log"));
+        let moved = view.run_move(root, from, root, to, RenameMode::Replace);
+        assert!(matches!(moved, Ok(Moved::Again(_))), "{moved:?}");
+        assert!(!area.path().join("kept.log").exists(), "nothing placed");
+        save.finish().unwrap();
+        assert_eq!(
+            view.run_move(root, from, root, to, RenameMode::Replace),
+            Ok(Moved::Done)
+        );
+        assert_eq!(
+            std::fs::read(area.path().join("kept.log")).unwrap(),
+            b"new\n"
+        );
+        assert!(matches!(
+            view.actor().unwrap().node("notes.md"),
+            Err(Error::NotFound)
+        ));
     }
 
     /// `Now` is the step's time and a specific time is kept to the
@@ -2731,12 +2814,15 @@ mod tests {
             .unwrap()
             .as_nanos();
         let at = UNIX_EPOCH + Duration::new(1_000_000_000, 5);
-        let changes = AttrChanges {
+        let mut changes = AttrChanges {
             atime: Some(TimeOrNow::Now),
             mtime: Some(TimeOrNow::SpecificTime(at)),
             ..AttrChanges::default()
         };
-        let PathStep::Done(attr) = view.set_attrs(&mut volume, ino, changes, None).unwrap() else {
+        let PathStep::Done(attr) = view
+            .set_attrs(&mut volume, ino, &mut changes, None)
+            .unwrap()
+        else {
             panic!("refused");
         };
         assert_eq!(attr.mtime, at);
