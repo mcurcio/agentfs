@@ -492,12 +492,7 @@ impl TreeActor {
 
     /// `object` as `by`'s pending saves leave it, or None when `by` has no
     /// pending save of it (see [`TreeActor::open_map`]).
-    fn pending_content(
-        &self,
-        tree: TreeId,
-        object: u64,
-        by: &WriterAt,
-    ) -> Result<Option<FileMap>> {
+    fn pending_content(&self, tree: TreeId, object: u64, by: &WriterAt) -> Result<Option<FileMap>> {
         let mut mine: Vec<(u64, &Handle)> = self
             .handles
             .iter()
