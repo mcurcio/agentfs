@@ -111,7 +111,7 @@ impl Folded {
     }
 
     /// One step's part of the fold: its pointers, the open a create makes, the
-    /// fork it makes, the open a close ends.
+    /// fork it makes, the open a close ends (which has its close record).
     pub(in crate::tree_actor) fn add_step(
         &mut self,
         seq: u64,
@@ -136,8 +136,13 @@ impl Folded {
                     o.open.anonymous = false;
                     o.open.meta = None;
                 }),
+            // Every save follows its open's close record: one without is
+            // no journal this format writes.
             Change::Save { handle, .. } => {
                 let open = self.opens.remove(handle).ok_or(Error::Format)?.open;
+                if open.close_begun.is_none() {
+                    return Err(Error::Format);
+                }
                 self.saved_through.insert((open.tree, open.object), seq);
             }
             Change::Fork { upstream } => {
@@ -559,9 +564,14 @@ pub(in crate::tree_actor) fn fold(frames: &[Frame]) -> Result<Folded> {
                     .calls
                     .push((seq, call.clone(), tail.pos.clone()));
             }
-            // close-order-1 folds it onto its live open
-            // (`LiveOpen::close_begun`); until then no record appends one.
-            Entry::CloseBegun { .. } => return Err(Error::Format),
+            // A close's start, on its live open: at most one per open.
+            Entry::CloseBegun { handle } => {
+                let open = &mut folded.opens.get_mut(handle).ok_or(Error::Format)?.open;
+                if open.close_begun.is_some() {
+                    return Err(Error::Format);
+                }
+                open.close_begun = Some(record.seq);
+            }
             Entry::PageWrite { tree, object, runs } => folded
                 .page_writes
                 .entry((tree.parse::<TreeId>()?, *object))

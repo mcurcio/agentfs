@@ -83,7 +83,7 @@ use stages::Stages;
 use tree::{EventNumber, SavedTree};
 pub use untracked::{AreaWrite, UntrackedArea};
 
-const FORMAT: &str = "agentfs-trees-14\n";
+const FORMAT: &str = "agentfs-trees-15\n";
 
 /// How one open volume keeps its journal (docs/library/core.md, "Git-backed
 /// tree views"). Fixed for the life of the open; nothing of it is stored in
@@ -411,12 +411,10 @@ pub struct TreeActor {
     /// The tree each queue entry came from: the step's tree that queued it.
     sources: BTreeMap<String, TreeId>,
     handles: BTreeMap<u64, Handle>,
-    /// Closes that could not save, in arrival order. Their handles count as
-    /// open until a later step in their tree saves them, or a restart does.
+    /// Closes that could not save, in arrival order; a step saves them in
+    /// close order (`recording::close_rank`). Their handles count as open
+    /// until a later step in their tree saves them, or a restart does.
     pending_closes: Vec<u64>,
-    /// Closes begun since open: the next close's begin order
-    /// (`Handle::close_order`).
-    closes_begun: u64,
     next: u64,
     /// The last record's time: what a step just recorded applies its times at.
     last_at_ns: u64,
@@ -774,7 +772,9 @@ impl TreeActor {
     /// write. Recovery serves the trees as built with every later record
     /// replayed on them, never waiting for history (the builder catches up
     /// behind); then closes every abandoned write-open exactly once, as its
-    /// own writer with its journaled pod context, and makes every record
+    /// own writer with its journaled pod context, in close order (those
+    /// whose close began in the order of their close records, then the rest
+    /// in open order), and makes every record
     /// durable. `service` is carried by the Sync commits this run writes. It
     /// takes no queue entries: the view's worker or a caller runs
     /// [`TreeActor::progress`].
@@ -1117,7 +1117,6 @@ impl TreeActor {
             sources,
             handles: BTreeMap::new(),
             pending_closes: Vec::new(),
-            closes_begun: 0,
             // Never a built record's: a journal that ends before the built
             // log is corrupt (`Journal::open`).
             next: folded.next_seq.max(built.get().saturating_add(1)),
@@ -1163,8 +1162,16 @@ impl TreeActor {
             let saved_through = saved.get(&key).copied().unwrap_or(0);
             volume.pages_restore(key.0, key.1, writes, saved_through);
         }
-        let abandoned: Vec<_> = volume.handles.keys().copied().collect();
-        for handle in abandoned {
+        // In close order: the closes a client began, in their close
+        // records' order, then the rest in open order, each given its close
+        // record by its recovery close, as a client's end gives them.
+        let mut abandoned: Vec<_> = volume
+            .handles
+            .iter()
+            .map(|(handle, h)| recording::close_rank(*handle, h))
+            .collect();
+        abandoned.sort_unstable();
+        for (_, _, handle) in abandoned {
             volume.close(handle)?;
         }
         // Tracked paths the rules now never record leave history.
@@ -2259,6 +2266,7 @@ mod tests {
             "agentfs-trees-11\n",
             "agentfs-trees-12\n",
             "agentfs-trees-13\n",
+            "agentfs-trees-14\n",
         ] {
             let tmp = tempfile::tempdir().unwrap();
             drop(new_actor(tmp.path()));

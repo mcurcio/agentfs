@@ -3,8 +3,9 @@
 //! by `SaveToDecide::finish`. Meanwhile the file's own client reads its
 //! pending content, a delete, a rename onto it, a replace or a path truncate
 //! waits for the save, a rename of it goes first, takes hold it, and a
-//! file's saves land in the order their closes began. Through `Recording`
-//! and `Sessions`, with two read-write clients of the root.
+//! file's saves land in the order their closes began, live and after a
+//! restart. Through `Recording` and `Sessions`, with read-write clients of
+//! the root.
 #![allow(
     clippy::disallowed_methods,
     reason = "a test is its own composition root"
@@ -23,7 +24,7 @@ use agentfs_core::session::{Sessions, TreeSession};
 use agentfs_core::tree_actor::{
     Closing, PathStep, Recording, RenameMode, SaveToDecide, Saved, Took, TreeId,
 };
-use trees::{ATTRS, identity, rowless_fork, writer};
+use trees::{ATTRS, fanned, identity, rowless_fork, writer};
 
 #[path = "support/trees.rs"]
 mod trees;
@@ -536,4 +537,105 @@ fn an_open_reads_its_pending_save_on_a_moved_base() {
     assert_eq!(opened(&a, "f"), b"AA00BB00");
     save.finish().unwrap();
     assert_eq!(read(&rec, ROOT, "f"), b"AA00BB00");
+}
+
+/// `path` in the root's commit `rev` (`root`, `root~1`, ...) of the
+/// volume in `dir`.
+fn committed(dir: &Path, rev: &str, path: &str) -> Vec<u8> {
+    let output = Command::new("git")
+        .env("GIT_DIR", dir.join("history.git"))
+        .args(["show", &format!("{rev}:files/{}", fanned(path))])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{rev}:{path}");
+    output.stdout
+}
+
+/// `f` saved as `SEED`; two opens of it by client `a`, `AAAA` written
+/// through the first and `BBBB` through the second, both at 0; the second's
+/// close begun, then the first's, neither finished: the saves, the
+/// second's first. The client reads the first's bytes, as the saves will
+/// land.
+fn closed_in_reverse(a: &TreeSession) -> (SaveToDecide, SaveToDecide) {
+    save(a, "f", b"SEED");
+    let h1 = written(a, "f", 0, b"AAAA");
+    let h2 = written(a, "f", 0, b"BBBB");
+    let Closing::Decide(second) = a.start_close(h2).unwrap() else {
+        panic!("the second close saved at its start");
+    };
+    let Closing::Decide(first) = a.start_close(h1).unwrap() else {
+        panic!("the first close saved at its start");
+    };
+    assert_eq!(opened(a, "f"), b"AAAA");
+    (second, first)
+}
+
+/// A restart after a kill lands two pending saves of one file in the order
+/// their closes began (each close's start is on record in the journal),
+/// not in the order the opens were made: as the live volume would have.
+#[test]
+fn a_restart_lands_two_pending_saves_in_close_order() {
+    let tmp = tempfile::tempdir().unwrap();
+    {
+        let (rec, mut sessions) = serve(tmp.path());
+        let a = client(&mut sessions, "a");
+        let (second, first) = closed_in_reverse(&a);
+        rec.durable_all().unwrap();
+        // A kill: the save worker reaches neither, and nothing lands them.
+        drop(second);
+        drop(first);
+        drop((a, sessions, rec));
+    }
+    let rec = Recording::open(tmp.path(), &PodContext::default()).unwrap();
+    assert_eq!(read(&rec, ROOT, "f"), b"AAAA");
+    rec.settle().unwrap();
+    assert_eq!(committed(tmp.path(), "root", "f"), b"AAAA");
+    assert_eq!(committed(tmp.path(), "root~1", "f"), b"BBBB");
+}
+
+/// A client's end gives each open it closes its close record before any
+/// save: `a`'s open, ended behind `c`'s save in flight, keeps its place
+/// before `b`'s close, begun after the end, across a restart.
+#[test]
+fn a_restart_keeps_a_client_ends_close_order() {
+    let tmp = tempfile::tempdir().unwrap();
+    {
+        let (rec, mut sessions) = serve(tmp.path());
+        let (a_id, a) = bound(&mut sessions, "a");
+        let b = client(&mut sessions, "b");
+        let c = client(&mut sessions, "c");
+        save(&a, "f", b"SEED");
+        let held = pending(&c, "f", 0, b"CCCC");
+        let hb = b.lock().unwrap().write_open("f", None).unwrap();
+        written(&a, "f", 0, b"AAAA");
+        drop(a);
+        sessions.unbind(a_id);
+        b.lock().unwrap().write(hb, 0, b"BBBB", false).unwrap();
+        let Closing::Decide(later) = b.start_close(hb).unwrap() else {
+            panic!("b's close saved at its start");
+        };
+        assert_eq!(read(&rec, ROOT, "f"), b"SEED", "every save waits for c's");
+        rec.durable_all().unwrap();
+        drop(held);
+        drop(later);
+        drop((b, c, sessions, rec));
+    }
+    let rec = Recording::open(tmp.path(), &PodContext::default()).unwrap();
+    assert_eq!(read(&rec, ROOT, "f"), b"BBBB");
+}
+
+/// Failed saves are saved at the tree's next step in close order, not in
+/// the order they failed.
+#[test]
+fn failed_saves_land_in_close_order() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (rec, mut sessions) = serve(tmp.path());
+    let a = client(&mut sessions, "a");
+    let (second, first) = closed_in_reverse(&a);
+    drop(first);
+    drop(second);
+    assert_eq!(rec.actor().unwrap().metrics().failed_saves, 2);
+    a.lock().unwrap().mkdir("d", ATTRS).unwrap();
+    assert_eq!(read(&rec, ROOT, "f"), b"AAAA");
+    assert_eq!(rec.actor().unwrap().metrics().pending_saves, 0);
 }
