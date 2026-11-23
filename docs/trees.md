@@ -516,23 +516,34 @@ releases began, in the order they began. While a save is pending:
 | A call on the file | Waits? | What it sees |
 |---|---|---|
 | a stat, a lookup, a page fill | no | the size the view gives while the file has a write-open; the modification time moves when the save lands |
-| an open by the file's own client, read-only or for writing | no | the file as that client's pending saves leave it: each save's own calls and the page-write pieces it takes, replayed on the saved bytes in close order. Another open's unsaved calls are not in it. A write-open's own save replays its calls on the saved head |
+| an open by the file's own client, read-only or for writing | no | the file as that client's pending saves leave it: each save's own calls and the page-write pieces it takes, replayed on the saved bytes in close order. Another open's unsaved calls are not in it. A write-open's own save replays its calls on the saved head. One pending save whose base did not move and with no page write is its open's view, at no cost; two or more, a moved base or page writes are read back from the journal and replayed under the actor's lock, so every call of the volume waits that long, at each such open |
 | an open by another client of the tree | no | the saved content |
-| a second close of the file | no | begun and answered at once; its save lands after the earlier one, so a file's saves land in the order its closes began |
+| a second close of the file | no | begun and answered at once; its save lands after the earlier one, so a file's saves land in the order its closes began. A client's end saves its open of the file after every save of it in flight |
 | a rename of the file | no | the file keeps its object, and the save lands at the new name |
-| an unlink of it, a rename onto it, a move from the untracked area onto it, a path `truncate(2)` of it | **yes** | the call is retried from the save worker once the save has landed or failed. History holds the save, then the delete. A move out of the tree copies the pending content into the area, then waits so before the tree's name goes |
+| an unlink of it, a rename onto it, a move from the untracked area onto it, a move of it out of the tree, a path `truncate(2)` of it, a time set (`utimensat(2)`) of it | **yes** | the call is retried from the save worker once the save has landed or failed. History holds the save, then the delete. A move out of the tree copies the landed content into the area; a time set is made after the landing, which moves the modification time, so the time set stays |
 
 Takes, syncs and landings treat a pending save as an open file: one that touches
 it waits for the save's built event, and one that does not lands meanwhile.
 History and other trees see only landed saves. A view drains its save worker
-when it ends, before its client's end is recorded. `Recording::settle` waits until
-no save is pending.
+when it ends. `Recording::settle` waits until no save is pending. When the actor
+stops (a failed journal fsync, a failed record) a close queued behind a save of
+its file and `Recording::settle` wake and answer `Stopped`.
+
+A restart does not keep close order. The journal records each open and its
+calls, not when its close began, so recovery saves a crash's abandoned opens in
+the order they were opened. Two pending saves of one file closed in the other
+order than they were opened land, after a crash, in open order: where they
+overlap, the file holds the earlier-closed open's bytes, which its client had
+not read.
 
 A decision that fails, or a save worker that panics in one, leaves the save
 pending as a failed close: `tree SaveFailed` on stderr, the `failed_saves`
 counter and the `pending_saves` gauge in the metrics file, and the save made
-again at the tree's next step or at restart. No timer turns a slow save into a
-failure: `oldest_pending_save_ns` says how long the oldest has waited.
+again at the tree's next step or at restart. Until it is, every release of that
+tree is saved on the view's request thread under the actor's lock, the failed
+save first, so the view and every call of the volume wait for both. No timer
+turns a slow save into a failure: `oldest_pending_save_ns` says how long the
+oldest has waited.
 
 ## File maps
 

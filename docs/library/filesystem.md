@@ -840,17 +840,22 @@ not served. `RENAME_NOREPLACE` is
 served; `RENAME_EXCHANGE` and `RENAME_WHITEOUT` answer `EINVAL`.
 
 Each view has two threads of its own. Its request thread answers the kernel in
-order and never waits for a save: a `RELEASE` calls `TreeSession::start_close`,
+order and does not wait for a save while its tree has no failed one (after a
+failed save, a `RELEASE` saves on this thread: [trees](../trees.md#pending-saves)):
+a `RELEASE` calls `TreeSession::start_close`,
 is answered, and hands a `Closing::Decide` to the view's save worker
 (`tree_view/save_worker.rs`, thread `tree-saves`), which runs `SaveToDecide::finish`
 for each in the order they were begun and logs `tree SaveFailed` or
 `tree OrphanDropped`. A job that panics is caught and the worker goes on. A
-read-only open and a move out of the tree read `SessionGuard::open_map`, so the
-view's own client sees its pending saves ([trees](../trees.md#pending-saves)). A
-call refused with `PathStep::WaitFor` (`unlink`, a rename onto a pending file, a
-move in onto one, a setattr's path truncate) drops its guard and hands a retry of
-the whole request to `TreeSession::when_saved_then`, replying only from the retry;
-a setattr retries only its size and times, so its metadata step is not made twice.
+read-only open reads `SessionGuard::open_map`, so the view's own client sees
+its pending saves ([trees](../trees.md#pending-saves)). A call refused with
+`PathStep::WaitFor` (`unlink`, a rename onto a pending file, a move in onto one,
+a setattr's path truncate or time set) and a move out of the tree of a file
+with a pending save (`SessionGuard::pending_save`) drop the guard and hand a
+retry of the whole request to `TreeSession::when_saved_then`, replying only from
+the retry; a setattr retries only what it has not done, so its metadata step is
+not made twice. A move out whose unlink is refused after it placed its copy is
+retried whole, replacing that copy.
 A thread joins each view's session, drains its save worker, then sends
 `HostEvent::ViewEnded`; `Landed` follows each landed take,
 after its pages were dropped. `close` is a lazy unmount (`stale::detach`),

@@ -758,7 +758,6 @@ cffc114. Two cells for one figure are two runs. All times in ms.
 | `close_frag`: longest `release` on the view's thread | 552 | 0.4 |
 | `creates_during_close`: longest create | 506, 507 | 121, 337 |
 | `creates_during_close`: longest `close(2)` of a create | 0.5, 0.4 | 0.1, 0.4 |
-| `many_closes`: longest `close(2)` | 3.6 | 0.1 |
 | `rename_save`: longest create, and the rename | 2,597 and 2,594 | 2,051 and 2,051 |
 | `other_view_close`: other view, longest call | 1,289, 1,225 | 832, 206 |
 
@@ -777,13 +776,27 @@ cffc114. Two cells for one figure are two runs. All times in ms.
   all of it at the lag gate (2,048 and 2,593 ms) while history built the
   128 MiB just written. The real file held the renamed file's bytes in
   every run.
+- **`many_closes` does not time the stall.** Its `close(2)` is a FLUSH,
+  answered before the kernel sends the RELEASE that held the view's thread,
+  so its longest `close(2)` (3.6 ms before, 0.1 after, one run each) is
+  noise either way; the stall showed as the next open's wait, which the leg
+  does not time.
 - **A file's saves land in close order under load.** In every run each of
   `many_closes`' 64 files held its second round's bytes once its saves
   landed. One view's save worker lands its saves in the order they began,
   so this leg checks that order on one view; the core's wait between two
   saves of one file decided on different threads is checked by
-  `two_closes_of_one_file_land_in_close_order`
-  (`crates/agentfs-core/tests/tree_pending_saves.rs`).
+  `a_queued_close_waits_for_the_earlier_landing`
+  (`crates/agentfs-core/src/tree_actor/call_path.rs`).
+- **A client's open of a file with several pending saves pays under the
+  volume's lock.** Such an open reads every call of those saves back from
+  the journal and replays them under the actor's lock, at each open
+  ([trees](trees.md#pending-saves)). Measured locally (release build, ext4,
+  two runs): after one million 64-byte appends and their close, then one
+  more append and its close, the first open took 928 and 1,098 ms and a
+  stat in the fork's view waited as long, where before it waited at most
+  45 ms. An open of a file with one pending save on an unmoved base fell
+  from 970 ms to 0.4 ms.
 - **Another view still waits for the volume's lock.** When both views close
   a fragmented file at once, the other view's slowest call (a stat) waited
   206 to 832 ms, against 1.2 to 1.3 s before; the lock was held longest by

@@ -988,7 +988,7 @@ under the same hold, which `TreeSession::start_close` uses.
 pending saves leave it (their own calls and the page-write pieces their saves
 take, replayed on the saved map in close order), else the saved map; never
 another open's unsaved calls, and it never waits. `unlink`, `rename` (onto `to`),
-`replace_file` and `truncate_path` answer `tree_actor::PathStep`: `Done(value)`,
+`replace_file`, `truncate_path` and `set_times` answer `tree_actor::PathStep`: `Done(value)`,
 or `WaitFor(SavePending)` with nothing done while the file they would delete or
 replace has a pending save. `SavePending` is made only by the core and must be
 used: hand it and a retry of the whole call to `when_saved_then(pending, then)`,
@@ -996,7 +996,10 @@ which runs `then` once no save of that file is pending (at once when none is, el
 on the thread that lands it, with the lock released; `Error::Stopped` when the
 actor stops first); `Recording::when_saved_then` is the same without a session.
 The retry may be refused again for a save begun meanwhile. A rename of the pending
-file itself goes first. `Recording::settle` waits until no save is pending, then
+file itself goes first. `pending_save(path)` names the file's pending save, if
+any, for a caller that reads the file to put it elsewhere (a move out of the
+tree). Once the actor stops, a `finish` queued behind another save of its file
+and a `settle` wake and answer `Error::Stopped`. `Recording::settle` waits until no save is pending, then
 until history is built through every record by then; it is never called from a
 thread that finishes saves. `TreeActor::metrics()` counts them in
 `pending_saves`, `oldest_pending_save_ns` and `failed_saves`
@@ -1004,7 +1007,8 @@ thread that finishes saves. `TreeActor::metrics()` counts them in
 
 `unbind` removes the binding and, under the same lock,
 `TreeActor::close_writer` closes every open of the client's writer as a save,
-in handle order, with no wait for the disk. A failure is logged and an
+in handle order, with no wait for the disk; an open of a file with a save in
+flight is saved when that save lands, after it. A failure is logged and an
 unsaved close stays pending. Lock order: the actor, then the bindings.
 
 ### Rows and domain events
