@@ -31,48 +31,108 @@ use super::takes::{self, Lands};
 use super::{Error, Saved, Took, TreeActor, TreeId, Upkeep};
 
 /// The actor, locked through the call path: [`TreeActor`] by `Deref`. Each
-/// guard adds one run of `Stages::actor_lock` when it is dropped, from the
-/// lock taken to its release, with each kind of work's share of it in
-/// `Stages::lock_hold`, and reports each tree's overlay to the lag
-/// gate before the lock is released.
+/// hold, from the lock taken to its release, adds one run of
+/// `Stages::actor_lock`, with each kind of work's share of it in
+/// `Stages::lock_hold`, and reports each tree's overlay to the lag gate
+/// before the lock is released. [`ActorGuard::unlocked`] ends one hold and
+/// begins another.
 pub struct ActorGuard<'a> {
-    guard: MutexGuard<'a, TreeActor>,
-    _held: Held,
+    /// The lock: `Some` except while [`ActorGuard::unlocked`] runs its
+    /// work, when the guard itself is borrowed mutably and unreachable.
+    guard: Option<MutexGuard<'a, TreeActor>>,
+    held: Option<Held>,
+    recording: &'a Recording,
 }
 
 impl Drop for ActorGuard<'_> {
-    /// Every step and every rebuild at a built event runs under a guard, so
-    /// the gate sees each tree's overlay grow at each step and shrink at each
-    /// rebuild: event-driven. Runs before the fields drop, with the actor
-    /// still locked (lock order: the actor, then History).
+    /// Ends the hold: see `ActorGuard::release`.
     fn drop(&mut self) {
-        let actor = &*self.guard;
-        actor.history().overlays(
-            actor
-                .trees
-                .iter()
-                .map(|(tree, saved)| (*tree, saved.overlay_bytes())),
-        );
+        self.release();
     }
 }
 
-impl ActorGuard<'_> {
+impl<'a> ActorGuard<'a> {
+    /// A hold of `recording`'s actor, its lock just taken.
+    fn hold(recording: &'a Recording, guard: MutexGuard<'a, TreeActor>) -> Self {
+        Self {
+            guard: Some(guard),
+            held: Some(Held::start()),
+            recording,
+        }
+    }
+
+    /// Ends this hold. Every step and every rebuild at a built event runs
+    /// under a guard, so the gate sees each tree's overlay grow at each
+    /// step and shrink at each rebuild: event-driven. The overlays are
+    /// reported with the actor still locked (lock order: the actor, then
+    /// History), then the lock is released, then the hold's measure ends.
+    fn release(&mut self) {
+        if let Some(guard) = self.guard.take() {
+            guard.history().overlays(
+                guard
+                    .trees
+                    .iter()
+                    .map(|(tree, saved)| (*tree, saved.overlay_bytes())),
+            );
+            drop(guard);
+        }
+        drop(self.held.take());
+    }
+
     /// Runs `work` with the actor's lock released, then takes it again, as
     /// parking_lot's `MutexGuard::unlocked` does: the one way a call path
     /// that holds the lock does slow work without it (a pending fold,
-    /// `PendingFold::fold`). Each side is its own measured hold. Whatever
-    /// the caller read through the guard before may have moved by the time
-    /// it returns. The guard cannot be reached while `work` runs: it is
-    /// borrowed mutably.
+    /// `PendingFold::fold`). Each side is its own measured hold, its
+    /// overlays reported as at a drop, and the wait to take the lock again
+    /// is measured as every wait is. Whatever the caller read through the
+    /// guard before may have moved by the time it returns. The guard cannot
+    /// be reached while `work` runs: it is borrowed mutably.
     ///
     /// # Errors
     ///
-    /// [`Error::Stopped`] when the lock cannot be taken again, or the actor
-    /// stopped meanwhile; `work` has run.
-    #[expect(dead_code, reason = "close-order-2 builds it")]
+    /// [`Error::Stopped`] when the actor stopped meanwhile, or its lock was
+    /// poisoned; `work` has run, and the guard holds the lock again.
     pub(crate) fn unlocked<R>(&mut self, work: impl FnOnce() -> R) -> Result<R, Error> {
-        let _ = work;
-        todo!("close-order-2")
+        self.release();
+        #[cfg(test)]
+        if let Some(hook) = &*self
+            .recording
+            .in_unlocked
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+        {
+            hook();
+        }
+        let done = work();
+        let waiting = std::time::Instant::now();
+        let (guard, poisoned) = match self.recording.actor.lock() {
+            Ok(guard) => (guard, false),
+            Err(poisoned) => (poisoned.into_inner(), true),
+        };
+        stages::waited(waiting);
+        self.held = Some(Held::start());
+        let stopped = poisoned || guard.is_stopped();
+        self.guard = Some(guard);
+        if stopped {
+            return Err(Error::Stopped);
+        }
+        Ok(done)
+    }
+
+    /// The lock, held whenever the guard can be reached: only
+    /// [`ActorGuard::unlocked`]'s work runs without it, with the guard
+    /// borrowed mutably.
+    fn locked(&self) -> &MutexGuard<'a, TreeActor> {
+        self.guard
+            .as_ref()
+            .expect("the actor's guard is reached only while it holds the lock")
+    }
+
+    /// [`ActorGuard::locked`], mutably.
+    fn locked_mut(&mut self) -> &mut MutexGuard<'a, TreeActor> {
+        self.guard
+            .as_mut()
+            .expect("the actor's guard is reached only while it holds the lock")
     }
 }
 
@@ -80,13 +140,13 @@ impl Deref for ActorGuard<'_> {
     type Target = TreeActor;
 
     fn deref(&self) -> &TreeActor {
-        &self.guard
+        self.locked()
     }
 }
 
 impl DerefMut for ActorGuard<'_> {
     fn deref_mut(&mut self) -> &mut TreeActor {
-        &mut self.guard
+        self.locked_mut()
     }
 }
 
@@ -309,6 +369,9 @@ pub struct Recording {
     /// epoch, with the epoch's lock held, so no bump is missed.
     #[cfg(test)]
     in_wait: Mutex<Option<Box<dyn Fn() + Send>>>,
+    /// Tests: runs inside every [`ActorGuard::unlocked`], lock released.
+    #[cfg(test)]
+    in_unlocked: Mutex<Option<Box<dyn Fn() + Send>>>,
     /// Each file's [`Recording::when_saved_then`] callbacks, run once no
     /// save of it is in flight. Locked only under the actor's lock.
     waiters: Mutex<BTreeMap<(TreeId, u64), Vec<Then>>>,
@@ -371,6 +434,8 @@ impl Recording {
             in_decide: Mutex::new(None),
             #[cfg(test)]
             in_wait: Mutex::new(None),
+            #[cfg(test)]
+            in_unlocked: Mutex::new(None),
             waiters: Mutex::default(),
             epoch: Mutex::new(0),
             epoch_moved: Condvar::new(),
@@ -458,14 +523,11 @@ impl Recording {
         let waiting = std::time::Instant::now();
         let actor = self.actor.lock().map_err(|_| Error::Stopped)?;
         stages::waited(waiting);
-        let held = Held::start();
-        if actor.is_stopped() {
+        let guard = ActorGuard::hold(self, actor);
+        if guard.is_stopped() {
             return Err(Error::Stopped);
         }
-        Ok(ActorGuard {
-            guard: actor,
-            _held: held,
-        })
+        Ok(guard)
     }
 
     /// RELEASE on the caller's thread, for the CLI, tests and recovery:
@@ -635,6 +697,16 @@ impl Recording {
     pub(in crate::tree_actor) fn on_wait_with(&self, hook: impl Fn() + Send + 'static) {
         *self
             .in_wait
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Box::new(hook));
+    }
+
+    /// Tests: `hook` runs inside every [`ActorGuard::unlocked`], with the
+    /// actor's lock released, before its work.
+    #[cfg(test)]
+    pub(crate) fn on_unlocked_with(&self, hook: impl Fn() + Send + 'static) {
+        *self
+            .in_unlocked
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Box::new(hook));
     }
@@ -1605,5 +1677,116 @@ mod tests {
         );
         let v = super::super::test_support::reopen(tmp.path());
         assert_eq!(v.history().built_through(), last);
+    }
+
+    /// A session bound to write the root as client `label`.
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "a test is its own composition root"
+    )]
+    fn client(rec: &Arc<Recording>, label: &str) -> crate::session::TreeSession {
+        use agentfs_contracts::caps::{ClientCap, Minter};
+        use agentfs_contracts::clients::{ClientId, Ordinal};
+        use agentfs_contracts::name::{ClientLabel, LauncherId};
+        use agentfs_contracts::pod::WriterAt;
+        use agentfs_contracts::ports::{SessionAuthority, SessionBinder};
+        let mut sessions = crate::session::Sessions::new(Arc::clone(rec));
+        let id = ClientId {
+            launcher: LauncherId::parse("cli").unwrap(),
+            tree: TreeId::Root,
+            label: ClientLabel::parse(label).unwrap(),
+            n: Ordinal(1),
+        };
+        let writes_as = WriterAt {
+            writer: id.writer(),
+            at: PodContext::default(),
+        };
+        let session = sessions.open();
+        let cap = ClientCap::mint(&Minter::new(), id, TreeId::Root, writes_as);
+        sessions.bind(session, SessionAuthority::Write(cap));
+        sessions.session(session).unwrap()
+    }
+
+    /// `f` saved as `00000000` by `session`'s client, then two of its opens
+    /// of `f`, `AA` written at 0 through the first and `BB` at 4 through the
+    /// second, each closed and its save held pending: an open by the client
+    /// must fold both.
+    fn two_pending_saves(session: &crate::session::TreeSession) -> (SaveToDecide, SaveToDecide) {
+        let (one, two) = {
+            let mut guard = session.lock().unwrap();
+            let h = guard.write_open("f", Some(ATTRS)).unwrap();
+            guard.write(h, 0, b"00000000", false).unwrap();
+            guard.close(h).unwrap();
+            let one = guard.write_open("f", None).unwrap();
+            guard.write(one, 0, b"AA", false).unwrap();
+            let two = guard.write_open("f", None).unwrap();
+            guard.write(two, 4, b"BB", false).unwrap();
+            (one, two)
+        };
+        let mut held = [one, two].map(|h| match session.start_close(h).unwrap() {
+            Closing::Decide(save) => Some(save),
+            Closing::Saved(saved) => panic!("the close saved at its start: {saved:?}"),
+        });
+        (held[0].take().unwrap(), held[1].take().unwrap())
+    }
+
+    /// An open of a file with two pending saves by its own client folds
+    /// them with the volume's lock released: inside the fold the lock is
+    /// free, and the open reads both saves in close order.
+    #[test]
+    fn an_opens_fold_runs_with_the_lock_released() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rec = Recording::serve(new_actor(tmp.path())).unwrap();
+        let a = client(&rec, "a");
+        let (first, second) = two_pending_saves(&a);
+        let (seen, free) = mpsc::channel::<bool>();
+        let seen = Mutex::new(seen);
+        let weak = Arc::downgrade(&rec);
+        rec.on_unlocked_with(move || {
+            let unlocked = weak
+                .upgrade()
+                .is_some_and(|rec| rec.actor.try_lock().is_ok());
+            let _ = seen.lock().map(|s| s.send(unlocked));
+        });
+        let map = a.lock().unwrap().open_map("f").unwrap();
+        assert_eq!(map.to_vec().unwrap(), b"AA00BB00");
+        assert_eq!(free.try_recv(), Ok(true), "the fold ran under the lock");
+        assert!(free.try_recv().is_err(), "the lock was released twice");
+        first.finish().unwrap();
+        second.finish().unwrap();
+        assert_eq!(
+            rec.actor().unwrap().read(TreeId::Root, "f").unwrap(),
+            b"AA00BB00"
+        );
+    }
+
+    /// A write-open's fold runs with the lock released, and a page write of
+    /// the file made meanwhile by another client's open is on its view, as
+    /// it is on every open view of the file at its call.
+    #[test]
+    fn a_write_opens_fold_keeps_page_writes_made_meanwhile() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rec = Recording::serve(new_actor(tmp.path())).unwrap();
+        let a = client(&rec, "a");
+        let (first, second) = two_pending_saves(&a);
+        let (seen, free) = mpsc::channel::<bool>();
+        let seen = Mutex::new(seen);
+        let weak = Arc::downgrade(&rec);
+        rec.on_unlocked_with(move || {
+            let Some(rec) = weak.upgrade() else { return };
+            let mut actor = rec.actor().unwrap();
+            let g = actor
+                .write_open(TreeId::Root, "f", &writer("other"), None)
+                .unwrap();
+            actor.page_writeback(g, 8, b"PP").unwrap();
+            let _ = seen.lock().map(|s| s.send(true));
+        });
+        let mut guard = a.lock().unwrap();
+        let h = guard.write_open("f", None).unwrap();
+        assert_eq!(free.try_recv(), Ok(true), "the fold ran under the lock");
+        assert_eq!(guard.read_open(h).unwrap().to_vec().unwrap(), b"AA00BB00PP");
+        drop(guard);
+        first.finish().unwrap();
+        second.finish().unwrap();
     }
 }

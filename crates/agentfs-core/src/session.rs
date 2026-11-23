@@ -9,7 +9,6 @@
 //! Lock order: the tree actor's lock, then the bindings'.
 
 use std::collections::BTreeMap;
-use std::ops::DerefMut;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
@@ -18,8 +17,9 @@ use agentfs_contracts::pod::WriterAt;
 use agentfs_contracts::ports::{SessionAuthority, SessionBinder};
 
 use crate::tree_actor::{
-    Attrs, Closing, DirEntry, Error, FileMap, Node, PathStep, Recording, RenameMode, SavePending,
-    Saved, SetTime, Then, TreeActor, TreeId, UntrackedArea,
+    ActorGuard, Attrs, Closing, DirEntry, Error, FileMap, Node, OpenContent, PathStep, Recording,
+    RenameMode, SavePending, Saved, SetTime, Then, TreeActor, TreeId, UntrackedArea,
+    WriteOpenStart,
 };
 
 type Result<T> = std::result::Result<T, Error>;
@@ -127,7 +127,7 @@ impl TreeSession {
         let actor = self.sessions.recording.actor()?;
         let writes_as = self.writes_as();
         Ok(SessionGuard {
-            actor: Box::new(actor),
+            actor,
             tree: self.tree,
             writes_as,
         })
@@ -242,10 +242,11 @@ fn own(actor: &TreeActor, tree: TreeId, writes_as: Option<&WriterAt>, handle: u6
 
 /// The actor locked for one session: [`TreeActor`]'s calls of the same name,
 /// with the session's tree and writer. The lock is [`Recording::actor`]'s
-/// guard, measured as every hold is; it is held boxed because the guard's
-/// type is not named outside the tree actor.
+/// guard, measured as every hold is. Two calls may release it inside them
+/// and take it again, to fold the client's pending saves:
+/// [`SessionGuard::open_map`] and [`SessionGuard::write_open`].
 pub struct SessionGuard<'a> {
-    actor: Box<dyn DerefMut<Target = TreeActor> + 'a>,
+    actor: ActorGuard<'a>,
     tree: TreeId,
     writes_as: Option<WriterAt>,
 }
@@ -274,16 +275,25 @@ impl SessionGuard<'_> {
     /// client's pending save is not shown (close-to-open, ledger R1.1, for
     /// the file's own client). O(1) when one pending save whose base did
     /// not move and no page write is the file's; else the fold of its
-    /// client's pending saves on the saved map, in close order, built under
-    /// the lock (`TreeActor::open_map`).
+    /// client's pending saves on the saved map, in close order
+    /// (`TreeActor::open_content`).
+    ///
+    /// **The lock may be released inside.** A fold runs with the actor's
+    /// lock released (`ActorGuard::unlocked`): the content is as of the
+    /// hold that took its snapshot, and whatever the caller read through
+    /// the guard before may have moved by the time this returns.
     ///
     /// # Errors
     ///
-    /// As [`TreeActor::file_map`].
+    /// As [`TreeActor::file_map`]; a failed fold; [`Error::Stopped`] when
+    /// the actor stopped while the fold ran.
     pub fn open_map(&mut self, path: &str) -> Result<FileMap> {
-        match &self.writes_as {
-            Some(by) => self.actor.open_map(self.tree, path, by),
-            None => self.actor.file_map(self.tree, path),
+        let Some(by) = &self.writes_as else {
+            return self.actor.file_map(self.tree, path);
+        };
+        match self.actor.open_content(self.tree, path, by)? {
+            OpenContent::Ready(map) => Ok(map),
+            OpenContent::Fold(fold) => self.actor.unlocked(|| fold.fold())?,
         }
     }
 
@@ -377,9 +387,30 @@ impl SessionGuard<'_> {
         self.actor.page_fill(self.tree, object, offset, size)
     }
 
+    /// A write-open of `path` ([`TreeActor::write_open`]): its view starts
+    /// from the file as this client's pending saves leave it.
+    ///
+    /// **The lock may be released inside.** When those saves need a fold,
+    /// the open is recorded in one hold, the fold runs with the actor's lock
+    /// released (`ActorGuard::unlocked`), and the view is set in a second
+    /// hold, with every page write of the file made meanwhile on it
+    /// (`TreeActor::write_open_view`). Whatever the caller read through the
+    /// guard before may have moved by the time this returns.
+    ///
+    /// # Errors
+    ///
+    /// As [`TreeActor::write_open`]; a failed fold closes the open and is
+    /// the answer; [`Error::NotFound`] when the client ended while the fold
+    /// ran; [`Error::Stopped`].
     pub fn write_open(&mut self, path: &str, create: Option<Attrs>) -> Result<u64> {
         let by = self.writes_as.as_ref().ok_or(Error::ReadOnly)?;
-        self.actor.write_open(self.tree, path, by, create)
+        match self.actor.write_open_begin(self.tree, path, by, create)? {
+            WriteOpenStart::Ready(handle) => Ok(handle),
+            WriteOpenStart::Fold { handle, fold } => {
+                let folded = self.actor.unlocked(|| fold.fold())?;
+                self.actor.write_open_folded(handle, folded)
+            }
+        }
     }
 
     pub fn write_open_truncating(&mut self, path: &str, create: Option<Attrs>) -> Result<u64> {

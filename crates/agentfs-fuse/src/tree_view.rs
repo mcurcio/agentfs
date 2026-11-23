@@ -1073,13 +1073,20 @@ impl View {
         let node = v.node(path).map_err(errno)?;
         self.attr(v, inode(&node)?, fh)
     }
+    /// An open of `path`: its file handle, and the object it opened. A
+    /// write-open or a read open may release the actor's lock to fold the
+    /// client's pending saves (`SessionGuard::write_open`,
+    /// `SessionGuard::open_map`), so the object is what a reply names, never
+    /// `path` looked up again (a rename may come between). The view's
+    /// handles are locked only after the open: their lock is taken under
+    /// the actor's, never across its release.
     fn open_file(
         &self,
         v: &mut SessionGuard<'_>,
         path: &str,
         flags: i32,
         create: Option<Attrs>,
-    ) -> Result<u64> {
+    ) -> Result<(u64, u64)> {
         // The kernel follows a link before it opens; a link reached here was
         // opened with `O_NOFOLLOW`.
         if v.node(path)
@@ -1087,7 +1094,6 @@ impl View {
         {
             return Err(Errno::ELOOP);
         }
-        let mut handles = self.handles()?;
         let write = flags & libc::O_ACCMODE != libc::O_RDONLY;
         if flags & libc::O_TRUNC != 0 && !write {
             return Err(Errno::EACCES);
@@ -1099,24 +1105,30 @@ impl View {
                 v.write_open(path, create)
             }
             .map_err(errno)?;
-            Open::Write {
+            let object = v.open_object(handle).map_err(errno)?;
+            let entry = Open::Write {
                 handle,
                 append: flags & libc::O_APPEND != 0,
                 readable: flags & libc::O_ACCMODE == libc::O_RDWR,
                 sync: sync_flags(flags),
-            }
+            };
+            (entry, object)
         } else {
             if create.is_some() && v.node(path).is_err() {
                 let h = v.write_open(path, create).map_err(errno)?;
                 v.close(h).map_err(errno)?;
             }
+            // Read in the hold that takes the open's snapshot.
+            let object = v.object_at(path).map_err(errno)?;
             // The client's own pending saves are its newest content.
-            Open::Read(v.open_map(path).map_err(errno)?)
+            (Open::Read(v.open_map(path).map_err(errno)?), object)
         };
+        let (entry, object) = entry;
+        let mut handles = self.handles()?;
         let fh = handles.next;
         handles.next += 1;
         handles.entries.insert(fh, entry);
-        Ok(fh)
+        Ok((fh, object))
     }
     /// A setattr's changes, in one order: the metadata (one `set_meta`),
     /// the size, then the times (one `set_times`, which builds no commit). A
@@ -1626,6 +1638,7 @@ impl Filesystem for View {
                 let mut v = view.actor()?;
                 let path = view.path(&v, ino)?;
                 view.open_file(&mut v, &path, flags.0, None)
+                    .map(|(fh, _)| fh)
             });
             match result {
                 Ok(fh) => reply.opened(FileHandle(fh), FopenFlags::FOPEN_DIRECT_IO),
@@ -1678,8 +1691,9 @@ impl Filesystem for View {
                     if flags & libc::O_EXCL != 0 && v.node(&path).is_ok() {
                         return Err(Errno::EEXIST);
                     }
-                    let fh = view.open_file(&mut v, &path, flags, Some(attrs))?;
-                    Ok((fh, view.attr_at(&v, &path, Some(FileHandle(fh)))?))
+                    let (fh, object) = view.open_file(&mut v, &path, flags, Some(attrs))?;
+                    let attr = view.attr(&v, tracked_inode(object)?, Some(FileHandle(fh)))?;
+                    Ok((fh, attr))
                 })()
             });
             match result {
@@ -2585,7 +2599,7 @@ mod tests {
         let h = volume.write_open("a", Some(ATTRS)).unwrap();
         volume.write(h, 0, b"old", false).unwrap();
         volume.close(h).unwrap();
-        let reader = view
+        let (reader, _) = view
             .open_file(&mut volume, "a", libc::O_RDONLY, None)
             .unwrap();
         let h = volume.write_open("a", None).unwrap();
@@ -2621,7 +2635,7 @@ mod tests {
                 volume.write(h, 0, bytes, false).unwrap();
                 volume.close(h).unwrap();
             }
-            let fh = view
+            let (fh, _) = view
                 .open_file(&mut volume, "a", libc::O_RDWR, None)
                 .unwrap();
             let handle = match &view.handles().unwrap().entries[&fh] {
@@ -2638,7 +2652,7 @@ mod tests {
         assert_eq!(recording.actor().unwrap().metrics().pending_saves, 1);
         {
             let mut volume = view.actor().unwrap();
-            let reader = view
+            let (reader, _) = view
                 .open_file(&mut volume, "a", libc::O_RDONLY, None)
                 .unwrap();
             match &view.handles().unwrap().entries[&reader] {
@@ -2925,7 +2939,8 @@ mod tests {
             let flags = libc::O_WRONLY | libc::O_CREAT | flags;
             FileHandle(
                 view.open_file(&mut volume, name, flags, Some(ATTRS))
-                    .unwrap(),
+                    .unwrap()
+                    .0,
             )
         };
         let write = |fh: FileHandle| {

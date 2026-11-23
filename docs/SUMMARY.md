@@ -86,7 +86,6 @@
   - [Latency and upkeep](target-architecture/future/latency-upkeep.md)
   - [Live landing](target-architecture/future/live-landing.md)
   - [Recovery tooling](target-architecture/future/recovery-tooling.md)
-  - [Close order](target-architecture/future/close-order.md)
   - [Overlay gaps](target-architecture/future/sandbox-overlay-gaps.md)
   - [Power-loss coverage](target-architecture/future/power-loss-coverage.md)
   - [OTLP TLS reload](target-architecture/future/otlp-tls-reload.md)

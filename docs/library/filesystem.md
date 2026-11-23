@@ -848,7 +848,11 @@ is answered, and hands a `Closing::Decide` to the view's save worker
 for each in the order they were begun and logs `tree SaveFailed` or
 `tree OrphanDropped`. A job that panics is caught and the worker goes on. A
 read-only open reads `SessionGuard::open_map`, so the view's own client sees
-its pending saves ([trees](../trees.md#pending-saves)). A call refused with
+its pending saves ([trees](../trees.md#pending-saves)). An open (`open_map` or
+`SessionGuard::write_open`) may release the actor's lock to fold those saves, so
+`create` replies with the attributes of the object it opened, never a lookup of
+the path after the open (a rename may come between), and the view's table of
+open handles is locked only after the open, never across the release. A call refused with
 `PathStep::WaitFor` (`unlink`, a rename onto a pending file, a move in onto one,
 a setattr's path truncate or time set) and a move out of the tree of a file
 with a pending save (`SessionGuard::pending_save`) drop the guard and hand a

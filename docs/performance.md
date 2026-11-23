@@ -412,8 +412,11 @@ must exit 1, and the tracer runs it before the figures.
   while `close_frag`'s save is decided, and checks each holds its second
   round; `other_view_close` closes `close_frag`'s file in the workload's
   view and the same file in `--probe-view` at once, probing the other
-  view. Each gives p50, p99 and the longest of its calls, and the lock,
-  gate and request figures of its window.
+  view; `pending_open` makes one million 64-byte appends and closes them,
+  makes one more append and closes it, then opens the file read-only, an
+  open that folds both pending saves, and times that open with the probe
+  in both views. Each gives p50, p99 and the longest of its calls, and the
+  lock, gate and request figures of its window.
 - The report is the job's artifact `trees-figures-<fs>`.
 
 Figures from two runs on GitHub `ubuntu-24.04` runners, each one
@@ -788,15 +791,29 @@ cffc114. Two cells for one figure are two runs. All times in ms.
   saves of one file decided on different threads is checked by
   `a_queued_close_waits_for_the_earlier_landing`
   (`crates/agentfs-core/src/tree_actor/call_path.rs`).
-- **A client's open of a file with several pending saves pays under the
-  volume's lock.** Such an open reads every call of those saves back from
-  the journal and replays them under the actor's lock, at each open
-  ([trees](trees.md#pending-saves)). Measured locally (release build, ext4,
-  two runs): after one million 64-byte appends and their close, then one
-  more append and its close, the first open took 928 and 1,098 ms and a
-  stat in the fork's view waited as long, where before it waited at most
-  45 ms. An open of a file with one pending save on an unmoved base fell
-  from 970 ms to 0.4 ms.
+- **A client's open of a file with several pending saves folds them off
+  the volume's lock, on its own view.** Such an open reads every call of
+  those saves back from the journal and replays them, at each open; the
+  lock is held only for the snapshot ([trees](trees.md#pending-saves)).
+  The `pending_open` leg, run alone on a fresh volume with a fork's view
+  (release build, the container above, ext4, two runs each; local
+  observations, not CI). "Before" is commit ae45af8, which folded under
+  the lock; "after" is the commit that moved the fold off it. All in ms.
+
+  | Figure | Before | After |
+  |---|---|---|
+  | the open(2) that folds | 1,792, 1,443 | 836, 948 |
+  | longest probe call in the fork's view | 1,811, 1,462 | 51, 31 |
+  | longest probe call in the opening view | 1,811, 1,462 | 879, 939 |
+  | longest `page_image` hold of the lock | 1,792, 1,443 | none |
+  | longest wait for the lock | 1,782, 1,434 | 53, 31 |
+
+  The fork's view no longer waits for the fold: its longest call is back
+  near the 45 ms it waited before pending saves. The opening view still
+  does, because one thread answers its requests in order: a stat of
+  another file in that view waits as long as the open. An open of a file
+  with one pending save on an unmoved base is its open's view, about
+  0.4 ms, with no fold.
 - **Another view still waits for the volume's lock.** When both views close
   a fragmented file at once, the other view's slowest call (a stat) waited
   206 to 832 ms, against 1.2 to 1.3 s before; the lock was held longest by

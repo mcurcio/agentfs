@@ -987,7 +987,18 @@ under the same hold, which `TreeSession::start_close` uses.
 `SessionGuard::open_map(path)` is what an open reads: the file as this client's
 pending saves leave it (their own calls and the page-write pieces their saves
 take, replayed on the saved map in close order), else the saved map; never
-another open's unsaved calls, and it never waits. `unlink`, `rename` (onto `to`),
+another open's unsaved calls, and it never waits for a save. **`open_map` and
+`write_open` may release the guard's lock inside them and take it again**: when
+the client's pending saves need a fold, the guard's hold takes a snapshot and
+the fold runs with the lock released, so other views go on meanwhile. Anything
+read through the guard before the call may have moved when it returns: read
+what a reply names from the open (`open_object`), not the path again. The
+content a read-only open gets is as of its snapshot; a write-open is recorded in
+the snapshot's hold and gets its view in a second hold, with the file's page
+writes made meanwhile on it. A failed fold closes a write-open and is its
+answer; `Error::NotFound` when the client ended meanwhile; `Error::Stopped` when
+the actor stopped. `TreeActor::write_open`, the library's one-hold call for the
+CLI and tests, folds under the lock. `unlink`, `rename` (onto `to`),
 `replace_file`, `truncate_path` and `set_times` answer `tree_actor::PathStep`: `Done(value)`,
 or `WaitFor(SavePending)` with nothing done while the file they would delete or
 replace has a pending save. `SavePending` is made only by the core and must be
