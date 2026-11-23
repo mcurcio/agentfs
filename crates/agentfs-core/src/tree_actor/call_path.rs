@@ -1754,7 +1754,10 @@ mod tests {
         assert!(free.try_recv().is_err(), "the lock was released twice");
         first.finish().unwrap();
         second.finish().unwrap();
-        assert_eq!(rec.actor().unwrap().read(TreeId::Root, "f").unwrap(), b"AA00BB00");
+        assert_eq!(
+            rec.actor().unwrap().read(TreeId::Root, "f").unwrap(),
+            b"AA00BB00"
+        );
     }
 
     /// A write-open's fold runs with the lock released, and a page write of

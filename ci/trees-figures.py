@@ -141,7 +141,7 @@ alone is the view's one thread; in both, the lock. The probe never writes,
 so the lag gate, which holds only new work, never holds it. It adds requests
 beside the workload, so the tracer does not pass it: it is read locally.
 
-With --probe, four probe legs run after the workloads, each alone with
+With --probe, five probe legs run after the workloads, each alone with
 `--only NAME`, against a deadline of their own (LEG_DEADLINE_S) and with no
 bar: they are read, never gated (owner, 2026-11-20). Each needs --metrics,
 waits for its saves to land (`landed_s`: until a metrics file written after
@@ -168,6 +168,14 @@ landed:
                and the same close in --probe-view at once, with the probe
                in the other view: `other`, its calls, and `longest_ms`, the
                longest of them
+    pending_open  1,000,000 64-byte appends in one open and its close, one
+               more append-open, append and close, then a read-only open of
+               the file, which folds the view's two pending saves of it:
+               `open_ms`, that open(2); `bytes_ok`, its last line read back;
+               `probe`, the probe's calls from the second open to the
+               landing in this view (`same`) and in --probe-view (`other`),
+               with `same_longest_ms` and `other_longest_ms`; the fold's
+               lock share is `lock`'s `page_image`
 
 Each workload runs on a worker thread. One the deadline catches inside a
 save gets `grace_s` more to come back; one still blocked then is stuck in
@@ -1201,10 +1209,53 @@ def other_view_close(args, run, grace):
                     and "error" not in calls and "stuck" not in calls)
 
 
+def pending_open(args, run, grace):
+    """1,000,000 appends and their close, one more append and its close,
+    then a read-only open that folds both pending saves: its time, and the
+    probe's longest call in this view and in --probe-view meanwhile."""
+    path = os.path.join(args.view, "fig-leg-pending")
+    line = b"x" * (SMALL_WRITE - 1) + b"\n"
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_APPEND, 0o644)
+    try:
+        for n in range(APPENDS):
+            if n % 1000 == 0 and not run.open():
+                return
+            write_all(fd, line)
+    finally:
+        os.close(fd)
+    views = {"same": args.view}
+    if args.probe_view:
+        views["other"] = args.probe_view
+    probe = Probe(views)
+    probe.start()
+    fd = os.open(path, os.O_WRONLY | os.O_APPEND)
+    try:
+        write_all(fd, line)
+    finally:
+        os.close(fd)
+    start = time.monotonic()
+    fd = os.open(path, os.O_RDONLY)
+    run.extra["open_ms"] = ms(time.monotonic() - start)
+    try:
+        run.extra["bytes_ok"] = os.pread(fd, SMALL_WRITE, APPENDS * SMALL_WRITE) == line
+    finally:
+        os.close(fd)
+    os.stat(args.view)
+    run.extra["landed_s"] = landed(args.metrics, args.drain_cap)
+    calls = probe.stop(grace)
+    run.extra["probe"] = calls
+    for label, found in calls.items():
+        longest = [v["max_ms"] for k, v in found.items() if k in ("stat", "open", "read") and v]
+        run.extra[f"{label}_longest_ms"] = max(longest) if longest else None
+    run.finished = (run.extra["landed_s"] is not None and run.extra["bytes_ok"]
+                    and not any("error" in c or "stuck" in c for c in calls.values()))
+
+
 # Probe legs (--probe only): what a pending save leaves waiting. Each reports
 # `spread` figures under its name; none has a bar (owner, 2026-11-20).
 LEGS = [("creates_during_close", creates_during_close), ("rename_save", rename_save),
-        ("many_closes", many_closes), ("other_view_close", other_view_close)]
+        ("many_closes", many_closes), ("other_view_close", other_view_close),
+        ("pending_open", pending_open)]
 LEG_DEADLINE_S = 600
 MANY_FILES = 64
 MANY_BYTES = 4 * MIB
