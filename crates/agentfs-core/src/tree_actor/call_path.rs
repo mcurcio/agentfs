@@ -56,6 +56,26 @@ impl Drop for ActorGuard<'_> {
     }
 }
 
+impl ActorGuard<'_> {
+    /// Runs `work` with the actor's lock released, then takes it again, as
+    /// parking_lot's `MutexGuard::unlocked` does: the one way a call path
+    /// that holds the lock does slow work without it (a pending fold,
+    /// `PendingFold::fold`). Each side is its own measured hold. Whatever
+    /// the caller read through the guard before may have moved by the time
+    /// it returns. The guard cannot be reached while `work` runs: it is
+    /// borrowed mutably.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Stopped`] when the lock cannot be taken again, or the actor
+    /// stopped meanwhile; `work` has run.
+    #[expect(dead_code, reason = "close-order-2 builds it")]
+    pub(crate) fn unlocked<R>(&mut self, work: impl FnOnce() -> R) -> Result<R, Error> {
+        let _ = work;
+        todo!("close-order-2")
+    }
+}
+
 impl Deref for ActorGuard<'_> {
     type Target = TreeActor;
 

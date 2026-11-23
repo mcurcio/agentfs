@@ -235,6 +235,7 @@ fn checkpoint_at(at: &AtBuilt, folded: &Folded) -> Checkpoint {
                 object: folded.open.object,
                 anonymous: folded.open.anonymous,
                 meta: folded.open.meta,
+                close_begun: folded.open.close_begun,
             })
             .collect(),
         page_saved: folded

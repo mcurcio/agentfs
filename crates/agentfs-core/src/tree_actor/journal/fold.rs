@@ -34,6 +34,10 @@ pub(in crate::tree_actor) struct LiveOpen {
     pub(in crate::tree_actor) anonymous: bool,
     /// An anonymous open's metadata.
     pub(in crate::tree_actor) meta: Option<Meta>,
+    /// Its close's [`Entry::CloseBegun`] record, once its close has begun:
+    /// recovery saves abandoned opens with one in this order, before those
+    /// without one.
+    pub(in crate::tree_actor) close_begun: Option<RecordNo>,
 }
 
 impl LiveOpen {
@@ -45,6 +49,7 @@ impl LiveOpen {
             object: record.object,
             anonymous: record.anonymous,
             meta: record.meta,
+            close_begun: record.close_begun,
         })
     }
 }
@@ -121,6 +126,7 @@ impl Folded {
                 object: seq,
                 anonymous: false,
                 meta: None,
+                close_begun: None,
             }),
             Change::Link { object, .. } => self
                 .opens
@@ -252,6 +258,8 @@ impl Replay {
                     tail.pos.clone(),
                 ));
             }
+            // No tree changes: the order is the fold's.
+            Entry::CloseBegun { .. } => {}
             Entry::PageWrite { tree, object, runs } => self
                 .pages
                 .entry((tree.parse::<TreeId>()?, *object))
@@ -531,6 +539,7 @@ pub(in crate::tree_actor) fn fold(frames: &[Frame]) -> Result<Folded> {
                 object: *object,
                 anonymous: false,
                 meta: None,
+                close_begun: None,
             }),
             Entry::AnonymousOpen { tree, by, meta } => folded.add_open(LiveOpen {
                 handle: seq,
@@ -539,6 +548,7 @@ pub(in crate::tree_actor) fn fold(frames: &[Frame]) -> Result<Folded> {
                 object: seq,
                 anonymous: true,
                 meta: Some(*meta),
+                close_begun: None,
             }),
             Entry::Call { handle, call } => {
                 call.check_tail(tail.len)?;
@@ -549,6 +559,9 @@ pub(in crate::tree_actor) fn fold(frames: &[Frame]) -> Result<Folded> {
                     .calls
                     .push((seq, call.clone(), tail.pos.clone()));
             }
+            // close-order-1 folds it onto its live open
+            // (`LiveOpen::close_begun`); until then no record appends one.
+            Entry::CloseBegun { .. } => return Err(Error::Format),
             Entry::PageWrite { tree, object, runs } => folded
                 .page_writes
                 .entry((tree.parse::<TreeId>()?, *object))

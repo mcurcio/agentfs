@@ -156,6 +156,17 @@ pub(super) enum Entry {
         handle: u64,
         call: CallHead,
     },
+    /// A write-open's close begun: this record's number is the close's
+    /// order, the one a file's saves land in, live and at restart
+    /// (docs/target-architecture/future/close-order.md, until built). At
+    /// most one per open, appended under the lock before the close is
+    /// answered, with no fsync, as a call is. Not a step: no writer, no
+    /// commit, no lag. The fold keeps it on the open
+    /// ([`OpenRecord::close_begun`]), so a checkpoint folds it and no carry
+    /// file holds it.
+    CloseBegun {
+        handle: u64,
+    },
     /// The file's, never a handle's (ledger R1.4).
     PageWrite {
         tree: String,
@@ -544,6 +555,10 @@ pub(super) struct OpenRecord {
     /// An anonymous open's metadata, which no commit holds yet.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub meta: Option<Meta>,
+    /// Its [`Entry::CloseBegun`] record, once its close has begun: the
+    /// order recovery saves it in.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub close_begun: Option<RecordNo>,
 }
 
 /// What a checkpoint keeps of one tree that history never holds: each
@@ -1235,6 +1250,7 @@ mod tests {
             object: handle,
             anonymous: false,
             meta: None,
+            close_begun: None,
         }
     }
 

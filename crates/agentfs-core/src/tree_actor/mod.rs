@@ -75,6 +75,8 @@ pub use recording::file_map::FileMapReader;
 pub use recording::layout::Fingerprint;
 pub use recording::{DirEntry, FileMap, Node, RenameMode};
 use recording::{Handle, pages};
+#[expect(unused_imports, reason = "close-order-2 uses them in session.rs")]
+pub(crate) use recording::{OpenContent, PendingFold, WriteOpenStart};
 use rows::SavedRows;
 pub use rows::{Chain, RowDomain, RowEvent, RowWrite};
 use stages::Stages;

@@ -307,6 +307,66 @@ pub(in crate::tree_actor) struct CloseDecision {
     pieces: Vec<(u64, pages::Run)>,
 }
 
+/// What an open by a client with pending saves of a file reads, taken
+/// under the actor's lock and folded with it released
+/// ([`PendingFold::fold`]), as a close's decision is: the saved map (a
+/// clone, O(1)), the client's pending saves in close order with how many
+/// calls each made, the file's page writes and `saved_through`, and a
+/// reader of the journal as it stood. Every input is a snapshot: a pending
+/// save takes no more calls, so the fold gives the content as of the hold
+/// that took it, whatever lands meanwhile
+/// (docs/target-architecture/future/close-order.md, until built).
+#[must_use = "a pending fold must be folded, with the actor's lock released"]
+#[expect(dead_code, reason = "close-order-2 builds it")]
+pub(crate) struct PendingFold {
+    saved: FileMap,
+    /// Each pending save's open and its call count, in close order.
+    closes: Vec<(u64, u64)>,
+    /// The file's page writes and `saved_through`, when it has any.
+    pages: Option<(Vec<(u64, pages::Run)>, u64)>,
+    reader: CallReader,
+}
+
+impl PendingFold {
+    /// The fold, from the snapshots alone, reading no actor state: each
+    /// pending save's own calls read back from the journal and replayed on
+    /// the saved map in close order, each with the page-write pieces its
+    /// save takes ([`pages::calls_for_close`]), as the saves will land.
+    /// Never called with the actor locked, but by
+    /// [`TreeActor::write_open`]'s one hold (`Hold::PageImage`).
+    ///
+    /// # Errors
+    ///
+    /// A failed read of the journal; a call that does not apply.
+    #[expect(dead_code, reason = "close-order-2 builds it")]
+    pub(crate) fn fold(self) -> Result<FileMap> {
+        todo!("close-order-2")
+    }
+}
+
+/// What an open by a file's own client reads, decided under the lock
+/// ([`TreeActor::open_content`]).
+#[must_use = "a pending fold must be folded, with the actor's lock released"]
+#[expect(dead_code, reason = "close-order-2 builds it")]
+pub(crate) enum OpenContent {
+    /// The saved map, or the one pending save's view whose base did not
+    /// move with no page write: a clone, O(1).
+    Ready(FileMap),
+    /// Two or more pending saves, a moved base or page writes: folded with
+    /// the lock released.
+    Fold(PendingFold),
+}
+
+/// How a write-open goes on after [`TreeActor::write_open_begin`]: its
+/// view is set, or its open is on record and its view waits for the fold
+/// of its client's pending saves ([`TreeActor::write_open_view`]).
+#[must_use = "a write-open's view must be set from its fold"]
+#[expect(dead_code, reason = "close-order-2 builds it")]
+pub(crate) enum WriteOpenStart {
+    Ready(u64),
+    Fold { handle: u64, fold: PendingFold },
+}
+
 /// How a close goes on after [`TreeActor::close_begin`]: saved under the
 /// lock already, to be decided with it released, or queued behind an
 /// earlier-begun save of its file, its snapshot taken at its turn
@@ -488,6 +548,66 @@ impl TreeActor {
             Some(map) => Ok(map),
             None => self.file_map(tree, path),
         }
+    }
+
+    /// What an open of `path` by `by` reads, under the lock in O(segments +
+    /// the file's page writes): the saved map when `by` has no pending save
+    /// of it; one pending save's view whose base did not move, with no page
+    /// write, as a clone; else a [`PendingFold`] of `by`'s pending saves in
+    /// close order, for the caller to fold with the lock released. Never
+    /// reads the journal and never waits. Replaces `open_map`.
+    ///
+    /// # Errors
+    ///
+    /// As [`TreeActor::file_map`].
+    #[expect(dead_code, reason = "close-order-2 builds it")]
+    pub(crate) fn open_content(
+        &self,
+        tree: TreeId,
+        path: &str,
+        by: &WriterAt,
+    ) -> Result<OpenContent> {
+        let _ = (tree, path, by);
+        todo!("close-order-2")
+    }
+
+    /// A write-open's first half, under the lock: as
+    /// [`TreeActor::write_open`] up to its view. With pending saves of the
+    /// file by `by` that need a fold, the open is on record (its `Open`
+    /// record appended, its handle live, its view the saved map until set)
+    /// and its fold is handed back; the handle is never given to a client
+    /// before [`TreeActor::write_open_view`] sets its view. Never reads the
+    /// journal.
+    ///
+    /// # Errors
+    ///
+    /// As [`TreeActor::write_open`].
+    #[expect(dead_code, reason = "close-order-2 builds it")]
+    pub(crate) fn write_open_begin(
+        &mut self,
+        tree: TreeId,
+        path: &str,
+        by: &WriterAt,
+        create: Option<Attrs>,
+    ) -> Result<WriteOpenStart> {
+        let _ = (tree, path, by, create);
+        todo!("close-order-2")
+    }
+
+    /// A write-open's second half, under the lock: its view is `folded`,
+    /// the fold its [`WriteOpenStart::Fold`] gave, with every page-write run
+    /// of the file recorded after its `Open` record applied in record order,
+    /// as each was applied to every open view of the file at its call. O(those
+    /// runs); no journal read.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NotFound`] for an open that is gone (its client ended while
+    /// the fold ran); [`Error::Stopped`].
+    #[expect(dead_code, reason = "close-order-2 builds it")]
+    pub(crate) fn write_open_view(&mut self, handle: u64, folded: FileMap) -> Result<()> {
+        let _ = (handle, folded);
+        todo!("close-order-2")
     }
 
     /// `object` as `by`'s pending saves leave it, or None when `by` has no
