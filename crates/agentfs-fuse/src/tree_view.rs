@@ -17,6 +17,7 @@
 //! untracked half is plain passthrough on real files (`untracked`); this
 //! module routes each call to one half or the other.
 
+mod save_worker;
 mod untracked;
 
 use std::collections::BTreeMap;

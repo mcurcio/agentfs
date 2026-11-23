@@ -45,7 +45,7 @@ use serde::Serialize;
 use crate::file_lock::{FileLock, Mode};
 use crate::fsutil::sync_dir;
 pub use agentfs_contracts::{NotATree, TreeId};
-pub use call_path::{Progress, Recording, Then};
+pub use call_path::{Closing, PathStep, Progress, Recording, SavePending, SaveToDecide, Then};
 use history::builder::{BuildState, Builder, JournalReader, copy_all};
 pub use history::built::{
     BuildError, BuiltSnapshot, Checkpointed, Health, History, Lag, TreeLag, WaitError,

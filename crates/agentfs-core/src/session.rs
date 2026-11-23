@@ -18,8 +18,8 @@ use agentfs_contracts::pod::WriterAt;
 use agentfs_contracts::ports::{SessionAuthority, SessionBinder};
 
 use crate::tree_actor::{
-    Attrs, DirEntry, Error, FileMap, Node, Recording, RenameMode, Saved, SetTime, Then, TreeActor,
-    TreeId, UntrackedArea,
+    Attrs, Closing, DirEntry, Error, FileMap, Node, PathStep, Recording, RenameMode, SavePending,
+    Saved, SetTime, Then, TreeActor, TreeId, UntrackedArea,
 };
 
 type Result<T> = std::result::Result<T, Error>;
@@ -157,6 +157,27 @@ impl TreeSession {
         })
     }
 
+    /// RELEASE's first half for this session's open `handle`
+    /// ([`Recording::start_close_with`]): checked as the session's own under
+    /// the lock; a [`Closing::Decide`] goes to the view's save worker. The
+    /// view answers the kernel on return.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NotFound`] for an open that is not this session's; as
+    /// [`Recording::start_close_with`].
+    pub fn start_close(&self, handle: u64) -> Result<Closing> {
+        let _ = handle;
+        todo!("view-save-1")
+    }
+
+    /// Retries a refused path call once `pending`'s save has landed or
+    /// failed ([`Recording::when_saved_then`]).
+    pub fn when_saved_then(&self, pending: SavePending, then: Then) {
+        let _ = (pending, then);
+        todo!("view-save-1")
+    }
+
     /// The operator's rules ([`Recording::rules`]).
     pub fn rules(&self) -> &Arc<agentfs_rules::RuleSet> {
         self.sessions.recording.rules()
@@ -246,6 +267,21 @@ impl SessionGuard<'_> {
 
     pub fn file_map(&self, path: &str) -> Result<FileMap> {
         self.actor.file_map(self.tree, path)
+    }
+
+    /// What an open of `path` by this session's client reads: the file as
+    /// its client's pending saves leave it, else its saved map. Another
+    /// client's pending save is not shown (close-to-open, ledger R1.1, for
+    /// the file's own client). O(1) when one pending save whose base did
+    /// not move and no page write is the file's; else the file's image,
+    /// built under the lock as a page fill builds it.
+    ///
+    /// # Errors
+    ///
+    /// As [`TreeActor::file_map`].
+    pub fn open_map(&mut self, path: &str) -> Result<FileMap> {
+        let _ = path;
+        todo!("view-save-1")
     }
 
     pub fn file_len(&self, path: &str) -> Result<u64> {
@@ -360,6 +396,19 @@ impl SessionGuard<'_> {
         let by = self.writes_as.as_ref().ok_or(Error::ReadOnly)?;
         self.actor
             .replace_file(self.tree, path, attrs, src, len, by)
+    }
+
+    /// A path `truncate(2)` of `path` to `size`: an open, its truncate and
+    /// its close in this one hold ([`TreeActor::write_open`],
+    /// [`TreeActor::truncate`], [`TreeActor::close`]), refused with nothing
+    /// done while the file has a pending save.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::ReadOnly`]; as the three calls it makes.
+    pub fn truncate_path(&mut self, path: &str, size: u64) -> Result<PathStep<()>> {
+        let _ = (path, size);
+        todo!("view-save-1")
     }
 
     pub fn unlink(&mut self, path: &str) -> Result<()> {

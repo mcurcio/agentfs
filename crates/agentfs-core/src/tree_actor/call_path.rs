@@ -67,6 +67,94 @@ impl DerefMut for ActorGuard<'_> {
 /// the gate's, never with the actor locked.
 pub type Then = Box<dyn FnOnce(Result<(), Error>) + Send + 'static>;
 
+/// How a RELEASE goes on after its first half
+/// ([`Recording::start_close_with`]): saved already, under the one hold, or
+/// a pending save for the view's save worker to decide and land
+/// (docs/target-architecture/future/view-save-worker.md).
+#[must_use = "a pending save must be finished or dropped, which leaves it a failed pending save"]
+pub enum Closing {
+    /// Saved under the lock: an unchanged open, a quick save, an anonymous
+    /// or orphaned file's, or one after the tree's failed closes.
+    Saved(Saved),
+    /// The file is a pending save until [`SaveToDecide::finish`] lands it:
+    /// held for takes (model rule 9), its content served to its own client.
+    Decide(SaveToDecide),
+}
+
+/// A pending save: a closed file's save, begun under the lock and not yet
+/// landed. Its open takes no more calls; its file counts as open for every
+/// take, sync and landing until it lands; opens by its own client read its
+/// pending content ([`crate::session::SessionGuard::open_map`]).
+///
+/// Dropped unfinished, a panic's unwinding included, it becomes a failed
+/// pending save: its handle stays open, saved again at its tree's next step
+/// and at restart, and every [`Recording::when_saved_then`] waiting on its
+/// file runs.
+pub struct SaveToDecide {
+    recording: Arc<Recording>,
+    handle: u64,
+}
+
+impl SaveToDecide {
+    /// The open this save closes.
+    pub fn handle(&self) -> u64 {
+        self.handle
+    }
+
+    /// Decides the save with the lock released and lands it under the lock.
+    /// Same-file order: when an earlier-begun save of this file has not
+    /// landed, waits for its landing event (never a timer), then takes its
+    /// snapshot. Waits only on saves begun before it, so no two saves wait
+    /// on each other. Runs the [`Recording::when_saved_then`] callbacks of
+    /// its file once no save of it is pending, after the lock is released.
+    /// Never call it with the actor locked.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Stopped`]; a failed decision or land, which leaves the save
+    /// pending as [`TreeActor::close`]'s failure does.
+    pub fn finish(self) -> Result<Saved, Error> {
+        let _ = (&self.recording, self.handle);
+        todo!("view-save-1")
+    }
+}
+
+/// A path call refused, nothing done, because a file it would delete or
+/// replace has a pending save: an `unlink(2)`, a `rename(2)` onto it, a
+/// whole-file replace of it, a path `truncate(2)`. Made only by the core;
+/// handed to [`Recording::when_saved_then`] to retry the call once that
+/// save has landed or failed (the owner, 2026-11-23: the delete waits).
+#[must_use = "the refused call must be retried once the save lands"]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SavePending {
+    tree: TreeId,
+    object: u64,
+}
+
+impl SavePending {
+    /// The tree whose file has the pending save.
+    pub fn tree(&self) -> TreeId {
+        self.tree
+    }
+
+    /// The file's object.
+    pub fn object(&self) -> u64 {
+        self.object
+    }
+}
+
+/// What a path call that may delete or replace a file did: ran, or was
+/// refused for that file's pending save.
+#[must_use = "a refused call must be retried once the save lands"]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PathStep<T> {
+    /// The call ran: recorded before this returned.
+    Done(T),
+    /// Nothing was done: retry the call through
+    /// [`Recording::when_saved_then`].
+    WaitFor(SavePending),
+}
+
 /// What [`Recording::progress`] did.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Progress {
@@ -280,6 +368,39 @@ impl Recording {
             Ok(decision) => actor.close_finish(decision),
             Err(e) => Err(actor.close_failed(handle, e)),
         }
+    }
+
+    /// RELEASE's first half: `check` and [`TreeActor::close_begin`] under one
+    /// hold, O(1) plus the file's page writes; no decision runs here. Never
+    /// saved ahead of an earlier-begun save of the same file in flight: such
+    /// a close is a [`Closing::Decide`] that snapshots at its turn.
+    /// [`Recording::close_with`] is this and [`SaveToDecide::finish`] on the
+    /// caller's thread.
+    ///
+    /// # Errors
+    ///
+    /// `check`'s error, with nothing done; as [`TreeActor::close`] for a
+    /// save made under this hold.
+    pub fn start_close_with(
+        self: &Arc<Self>,
+        handle: u64,
+        check: impl FnOnce(&TreeActor) -> Result<(), Error>,
+    ) -> Result<Closing, Error> {
+        let _ = (handle, check);
+        todo!("view-save-1")
+    }
+
+    /// Runs `then` once no save of `pending`'s file is pending: at once on
+    /// this thread when its save has already landed or failed, else on the
+    /// thread that lands or fails the last of them (a view's save worker,
+    /// or a [`Recording::close_with`] caller), with the actor unlocked. The
+    /// check and the registration are under the actor's lock, so no landing
+    /// is missed. `then` gets [`Error::Stopped`] when the actor stops first;
+    /// it retries the refused call, which may be refused again for a save
+    /// begun meanwhile.
+    pub fn when_saved_then(&self, pending: SavePending, then: Then) {
+        let _ = (pending, then);
+        todo!("view-save-1")
     }
 
     /// Tests: `hook` runs in every close's decision, with the lock released.
