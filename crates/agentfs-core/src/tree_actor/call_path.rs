@@ -1471,6 +1471,21 @@ mod tests {
             .write_open(TreeId::Root, "log", &w, Some(ATTRS))
             .unwrap();
         rec.settle().unwrap();
+        // Quiet before the hook goes in: every built event taken by the
+        // actor and nothing left for the builder. A batch begun before the
+        // hook (one the actor asked for at the create's built event) would
+        // take no gate, and its built event, taken after the saves and
+        // before the write, would seal the saves' entries short of the
+        // write: the overlay would go at a build that stops before it.
+        let history = rec.history().clone();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let mut epoch = 0;
+        while history.overlay_bytes(TreeId::Root) > 0
+            || history.built_through() < rec.durability.appended()
+        {
+            assert!(std::time::Instant::now() < deadline, "never quiet");
+            epoch = history.wait_epoch_for(epoch, std::time::Duration::from_millis(100));
+        }
         let (wrote, written) = mpsc::channel::<RecordNo>();
         let (open_gate, gate) = mpsc::channel::<()>();
         let last_save = Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX));
@@ -1788,5 +1803,120 @@ mod tests {
         drop(guard);
         first.finish().unwrap();
         second.finish().unwrap();
+    }
+
+    /// A failed fold closes the write-open as a client's end closes an
+    /// open: saved, unchanged, after the pending saves it would have
+    /// folded, and never a failed save of its own.
+    #[cfg(feature = "failpoints")]
+    #[test]
+    fn a_failed_fold_closes_the_write_open_after_the_saves_it_folded() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rec = Recording::serve(new_actor(tmp.path())).unwrap();
+        let a = client(&rec, "a");
+        let (first, second) = two_pending_saves(&a);
+        {
+            let _fold = crate::failpoints::configure("tree.pending_fold=error").unwrap();
+            assert!(a.lock().unwrap().write_open("f", None).is_err());
+        }
+        let metrics = rec.actor().unwrap().metrics();
+        assert_eq!(
+            (metrics.failed_saves, metrics.pending_saves),
+            (0, 3),
+            "the open is held behind both saves, not failed"
+        );
+        first.finish().unwrap();
+        second.finish().unwrap();
+        let actor = rec.actor().unwrap();
+        assert_eq!(actor.metrics().pending_saves, 0);
+        assert_eq!(actor.metrics().failed_saves, 0);
+        assert_eq!(actor.read(TreeId::Root, "f").unwrap(), b"AA00BB00");
+    }
+
+    /// A client's end while its write-open folds with the lock released:
+    /// the open is closed with the client's, and the write-open answers
+    /// NotFound rather than hand out an open already closing. Also when an
+    /// earlier open's close record could not be appended, which leaves the
+    /// rest of the client's opens pending with no record.
+    #[cfg(feature = "failpoints")]
+    #[test]
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "a client's end, below the sessions that make one"
+    )]
+    fn a_client_end_during_a_write_opens_fold_answers_not_found() {
+        for append_fails in [false, true] {
+            let tmp = tempfile::tempdir().unwrap();
+            let rec = Recording::serve(new_actor(tmp.path())).unwrap();
+            let a = client(&rec, "a");
+            let (first, second) = two_pending_saves(&a);
+            let older = a.lock().unwrap().write_open("g", Some(ATTRS)).unwrap();
+            let by = rec.actor().unwrap().open_by(older).unwrap().1.clone();
+            let weak = Arc::downgrade(&rec);
+            rec.on_unlocked_with(move || {
+                let Some(rec) = weak.upgrade() else { return };
+                let _append = append_fails
+                    .then(|| crate::failpoints::configure("tree.wal_before_header=error").unwrap());
+                let ended = rec.actor().unwrap().close_writer(TreeId::Root, &by);
+                assert_eq!(ended.is_err(), append_fails, "{ended:?}");
+            });
+            let late = a.lock().unwrap().write_open("f", None);
+            assert!(matches!(late, Err(Error::NotFound)), "{late:?}");
+            rec.on_unlocked_with(|| {});
+            first.finish().unwrap();
+            second.finish().unwrap();
+            if append_fails {
+                rec.actor()
+                    .unwrap()
+                    .mkdir(TreeId::Root, "d", ATTRS, &writer("w"))
+                    .unwrap();
+            }
+            let actor = rec.actor().unwrap();
+            assert_eq!(actor.metrics().pending_saves, 0);
+            assert_eq!(actor.read(TreeId::Root, "f").unwrap(), b"AA00BB00");
+        }
+    }
+
+    /// The actor stopping while the lock is released is the answer of the
+    /// work's guard: the caller learns it before it uses what it read.
+    #[test]
+    fn a_stop_while_the_lock_is_released_is_the_answer() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rec = Recording::serve(new_actor(tmp.path())).unwrap();
+        let mut guard = rec.actor().unwrap();
+        let ran = guard.unlocked(|| {
+            rec.durability
+                .fsync_failed(&std::io::Error::from_raw_os_error(libc::EIO));
+        });
+        assert!(matches!(ran, Err(Error::Stopped)), "{ran:?}");
+    }
+
+    /// A path truncate of a file its client has failed saves of reads no
+    /// fold of them: a fold that would fail does not fail it, and the
+    /// truncate lands after both saves.
+    #[cfg(feature = "failpoints")]
+    #[test]
+    fn a_path_truncate_reads_no_fold_of_its_clients_saves() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rec = Recording::serve(new_actor(tmp.path())).unwrap();
+        let a = client(&rec, "a");
+        let (first, second) = two_pending_saves(&a);
+        {
+            let _decide = crate::failpoints::configure("tree.close_decide=error").unwrap();
+            assert!(first.finish().is_err());
+        }
+        // Dropped unfinished: failed too.
+        drop(second);
+        let metrics = rec.actor().unwrap().metrics();
+        assert_eq!((metrics.failed_saves, metrics.pending_saves), (2, 2));
+        {
+            let _fold = crate::failpoints::configure("tree.pending_fold=error@*").unwrap();
+            let truncated = a.lock().unwrap().truncate_path("f", 6).unwrap();
+            assert!(matches!(truncated, PathStep::Done(())));
+        }
+        assert_eq!(
+            rec.actor().unwrap().read(TreeId::Root, "f").unwrap(),
+            b"AA00BB"
+        );
     }
 }

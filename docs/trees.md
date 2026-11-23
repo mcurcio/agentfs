@@ -552,9 +552,14 @@ counter and the `pending_saves` gauge in the metrics file, and the save made
 again at the tree's next step or at restart. A step saves its tree's failed
 closes in close order, not in the order they failed. A close whose close record
 cannot be appended (a full state area) is a failed close the same way: its
-retry appends the record first, so its order is the retry's. Until it is, every release of that
-tree is saved on the view's request thread under the actor's lock, the failed
-save first, so the view and every call of the volume wait for both. No timer
+retry appends the record first, so its order is the retry's, not its client's.
+It lands after every save of its file whose close record was appended before
+the retry, even one its client closed later: where two such saves overlap, the
+file holds the failed close's bytes. Until a tree's failed closes are saved,
+every release of that tree is saved on the view's request thread under the
+actor's lock together with them, in close order (a failed close with no record
+after every close with one), so the view and every call of the volume wait for
+all of them. No timer
 turns a slow save into a failure: `oldest_pending_save_ns` says how long the
 oldest has waited.
 

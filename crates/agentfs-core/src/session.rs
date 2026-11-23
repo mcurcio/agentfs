@@ -462,9 +462,11 @@ impl SessionGuard<'_> {
     }
 
     /// A path `truncate(2)` of `path` to `size`: an open, its truncate and
-    /// its close in this one hold ([`TreeActor::write_open`],
+    /// its close in this one hold ([`TreeActor::write_open_to_truncate`],
     /// [`TreeActor::truncate`], [`TreeActor::close`]), refused with nothing
-    /// done while the file has a pending save.
+    /// done while the file has a pending save. No fold of the client's
+    /// pending saves is read: the close replays the truncate on the saved
+    /// head, after them.
     ///
     /// # Errors
     ///
@@ -474,7 +476,9 @@ impl SessionGuard<'_> {
         if let Some(pending) = self.actor.pending_save(self.tree, path) {
             return Ok(PathStep::WaitFor(pending));
         }
-        let handle = self.actor.write_open(self.tree, path, by, None)?;
+        let handle = self
+            .actor
+            .write_open_to_truncate(self.tree, path, by, None)?;
         let truncated = self.actor.truncate(handle, size);
         self.actor.close(handle)?;
         truncated.map(PathStep::Done)

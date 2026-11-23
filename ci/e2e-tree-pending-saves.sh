@@ -91,7 +91,8 @@ stop
 fresh
 start tree.close_decide=kill "$work/kill.log"
 saves --case kill
-tree_wait_exit "$pid" 60 || true; pid=
+status=0; tree_wait_exit "$pid" 60 || status=$?; pid=
+[ "$status" = 137 ] || { echo "agentfs exited with status $status, not the failpoint's SIGKILL" >&2; cat "$work/kill.log" >&2; exit 1; }
 fired kill "$work/kill.log"
 fusermount3 -uz "$work/main"
 flock "$work/state/actor.lock" true
@@ -106,9 +107,7 @@ stop
 fresh
 start 'tree.close_decide=sleep(600000)' "$work/order.log"
 saves --case order
-kill -KILL "$pid"
-tree_wait_exit "$pid" 60 || true; pid=
-fusermount3 -uz "$work/main"
+tree_kill_mount "$pid" "$work/order.log" "$work/main"; pid=
 flock "$work/state/actor.lock" true
 start '' "$work/order-restarted.log"
 saves --case order-restarted

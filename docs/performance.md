@@ -809,7 +809,11 @@ cffc114. Two cells for one figure are two runs. All times in ms.
   | longest `page_image` hold of the lock | 1,792, 1,443 | none |
   | longest wait for the lock | 1,782, 1,434 | 53, 31 |
 
-  The fork's view no longer waits for the fold: its longest call is back
+  The folding open(2) itself is not faster: the fold does the same work,
+  only off the lock. The first row's drop is run-to-run spread: a later
+  A/B on the same host, alternating runs, gave 1,002 and 1,491 ms at
+  commit 773efe0 (under the lock) and 912 and 1,647 ms at c26cb70 (off
+  it). The fork's view no longer waits for the fold: its longest call is back
   near the 45 ms it waited before pending saves. The opening view still
   does, because one thread answers its requests in order: a stat of
   another file in that view waits as long as the open. An open of a file

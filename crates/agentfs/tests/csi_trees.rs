@@ -433,9 +433,12 @@ fn messages(state: &Path, path: &str) -> String {
     text(&out.stdout)
 }
 
-/// The pids of processes running `agentfs --state <state> host`.
+/// The pids of processes running `agentfs --state <state> host`: hosts,
+/// not their children. A child the host forks (a git child of a builder
+/// batch) carries its parent's command line until it execs, so one caught
+/// between its fork and its exec matches too; it is dropped by its parent.
 fn host_pids(state: &Path) -> Vec<i32> {
-    let mut pids = Vec::new();
+    let mut matched = Vec::new();
     for entry in fs::read_dir("/proc").unwrap().filter_map(Result::ok) {
         let Ok(pid) = entry.file_name().to_string_lossy().parse::<i32>() else {
             continue;
@@ -448,10 +451,60 @@ fn host_pids(state: &Path) -> Vec<i32> {
             w[0] == b"--state" && w[1] == state.as_os_str().as_encoded_bytes() && w[2] == b"host"
         });
         if at_state {
-            pids.push(pid);
+            let parent = fs::read_to_string(entry.path().join("status"))
+                .ok()
+                .and_then(|status| {
+                    status
+                        .lines()
+                        .find_map(|line| line.strip_prefix("PPid:"))
+                        .and_then(|ppid| ppid.trim().parse::<i32>().ok())
+                });
+            matched.push((pid, parent));
         }
     }
-    pids
+    not_forked_from_one(&matched)
+}
+
+/// The pids of `matched` (each with its parent's pid) whose parent is not
+/// itself in `matched`.
+fn not_forked_from_one(matched: &[(i32, Option<i32>)]) -> Vec<i32> {
+    matched
+        .iter()
+        .filter(|(_, parent)| !matched.iter().any(|(pid, _)| Some(*pid) == *parent))
+        .map(|(pid, _)| *pid)
+        .collect()
+}
+
+/// A host's child caught between its fork and its exec matches the host's
+/// command line: it is not counted as a second host.
+#[test]
+fn a_hosts_forked_child_is_not_a_second_host() {
+    use std::io::BufRead;
+    let state = tempfile::tempdir().unwrap();
+    // `sh -c SCRIPT --state <state> host`: the shell's command line ends as
+    // a host's does. Its subshell is a fork that never execs: it says so,
+    // then waits for the end of its parent's stdin.
+    let mut host = Command::new("sh")
+        .args([
+            "-c",
+            "exec 3<&0; (echo forked; read -r line <&3; :) & wait",
+            "--state",
+        ])
+        .arg(state.path())
+        .arg("host")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut said = String::new();
+    std::io::BufReader::new(host.stdout.take().unwrap())
+        .read_line(&mut said)
+        .unwrap();
+    assert_eq!(said, "forked\n");
+    let pids = host_pids(state.path());
+    drop(host.stdin.take());
+    assert!(host.wait().unwrap().success());
+    assert_eq!(pids, vec![i32::try_from(host.id()).unwrap()]);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

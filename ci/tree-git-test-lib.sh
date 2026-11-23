@@ -83,23 +83,67 @@ PY
 # and returns its status. A process that never exits (a drain that never
 # releases) is a failure, not a hang: past the bound (default 120 s) it is
 # killed with SIGKILL, said on stderr, and this returns 124. The wait is on
-# the exit itself; the bound only ends a hang.
+# the exit itself (`wait PID`, which also answers for a child that exited and
+# was reaped already); the bound only ends a hang, from its own process.
+# Never `wait -n` here: bash forgets a job that ended before the call ("no
+# such job") and waits out the bound, the 120 s stall after a `kill -KILL`.
 tree_wait_exit() {
-  local pid=$1 bound=${2:-120} timer done= status=0
-  # Gone already (reaped, or never this shell's): its status, if any, at once.
-  kill -0 "$pid" 2>/dev/null || { wait "$pid" 2>/dev/null; return; }
-  sleep "$bound" &
-  timer=$!
-  wait -n -p done "$pid" "$timer" || status=$?
-  if [ "$done" = "$timer" ]; then
+  local pid=$1 bound=${2:-120} timer status=0
+  (
+    trap 'kill "$s" 2>/dev/null; exit 0' TERM
+    sleep "$bound" &
+    s=$!
+    wait "$s"
     echo "process $pid did not exit within ${bound}s: killed with SIGKILL" >&2
-    kill -KILL "$pid" 2>/dev/null || true
-    wait "$pid" 2>/dev/null || true
-    return 124
+    kill -KILL "$pid" 2>/dev/null
+  ) &
+  timer=$!
+  wait "$pid" || status=$?
+  if kill "$timer" 2>/dev/null; then
+    wait "$timer" 2>/dev/null || true
+    return "$status"
   fi
-  kill "$timer" 2>/dev/null || true
   wait "$timer" 2>/dev/null || true
-  return "$status"
+  return 124
+}
+
+# tree_kill_mount PID LOG MOUNTPOINT...: kills PID, an agentfs mount and a
+# child of this shell, with SIGKILL, as a crash does, and unmounts what it
+# left. Before the kill it fails loudly, printing LOG and /proc/self/mounts,
+# unless PID is alive (not a zombie) and every MOUNTPOINT is still mounted: a
+# mount that ended by itself is a product bug to find, not a step to skip.
+# The exit must then be the kill's (137): one that takes the bound is a
+# failure too. A mountpoint is unmounted only while /proc/self/mounts lists it.
+tree_kill_mount() {
+  local pid=$1 log=$2 state status=0 m
+  shift 2
+  local mounts=()
+  state=$(ps -o stat= -p "$pid" 2>/dev/null || true)
+  if [ -z "$state" ] || [[ $state == Z* ]]; then
+    echo "agentfs $pid ended before its kill (state '$state')" >&2
+    cat "$log" /proc/self/mounts >&2
+    return 1
+  fi
+  for m in "$@"; do
+    if ! mountpoint -q "$m"; then
+      echo "$m was no longer mounted before agentfs $pid's kill" >&2
+      cat "$log" /proc/self/mounts >&2
+      return 1
+    fi
+    mounts+=("$(realpath "$m")")
+  done
+  kill -KILL "$pid"
+  tree_wait_exit "$pid" 60 || status=$?
+  if [ "$status" != 137 ]; then
+    echo "agentfs $pid exited with status $status after SIGKILL, not 137" >&2
+    cat "$log" >&2
+    return 1
+  fi
+  for m in "${mounts[@]}"; do
+    if awk -v m="$m" '$2 == m { found = 1 } END { exit !found }' /proc/self/mounts; then
+      fusermount3 -uz "$m"
+    fi
+  done
 }
 
 # tree_stop PID: SIGTERM, then tree_wait_exit with a short bound: a cleanup

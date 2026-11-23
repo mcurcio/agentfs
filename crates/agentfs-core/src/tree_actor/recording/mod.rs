@@ -356,6 +356,7 @@ impl PendingFold {
             pages,
             reader,
         } = self;
+        crate::failpoints::hit("tree.pending_fold")?;
         let (writes, mut through) = pages.unwrap_or_default();
         for (handle, call_count) in closes {
             let own = if call_count > 0 {
@@ -682,7 +683,9 @@ impl TreeActor {
         let h = self
             .handles
             .get(&handle)
-            .filter(|h| h.close_order.is_none() && !h.closing)
+            .filter(|h| {
+                h.close_order.is_none() && !h.closing && !self.pending_closes.contains(&handle)
+            })
             .ok_or(Error::NotFound)?;
         if let Some(state) = self.pages.get(&(h.tree, h.object)) {
             for (_, run) in state.writes.iter().filter(|(seq, _)| *seq > handle) {
@@ -1055,14 +1058,7 @@ impl TreeActor {
         by: &WriterAt,
         create: Option<Attrs>,
     ) -> Result<u64> {
-        // Its truncate empties the view: no fold of pending saves is read.
-        let handle = match self.write_open_begin(tree, path, by, create)? {
-            WriteOpenStart::Ready(handle) => handle,
-            WriteOpenStart::Fold { handle, fold } => {
-                drop(fold);
-                handle
-            }
-        };
+        let handle = self.write_open_to_truncate(tree, path, by, create)?;
         if let Err(error) = self.truncate(handle, 0) {
             if let Err(close) = self.close(handle) {
                 eprintln!("tree close after a failed truncate: {close}");
@@ -1070,6 +1066,31 @@ impl TreeActor {
             return Err(error);
         }
         Ok(handle)
+    }
+
+    /// A write-open whose first call is a truncate, as `open(O_TRUNC)` and
+    /// a path `truncate(2)` make: no fold of `by`'s pending saves is read,
+    /// under the lock or off it. Its view (the saved map) feeds only the
+    /// truncate's length check, and its close replays its calls on the
+    /// saved head (it has no base), after those saves.
+    ///
+    /// # Errors
+    ///
+    /// As [`TreeActor::write_open`], but never a failed fold.
+    pub(crate) fn write_open_to_truncate(
+        &mut self,
+        tree: TreeId,
+        path: &str,
+        by: &WriterAt,
+        create: Option<Attrs>,
+    ) -> Result<u64> {
+        Ok(match self.write_open_begin(tree, path, by, create)? {
+            WriteOpenStart::Ready(handle) => handle,
+            WriteOpenStart::Fold { handle, fold } => {
+                drop(fold);
+                handle
+            }
+        })
     }
 
     /// Open a private write buffer. With `create`, a missing file is made
@@ -1108,7 +1129,8 @@ impl TreeActor {
 
     /// A write-open's view set from its fold's outcome
     /// ([`TreeActor::write_open_view`]); a failed fold closes the open, with
-    /// no calls, and is the answer.
+    /// no calls, as a client's end closes an open (saved after the pending
+    /// saves of its file, not a failed save), and is the answer.
     ///
     /// # Errors
     ///
@@ -1121,7 +1143,13 @@ impl TreeActor {
         match folded {
             Ok(map) => self.write_open_view(handle, map).map(|()| handle),
             Err(error) => {
-                if let Err(close) = self.close(handle) {
+                // The open has no call: it closes as a client's end closes
+                // it, after the pending saves it would have folded, never
+                // as a failed save of its own.
+                let tree = self.handles.get(&handle).map(|h| h.tree);
+                if let Some(tree) = tree
+                    && let Err(close) = self.close_held(tree, &[handle])
+                {
                     eprintln!("tree close after a failed fold: {close}");
                 }
                 Err(error)
@@ -1220,8 +1248,18 @@ impl TreeActor {
             .filter(|(_, h)| h.tree == tree && h.by.writer == *writer && !h.closing)
             .map(|(handle, _)| *handle)
             .collect();
+        self.close_held(tree, &mine)
+    }
+
+    /// The opens `mine` of `tree`, in handle order, close as a client's
+    /// end closes them ([`TreeActor::close_writer`]): each pending, then
+    /// each given its close record, then the tree's pending closes saved
+    /// in close order, a close held back behind an earlier-begun save of
+    /// its file saved when that save lands. Answers each of `mine` saved
+    /// here. Not a failed save, unless an append or a save fails.
+    fn close_held(&mut self, tree: TreeId, mine: &[u64]) -> Result<Vec<Saved>> {
         let now = std::time::Instant::now();
-        for handle in &mine {
+        for handle in mine {
             if let Some(h) = self.handles.get_mut(handle) {
                 h.pending_since.get_or_insert(now);
             }
@@ -1229,7 +1267,7 @@ impl TreeActor {
                 self.pending_closes.push(*handle);
             }
         }
-        for handle in &mine {
+        for handle in mine {
             if let Err(e) = self.record_close_begun(*handle) {
                 return Err(self.close_failed(*handle, e));
             }

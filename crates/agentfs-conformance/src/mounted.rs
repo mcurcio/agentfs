@@ -327,7 +327,8 @@ impl Mounted {
     /// answered means the release was begun: its close is under way, its save
     /// pending on the view's save worker. The stat only orders that start before
     /// the gate's next line; `settle` then waits for the save itself
-    /// (`Recording::settle` waits until no save is pending). Events only: no poll.
+    /// (`Recording::settle` waits for every close begun before it, this one
+    /// included; a failed save is not waited for). Events only: no poll.
     fn released(&self) -> Result<(), CallError> {
         for root in self.mountpoints() {
             std::fs::metadata(&root).map_err(|e| io_fail("stat", &e))?;
@@ -345,8 +346,9 @@ impl Mounted {
         self.settle()
     }
 
-    /// Asks the gate to wait until no save is pending and history is built
-    /// through every record then (`Recording::settle`): the invariants read
+    /// Asks the gate to wait until every close begun so far is saved (a
+    /// failed save aside) and history is built through every record then
+    /// (`Recording::settle`): the invariants read
     /// git after each call, and the save worker and the builder make history
     /// behind the call path.
     fn settle(&mut self) -> Result<(), CallError> {

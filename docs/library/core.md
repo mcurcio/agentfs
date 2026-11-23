@@ -995,8 +995,10 @@ read through the guard before the call may have moved when it returns: read
 what a reply names from the open (`open_object`), not the path again. The
 content a read-only open gets is as of its snapshot; a write-open is recorded in
 the snapshot's hold and gets its view in a second hold, with the file's page
-writes made meanwhile on it. A failed fold closes a write-open and is its
-answer; `Error::NotFound` when the client ended meanwhile; `Error::Stopped` when
+writes made meanwhile on it. A failed fold closes a write-open, as a client's
+end closes an open (saved after the pending saves it would have folded, not a
+failed save), and is its answer; `Error::NotFound` when the client ended
+meanwhile; `Error::Stopped` when
 the actor stopped. `TreeActor::write_open`, the library's one-hold call for the
 CLI and tests, folds under the lock. `unlink`, `rename` (onto `to`),
 `replace_file`, `truncate_path` and `set_times` answer `tree_actor::PathStep`: `Done(value)`,

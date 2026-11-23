@@ -68,8 +68,7 @@ leave_root_attached() {
   start '' root
   tree_git_wait_root_attached "$work/state/history.git" "$before"
   tree_at_rest "$work/metrics.json"
-  kill -KILL "$pid"; tree_wait_exit "$pid" 2>/dev/null || true; pid=
-  fusermount3 -uz "$work/main"
+  tree_kill_mount "$pid" "$work/mount.log" "$work/main"; pid=
   flock "$work/state/actor.lock" true
 }
 points=(tree.wal_before_header tree.wal_after_payload tree.wal_before_fsync tree.wal_after_fsync tree.before_step tree.build_before_batch tree.build_after_pack tree.build_after_built_log tree.build_after_ref_copy)
@@ -219,9 +218,8 @@ for gap in covered written renamed dir_synced before_unlink; do
     [ "$reached" != "$gap" ] || break
     echo go >&8
   done
-  kill -KILL "$pid"; tree_wait_exit "$pid" 2>/dev/null || true; pid=
+  tree_kill_mount "$pid" "$work/mount.log" "$work/main"; pid=
   exec 7<&- 8>&-
-  fusermount3 -uz "$work/main"
   flock "$work/state/actor.lock" true
   "$bin" --state "$work/state" init --volume t
   gitdir=$work/state/history.git
@@ -268,9 +266,8 @@ for _ in $(seq 1 200); do
   kill -0 "$client"; sleep .1
 done
 [ -f "$work/orphan-receipt" ]
-kill -KILL "$pid"; tree_wait_exit "$pid" 2>/dev/null || true; pid=
+tree_kill_mount "$pid" "$work/mount.log" "$work/main" "$work/fork"; pid=
 kill "$client"; wait "$client" 2>/dev/null || true
-fusermount3 -uz "$work/main"; fusermount3 -uz "$work/fork"
 "$bin" --state "$work/state" init --volume t
 gitdir=$work/state/history.git
 [ "$(tree_git_file "$gitdir" root old)" = replacement ]

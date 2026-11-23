@@ -135,8 +135,7 @@ PY
   done
   tree_git_file "$work/volume/state/history.git" root source >/dev/null
   tree_at_rest "$work/metrics.json"
-  kill -KILL "$pid"; tree_wait_exit "$pid" 2>/dev/null || true; pid=
-  fusermount3 -uz "$work/main"
+  tree_kill_mount "$pid" "$work/setup-mount.log" "$work/main"; pid=
   flock "$work/volume/state/actor.lock" true
 }
 # mount_counted SPEC LOG: mounts the root of the volume `leave_root_attached`
