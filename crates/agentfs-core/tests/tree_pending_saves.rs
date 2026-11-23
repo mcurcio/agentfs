@@ -265,7 +265,8 @@ fn a_replace_or_path_truncate_of_a_pending_file_waits() {
 
 /// Two closes of one file land in the order they began: B, begun after A,
 /// waits for A's landing and is replayed on A's save, though B's decision
-/// is quick and A's is not.
+/// is quick and A's is not (it compares the whole file to find its one
+/// changed byte, the last).
 #[test]
 fn two_closes_of_one_file_land_in_close_order() {
     const LEN: usize = 4 << 20;
@@ -275,10 +276,9 @@ fn two_closes_of_one_file_land_in_close_order() {
     let b = client(&mut sessions, "b");
     save(&a, "f", &vec![b'0'; LEN]);
     let ha = a.lock().unwrap().write_open("f", None).unwrap();
-    a.lock()
-        .unwrap()
-        .write(ha, 0, &vec![b'A'; LEN], false)
-        .unwrap();
+    let mut written = vec![b'0'; LEN];
+    written[LEN - 1] = b'A';
+    a.lock().unwrap().write(ha, 0, &written, false).unwrap();
     let hb = b.lock().unwrap().write_open("f", None).unwrap();
     b.lock().unwrap().write(hb, 0, b"BBBB", false).unwrap();
     let Closing::Decide(first) = a.start_close(ha).unwrap() else {
@@ -296,9 +296,9 @@ fn two_closes_of_one_file_land_in_close_order() {
     let a_step = commit(first.finish().unwrap());
     let b_step = commit(later.join().unwrap().unwrap());
     assert!(a_step < b_step, "A's save at {a_step}, B's at {b_step}");
-    let bytes = read(&rec, ROOT, "f");
-    assert_eq!(&bytes[..4], b"BBBB");
-    assert!(bytes[4..].iter().all(|b| *b == b'A'));
+    let mut expected = written;
+    expected[..4].copy_from_slice(b"BBBB");
+    assert!(read(&rec, ROOT, "f") == expected, "f holds A's save, then B's");
 }
 
 /// A pending save dropped unfinished (a panicking worker) stays pending as
@@ -335,18 +335,23 @@ fn settle_waits_for_a_pending_save() {
     let (rec, mut sessions) = serve(tmp.path());
     let a = client(&mut sessions, "a");
     save(&a, "f", &vec![b'0'; LEN]);
+    // At rest: a settle that did not wait would answer at once.
+    rec.settle().unwrap();
     let save = pending(&a, "f", 0, &vec![b'1'; LEN]);
     let (started, starting) = mpsc::channel();
     let settling = {
         let rec = Arc::clone(&rec);
         std::thread::spawn(move || {
             started.send(()).unwrap();
-            rec.settle()
+            let settled = rec.settle();
+            (settled, read(&rec, ROOT, "f")[0])
         })
     };
     starting.recv().unwrap();
     let step = commit(save.finish().unwrap());
-    let settled = settling.join().unwrap().unwrap();
+    let (settled, first) = settling.join().unwrap();
+    let settled = settled.unwrap();
+    assert_eq!(first, b'1', "settle answered before the save landed");
     assert!(
         settled.get() >= step,
         "settled at {settled:?}, saved at {step}"

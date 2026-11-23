@@ -2409,3 +2409,32 @@ One fix agent, the review's findings. Local runs as root with FUSE, debug builds
 **The bound to state and enforce:** restart memory is the tree state, plus the calls of opens live at the built point, plus records after it. Not the linked journal's length.
 
 **Fix to build (not built; its own piece of work):** fold while reading. `open_with` feeds each record at or below the built log's point into an incremental fold and returns only the frames after it; `fold_through` likewise. Red test: after N built small records and no compaction, `open_with` returns 1 + live + after-built frames (today 200,013). Add the 200,000-append restart to `ci/trees-figures.py` (expected under 10 MiB), and have the tracer report `journal_bytes` at stop so `restart` can be explained. Unchecked: what `serve` uses its second whole-journal fold for.
+
+## 2026-11-23, view-save-1 (the tracer, pending saves): the frozen page's accepted cost breaks an existing CI check; stopped
+
+1. **The page's "f's image" for an open of a pending file contradicts `ci/trees-pagecache.py` (not in the slice's owned
+   paths), and the result is a timing-dependent red in `ci/e2e-tree-pagecache.sh`.** The frozen invariant says
+   `open_map` gives, for anything but one pending save with an unmoved base and no page write, "f's image, built under
+   the lock as a page fill builds it", and the page lists the cost ("a second live writer's unsaved calls are visible
+   to an open of a pending file when the file's image is the source"). `trees-pagecache.py`'s `map-fd-overlap` and
+   `map-fd-disjoint` assert the opposite at "fresh open after A closes while B remains open (R1.1, R1.4)": A is the
+   mapped writer (its save has page writes), B a descriptor writer still open, and the fresh open is by the same
+   client (every process behind one mount is one client). When A's save is still pending at that open, the image
+   folds in B's unsaved `1234` (seen locally: `WX1234gh` and `WXYZ1234` against `WXYZefgh`); when it has landed, the
+   check passes. One local run passed, the next failed both cases. Either the page changes `open_map`'s fallback to
+   the exact fold of the client's own pending saves (their calls and the page-write pieces their saves take, replayed
+   on the saved map in close order: R1.1 kept, a journal read under the lock as the image's is), or the check's
+   expectation changes with the cost, which then needs an event to wait on, not a race. The architect's call; the
+   tracer is pushed unlanded on `wip/view-save-1`.
+2. **Two files outside the owned paths need a line each** (convention as in M3 S2's erratum 1): `tree.close_decide`
+   in `failpoints::POINTS` (`crates/agentfs-core/src/failpoints.rs`), and `.map(drop)` on `guard.rename` and
+   `guard.unlink` in `crates/agentfs-core/tests/tree_clients.rs`, whose array of refused calls no longer type-checks
+   once those return `Result<PathStep<()>>`. Both are made on the wip branch.
+3. **The existing unit test A5 (`a_close_whose_file_moved_meanwhile_is_redone_and_recorded`, `call_path.rs`) deadlocks
+   under the same-file order** as written: its second close of the same file now waits for the held first one. It
+   moves the file meanwhile by another client's end (`close_writer`), which the page lets go ahead of a pending save.
+4. **The mutation "the write-open's base step kept, so it saves its view"** cannot change an outcome: the same-file
+   order makes that open's close wait until the pending save lands, which moves the saved step, so a kept base is
+   always "moved". `base_step: None` is kept as defence in depth; the test catches the view taken from the saved map.
+5. **git-model §3** ("readers keep the old content") now holds for every reader but the file's own client, which reads
+   its pending save; reported here for the owner, not edited (a baseline page).
