@@ -24,6 +24,19 @@ starts a fresh volume for each case and runs this once per case:
                decision kills agentfs. close(2) has returned by then.
     restarted  after the kill and a mount without failpoints: the view and
                history both hold f's new content.
+    order      (with tree.close_decide=sleep(600000)) two fds on `order`,
+               saved as SEED: AAAA written through the first and BBBB
+               through the second, both at 0, then the second closed, then
+               the first. Both saves wait behind the sleeping decision. A
+               fresh open reads AAAA (the fold of the client's saves in
+               close order); the metrics file says pending_saves 2; an
+               fsync of the mount's root makes every record durable. ci/e2e-tree-pending-saves.sh then kills
+               agentfs with SIGKILL.
+    order-restarted  after that kill and a mount without failpoints: the
+               view reads AAAA, and the last two commits that change
+               `order` are the second fd's save, then the first's: the
+               restart lands them in close order, from the journal's close
+               records.
 
 A wait on the view's metrics file, a view or history reads again every 50 ms
 until what it waits for holds, bounded by BOUND_S (a hang fails the case); no
@@ -37,7 +50,7 @@ import subprocess
 import sys
 import time
 
-from tree_git_read import read, read_once
+from tree_git_read import fanned, read, read_once
 
 BOUND_S = 60.0
 
@@ -49,6 +62,8 @@ OLD = b"old content\n" * 4096
 NEW = b"NEW CONTENT\n" * 4096
 G1 = b"g first....\n" * 4096
 G2 = b"g second...\n" * 4096
+FIRST = b"AAAA" + SEED[4:]
+SECOND = b"BBBB" + SEED[4:]
 
 
 def check(name, observed, expected):
@@ -205,12 +220,45 @@ def case_restarted(root, git):
     check("restarted: history has the save", read(git, "root", "f", NEW, BOUND_S) == NEW, True)
 
 
+def case_order(root, metrics):
+    path = root / "order"
+    write_new(path, SEED)
+    first = os.open(path, os.O_WRONLY)
+    second = os.open(path, os.O_WRONLY)
+    assert os.pwrite(first, b"AAAA", 0) == 4
+    assert os.pwrite(second, b"BBBB", 0) == 4
+    os.close(second)
+    os.close(first)
+    check("order: a fresh open reads the saves in close order", read_all(path), FIRST)
+    metrics_until(metrics, "order: both saves pending", lambda m: m["pending_saves"] == 2)
+    fd = os.open(root, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def case_order_restarted(root, git):
+    check("order-restarted: the view reads the saves in close order",
+          read_all(root / "order"), FIRST)
+    check("order-restarted: history ends with the first fd's save",
+          read(git, "root", "order", FIRST, BOUND_S), FIRST)
+    changed = subprocess.check_output(
+        ["git", "--git-dir=" + str(git), "log", "--format=%H", "root", "--",
+         "files/" + fanned("order")], text=True).split()
+    check("order-restarted: the save before it is the second fd's",
+          committed(git, changed[1], "order"), SECOND)
+    check("order-restarted: and before that the seed", committed(git, changed[2], "order"), SEED)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("mount", type=Path)
     parser.add_argument("history_git", type=Path)
     parser.add_argument("metrics")
-    parser.add_argument("--case", required=True, choices=("error", "panic", "kill", "restarted"))
+    parser.add_argument("--case", required=True,
+                        choices=("error", "panic", "kill", "restarted", "order",
+                                 "order-restarted"))
     parser.add_argument("--fork", type=Path, help="with --case error: the fork's view")
     parser.add_argument("--fork-ref", help="with --case error: the fork's branch")
     args = parser.parse_args()
@@ -222,6 +270,10 @@ def main():
         case_panic(args.mount, args.history_git, args.metrics)
     elif args.case == "kill":
         case_kill(args.mount, args.metrics)
+    elif args.case == "order":
+        case_order(args.mount, args.metrics)
+    elif args.case == "order-restarted":
+        case_order_restarted(args.mount, args.history_git)
     else:
         case_restarted(args.mount, args.history_git)
     print(f"{args.case}: ok", flush=True)

@@ -999,17 +999,21 @@ The retry may be refused again for a save begun meanwhile. A rename of the pendi
 file itself goes first. `pending_save(path)` names the file's pending save, if
 any, for a caller that reads the file to put it elsewhere (a move out of the
 tree). Once the actor stops, a `finish` queued behind another save of its file
-and a `settle` wake and answer `Error::Stopped`. `Recording::settle` waits until no save is pending, then
-until history is built through every record by then; it is never called from a
+and a `settle` wake and answer `Error::Stopped`. `Recording::settle` waits until
+no save begun before it is pending (a close whose close record is below the
+journal's next record when it starts; one begun after it, of any file, does not
+hold it), then until history is built through every record by then; it is never called from a
 thread that finishes saves. `TreeActor::metrics()` counts them in
 `pending_saves`, `oldest_pending_save_ns` and `failed_saves`
 ([telemetry](../telemetry.md#pending-saves)).
 
 `unbind` removes the binding and, under the same lock,
 `TreeActor::close_writer` closes every open of the client's writer as a save,
-in handle order, with no wait for the disk; an open of a file with a save in
-flight is saved when that save lands, after it. A failure is logged and an
-unsaved close stays pending. Lock order: the actor, then the bindings.
+in handle order, with no wait for the disk: each gets its close record first,
+all before any save, so the end's order survives a restart; an open of a file
+with a save in flight begun before the end is saved when that save lands, after
+it. A failure (of an append or a save) is logged and an unsaved close stays
+pending, saved at its tree's next step. Lock order: the actor, then the bindings.
 
 ### Rows and domain events
 
