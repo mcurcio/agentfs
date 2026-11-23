@@ -358,6 +358,14 @@ pub struct Metrics {
     pub journal_carried_bytes: u64,
     /// History as built behind the call path.
     pub history: HistoryMetrics,
+    /// Saves begun and not landed: being decided, queued, or failed and
+    /// awaiting a retry (docs/trees.md, "Recording and durability").
+    pub pending_saves: u64,
+    /// The age of the oldest of them, in nanoseconds; 0 with none.
+    pub oldest_pending_save_ns: u64,
+    /// Saves whose decision or land failed, or that were dropped
+    /// unfinished, since open.
+    pub failed_saves: u64,
 }
 
 /// A single synchronous actor. Sharing requires a mutex; a second process
@@ -404,6 +412,9 @@ pub struct TreeActor {
     /// Closes that could not save, in arrival order. Their handles count as
     /// open until a later step in their tree saves them, or a restart does.
     pending_closes: Vec<u64>,
+    /// Closes begun since open: the next close's begin order
+    /// (`Handle::close_order`).
+    closes_begun: u64,
     next: u64,
     /// The last record's time: what a step just recorded applies its times at.
     last_at_ns: u64,
@@ -1104,6 +1115,7 @@ impl TreeActor {
             sources,
             handles: BTreeMap::new(),
             pending_closes: Vec::new(),
+            closes_begun: 0,
             // Never a built record's: a journal that ends before the built
             // log is corrupt (`Journal::open`).
             next: folded.next_seq.max(built.get().saturating_add(1)),
@@ -1229,6 +1241,19 @@ impl TreeActor {
             pointers_at_steps: self.at_steps.len() as u64,
             compactor_through: self.history.compactor_through().get(),
         };
+        let pending: Vec<_> = self
+            .handles
+            .iter()
+            .filter(|(handle, h)| h.closing || self.pending_closes.contains(handle))
+            .map(|(_, h)| h.pending_since)
+            .collect();
+        metrics.pending_saves = pending.len() as u64;
+        metrics.oldest_pending_save_ns = pending
+            .iter()
+            .flatten()
+            .map(|since| u64::try_from(since.elapsed().as_nanos()).unwrap_or(u64::MAX).max(1))
+            .max()
+            .unwrap_or(0);
         metrics
     }
 

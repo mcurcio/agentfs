@@ -485,6 +485,24 @@ impl TreeActor {
         std::mem::take(&mut self.changed)
     }
 
+    /// The file's image, a clone (O(1) once built): what an open by the
+    /// client of a pending save reads when its open's own map will not do
+    /// (`TreeActor::open_map`). Every open's calls are in it, a pending
+    /// save's included, because its handle lives until the save lands.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NotFound`] with no write-open of the file; a failed read of
+    /// the journal.
+    pub(in crate::tree_actor) fn pages_image(&mut self, tree: TreeId, object: u64) -> Result<FileMap> {
+        let key = (tree, object);
+        self.pages_build_image(&key)?;
+        self.pages
+            .get(&key)
+            .and_then(|state| state.image.clone())
+            .ok_or(Error::NotFound)
+    }
+
     /// Builds the image if it has none: the saved map plus every live open's
     /// calls and the file's page writes, by the one close rule.
     fn pages_build_image(&mut self, key: &(TreeId, u64)) -> Result<()> {

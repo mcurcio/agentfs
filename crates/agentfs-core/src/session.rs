@@ -167,15 +167,15 @@ impl TreeSession {
     /// [`Error::NotFound`] for an open that is not this session's; as
     /// [`Recording::start_close_with`].
     pub fn start_close(&self, handle: u64) -> Result<Closing> {
-        let _ = handle;
-        todo!("view-save-1")
+        self.sessions.recording.start_close_with(handle, |actor| {
+            own(actor, self.tree, self.writes_as().as_ref(), handle)
+        })
     }
 
     /// Retries a refused path call once `pending`'s save has landed or
     /// failed ([`Recording::when_saved_then`]).
     pub fn when_saved_then(&self, pending: SavePending, then: Then) {
-        let _ = (pending, then);
-        todo!("view-save-1")
+        self.sessions.recording.when_saved_then(pending, then);
     }
 
     /// The operator's rules ([`Recording::rules`]).
@@ -280,8 +280,10 @@ impl SessionGuard<'_> {
     ///
     /// As [`TreeActor::file_map`].
     pub fn open_map(&mut self, path: &str) -> Result<FileMap> {
-        let _ = path;
-        todo!("view-save-1")
+        match &self.writes_as {
+            Some(by) => self.actor.open_map(self.tree, path, by),
+            None => self.actor.file_map(self.tree, path),
+        }
     }
 
     pub fn file_len(&self, path: &str) -> Result<u64> {
@@ -379,23 +381,36 @@ impl SessionGuard<'_> {
         self.actor.first_link(self.tree, object, path, by)
     }
 
-    pub fn rename(&mut self, from: &str, to: &str, mode: RenameMode) -> Result<()> {
+    /// `rename(2)` ([`TreeActor::rename`]): refused with nothing done while
+    /// `to` names a file with a pending save (the rename would replace
+    /// it); a pending save of `from` follows its file to `to`.
+    pub fn rename(&mut self, from: &str, to: &str, mode: RenameMode) -> Result<PathStep<()>> {
         let by = self.writes_as.as_ref().ok_or(Error::ReadOnly)?;
-        self.actor.rename(self.tree, from, to, mode, by)
+        if let Some(pending) = self.actor.pending_save(self.tree, to) {
+            return Ok(PathStep::WaitFor(pending));
+        }
+        self.actor
+            .rename(self.tree, from, to, mode, by)
+            .map(PathStep::Done)
     }
 
     /// A whole-file replace of `path` with the `len` bytes of `src`
-    /// ([`TreeActor::replace_file`]).
+    /// ([`TreeActor::replace_file`]): refused with nothing done, `src`
+    /// unread, while `path` names a file with a pending save.
     pub fn replace_file(
         &mut self,
         path: &str,
         attrs: Attrs,
         src: &mut dyn std::io::Read,
         len: u64,
-    ) -> Result<Saved> {
+    ) -> Result<PathStep<Saved>> {
         let by = self.writes_as.as_ref().ok_or(Error::ReadOnly)?;
+        if let Some(pending) = self.actor.pending_save(self.tree, path) {
+            return Ok(PathStep::WaitFor(pending));
+        }
         self.actor
             .replace_file(self.tree, path, attrs, src, len, by)
+            .map(PathStep::Done)
     }
 
     /// A path `truncate(2)` of `path` to `size`: an open, its truncate and
@@ -407,13 +422,25 @@ impl SessionGuard<'_> {
     ///
     /// [`Error::ReadOnly`]; as the three calls it makes.
     pub fn truncate_path(&mut self, path: &str, size: u64) -> Result<PathStep<()>> {
-        let _ = (path, size);
-        todo!("view-save-1")
+        let by = self.writes_as.as_ref().ok_or(Error::ReadOnly)?;
+        if let Some(pending) = self.actor.pending_save(self.tree, path) {
+            return Ok(PathStep::WaitFor(pending));
+        }
+        let handle = self.actor.write_open(self.tree, path, by, None)?;
+        let truncated = self.actor.truncate(handle, size);
+        self.actor.close(handle)?;
+        truncated.map(PathStep::Done)
     }
 
-    pub fn unlink(&mut self, path: &str) -> Result<()> {
+    /// `unlink(2)` ([`TreeActor::unlink`]): refused with nothing done while
+    /// the file at `path` has a pending save, so history keeps the save,
+    /// then the delete (the owner, 2026-11-23: the delete waits).
+    pub fn unlink(&mut self, path: &str) -> Result<PathStep<()>> {
         let by = self.writes_as.as_ref().ok_or(Error::ReadOnly)?;
-        self.actor.unlink(self.tree, path, by)
+        if let Some(pending) = self.actor.pending_save(self.tree, path) {
+            return Ok(PathStep::WaitFor(pending));
+        }
+        self.actor.unlink(self.tree, path, by).map(PathStep::Done)
     }
 
     pub fn open_object(&self, handle: u64) -> Result<u64> {
