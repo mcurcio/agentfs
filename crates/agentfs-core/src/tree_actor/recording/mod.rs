@@ -35,7 +35,7 @@ use super::meta::{Attrs, Kind, Meta, Perm, SetTime, Times};
 use super::queue::Key;
 use super::stages::{Hold, section};
 use super::tree::{DirState, EventNumber, SavedTree};
-use super::{Error, Result, Saved, TreeActor, TreeId};
+use super::{Error, Result, SavePending, Saved, TreeActor, TreeId};
 use crate::paths::RepoPath;
 pub use file_map::FileMap;
 use layout::{Layout, Positions};
@@ -224,9 +224,16 @@ pub(in crate::tree_actor) struct Handle {
     /// The saved map's step when the view was taken (open, or rebase_built
     /// moving a call-less view).
     pub(in crate::tree_actor) base_step: Option<RecordNo>,
-    /// Its close is being decided with the lock released: only that close's
-    /// finish saves it; close_writer and save_pending leave it.
+    /// Its close is being decided with the lock released, or waits its turn
+    /// behind an earlier-begun save of its file: a pending save that only
+    /// that close's finish saves; close_writer and save_pending leave it.
     pub(in crate::tree_actor) closing: bool,
+    /// The order its close began in, under the lock: a file's saves land
+    /// in this order. None until a close begins (an ended client's opens
+    /// have none).
+    pub(in crate::tree_actor) close_order: Option<u64>,
+    /// When its save became pending: the age the metrics give.
+    pub(in crate::tree_actor) pending_since: Option<std::time::Instant>,
 }
 
 impl Handle {
@@ -248,6 +255,8 @@ impl Handle {
             call_count: 0,
             base_step,
             closing: false,
+            close_order: None,
+            pending_since: None,
         }
     }
 
@@ -299,10 +308,13 @@ pub(in crate::tree_actor) struct CloseDecision {
 }
 
 /// How a close goes on after [`TreeActor::close_begin`]: saved under the
-/// lock already, or to be decided with it released.
+/// lock already, to be decided with it released, or queued behind an
+/// earlier-begun save of its file, its snapshot taken at its turn
+/// ([`TreeActor::close_resume`]).
 pub(in crate::tree_actor) enum CloseStart {
     Done(Saved),
     Decide(CloseWork),
+    Queued,
 }
 
 impl CloseWork {
@@ -421,6 +433,98 @@ impl TreeActor {
         let tree = self.tree(tree)?;
         let object = tree.names.get(path).ok_or(Error::NotFound)?;
         Ok(tree.bytes.get(object).ok_or(Error::NotFound)?.clone())
+    }
+
+    /// A file at `path` whose save is being decided, or queued behind an
+    /// earlier save of it: the session's refusal of a call that would
+    /// delete or replace it (an unlink, a rename onto it, a whole-file
+    /// replace, a path truncate). A failed save is no refusal: its retry
+    /// saves first at the call's own step.
+    pub(crate) fn pending_save(&self, tree: TreeId, path: &str) -> Option<SavePending> {
+        let t = self.tree(tree).ok()?;
+        let object = *t.names.get(path)?;
+        self.save_in_flight(tree, object, None)
+            .then(|| SavePending::new(tree, object))
+    }
+
+    /// Whether a close of `object` in `tree` is in flight (being decided or
+    /// queued), begun before `before` when given.
+    pub(in crate::tree_actor) fn save_in_flight(
+        &self,
+        tree: TreeId,
+        object: u64,
+        before: Option<u64>,
+    ) -> bool {
+        self.handles.values().any(|h| {
+            h.closing
+                && h.tree == tree
+                && h.object == object
+                && before.is_none_or(|b| h.close_order.is_some_and(|o| o < b))
+        })
+    }
+
+    /// Whether any close of the volume is in flight: what
+    /// `Recording::settle` waits out.
+    pub(in crate::tree_actor) fn saves_in_flight(&self) -> bool {
+        self.handles.values().any(|h| h.closing)
+    }
+
+    /// The file at `path` as `by`'s pending saves leave it, else its saved
+    /// map: what an open by the file's own client reads (close-to-open,
+    /// ledger R1.1). Another client's pending save is not shown. One
+    /// pending save whose base did not move, with no page write of the
+    /// file, gives its open's map, a clone; more, or a moved base, or page
+    /// writes give the file's image, built under the lock as a page fill
+    /// builds it.
+    ///
+    /// # Errors
+    ///
+    /// As [`TreeActor::file_map`]; a failed read of the journal for the
+    /// image.
+    pub(crate) fn open_map(&mut self, tree: TreeId, path: &str, by: &WriterAt) -> Result<FileMap> {
+        let object = *self.tree(tree)?.names.get(path).ok_or(Error::NotFound)?;
+        match self.pending_content(tree, object, by)? {
+            Some(map) => Ok(map),
+            None => self.file_map(tree, path),
+        }
+    }
+
+    /// `object` as `by`'s pending saves leave it, or None when `by` has no
+    /// pending save of it (see [`TreeActor::open_map`]).
+    fn pending_content(
+        &mut self,
+        tree: TreeId,
+        object: u64,
+        by: &WriterAt,
+    ) -> Result<Option<FileMap>> {
+        let mine: Vec<&Handle> = self
+            .handles
+            .iter()
+            .filter(|(handle, h)| {
+                h.tree == tree
+                    && h.object == object
+                    && h.by.writer == by.writer
+                    && (h.closing || self.pending_closes.contains(handle))
+            })
+            .map(|(_, h)| h)
+            .collect();
+        let [only, ..] = mine.as_slice() else {
+            return Ok(None);
+        };
+        let saved_step = self
+            .tree(tree)?
+            .bytes
+            .get(&object)
+            .ok_or(Error::NotFound)?
+            .step();
+        if mine.len() == 1
+            && only.base_step.is_some()
+            && only.base_step == saved_step
+            && self.pages_written(tree, object).is_none()
+        {
+            return Ok(Some(only.bytes.clone()));
+        }
+        self.pages_image(tree, object).map(Some)
     }
 
     /// The saved length of `path`.
@@ -756,6 +860,14 @@ impl TreeActor {
             },
             &[],
         )?;
+        // The writer's own pending saves are its view's start: such a view
+        // has no base, so its close replays its calls on the saved head and
+        // never saves the view.
+        if let Some(bytes) = self.pending_content(tree, object, by)? {
+            self.handles
+                .insert(handle, Handle::new(tree, by, object, bytes, None));
+            return Ok(handle);
+        }
         let bytes = self
             .tree(tree)?
             .bytes
@@ -854,7 +966,11 @@ impl TreeActor {
             .filter(|(_, h)| h.tree == tree && h.by.writer == *writer && !h.closing)
             .map(|(handle, _)| *handle)
             .collect();
+        let now = std::time::Instant::now();
         for handle in &mine {
+            if let Some(h) = self.handles.get_mut(handle) {
+                h.pending_since.get_or_insert(now);
+            }
             if !self.pending_closes.contains(handle) {
                 self.pending_closes.push(*handle);
             }
@@ -975,6 +1091,9 @@ impl TreeActor {
     /// next step in its tree and at restart. [`TreeActor::close_begin`],
     /// [`CloseWork::decide`] and [`TreeActor::close_finish`] in one hold of
     /// the lock: `Recording::close_with` releases it for the decision.
+    /// A close of a file whose earlier-begun save is in flight cannot wait
+    /// in one hold: it answers [`Error::Busy`] and stays pending, saved
+    /// after that save. A session reaches this only for a file with none.
     pub fn close(&mut self, handle: u64) -> Result<Saved> {
         let _kind = section(Hold::Close);
         match self.close_begin(handle)? {
@@ -983,6 +1102,7 @@ impl TreeActor {
                 Ok(decision) => self.close_finish(decision),
                 Err(e) => Err(self.close_failed(handle, e)),
             },
+            CloseStart::Queued => Err(self.close_failed(handle, Error::Busy)),
         }
     }
 
@@ -992,7 +1112,10 @@ impl TreeActor {
     /// no call and no page write (unchanged), and an open whose saved map
     /// has not moved, whose file has no page writes and whose length changed,
     /// with few pieces: its view is the save. Else the snapshots for
-    /// [`CloseWork::decide`], the handle marked closing.
+    /// [`CloseWork::decide`], the handle marked closing. First of all, a
+    /// close of a file with an earlier-begun save in flight is marked
+    /// closing with no snapshot ([`CloseStart::Queued`]): it is never saved
+    /// ahead of that save.
     ///
     /// # Errors
     ///
@@ -1007,6 +1130,51 @@ impl TreeActor {
         if h.closing {
             return Err(Error::NotFound);
         }
+        let (tree, object) = (h.tree, h.object);
+        let order = self.closes_begun;
+        self.closes_begun += 1;
+        let queued = self.save_in_flight(tree, object, None);
+        if let Some(h) = self.handles.get_mut(&handle) {
+            h.close_order.get_or_insert(order);
+            h.pending_since.get_or_insert_with(std::time::Instant::now);
+            if queued {
+                h.closing = true;
+                return Ok(CloseStart::Queued);
+            }
+        }
+        self.close_start(handle)
+    }
+
+    /// A queued close's turn, under the lock: still [`CloseStart::Queued`]
+    /// while an earlier-begun save of its file is in flight, else its close
+    /// as [`TreeActor::close_begin`] goes on past that check.
+    ///
+    /// # Errors
+    ///
+    /// As [`TreeActor::close_begin`]; [`Error::NotFound`] for an open not
+    /// queued.
+    pub(in crate::tree_actor) fn close_resume(&mut self, handle: u64) -> Result<CloseStart> {
+        let _kind = section(Hold::Close);
+        if self.is_stopped() {
+            return Err(Error::Stopped);
+        }
+        let h = self
+            .handles
+            .get(&handle)
+            .filter(|h| h.closing)
+            .ok_or(Error::NotFound)?;
+        if self.save_in_flight(h.tree, h.object, h.close_order) {
+            return Ok(CloseStart::Queued);
+        }
+        if let Some(h) = self.handles.get_mut(&handle) {
+            h.closing = false;
+        }
+        self.close_start(handle)
+    }
+
+    /// [`TreeActor::close_begin`] past its same-file check.
+    fn close_start(&mut self, handle: u64) -> Result<CloseStart> {
+        let h = self.handles.get(&handle).ok_or(Error::NotFound)?;
         let (tree, object) = (h.tree, h.object);
         let t = self.tree(tree)?;
         let pending = self
@@ -1111,12 +1279,15 @@ impl TreeActor {
 
     /// A close that could not save: it stays pending, its handle still
     /// counting as open, and saves at its tree's next step or at restart.
+    /// Counted in `failed_saves`.
     pub(in crate::tree_actor) fn close_failed(&mut self, handle: u64, error: Error) -> Error {
         if let Some(h) = self.handles.get_mut(&handle) {
             h.closing = false;
+            h.pending_since.get_or_insert_with(std::time::Instant::now);
             if !self.pending_closes.contains(&handle) {
                 self.pending_closes.push(handle);
             }
+            self.metrics.failed_saves = self.metrics.failed_saves.saturating_add(1);
         }
         error
     }
@@ -1333,13 +1504,23 @@ impl TreeActor {
             .map_or(Saved::Unchanged, |(_, saved)| saved))
     }
 
-    /// Saves this tree's pending closes in arrival order; answers each.
+    /// Saves this tree's pending closes in arrival order; answers each. A
+    /// failed save of a file whose earlier-begun save is still in flight
+    /// stays pending, for a later step: a file's saves land in the order
+    /// their closes began.
     fn save_pending(&mut self, tree: TreeId) -> Result<Vec<(u64, Saved)>> {
         let due: Vec<u64> = self
             .pending_closes
             .iter()
             .copied()
-            .filter(|handle| self.handles.get(handle).is_some_and(|h| h.tree == tree))
+            .filter(|handle| {
+                self.handles.get(handle).is_some_and(|h| {
+                    h.tree == tree
+                        && !h
+                            .close_order
+                            .is_some_and(|o| self.save_in_flight(tree, h.object, Some(o)))
+                })
+            })
             .collect();
         let mut saved = Vec::with_capacity(due.len());
         for handle in due {

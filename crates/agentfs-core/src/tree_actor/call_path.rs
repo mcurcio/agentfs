@@ -6,10 +6,18 @@
 //! (`Stages::actor_lock`, and by kind of work in `Stages::lock_hold`), and
 //! so is each wait to take the lock (`Stages::lock_wait`).
 //!
+//! A RELEASE is begun under the lock ([`Recording::start_close_with`]) and
+//! its save, a pending save, is decided and landed later by
+//! [`SaveToDecide::finish`], on a view's save worker. A file's saves land in
+//! the order their closes began: a later one waits on the close epoch, a
+//! counter bumped at every landing or failure of a pending save. Lock order:
+//! the actor, then the waiters of [`Recording::when_saved_then`], then the
+//! epoch (docs/trees.md, "Recording and durability").
 
+use std::collections::BTreeMap;
 use std::ops::{Deref, DerefMut};
 use std::path::Path;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 
 use agentfs_contracts::clients::FileOwner;
 use agentfs_contracts::pod::PodContext;
@@ -17,7 +25,7 @@ use agentfs_contracts::volume::VolumeIdentity;
 
 use super::history::built::History;
 use super::journal::durable::{Durability, RecordNo};
-use super::recording::CloseStart;
+use super::recording::{CloseStart, CloseWork};
 use super::stages::{self, Held};
 use super::takes::{self, Lands};
 use super::{Error, Saved, Took, TreeActor, TreeId, Upkeep};
@@ -93,6 +101,14 @@ pub enum Closing {
 pub struct SaveToDecide {
     recording: Arc<Recording>,
     handle: u64,
+    /// The file it saves, by tree and object: whose waiters run once it
+    /// lands or fails.
+    file: (TreeId, u64),
+    /// The snapshot taken when the close began; None for a close queued
+    /// behind an earlier save of its file, which snapshots at its turn.
+    work: Option<CloseWork>,
+    /// Finished: its drop leaves the save alone.
+    done: bool,
 }
 
 impl SaveToDecide {
@@ -113,9 +129,89 @@ impl SaveToDecide {
     ///
     /// [`Error::Stopped`]; a failed decision or land, which leaves the save
     /// pending as [`TreeActor::close`]'s failure does.
-    pub fn finish(self) -> Result<Saved, Error> {
-        let _ = (&self.recording, self.handle);
-        todo!("view-save-1")
+    pub fn finish(mut self) -> Result<Saved, Error> {
+        let recording = Arc::clone(&self.recording);
+        let (saved, waiters) = match self.land() {
+            Ok(landed) => landed,
+            // The actor stopped: nothing lands, and every waiter of the
+            // file hears so.
+            Err(e) => (Err(e), recording.take_waiters(self.file)),
+        };
+        self.done = true;
+        recording.run_waiters(waiters);
+        saved
+    }
+
+    /// The decision and its land. `Ok` carries the save's outcome and the
+    /// file's waiters, taken in the landing's hold once no save of the file
+    /// is in flight; `Err` only when the actor's lock could not be taken.
+    fn land(&mut self) -> Result<(Result<Saved, Error>, Vec<Then>), Error> {
+        let recording = Arc::clone(&self.recording);
+        let handle = self.handle;
+        let work = match self.work.take() {
+            Some(work) => work,
+            None => loop {
+                let mut actor = recording.actor()?;
+                match actor.close_resume(handle) {
+                    Ok(CloseStart::Queued) => {
+                        // Read under the actor's lock with the state it
+                        // checked: a landing after this moves it.
+                        let seen = recording.epoch();
+                        drop(actor);
+                        recording.wait_epoch(seen);
+                    }
+                    Ok(CloseStart::Decide(work)) => break work,
+                    Ok(CloseStart::Done(saved)) => {
+                        return Ok((Ok(saved), recording.settled(&actor, self.file)));
+                    }
+                    Err(e) => return Ok((Err(e), recording.settled(&actor, self.file))),
+                }
+            },
+        };
+        let decided = crate::failpoints::hit("tree.close_decide")
+            .map_err(Error::from)
+            .and_then(|()| {
+                #[cfg(test)]
+                if let Some(hook) = &*recording
+                    .in_decide
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                {
+                    hook();
+                }
+                work.decide()
+            });
+        let mut actor = recording.actor()?;
+        let saved = match decided {
+            Ok(decision) => actor.close_finish(decision),
+            Err(e) => Err(actor.close_failed(handle, e)),
+        };
+        Ok((saved, recording.settled(&actor, self.file)))
+    }
+}
+
+impl Drop for SaveToDecide {
+    /// Unfinished, a panic's unwinding included: the save stays pending as
+    /// a failed one ([`TreeActor::close_failed`], counted in
+    /// `failed_saves`), saved at its tree's next step or at restart, and its
+    /// file's [`Recording::when_saved_then`] callbacks run.
+    fn drop(&mut self) {
+        if self.done {
+            return;
+        }
+        let recording = Arc::clone(&self.recording);
+        let waiters = match recording.actor() {
+            Ok(mut actor) => {
+                let _ = actor.close_failed(self.handle, Error::Stopped);
+                recording.settled(&actor, self.file)
+            }
+            Err(_) => recording.take_waiters(self.file),
+        };
+        eprintln!(
+            "tree SaveFailed: tree={} open={}: dropped unfinished, it stays pending",
+            self.file.0, self.handle
+        );
+        recording.run_waiters(waiters);
     }
 }
 
@@ -132,6 +228,11 @@ pub struct SavePending {
 }
 
 impl SavePending {
+    /// The refusal for `object` in `tree`: the core's alone.
+    pub(in crate::tree_actor) fn new(tree: TreeId, object: u64) -> Self {
+        Self { tree, object }
+    }
+
     /// The tree whose file has the pending save.
     pub fn tree(&self) -> TreeId {
         self.tree
@@ -184,6 +285,13 @@ pub struct Recording {
     /// Tests: runs where a close's decision runs, with the lock released.
     #[cfg(test)]
     in_decide: Mutex<Option<Box<dyn Fn() + Send>>>,
+    /// Each file's [`Recording::when_saved_then`] callbacks, run once no
+    /// save of it is in flight. Locked only under the actor's lock.
+    waiters: Mutex<BTreeMap<(TreeId, u64), Vec<Then>>>,
+    /// The close epoch: bumped at every landing or failure of a pending
+    /// save; read under the actor's lock with the state a waiter checks.
+    epoch: Mutex<u64>,
+    epoch_moved: Condvar,
 }
 
 impl Drop for Recording {
@@ -237,6 +345,9 @@ impl Recording {
             gate: Some(gate),
             #[cfg(test)]
             in_decide: Mutex::new(None),
+            waiters: Mutex::default(),
+            epoch: Mutex::new(0),
+            epoch_moved: Condvar::new(),
         }))
     }
 
@@ -331,42 +442,23 @@ impl Recording {
         })
     }
 
-    /// RELEASE: `check` and the close's first half under one hold
-    /// ([`TreeActor::close_begin`]), the decision with the lock released
-    /// ([`super::recording::CloseWork::decide`]), and its landing under the
-    /// lock again ([`TreeActor::close_finish`]). Other calls of the volume
-    /// run meanwhile. The save is recorded before this returns, or the close
-    /// stays pending as any failed close does.
+    /// RELEASE on the caller's thread, for the CLI, tests and recovery:
+    /// [`Recording::start_close_with`], then [`SaveToDecide::finish`]. Other
+    /// calls of the volume run while the save is decided. The save is
+    /// recorded before this returns, or the close stays pending as any
+    /// failed close does.
     ///
     /// # Errors
     ///
     /// `check`'s error, with nothing done; as [`TreeActor::close`].
     pub fn close_with(
-        &self,
+        self: &Arc<Self>,
         handle: u64,
         check: impl FnOnce(&TreeActor) -> Result<(), Error>,
     ) -> Result<Saved, Error> {
-        let work = {
-            let mut actor = self.actor()?;
-            check(&actor)?;
-            match actor.close_begin(handle)? {
-                CloseStart::Done(saved) => return Ok(saved),
-                CloseStart::Decide(work) => work,
-            }
-        };
-        #[cfg(test)]
-        if let Some(hook) = &*self
-            .in_decide
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-        {
-            hook();
-        }
-        let decided = work.decide();
-        let mut actor = self.actor()?;
-        match decided {
-            Ok(decision) => actor.close_finish(decision),
-            Err(e) => Err(actor.close_failed(handle, e)),
+        match self.start_close_with(handle, check)? {
+            Closing::Saved(saved) => Ok(saved),
+            Closing::Decide(save) => save.finish(),
         }
     }
 
@@ -386,8 +478,21 @@ impl Recording {
         handle: u64,
         check: impl FnOnce(&TreeActor) -> Result<(), Error>,
     ) -> Result<Closing, Error> {
-        let _ = (handle, check);
-        todo!("view-save-1")
+        let mut actor = self.actor()?;
+        check(&actor)?;
+        let file = (actor.open_by(handle)?.0, actor.open_object(handle)?);
+        let work = match actor.close_begin(handle)? {
+            CloseStart::Done(saved) => return Ok(Closing::Saved(saved)),
+            CloseStart::Decide(work) => Some(work),
+            CloseStart::Queued => None,
+        };
+        Ok(Closing::Decide(SaveToDecide {
+            recording: Arc::clone(self),
+            handle,
+            file,
+            work,
+            done: false,
+        }))
     }
 
     /// Runs `then` once no save of `pending`'s file is pending: at once on
@@ -399,8 +504,78 @@ impl Recording {
     /// it retries the refused call, which may be refused again for a save
     /// begun meanwhile.
     pub fn when_saved_then(&self, pending: SavePending, then: Then) {
-        let _ = (pending, then);
-        todo!("view-save-1")
+        let file = (pending.tree, pending.object);
+        let actor = match self.actor() {
+            Ok(actor) => actor,
+            Err(e) => return then(Err(e)),
+        };
+        if actor.save_in_flight(file.0, file.1, None) {
+            self.waiters
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .entry(file)
+                .or_default()
+                .push(then);
+            return;
+        }
+        drop(actor);
+        then(Ok(()));
+    }
+
+    /// In a landing's or failure's hold of `actor`: the close epoch bumped,
+    /// and `file`'s waiters taken once no save of it is in flight.
+    fn settled(&self, actor: &TreeActor, file: (TreeId, u64)) -> Vec<Then> {
+        let waiters = if actor.save_in_flight(file.0, file.1, None) {
+            Vec::new()
+        } else {
+            self.take_waiters(file)
+        };
+        self.bump_epoch();
+        waiters
+    }
+
+    /// `file`'s waiters, taken.
+    fn take_waiters(&self, file: (TreeId, u64)) -> Vec<Then> {
+        self.waiters
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&file)
+            .unwrap_or_default()
+    }
+
+    /// Runs `waiters` with the actor unlocked: each retries its refused
+    /// call, or hears [`Error::Stopped`] once the actor has stopped.
+    fn run_waiters(&self, waiters: Vec<Then>) {
+        if waiters.is_empty() {
+            return;
+        }
+        let stopped = self.is_stopped();
+        for then in waiters {
+            then(if stopped { Err(Error::Stopped) } else { Ok(()) });
+        }
+    }
+
+    /// The close epoch now.
+    fn epoch(&self) -> u64 {
+        *self.epoch.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Bumps the close epoch and wakes its waiters.
+    fn bump_epoch(&self) {
+        let mut epoch = self.epoch.lock().unwrap_or_else(PoisonError::into_inner);
+        *epoch = epoch.wrapping_add(1);
+        self.epoch_moved.notify_all();
+    }
+
+    /// Blocks until the close epoch moves past `seen`: an event, never a
+    /// timer.
+    fn wait_epoch(&self, seen: u64) {
+        let epoch = self.epoch.lock().unwrap_or_else(PoisonError::into_inner);
+        drop(
+            self.epoch_moved
+                .wait_while(epoch, |now| *now == seen)
+                .unwrap_or_else(PoisonError::into_inner),
+        );
     }
 
     /// Tests: `hook` runs in every close's decision, with the lock released.
@@ -586,14 +761,29 @@ impl Recording {
         self.history.wait_epoch_for(seen, at_most)
     }
 
-    /// Waits until every record appended so far is built: what a test, the
-    /// CLI or a replay calls before it reads history.
+    /// Waits until no save is in flight (being decided or queued; a failed
+    /// one waits for a step), then until every record appended by then is
+    /// built: what a test, the CLI or a replay calls before it reads
+    /// history. Never called from a save worker or with a [`SaveToDecide`]
+    /// held: it would wait for itself.
     ///
     /// # Errors
     ///
     /// As [`History::wait_built`], as an [`Error`].
     pub fn settle(&self) -> Result<RecordNo, Error> {
-        Ok(self.history.wait_built(self.durability.appended())?)
+        let through = loop {
+            let Ok(actor) = self.actor() else {
+                break self.durability.appended();
+            };
+            if !actor.saves_in_flight() {
+                break self.durability.appended();
+            }
+            // Read under the actor's lock with the state it checked.
+            let seen = self.epoch();
+            drop(actor);
+            self.wait_epoch(seen);
+        };
+        Ok(self.history.wait_built(through)?)
     }
 }
 
@@ -904,7 +1094,7 @@ mod tests {
 
     /// A saved file `a` of ten bytes, and an open of it whose close keeps the
     /// length: decided with the lock released.
-    fn held_close(rec: &Recording) -> u64 {
+    fn held_close(rec: &Arc<Recording>) -> u64 {
         let w = writer("w");
         let h = rec
             .actor()
@@ -1104,9 +1294,11 @@ mod tests {
         );
     }
 
-    /// A5: another open saves the file while a close is being decided: the
-    /// decision is stale, the close is redone under the lock on the new
-    /// save, and its save is in the journal before `close_with` returns.
+    /// A5: another client ends, saving its open of the file, while a close
+    /// is being decided (a client's end does not wait for the file's
+    /// pending save): the decision is stale, the close is redone under the
+    /// lock on the new save, and its save is in the journal before
+    /// `close_with` returns.
     #[test]
     fn a_close_whose_file_moved_meanwhile_is_redone_and_recorded() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1116,14 +1308,19 @@ mod tests {
         let saved = std::thread::scope(|scope| {
             let closing = scope.spawn(|| rec.close_with(h, |_| Ok(())));
             inside.recv().unwrap();
-            let w = writer("w");
+            let other = writer("other");
             let g = rec
                 .actor()
                 .unwrap()
-                .write_open(TreeId::Root, "a", &w, None)
+                .write_open(TreeId::Root, "a", &other, None)
                 .unwrap();
             rec.actor().unwrap().write(g, 0, b"zz", true).unwrap();
-            rec.close_with(g, |_| Ok(())).unwrap();
+            #[expect(clippy::disallowed_methods, reason = "the client's end, as unbind")]
+            let ended = rec
+                .actor()
+                .unwrap()
+                .close_writer(TreeId::Root, &other.writer);
+            ended.unwrap();
             release.send(()).unwrap();
             closing.join().unwrap().unwrap()
         });

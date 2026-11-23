@@ -40,7 +40,7 @@ fn with_a(dir: &std::path::Path) -> Arc<Recording> {
 }
 
 /// The lock holds and bytes compared by one `close_with`.
-fn close_costs(rec: &Recording, handle: u64) -> (Saved, u64, u64) {
+fn close_costs(rec: &Arc<Recording>, handle: u64) -> (Saved, u64, u64) {
     let before = Stages::current();
     let saved = rec.close_with(handle, |_| Ok(())).unwrap();
     let after = Stages::current();
