@@ -1589,3 +1589,89 @@ fn a_batch_one_record_short_of_a_switch_record_is_followed() {
 fn built_oid(history: &History, name: &str) -> Option<Oid> {
     history.snapshot().pointers().get(name)
 }
+
+/// `f` saved as `SEED`, then two opens of it, `AAAA` written through the
+/// first and `BBBB` through the second: their handles.
+fn two_opens_of_f(v: &mut TreeActor) -> (u64, u64) {
+    put(v, ROOT, "f", b"SEED");
+    let w = writer("w");
+    let h1 = v.write_open(ROOT, "f", &w, None).unwrap();
+    v.write(h1, 0, b"AAAA", false).unwrap();
+    let h2 = v.write_open(ROOT, "f", &w, None).unwrap();
+    v.write(h2, 0, b"BBBB", false).unwrap();
+    (h1, h2)
+}
+
+/// A close begun, not finished: its open is left closing.
+fn begin_close(v: &mut TreeActor, handle: u64) {
+    drop(v.close_begin(handle).unwrap());
+}
+
+/// A step after what came before, built and compacted past: the built
+/// point is that step.
+fn compact_past(v: &mut TreeActor, dir: &str) {
+    v.mkdir(ROOT, dir, ATTRS, &writer("w")).unwrap();
+    compact_now(v);
+}
+
+/// The checkpoint folds each live open's close record into its open record,
+/// so a compaction that lets the records' segments go keeps close order.
+#[test]
+fn a_checkpoint_keeps_each_live_opens_close_record() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut v = new_actor_with(tmp.path(), never_due());
+    let (h1, h2) = two_opens_of_f(&mut v);
+    begin_close(&mut v, h2);
+    begin_close(&mut v, h1);
+    compact_past(&mut v, "d");
+    let checkpoint = checkpoint_in(&tmp.path().join(JOURNAL));
+    let order = |handle: u64| {
+        checkpoint
+            .opens
+            .iter()
+            .find(|open| open.handle == handle)
+            .and_then(|open| open.close_begun)
+    };
+    let (first, second) = (order(h2).unwrap(), order(h1).unwrap());
+    assert!(
+        first < second && second <= checkpoint.built,
+        "{first:?} {second:?}"
+    );
+    // One frame a segment: the close records' segments were let go.
+    let firsts = v.journal.segment_firsts();
+    assert!(
+        !firsts.contains(&first) && !firsts.contains(&second),
+        "{first:?} {second:?} in {firsts:?}"
+    );
+    drop(v);
+    assert_eq!(opened(tmp.path()).read(ROOT, "f").unwrap(), b"AAAA");
+}
+
+/// A compaction whose built point falls between an open's record and its
+/// close record, or between two close records of one file: the record
+/// after the checkpoint folds onto the open the checkpoint lists, and a
+/// reopen keeps close order.
+#[test]
+fn a_compaction_between_close_records_keeps_close_order() {
+    // Between the opens and both close records.
+    let tmp = tempfile::tempdir().unwrap();
+    let mut v = new_actor_with(tmp.path(), never_due());
+    let (h1, h2) = two_opens_of_f(&mut v);
+    compact_past(&mut v, "d");
+    let listed = checkpoint_in(&tmp.path().join(JOURNAL)).opens;
+    assert_eq!(listed.len(), 2);
+    assert!(listed.iter().all(|open| open.close_begun.is_none()));
+    begin_close(&mut v, h2);
+    begin_close(&mut v, h1);
+    drop(v);
+    assert_eq!(opened(tmp.path()).read(ROOT, "f").unwrap(), b"AAAA");
+    // Between the two close records.
+    let tmp = tempfile::tempdir().unwrap();
+    let mut v = new_actor_with(tmp.path(), never_due());
+    let (h1, h2) = two_opens_of_f(&mut v);
+    begin_close(&mut v, h2);
+    compact_past(&mut v, "d");
+    begin_close(&mut v, h1);
+    drop(v);
+    assert_eq!(opened(tmp.path()).read(ROOT, "f").unwrap(), b"AAAA");
+}

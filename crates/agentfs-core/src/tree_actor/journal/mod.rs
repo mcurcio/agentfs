@@ -158,7 +158,7 @@ pub(super) enum Entry {
     },
     /// A write-open's close begun: this record's number is the close's
     /// order, the one a file's saves land in, live and at restart
-    /// (docs/target-architecture/future/close-order.md, until built). At
+    /// (docs/trees.md, "Pending saves" and "The journal"). At
     /// most one per open, appended under the lock before the close is
     /// answered, with no fsync, as a call is. Not a step: no writer, no
     /// commit, no lag. The fold keeps it on the open
@@ -1802,6 +1802,39 @@ mod tests {
         assert_eq!(
             journal.durability().make_all_durable(),
             Ok(RecordNo::new(1))
+        );
+    }
+
+    /// A close's start appends its close record as a call is appended: one
+    /// frame, no fsync. The builder, at rest, makes none either: the record
+    /// is no step.
+    #[test]
+    fn a_close_record_is_appended_without_an_fsync() {
+        use crate::tree_actor::test_support::{ATTRS, never_due, new_actor_with, writer};
+        use crate::tree_actor::{JOURNAL, TreeId};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let mut v = new_actor_with(tmp.path(), never_due());
+        let w = writer("w");
+        let h = v.write_open(TreeId::Root, "f", &w, Some(ATTRS)).unwrap();
+        v.write(h, 0, b"SEED", false).unwrap();
+        v.close(h).unwrap();
+        let h = v.write_open(TreeId::Root, "f", &w, None).unwrap();
+        v.write(h, 0, b"AAAA", false).unwrap();
+        v.settle().unwrap();
+        v.durability().make_all_durable().unwrap();
+        let (appended, mark) = (v.durability().appended(), v.durability().mark());
+        assert_eq!(mark, appended);
+        drop(v.close_begin(h).unwrap());
+        assert_eq!(v.durability().appended(), appended.next());
+        assert_eq!(v.durability().mark(), mark, "an fsync at the close's start");
+        drop(v);
+        let (_, frames) = Journal::open(&tmp.path().join(JOURNAL), RecordNo::ZERO).unwrap();
+        let last = frames.iter().filter(|(record, _)| record.seq > appended);
+        let entries: Vec<&Entry> = last.map(|(record, _)| &record.entry).collect();
+        assert!(
+            matches!(entries[..], [Entry::CloseBegun { handle }] if *handle == h),
+            "{entries:?}"
         );
     }
 }

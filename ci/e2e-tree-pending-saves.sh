@@ -98,4 +98,19 @@ flock "$work/state/actor.lock" true
 start '' "$work/restarted.log"
 saves --case restarted
 stop
-echo "pending saves: error, panic and kill each lose nothing"
+
+# Two pending saves of one file, closed in the reverse of their opens' order
+# while the first decision sleeps, made durable, then agentfs killed with
+# SIGKILL: the restart lands them in close order, from the journal's close
+# records, as the live volume would have.
+fresh
+start 'tree.close_decide=sleep(600000)' "$work/order.log"
+saves --case order
+kill -KILL "$pid"
+tree_wait_exit "$pid" 60 || true; pid=
+fusermount3 -uz "$work/main"
+flock "$work/state/actor.lock" true
+start '' "$work/order-restarted.log"
+saves --case order-restarted
+stop
+echo "pending saves: error, panic and kill each lose nothing; a restart keeps close order"

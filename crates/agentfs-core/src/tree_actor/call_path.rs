@@ -1277,6 +1277,56 @@ mod tests {
         );
     }
 
+    /// `settle` waits only for the closes begun before it: a save of
+    /// another file begun while it waits does not hold it, so a workload
+    /// that keeps closing files cannot keep a settle waiting.
+    #[test]
+    fn settle_waits_only_for_closes_begun_before_it() {
+        const BOUND: std::time::Duration = std::time::Duration::from_secs(60);
+        let tmp = tempfile::tempdir().unwrap();
+        let rec = Recording::serve(new_actor(tmp.path())).unwrap();
+        let h = held_close(&rec);
+        let w = writer("w");
+        let g = rec
+            .actor()
+            .unwrap()
+            .write_open(TreeId::Root, "b", &w, Some(ATTRS))
+            .unwrap();
+        rec.actor().unwrap().write(g, 0, b"0123", false).unwrap();
+        rec.close_with(g, |_| Ok(())).unwrap();
+        let g = rec
+            .actor()
+            .unwrap()
+            .write_open(TreeId::Root, "b", &w, None)
+            .unwrap();
+        rec.actor().unwrap().write(g, 0, b"BB", false).unwrap();
+        let (inside, release) = hold_first_decide(&rec);
+        let waits = note_waits(&rec);
+        let first = {
+            let rec = Arc::clone(&rec);
+            std::thread::spawn(move || rec.close_with(h, |_| Ok(())))
+        };
+        inside.recv_timeout(HANG).unwrap();
+        let (answer, answered) = mpsc::channel();
+        {
+            let rec = Arc::clone(&rec);
+            std::thread::spawn(move || answer.send(rec.settle()));
+        }
+        waits.recv_timeout(HANG).expect("the settle waits");
+        let Closing::Decide(later) = rec.start_close_with(g, |_| Ok(())).unwrap() else {
+            panic!("b's close saved at its start");
+        };
+        release.send(()).unwrap();
+        assert!(matches!(first.join().unwrap(), Ok(Saved::Commit(_))));
+        let settled = answered.recv_timeout(BOUND);
+        // Released either way, so a failure is a failure, not a hang.
+        assert!(matches!(later.finish(), Ok(Saved::Commit(_))));
+        assert!(
+            matches!(settled, Ok(Ok(_))),
+            "settle waited for a close begun after it: {settled:?}"
+        );
+    }
+
     /// The actor stops while a save is decided: the close of its file
     /// queued behind it, and a settle, wake and hear so rather than wait for
     /// a landing that never comes.
