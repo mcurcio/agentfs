@@ -55,6 +55,7 @@ Smaller slices, one page each:
 | Where the line map lives; two renames to one path | [Line map and renames](future/line-map-and-renames.md) |
 | Refusing shared mappings | [Shared mappings](future/shared-mappings.md) |
 | Faster saves and landings with large files or many saves | [Save and take speed](future/save-and-take-speed.md) |
+| Pending saves: close order on record in the journal, so a restart keeps it, and an open's fold of its client's pending saves with the volume's lock released | [Close order](future/close-order.md) |
 | Upkeep still under the volume lock: the catch-up's overlay walk, a dead client's closes, the fork copy (gated on a figure) | [Latency and upkeep](future/latency-upkeep.md) |
 | Landing patches while a workload runs | [Live landing](future/live-landing.md) |
 | Recovery tooling beyond restore and revert | [Recovery tooling](future/recovery-tooling.md) |
