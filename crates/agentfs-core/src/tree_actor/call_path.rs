@@ -813,21 +813,26 @@ impl Recording {
         self.history.wait_epoch_for(seen, at_most)
     }
 
-    /// Waits until no save is in flight (being decided or queued; a failed
-    /// one waits for a step), then until every record appended by then is
-    /// built: what a test, the CLI or a replay calls before it reads
-    /// history. Never called from a save worker or with a [`SaveToDecide`]
-    /// held: it would wait for itself.
+    /// Waits until no save begun before it is in flight (being decided or
+    /// queued; a failed one waits for a step): those whose close record is
+    /// below the journal's next record at its first hold. A close begun
+    /// after it, of any file, does not hold it. Then waits until every
+    /// record appended by then is built: what a test, the CLI or a replay
+    /// calls before it reads history. Never called from a save worker or
+    /// with a [`SaveToDecide`] held: it would wait for itself.
     ///
     /// # Errors
     ///
     /// As [`History::wait_built`], as an [`Error`].
     pub fn settle(&self) -> Result<RecordNo, Error> {
+        let mut before = None;
         let through = loop {
             let Ok(actor) = self.actor() else {
                 break self.durability.appended();
             };
-            if !actor.saves_in_flight() {
+            // Read under the lock: every close begun so far has its record.
+            let before = *before.get_or_insert_with(|| self.durability.appended().next());
+            if !actor.saves_in_flight(before) {
                 break self.durability.appended();
             }
             // Read under the actor's lock with the state it checked.
