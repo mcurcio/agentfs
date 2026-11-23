@@ -1251,7 +1251,11 @@ impl TreeActor {
         metrics.oldest_pending_save_ns = pending
             .iter()
             .flatten()
-            .map(|since| u64::try_from(since.elapsed().as_nanos()).unwrap_or(u64::MAX).max(1))
+            .map(|since| {
+                u64::try_from(since.elapsed().as_nanos())
+                    .unwrap_or(u64::MAX)
+                    .max(1)
+            })
             .max()
             .unwrap_or(0);
         metrics

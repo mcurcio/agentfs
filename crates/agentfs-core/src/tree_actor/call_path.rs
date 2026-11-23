@@ -106,7 +106,7 @@ pub struct SaveToDecide {
     file: (TreeId, u64),
     /// The snapshot taken when the close began; None for a close queued
     /// behind an earlier save of its file, which snapshots at its turn.
-    work: Option<CloseWork>,
+    work: Option<Box<CloseWork>>,
     /// Finished: its drop leaves the save alone.
     done: bool,
 }
@@ -149,7 +149,7 @@ impl SaveToDecide {
         let recording = Arc::clone(&self.recording);
         let handle = self.handle;
         let work = match self.work.take() {
-            Some(work) => work,
+            Some(work) => *work,
             None => loop {
                 let mut actor = recording.actor()?;
                 match actor.close_resume(handle) {
@@ -483,7 +483,7 @@ impl Recording {
         let file = (actor.open_by(handle)?.0, actor.open_object(handle)?);
         let work = match actor.close_begin(handle)? {
             CloseStart::Done(saved) => return Ok(Closing::Saved(saved)),
-            CloseStart::Decide(work) => Some(work),
+            CloseStart::Decide(work) => Some(Box::new(work)),
             CloseStart::Queued => None,
         };
         Ok(Closing::Decide(SaveToDecide {
