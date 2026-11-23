@@ -503,6 +503,36 @@ a program fsynced in the area are in the area or in the tree after any power
 cut. A file moved out of the tree is fsynced in the area, with its directory
 entry, before its unlink from the tree is recorded.
 
+### Pending saves
+
+A view answers a release (FUSE `RELEASE`, sent after the last `close(2)` of an
+open) once the close is begun under the actor's lock, not once its save is
+recorded. Until the save lands it is a **pending save**: the file's newest
+content for its own client, and an open file for everyone else. Each view has
+one save worker thread (`tree-saves`) that decides and lands the saves its
+releases began, in the order they began. While a save is pending:
+
+| A call on the file | Waits? | What it sees |
+|---|---|---|
+| a stat, a lookup, a page fill | no | the size the view gives while the file has a write-open; the modification time moves when the save lands |
+| an open by the file's own client, read-only or for writing | no | the file as that client's pending saves leave it: each save's own calls and the page-write pieces it takes, replayed on the saved bytes in close order. Another open's unsaved calls are not in it. A write-open's own save replays its calls on the saved head |
+| an open by another client of the tree | no | the saved content |
+| a second close of the file | no | begun and answered at once; its save lands after the earlier one, so a file's saves land in the order its closes began |
+| a rename of the file | no | the file keeps its object, and the save lands at the new name |
+| an unlink of it, a rename onto it, a move from the untracked area onto it, a path `truncate(2)` of it | **yes** | the call is retried from the save worker once the save has landed or failed. History holds the save, then the delete. A move out of the tree copies the pending content into the area, then waits so before the tree's name goes |
+
+Takes, syncs and landings treat a pending save as an open file: one that touches
+it waits for the save's built event, and one that does not lands meanwhile.
+History and other trees see only landed saves. A view drains its save worker
+when it ends, before its client's end is recorded. `Recording::settle` waits until
+no save is pending.
+
+A decision that fails, or a save worker that panics in one, leaves the save
+pending as a failed close: `tree SaveFailed` on stderr, the `failed_saves`
+counter and the `pending_saves` gauge in the metrics file, and the save made
+again at the tree's next step or at restart. No timer turns a slow save into a
+failure: `oldest_pending_save_ns` says how long the oldest has waited.
+
 ## File maps
 
 No file's bytes are held in memory, by the views or by the builder. A file is a map: pieces of journal frames
@@ -535,12 +565,12 @@ A close does bounded work under the actor's lock:
   left out of the save.
 
 Releasing the lock lets other views and claims of the volume go on while a
-close is decided. Within one view a slow close still holds its other
-requests, since one thread answers them in order (below): a sidecar's single
-root view gains only the shorter close.
+close is decided. A view begins each close under the lock and answers the
+release at once; the decision and the landing run on the view's save worker
+([pending saves](#pending-saves)), so a slow close holds none of the view's
+other requests.
 
-Either way the step is recorded before the release is answered. A view reads
-a map with the actor unlocked: the lock is held only to clone it.
+A view reads a map with the actor unlocked: the lock is held only to clone it.
 
 - After a batch is built and checked out, the builder reads each changed file
   from its checkout instead of the frames, through a hard link in the state
@@ -836,7 +866,8 @@ fsynced. That entry moves the built point. Only then are Git's refs, `config` an
 the private checkouts copied, the checked-out files' maps rebased onto them
 ([File maps](#file-maps)), and waiters woken.
 
-- A save is visible to every view at its release, before it is built. Git's refs,
+- A save is visible to every view once it lands, before it is built, and to its
+  own client from its release ([pending saves](#pending-saves)). Git's refs,
   commits and checkouts show only what is built.
 - Takes are decided on built history, off the actor's lock (below, "Takes").
 - A commit is dated by its step's record, in `+0000`. A replay after a crash may
@@ -1098,8 +1129,10 @@ either. The FUSE adapter uses zero entry and attribute TTLs and
 direct I/O, and negotiates neither passthrough nor the writeback cache. A read with
 no lock owner is a page fill and a write with `FUSE_WRITE_CACHE` is a page write.
 `max_background` is as high as the kernel allows, to keep a release ahead of a later
-open. One thread answers requests in order; a `FLUSH` is answered at once, and an `FSYNC`, FSYNCDIR or `O_SYNC`
-write from the journal's waiter thread once its records are durable. The queue worker takes one entry at a time, releasing the actor between takes,
+open. One thread answers requests in order; a `FLUSH` is answered at once, a `RELEASE` once its close is begun
+(its save lands on the view's save worker, [pending saves](#pending-saves)), and an `FSYNC`, FSYNCDIR or `O_SYNC`
+write from the journal's waiter thread once its records are durable. An `UNLINK`, a rename onto a file or a path
+truncate of a file with a pending save is answered from the save worker once the save has landed. The queue worker takes one entry at a time, releasing the actor between takes,
 and drops the kernel's pages of files a take changed. A file open for writing
 holds back that fork's syncs from its upstream until it closes; no alarm is raised
 for a waiting open. See [library/filesystem.md](library/filesystem.md).
@@ -1285,8 +1318,8 @@ What the tree views do not support:
   tracked file past an anonymous file's first answer `EPERM`; devices answer
   `EPERM`; FIFOs and sockets are untracked; extended attributes and ACLs are
   not supported.
-- **Times.** A file's mtime moves at its last close, not at each write
-  (close-to-open). Reads are not tracked: atime is the last time set, else
+- **Times.** A file's mtime moves when its last close's save lands, not at each
+  write (close-to-open). Reads are not tracked: atime is the last time set, else
   the time the entry was made. A checkout of history shows checkout times, as git does.
 - **A file no name reaches has no metadata steps.** `fchmod`, `fchown` and
   `futimens` of an `O_TMPFILE` file, or of a file unlinked while open, answer

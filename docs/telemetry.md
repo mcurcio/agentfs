@@ -159,7 +159,7 @@ history inside a close) counts to the inner kind only. Every hold is one
 | `close` | A close's first half and its land, a close decided under the lock, and pending closes saved again |
 | `take` | A take's inputs, the entries it leaves waiting, and its land |
 | `fork_copy` | A fork's step, its untracked area's copy included |
-| `page_image` | A page fill or writeback building a file's image from every live open's calls |
+| `page_image` | A page fill or writeback building a file's image from every live open's calls, and an open by a client with pending saves of the file folding them onto the saved bytes |
 | `other` | Everything else: the call's own work |
 
 Two more waits stall a request without the lock. A call that starts new
@@ -181,6 +181,18 @@ The longest values are kept since the process started, so a longest
 share or wait belongs to the whole run; compare two collections of the
 counters for an interval. `ci/trees-figures.py` reports these per workload
 ([performance](performance.md#tree-views-release-build)).
+
+### Pending saves
+
+A tree view answers a release before the file's save lands; its save worker
+lands it ([trees](trees.md#pending-saves)). The `--metrics-output` file has three
+keys for them, beside `history`:
+
+| Key | What |
+|---|---|
+| `pending_saves` | Saves begun and not landed: being decided, queued behind an earlier save of the same file, or failed and awaiting a retry |
+| `oldest_pending_save_ns` | The age of the oldest of them, in nanoseconds; 0 with none. A save worker that hangs shows here, since no timer fails a slow save |
+| `failed_saves` | Saves whose decision or land failed, or that were dropped unfinished, since the volume opened. Each also writes `tree SaveFailed` to stderr |
 
 ## Spans
 

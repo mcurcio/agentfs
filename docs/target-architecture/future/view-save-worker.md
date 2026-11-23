@@ -138,7 +138,7 @@ save, is never called from a save worker.
 | Requests on the same file | none waits but a delete, a rename onto it, a replace and a path truncate | stat, open and rename wait for the save |
 | RELEASE answered | at its start: nothing for the kernel to queue | at the save: a bound under `max_background`, the request thread stopping at it |
 | New machinery | a worker per view; small core changes | queues per file, a key per request kind, a turn value |
-| Gives up | the modification time until the save lands; a second live writer's unsaved calls are visible to an open of a pending file when the file's image is the source | the owner's "blissfully unaware" |
+| Gives up | the modification time until the save lands; an open of a pending file by its client pays a journal read of that client's pending saves' calls, under the lock, when one open's map will not do | the owner's "blissfully unaware" |
 
 **Canonical shape.** *Domain:* nothing added: rules 1 and 9 as written. *Patterns:* write-back caching with
 read-your-writes (Linux's page cache: dirty pages answer reads before writeback, and invalidation waits for writeback,
@@ -302,8 +302,11 @@ impl SaveWorker {
   closing open; a waiter reads it under the actor's lock with the state it checks. Lock order: the actor, then the
   waiters of `when_saved_then`, then the epoch.
 - `open_map` and `write_open` give f's pending content only to the writer whose pending saves they are: one pending
-  save whose base did not move and with no page write gives its open's map, a clone; otherwise f's image, built under
-  the lock as a page fill builds it. A write-open begun on pending content has no base step (`base_step: None`), so
+  save whose base did not move and with no page write gives its open's map, a clone; otherwise the exact fold of that
+  writer's pending saves: each one's own calls and the page-write pieces its save takes, replayed on the saved map in
+  close order, built under the lock (a journal read, as the image's is) and never waiting. Never f's image: another
+  live writer's unsaved calls stay out of an open of a pending file (R1.1, R1.4; `ci/trees-pagecache.py`'s
+  `map-fd-overlap` and `map-fd-disjoint`). A write-open begun on pending content has no base step (`base_step: None`), so
   its close replays its own calls on the saved head and never saves its view.
 - `TreeActor::close`, `truncate_path` and `close_writer` run in one hold. A session reaches the first two only after
   `pending_save` said no under the same hold. A client's end runs after its view drained its save worker; another
@@ -334,6 +337,7 @@ clients of the root where a test needs another client:
 | `a_save_dropped_unfinished_stays_pending_and_holds_its_file` | dropping the `SaveToDecide` counts `failed_saves` 1, leaves `pending_saves` 1, runs a waiting callback; a `mkdir` in the tree saves it with the new bytes | no `Drop`; a drop that discards the save |
 | `settle_waits_for_a_pending_save` | `settle` started on a thread while a save is pending returns a record at or past that save's step once `finish` runs | `settle` without the wait |
 | `a_take_waits_for_a_pending_save_and_lands_at_its_built_event` | a fork with a pending save of f: a sync into f is refused as held while the save is pending and lands after the save is built; a sync of another file lands meanwhile | `closing` opens left out of the take's held files |
+| `an_open_of_a_pending_mapped_save_reads_it_without_another_writers_calls` | A mapped writer with a page write and a descriptor writer of the same client still open; A's save pending: the client's `open_map` and a write-open's view give A's page write on the saved bytes, not B's call; the same after `finish` | the file's image as `open_map`'s fallback (B's unsaved call shows) |
 
 In `crates/agentfs-fuse` (no mount):
 
