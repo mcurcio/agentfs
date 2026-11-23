@@ -157,7 +157,7 @@ def calls(root, count):
 
 def journal_size(journal):
     """The journal's bytes: every segment in its directory."""
-    return sum(seg.stat().st_size for seg in journal.glob('*.seg'))
+    return sum(f.stat().st_size for pattern in ('*.seg', 'carry-*') for f in journal.glob(pattern))
 
 
 def hour(root, wal, duration, interval):
@@ -515,8 +515,8 @@ def held_log(root, metrics, timeout, report, name, saves=24, size=8 << 20):
     return {'status': 'MEASURED', 'saves': saves, 'bytes_per_save': size,
             'definition': 'one log stays write-open with one line written; another file is truncated and rewritten with the stated bytes after an 18-byte line that differs per save (R8.2), one close per save; journal_bytes sampled after each save',
             'journal_bytes_peak': peak, 'journal_bytes_final': final.get('journal_bytes'),
-            'compactions': final.get('stages', {}).get('compaction', {}).get('count', 0)
-            - baseline.get('stages', {}).get('compaction', {}).get('count', 0),
+            'compactions': final.get('stages', {}).get('checkpoints', 0)
+            - baseline.get('stages', {}).get('checkpoints', 0),
             'elapsed_ns': time.monotonic_ns() - started}
 
 

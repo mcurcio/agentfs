@@ -10,6 +10,7 @@ use std::time::Duration;
 use super::super::TreeId;
 use super::super::journal::durable::RecordNo;
 use super::built::{Health, TreeLag};
+pub(in crate::tree_actor) use crate::tree_actor::stages::GateCause;
 
 /// Over this, `tree HistoryLagging` is logged once (a placeholder, one home).
 pub(in crate::tree_actor) const LAG_ALARM: Duration = Duration::from_secs(30);
@@ -34,9 +35,6 @@ pub(in crate::tree_actor) struct LagGate {
     limit: Duration,
     alarm: Duration,
     failed: bool,
-    /// The journal's compaction is overdue: every tree's new work waits
-    /// until no step is unbuilt.
-    overdue: bool,
     /// Each tree's overlay as the actor last reported it, in estimated
     /// bytes; a tree with none reported is absent.
     overlay: BTreeMap<TreeId, u64>,
@@ -62,7 +60,6 @@ impl LagGate {
             limit,
             alarm,
             failed: false,
-            overdue: false,
             overlay: BTreeMap::new(),
             overlay_limit: OVERLAY_LIMIT,
             logged: Health::Current,
@@ -114,12 +111,6 @@ impl LagGate {
     /// `tree`'s overlay as last reported: 0 before any report.
     pub(in crate::tree_actor) fn overlay_of(&self, tree: TreeId) -> u64 {
         self.overlay.get(&tree).copied().unwrap_or(0)
-    }
-
-    /// Sets whether the journal's compaction is overdue; true when that
-    /// changed.
-    pub(in crate::tree_actor) fn compaction_overdue(&mut self, overdue: bool) -> bool {
-        std::mem::replace(&mut self.overdue, overdue) != overdue
     }
 
     /// The actor appended `step` in `tree`, which adds about `bytes` for the
@@ -179,14 +170,24 @@ impl LagGate {
     }
 
     /// Whether `tree`'s new work may start now: its lag and its overlay are
-    /// under their limits and no overdue compaction waits for the builder,
-    /// or the builder has failed (a failed builder holds nothing back: the
-    /// overlay cannot shrink while it has failed).
+    /// under their limits, or the builder has failed (a failed builder holds
+    /// nothing back: the overlay cannot shrink while it has failed). The
+    /// journal's length holds nothing: compaction runs behind the call path
+    /// at history's built point (docs/trees.md, "History trails the files").
     pub(in crate::tree_actor) fn admits(&self, tree: TreeId) -> bool {
-        self.failed
-            || (self.lag(tree) <= self.limit
-                && self.overlay_of(tree) <= self.overlay_limit
-                && !(self.overdue && !self.unbuilt.is_empty()))
+        self.failed || (self.lag(tree) <= self.limit && self.overlay_of(tree) <= self.overlay_limit)
+    }
+
+    /// Why `tree`'s new work waits now, or None when it may start: the
+    /// overlay limit first, then the lag limit.
+    pub(in crate::tree_actor) fn refusal(&self, tree: TreeId) -> Option<GateCause> {
+        if self.admits(tree) {
+            None
+        } else if self.overlay_of(tree) > self.overlay_limit {
+            Some(GateCause::Overlay)
+        } else {
+            Some(GateCause::Lag)
+        }
     }
 
     /// Every tree's lag, worst first.
@@ -285,19 +286,19 @@ mod tests {
         assert!(gate.trees().is_empty());
     }
 
+    /// 2.8: unbuilt steps under the limits hold no tree, however long the
+    /// journal behind them: the gate has no journal term, and a tree with no
+    /// unbuilt step of its own is never held by another's.
     #[test]
-    fn an_overdue_compaction_holds_every_tree_until_steps_are_built() {
+    fn a_long_journal_holds_no_tree() {
         let mut gate = LagGate::default();
-        gate.appended(A, step(1), 0);
+        for n in 1..=10 {
+            gate.appended(A, step(n), 1 << 20);
+        }
+        assert!(gate.lag(A) <= LAG_LIMIT);
+        assert_eq!(gate.refusal(A), None, "A is under its limits");
+        assert_eq!(gate.refusal(B), None, "B has no unbuilt step");
         assert!(gate.admits(A) && gate.admits(B));
-        assert!(gate.compaction_overdue(true));
-        assert!(!gate.admits(A) && !gate.admits(B), "the journal is shared");
-        gate.built(step(1), Duration::from_millis(1));
-        assert!(gate.admits(A) && gate.admits(B), "every step is built");
-        gate.appended(B, step(2), 0);
-        assert!(!gate.admits(A));
-        assert!(gate.compaction_overdue(false));
-        assert!(gate.admits(A));
     }
 
     #[test]
@@ -340,6 +341,24 @@ mod tests {
         assert!(!gate.overlay(A, 2_000), "still held: no change");
         assert!(gate.overlay(A, 1_000), "at the limit: admitted");
         assert!(gate.admits(A));
+    }
+
+    /// A held tree's cause: the overlay limit over the lag limit; none once
+    /// admitted.
+    #[test]
+    fn a_refusal_names_its_cause() {
+        let mut gate = LagGate::with_limits(Duration::from_secs(1), Duration::from_secs(2));
+        gate.set_overlay_limit(1_000);
+        assert_eq!(gate.refusal(A), None);
+        for n in 1..=1_000 {
+            gate.appended(A, step(n), 0);
+        }
+        assert_eq!(gate.refusal(A), Some(GateCause::Lag));
+        gate.overlay(A, 5_000);
+        assert_eq!(gate.refusal(A), Some(GateCause::Overlay));
+        assert_eq!(gate.refusal(B), None, "it holds only its tree");
+        gate.failed();
+        assert_eq!(gate.refusal(A), None);
     }
 
     #[test]

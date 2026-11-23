@@ -23,6 +23,7 @@ use agentfs_contracts::name::{ClientLabel, ForkKey, Label};
 use agentfs_contracts::pod::PodContext;
 use agentfs_contracts::tree::TreeId;
 use agentfs_contracts::trees::{ForkSettings, Landing};
+use agentfs_core::file_lock::{FileLock, Mode};
 use agentfs_fuse::stale::{MountState, mount_state};
 
 struct Volume {
@@ -118,6 +119,22 @@ impl Volume {
         }
     }
 
+    /// The volume's lease (`actor.lock`), taken once whoever holds it lets
+    /// go. A killed host's Git children keep its lease until each has
+    /// exited, which `wait` on the host does not wait for: a host started
+    /// before then exits 75, as the launcher's contract says.
+    fn lease(&self) -> FileLock {
+        let file = FileLock::open(&self.p("state/actor.lock")).unwrap();
+        FileLock::wait(file, Mode::Exclusive).unwrap()
+    }
+
+    /// SIGKILL to `host`, which leaves its views stale, and the lease free:
+    /// the next host of this volume is not busy.
+    fn kill(&self, mut host: Host) {
+        host.kill();
+        drop(self.lease());
+    }
+
     /// Every file under the state area with its size and modification time.
     fn snapshot(&self) -> Vec<(PathBuf, u64, std::time::SystemTime)> {
         fn walk(dir: &Path, out: &mut Vec<(PathBuf, u64, std::time::SystemTime)>) {
@@ -182,8 +199,17 @@ impl Host {
         (n > 0).then_some(line)
     }
 
+    /// The host's hello. A host that ended before it wrote one fails the
+    /// test with its exit status and what it logged.
     fn hello(&mut self) -> Hello {
-        let line = self.line().expect("the host wrote no hello");
+        let Some(line) = self.line() else {
+            let status = self.child.wait().unwrap();
+            let log = self.log.take().map(|log| log.join().unwrap());
+            panic!(
+                "the host wrote no hello: {status}: {}",
+                log.unwrap_or_default()
+            );
+        };
         serde_json::from_str(&line).unwrap()
     }
 
@@ -234,7 +260,8 @@ impl Host {
         (status, self.log.take().unwrap().join().unwrap())
     }
 
-    /// SIGKILL: the host's views are left stale.
+    /// SIGKILL: the host's views are left stale, and its lease is held
+    /// until its Git children have exited ([`Volume::kill`] waits for that).
     fn kill(&mut self) {
         self.child.kill().unwrap();
         self.child.wait().unwrap();
@@ -439,6 +466,27 @@ fn forks_by_key_and_the_drain() {
         .output()
         .unwrap();
     assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+}
+
+/// (f2) A killed host's lease outlives it while a process that shares it
+/// lives (a Git child of its builder). A host started then exits 75 before
+/// its hello, and one started once the lease is free serves.
+#[test]
+fn a_host_started_under_a_killed_hosts_lease_is_busy() {
+    let v = Volume::new();
+    let mut killed = v.host(&[]);
+    killed.hello();
+    killed.kill();
+    // The lease as a child that outlived the kill holds it.
+    let held = v.lease();
+    let mut early = v.host(&[]);
+    let (status, log) = early.eof();
+    assert_eq!(status.code(), Some(75), "{log}");
+    drop(held);
+    let mut later = v.host(&[]);
+    later.hello();
+    let (status, log) = later.eof();
+    assert_eq!(status.code(), Some(0), "{log}");
 }
 
 /// (f) A second host while one serves the volume exits 75.
@@ -656,7 +704,7 @@ fn a_restarted_host_rebinds_and_stacks() {
     ));
     std::fs::write(a.join("f"), "f\n").unwrap();
     std::fs::write(b.join("g"), "g\n").unwrap();
-    host.kill();
+    v.kill(host);
     assert!(matches!(mount_state(&a).unwrap(), MountState::Stale { .. }));
     assert!(matches!(mount_state(&b).unwrap(), MountState::Stale { .. }));
 
@@ -795,7 +843,7 @@ fn a_drain_ends_a_crashed_hosts_clients() {
         host.ask(&open(TreeRef::Root, &a, "a", pod("ns", "p1", "u1"))),
         Reply::Opened { .. }
     ));
-    host.kill();
+    v.kill(host);
     let mut host = v.host(&[]);
     host.hello();
     let (status, log) = host.eof();

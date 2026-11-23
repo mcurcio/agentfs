@@ -21,7 +21,7 @@
 
 use super::Call;
 use super::file_map::{FileMap, Source};
-use super::pages::{self, Run};
+use super::pages::{self, CloseCall, Run};
 use crate::tree_actor::journal::durable::RecordNo;
 use crate::tree_actor::journal::segment::FramePos;
 use crate::tree_actor::journal::{PagePiece, SaveOutcome, TAKE_CHUNK, Tail};
@@ -135,10 +135,13 @@ impl Layout {
     /// # Errors
     ///
     /// [`Error::TooLarge`], as [`FileMap::apply`].
-    pub fn of_close<L: Located>(saved_len: u64, calls: &[(Call, L)]) -> Result<Self> {
+    pub fn of_close<'a, L: Located + 'a>(
+        saved_len: u64,
+        calls: impl IntoIterator<Item = CloseCall<'a, L>>,
+    ) -> Result<Self> {
         let mut map = FileMap::<L>::as_before(saved_len);
-        for (call, at) in calls {
-            map.apply(call, at)?;
+        for call in calls {
+            map.apply(call.call(), call.at())?;
         }
         Ok(Self::of_view(&map, RecordNo::new(1)))
     }
@@ -173,25 +176,29 @@ impl Layout {
     /// The builder's replay of a recorded save: [`pages::recorded_close_calls`]
     /// then [`Layout::of_close`]. `Ok(None)` when a piece names no run. The
     /// failpoint `tree.build_replay_skew` (action `error`) drops the last own
-    /// call, as a replay that disagrees with its record.
+    /// call, as a replay that disagrees with its record. `own` is read where
+    /// the open's calls are held, never copied.
     ///
     /// # Errors
     ///
     /// As [`Layout::of_close`].
-    pub fn replay<L: Located>(
+    pub fn replay<'a, L: Located + 'a, O>(
         saved_len: u64,
-        own: &[(u64, Call, L)],
+        own: O,
         writes: &[(u64, Run<L>)],
         pieces: &[PagePiece],
-    ) -> Result<Option<Self>> {
-        let mut own = own;
+    ) -> Result<Option<Self>>
+    where
+        O: ExactSizeIterator<Item = &'a (u64, Call, L)> + Clone,
+    {
+        let mut keep = own.len();
         if crate::failpoints::hit("tree.build_replay_skew").is_err() {
-            own = &own[..own.len().saturating_sub(1)];
+            keep = keep.saturating_sub(1);
         }
-        let Some(calls) = pages::recorded_close_calls(own, writes, pieces) else {
+        let Some(calls) = pages::recorded_close_calls(own.take(keep), writes, pieces) else {
             return Ok(None);
         };
-        Self::of_close(saved_len, &calls).map(Some)
+        Self::of_close(saved_len, calls).map(Some)
     }
 
     /// The saved map: `before` with each range laid over it at the same
@@ -432,6 +439,11 @@ mod tests {
     use crate::tree_actor::recording::file_map::BaseFile;
     use std::sync::Arc;
 
+    /// Calls held as the open's own, borrowed into a close's merge.
+    fn own<L: Located>(calls: &[(Call, L)]) -> impl Iterator<Item = CloseCall<'_, L>> {
+        calls.iter().map(|(call, at)| CloseCall::Own(call, at))
+    }
+
     /// A small deterministic generator: the property needs no crate.
     struct Rng(u64);
 
@@ -558,7 +570,7 @@ mod tests {
                 after.apply(&call, &pos).unwrap();
                 calls.push((call, pos));
             }
-            let layout = Layout::of_close(before.len(), &calls).unwrap();
+            let layout = Layout::of_close(before.len(), own(&calls)).unwrap();
             let known = resolver(&calls);
             let laid = layout
                 .lay(&before, &mut |place| Ok(known.find(place)))
@@ -581,7 +593,7 @@ mod tests {
                 .map(|(call, pos)| (call.clone(), pos.place()))
                 .collect();
             assert_eq!(
-                Layout::of_close(before.len(), &places).unwrap(),
+                Layout::of_close(before.len(), own(&places)).unwrap(),
                 layout,
                 "seed {seed}"
             );
@@ -612,7 +624,7 @@ mod tests {
             .unwrap();
         let pos = frames.add(b"XY");
         let layout =
-            Layout::of_close(4, &[(Call::Write { offset: 4, len: 2 }, pos.clone())]).unwrap();
+            Layout::of_close(4, own(&[(Call::Write { offset: 4, len: 2 }, pos.clone())])).unwrap();
         let known = resolver(&[(Call::Append { len: 2 }, pos)]);
         let laid = layout
             .lay(&before, &mut |place| Ok(known.find(place)))

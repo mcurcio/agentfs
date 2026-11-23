@@ -31,6 +31,11 @@ use std::io;
 /// Release builds have no failpoints and ignore it.
 pub const ENV_VAR: &str = "AGENTFS_FAILPOINTS";
 
+/// The environment variable naming the compaction gate's directory
+/// ([`FifoGate`]): read only by the `agentfs` binary, and only in a
+/// `failpoints` build. Release builds ignore it.
+pub const COMPACT_GATE_VAR: &str = "AGENTFS_COMPACT_GATE";
+
 /// Every failpoint, in the order a change passes them. A test
 /// (`every_hit_is_listed`) keeps this list equal to the `hit` calls in
 /// the source.
@@ -49,9 +54,6 @@ pub const POINTS: &[&str] = &[
     "tree.untrack_after_place",
     "tree.fork_copy_file",
     "tree.fork_after_copy",
-    "tree.compact_before_checkpoint",
-    "tree.compact_before_fsync",
-    "tree.compact_before_drop",
     // The tree builder, behind the call path (docs/trees.md).
     "tree.build_before_batch",
     "tree.build_replay_skew",
@@ -121,6 +123,122 @@ pub fn adopt(_owner: Option<std::thread::ThreadId>) {}
 
 #[cfg(feature = "failpoints")]
 pub use take_gate::{TakeGate, take_gate};
+
+#[cfg(feature = "failpoints")]
+pub use compact_gate::FifoGate;
+
+/// A tree volume's compactor parked at each gap by a test script.
+#[cfg(feature = "failpoints")]
+mod compact_gate {
+    use std::fs::{File, OpenOptions};
+    use std::io::{self, BufRead, BufReader, Write};
+    use std::path::Path;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Mutex, PoisonError};
+
+    use crate::tree_actor::{CompactGate, Gap};
+
+    /// `AGENTFS_COMPACT_GATE=<dir>`'s gate: FIFOs `at` and `go` in `dir`,
+    /// both opened read and write so neither end blocks or sees end of file.
+    /// At each gap it writes the gap's name ([`Gap::name`]) and a newline to
+    /// `at`, then reads one line from `go`: `go` goes on, `fail` returns an
+    /// EIO error (the gap's fault), and an empty line or end of file ends the
+    /// gate, after which every gap passes without a line.
+    pub struct FifoGate {
+        at: Mutex<File>,
+        go: Mutex<BufReader<File>>,
+        ended: AtomicBool,
+    }
+
+    impl FifoGate {
+        /// The gate on the FIFOs in `dir`.
+        ///
+        /// # Errors
+        ///
+        /// Either FIFO could not be opened.
+        pub fn open(dir: &Path) -> io::Result<Self> {
+            let open = |name: &str| {
+                OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(dir.join(name))
+            };
+            Ok(Self {
+                at: Mutex::new(open("at")?),
+                go: Mutex::new(BufReader::new(open("go")?)),
+                ended: AtomicBool::new(false),
+            })
+        }
+    }
+
+    impl CompactGate for FifoGate {
+        fn at(&self, gap: Gap) -> io::Result<()> {
+            if self.ended.load(Ordering::Acquire) {
+                return Ok(());
+            }
+            writeln!(
+                self.at.lock().unwrap_or_else(PoisonError::into_inner),
+                "{}",
+                gap.name()
+            )?;
+            let mut line = String::new();
+            self.go
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .read_line(&mut line)?;
+            match line.trim_end() {
+                "go" => Ok(()),
+                "fail" => Err(io::Error::from_raw_os_error(libc::EIO)),
+                _ => {
+                    self.ended.store(true, Ordering::Release);
+                    Ok(())
+                }
+            }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// Each line a script answers: `go` passes the gap, `fail` fails it
+        /// with EIO, and an empty line ends the gate, which then writes and
+        /// reads nothing.
+        #[test]
+        fn a_script_passes_fails_and_ends_the_gate() {
+            let dir = tempfile::tempdir().unwrap();
+            for name in ["at", "go"] {
+                rustix::fs::mknodat(
+                    rustix::fs::CWD,
+                    dir.path().join(name),
+                    rustix::fs::FileType::Fifo,
+                    rustix::fs::Mode::from_raw_mode(0o600),
+                    0,
+                )
+                .unwrap();
+            }
+            let gate = FifoGate::open(dir.path()).unwrap();
+            let both = |name: &str| {
+                let mut options = OpenOptions::new();
+                options.read(true).write(true);
+                options.open(dir.path().join(name)).unwrap()
+            };
+            both("go").write_all(b"go\nfail\n\n").unwrap();
+            gate.at(Gap::Covered).unwrap();
+            let failed = gate.at(Gap::Written).unwrap_err();
+            assert_eq!(failed.raw_os_error(), Some(libc::EIO));
+            gate.at(Gap::Renamed).unwrap();
+            gate.at(Gap::DirSynced).unwrap();
+            let mut reached = BufReader::new(both("at")).lines();
+            for gap in [Gap::Covered, Gap::Written, Gap::Renamed] {
+                assert_eq!(reached.next().unwrap().unwrap(), gap.name());
+            }
+            // Nothing after the gate ended: a line written now is the next.
+            writeln!(both("at"), "end").unwrap();
+            assert_eq!(reached.next().unwrap().unwrap(), "end");
+        }
+    }
+}
 
 /// Takes at a test's points, not the queue worker's (git-model §18's replay).
 #[cfg(feature = "failpoints")]
@@ -418,6 +536,29 @@ mod imp {
         _lock: MutexGuard<'static, ()>,
     }
 
+    impl Guard {
+        /// Puts `spec` in force in place of the guard's own, for the same
+        /// thread, with the hits counted from here. One step: no hit falls
+        /// between the two specs with none in force, as one would between
+        /// a dropped guard and the next [`configure`].
+        ///
+        /// # Errors
+        ///
+        /// [`FailpointError`] for a spec that cannot be used; the guard's
+        /// own stays in force.
+        pub fn set(&self, spec: &str) -> Result<(), FailpointError> {
+            let actions = parse(spec)?;
+            let mut state = state();
+            let thread = state.as_ref().and_then(|st| st.thread);
+            *state = Some(State {
+                actions,
+                thread,
+                ..State::default()
+            });
+            Ok(())
+        }
+    }
+
     impl Drop for Guard {
         fn drop(&mut self) {
             ACTIVE.store(false, Ordering::Release);
@@ -477,6 +618,24 @@ mod imp {
                     "commit.after_ref"
                 ]
             );
+        }
+
+        #[test]
+        fn a_guard_changes_its_spec_in_one_step() {
+            let guard = configure("commit.after_ref=error@*").unwrap();
+            assert!(hit("commit.after_ref").is_err());
+            assert!(guard.set("nope=error").is_err());
+            assert!(hit("commit.after_ref").is_err(), "the old spec stands");
+            guard.set("journal.after_fsync=error@2").unwrap();
+            assert!(hit("commit.after_ref").is_ok());
+            assert_eq!(hits("commit.after_ref"), 1, "counted from the change");
+            assert!(hit("journal.after_fsync").is_ok());
+            assert!(hit("journal.after_fsync").is_err());
+            // Still this thread's alone.
+            std::thread::spawn(|| assert!(hit("journal.after_fsync").is_ok()))
+                .join()
+                .unwrap();
+            assert_eq!(hits("journal.after_fsync"), 2);
         }
 
         #[test]

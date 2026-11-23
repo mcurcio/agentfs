@@ -9,7 +9,9 @@ use agentfs_contracts::clients::FileOwner;
 use agentfs_contracts::name::{VolumeName, WriterLabel};
 use agentfs_contracts::pod::{PodContext, WriterAt};
 use agentfs_contracts::volume::{VolumeId, VolumeIdentity};
-use agentfs_core::tree_actor::{Attrs, Perm, TreeActor, TreeId};
+use agentfs_core::tree_actor::{
+    Attrs, ChannelGate, Checkpointed, CompactGate, Gap, Perm, RecordNo, TreeActor, TreeId, Upkeep,
+};
 
 /// What a test's create gives a file: mode 0644, owned by 1000:1000.
 pub const ATTRS: Attrs = Attrs {
@@ -31,6 +33,80 @@ pub fn identity() -> VolumeIdentity {
 /// A new volume [`identity`], served with an empty pod context.
 pub fn new_actor(dir: &Path) -> TreeActor {
     TreeActor::create(dir, &identity(), None, &PodContext::default()).expect("creates")
+}
+
+/// A new volume [`identity`] served with `upkeep`.
+pub fn new_actor_with(dir: &Path, upkeep: Upkeep) -> TreeActor {
+    TreeActor::create_with(dir, &identity(), None, &PodContext::default(), upkeep).expect("creates")
+}
+
+/// Opens the volume again, with `upkeep`.
+pub fn reopen_with(dir: &Path, upkeep: Upkeep) -> TreeActor {
+    TreeActor::open_with(dir, &PodContext::default(), upkeep).expect("reopens")
+}
+
+/// A compaction at every built event, never parked: `Upkeep::gated` over a
+/// gate whose two ends are dropped.
+pub fn compacting() -> Upkeep {
+    let (gate, _, _) = ChannelGate::pair();
+    Upkeep::gated(gate)
+}
+
+/// The checkpoint History counts once one at or past `through` is published
+/// and its compaction has ended: what it covers is unlinked.
+pub fn compacted_through(v: &TreeActor, through: RecordNo) -> Checkpointed {
+    let history = v.history();
+    let mut last = history.checkpointed();
+    while last.built < through {
+        last = history
+            .wait_checkpointed(last.generation)
+            .expect("a checkpoint is published");
+    }
+    history
+        .wait_compacted(last.generation)
+        .expect("its compaction ends");
+    last
+}
+
+/// A compaction gate that fails at `gap` while armed, passes everywhere
+/// else, and never parks.
+pub struct FailAt {
+    gap: Gap,
+    armed: std::sync::atomic::AtomicBool,
+    /// Disarms itself at its first failure.
+    once: bool,
+}
+
+impl FailAt {
+    pub fn new(gap: Gap, once: bool) -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self {
+            gap,
+            armed: std::sync::atomic::AtomicBool::new(true),
+            once,
+        })
+    }
+
+    pub fn disarm(&self) {
+        self.armed
+            .store(false, std::sync::atomic::Ordering::Release);
+    }
+
+    pub fn arm(&self) {
+        self.armed.store(true, std::sync::atomic::Ordering::Release);
+    }
+}
+
+impl CompactGate for FailAt {
+    fn at(&self, gap: Gap) -> std::io::Result<()> {
+        use std::sync::atomic::Ordering;
+        if gap != self.gap || !self.armed.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        if self.once {
+            self.armed.store(false, Ordering::Release);
+        }
+        Err(std::io::Error::other("a test's fault"))
+    }
 }
 
 /// A fork of the root with no row: the engine's own tests, below the store
@@ -103,15 +179,43 @@ pub fn current_segment(dir: &Path) -> std::path::PathBuf {
     segments(dir).pop().expect("a segment")
 }
 
-/// Every segment's bytes.
+/// The journal's carry files in the state area `dir`: live frames a
+/// compaction copied out of the segments it let go.
+pub fn carries(dir: &Path) -> Vec<std::path::PathBuf> {
+    std::fs::read_dir(dir.join("journal"))
+        .expect("reads the journal")
+        .map(|entry| entry.expect("an entry").path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("carry-"))
+        })
+        .collect()
+}
+
+/// Each segment's first record, in order: its file name.
+pub fn segment_firsts(dir: &Path) -> Vec<u64> {
+    segments(dir)
+        .iter()
+        .map(|path| {
+            path.file_stem()
+                .and_then(|stem| stem.to_str())
+                .and_then(|stem| stem.parse().ok())
+                .expect("a segment's name")
+        })
+        .collect()
+}
+
+/// Every segment's and carry file's bytes.
 pub fn journal_len(dir: &Path) -> u64 {
     segments(dir)
         .iter()
-        .map(|path| std::fs::metadata(path).expect("a segment").len())
+        .chain(carries(dir).iter())
+        .map(|path| std::fs::metadata(path).expect("a journal file").len())
         .sum()
 }
 
-/// The disk blocks the journal's segments hold, in bytes: the linked ones,
+/// The disk blocks the journal's segments and carry files hold, in bytes: the linked ones,
 /// and the unlinked ones this process still has open (a reader holding a
 /// dropped segment keeps its space). Read from each file's allocated blocks.
 pub fn journal_blocks(dir: &Path) -> u64 {
@@ -119,7 +223,8 @@ pub fn journal_blocks(dir: &Path) -> u64 {
     let journal = std::fs::canonicalize(dir.join("journal")).expect("the journal");
     let linked: u64 = segments(dir)
         .iter()
-        .map(|path| std::fs::metadata(path).expect("a segment").blocks() * 512)
+        .chain(carries(dir).iter())
+        .map(|path| std::fs::metadata(path).expect("a journal file").blocks() * 512)
         .sum();
     let mut held = 0;
     for fd in std::fs::read_dir("/proc/self/fd").expect("lists descriptors") {
@@ -131,7 +236,13 @@ pub fn journal_blocks(dir: &Path) -> u64 {
         let Some(path) = target.strip_suffix(" (deleted)") else {
             continue;
         };
-        if Path::new(path).parent() == Some(journal.as_path()) && path.ends_with(".seg") {
+        let name = Path::new(path)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default();
+        if Path::new(path).parent() == Some(journal.as_path())
+            && (name.ends_with(".seg") || name.starts_with("carry-"))
+        {
             // The descriptor itself: its file has no name left to stat.
             if let Ok(meta) = std::fs::metadata(&fd) {
                 held += meta.blocks() * 512;

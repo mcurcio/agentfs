@@ -61,7 +61,11 @@ pub(super) fn stage<T: Send + 'static>(
 ) -> Result<std::result::Result<Staged<T>, ExitCode>> {
     let events = DomainEvents::default();
     let clients = ClientsSlot::new(None);
-    let mut volume = VolumeService::new(TreeStateArea::at(state), clients.clone(), events.clone());
+    let mut volume = VolumeService::new(
+        TreeStateArea::at(state).with_upkeep(super::upkeep()),
+        clients.clone(),
+        events.clone(),
+    );
     match volume.stage(at, &cap) {
         Ok(_) => {}
         Err(VolumeError::Busy) => return Ok(Err(busy())),

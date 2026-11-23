@@ -275,7 +275,8 @@ no `#`, `@` or `/`, so the name parses back.
   root has no claim. The claim is released when the fork is dropped
   (`ClaimReleased`).
 - **Ends.** When a view is unmounted, its client is detached. Its open files close
-  as saves first, in handle order, durable before the detach returns; a write after
+  as saves first, in handle order, with no wait for the disk (as a close; see
+  [Recording and durability](#recording-and-durability)); a write after
   that answers `EROFS`. The end is one step with `AttachmentEnded`, then
   `LastDetached` when its tree has no client left.
 - **Restart.** A killed `mount` leaves its clients attached. The next mount
@@ -448,29 +449,59 @@ row and counts as released.
   saves can align repeated lines differently. Stored bytes and identities do not
   change.
 
-`fsync` and close make the file's calls durable; the final release publishes the
-file.
+`fsync` makes the file's calls durable; the final release publishes the file.
 
 ## Recording and durability
 
 Every file call is in the journal before it returns: one frame, written with one
 `write(2)` and no fsync. A call that returned survives a crash or kill of agentfs,
 because its frame is in the kernel. It survives a power cut once one of these has
-returned:
+returned after it:
 
-- `close(2)` of a descriptor that wrote (FUSE `FLUSH`), or `fsync(2)` of it;
+- `fsync(2)` or `fdatasync(2)` of a descriptor that wrote;
 - each `write(2)` of a descriptor opened `O_SYNC` or `O_DSYNC`;
 - `fsync(2)` of the view's directory (FSYNCDIR), or of a read-only descriptor.
 
 Each of these makes every record so far durable, not only the descriptor's own:
 creates, renames, unlinks, `mkdir`, `rmdir`, `symlink`, `chmod`, `chown` and
-time sets included, so `fchmod` then `fsync` keeps the mode. A power cut loses
-the calls and steps made since the last of these.
+time sets included, so `fchmod` then `fsync` keeps the mode.
 Waits share fsyncs (group commit): one fsync answers every wait whose records were
 written before it began. The fsync runs off the view's request thread and outside
-the actor's lock, so a waiting close holds no other call. A failed fsync stops the
+the actor's lock, so a waiting fsync holds no other call. A failed fsync stops the
 actor: its waiters get its error and every later call `EIO` (see
 [Recovery](#recovery)).
+
+**`close(2)` does not wait for the disk.** A close (FUSE `FLUSH`) returns once
+the descriptor's calls are in the journal, which they were when each returned.
+It makes no fsync and never returns a journal fsync's error; it answers `EIO`
+only once a failed fsync has stopped the actor. A client's end closes its open
+files as saves the same way, with no wait. A clean unmount makes every record
+durable before the state area's lease is released.
+
+**What a power cut loses.** It loses a suffix of the journal: no record
+survives without every record before it. The volume then opens as an
+uninterrupted run would stand had it stopped after some record, and that record
+is at or after the last one an `fsync`, FSYNCDIR or `O_SYNC` write that returned
+had covered. What this costs:
+
+- A power cut can lose every change since the last `fsync`, FSYNCDIR or `O_SYNC`
+  write, or since the builder's last batch (the builder makes every record
+  through its batch durable before it writes the batch's objects). That can be
+  many saves.
+- `sync(1)` and `syncfs(2)` send a FUSE mount no request, so they make no
+  closed save durable.
+- A failed journal fsync first shows as a later call's `EIO`, once the actor
+  has stopped, never as the close's own error.
+- One program's fsync pays for every view's unsynced bytes, because group
+  commit fsyncs the whole journal.
+
+**A change outside the journal that destroys bytes waits for the record that
+carries them.** A file moved from the untracked area into the tree is in the
+journal alone once the area's file is unlinked, so the view makes every record
+durable before that unlink, on its own thread and outside the actor's lock: bytes
+a program fsynced in the area are in the area or in the tree after any power
+cut. A file moved out of the tree is fsynced in the area, with its directory
+entry, before its unlink from the tree is recorded.
 
 ## File maps
 
@@ -645,12 +676,14 @@ event commit on it). It is appended as a call is and made
 durable as a call is. That record is the commit point. The actor decides the step,
 appends it and applies it to the saved state the views serve; it runs no git.
 
-- The journal is a directory of segments, `journal/<first record>.seg`, each
-  about 64 MiB; a frame never spans two, and a frame over 64 MiB has a segment of
-  its own. A new segment's directory entry is fsynced before the durable mark
-  covers any record in it.
+- The journal is a directory, `journal/`: segments, `<first record>.seg`, each
+  about 64 MiB; the newest checkpoint, in a file of its own, `checkpoint`; and
+  carry files, `carry-<built point>`. A frame never spans two segments, and a
+  frame over 64 MiB has a segment of its own. A new segment's directory entry is
+  fsynced before the durable mark covers any record in it.
 - A failed step keeps serving and saves at the next step in its tree. Only a failed
-  journal `fsync` (a leader's or a compaction's) or rollback stops the actor; a
+  journal `fsync` (a leader's, or the fsync of the directory a checkpoint is
+  renamed in) or rollback stops the actor; a
   failed fsync is never retried, since the page cache then says nothing about the
   disk.
 - Recovery reads the journal and serves from it without waiting for history: the
@@ -661,42 +694,118 @@ appends it and applies it to the saved state the views serve; it runs no git.
   [History trails the files](#history-trails-the-files)), and a failed build
   raises its alarm without refusing the open. The recovered records are made
   durable before anything is served (the directory first), and the steps past the
-  built point count in the lag gate as they did at their call. A journal whose
-  steps are all built compacts at once; otherwise compaction runs at the first
-  call after the builder catches up. It refuses
-  a missing journal, a missing `format` file, a lost object at a pointer's tip, and
+  built point count in the lag gate as they did at their call. Open does not
+  compact: a reopened volume compacts at its first built event, once due. It refuses
+  a missing journal, a missing checkpoint file, a missing `format` file, a lost object at a pointer's tip, and
   a journal that names a tree by anything but its identity, has no root, gives the
   root an upstream, gives an upstream to a fork with no branch, or gives a fork an
   upstream other than the root (forks are made only of the root). It deletes
   nothing outside a first init's own marker.
-- Compaction runs when the segments pass `max(64 MiB, twice the last compacted
-  length)`: it writes a checkpoint at the start of a new segment, then drops
-  (unlinks) every older segment whose records the builder has read and which
-  holds no live open's call and no page write memory holds. A held file pins only its own
-  frames: they are copied forward (marked `carried`, their record numbers kept)
-  once the dead bytes they pin exceed their own, so the segments stay under about
-  twice the live opens' bytes plus a segment. A frame is named by its record
-  and an offset into it, wherever it is carried, so a save's digest does not
-  change when it moves. The journal records where each carried frame went; the
-  actor moves its live opens, page writes and saved maps there as it compacts,
-  and the builder moves its own before its next batch, so the dropped segment's
-  space returns then. A reader holding a dropped segment (a view's open file)
-  keeps reading it; its space returns when the last lets go. Frames are at most
-  96 MiB; a take's bytes are in records of at most 16 MiB. The constants are not
-  settings. A checkpoint's pointers are the built ones, so a compaction that is
-  due waits for the first call after the builder has built every step and read
-  past the oldest segment; calls after the last step (a file under constant
-  writes) never hold it back, since the checkpoint holds them, and only the
-  segment they share with dead records waits for the next step. While steps
-  trail, the journal grows; once it is twice its due length, the lag gate holds
-  every tree's new work until the builder has built every step. A compaction
-  that fails before its checkpoint changes nothing and is retried at the next
-  call; one that fails while dropping leaves those segments for the next. Its
-  fsyncs (every segment the checkpoint covers, the directory, the frames it
-  copies forward) stop the actor when they fail, as a leader's do.
-- Recovery folds the last checkpoint, the live opens' calls and the held page
-  writes it names from the segments before it (kept or carried, each once), and
-  every frame after it.
+- **Compaction runs on history's own thread, the compactor, and no call waits
+  for it.** At a built event, once the linked files (segments and carry files)
+  pass `max(64 MiB, twice their baseline)`, it compacts at the built point B.
+  The baseline is what the last compaction kept of what it covered: the
+  linked bytes at or below its built point (the carry files, the covered
+  segments it kept, and the segment that point falls in, up to the point),
+  less the call frames it kept for opens whose saves are built since. Those
+  frames are dead, and what a file appends after a compaction's built point
+  is growth, never baseline. So a compaction that ran while a large file was
+  open and freed nothing does not hold the next one off: the built event of
+  the file's save is due. In this order:
+  1. It waits until every record at or below B is durable.
+  2. It folds the records from the last checkpoint through B, as recovery does,
+     and writes a checkpoint at B to `checkpoint.tmp`: the built pointers,
+     object numbers, directory numbers and times at B, and the live opens, held
+     page writes and unfinished chunk records the fold gives.
+  3. It copies the live frames (a live open's calls, a held page write, a chunk
+     no step has taken) out of each covered segment whose dead bytes outweigh
+     them into a carry file, marked `carried`, their record numbers kept.
+  4. It renames the checkpoint into place and fsyncs the directory.
+  5. It tells History the checkpoint is published. Only then may the builder
+     trim the built log by it.
+  6. It unlinks the covered segments.
+
+  A segment is covered once the next segment starts at or before B + 1: the
+  actor has rolled past it, and every record in it is at or below B. The newest
+  segment is never covered, so a quiet volume keeps up to one segment of
+  records the checkpoint covers until its journal rolls. A held file pins only
+  its own frames, so at the built event of a save, once the linked files are
+  at least 64 MiB, they are back under about twice the live opens' bytes plus
+  a segment. Two things sit outside that count: a frame's head (a few dozen
+  bytes a call, which matters only for many tiny writes), and a held page
+  write, which is kept by file while any write-open of the file lives and
+  leaves the baseline only at the next compaction. The segment in that bound
+  is the newest one: the last bytes of a large save stay in it, dead, until
+  the journal rolls. What the rule costs: while a file is written faster
+  than history is built, the bytes appended after the built point can
+  outweigh what the last compaction kept, and a built event then compacts
+  again and frees nothing of that file. With the build keeping up, a held
+  file is folded again only when the linked files have doubled. A frame is
+  named by its record and an offset into it,
+  wherever it is carried, so a save's digest does not change when it moves.
+  The journal records where each carried frame went. The actor moves its live
+  opens, held page writes and saved maps there at its next built event, a walk
+  under its lock that runs only when frames were carried, and the builder
+  moves its own before its next batch; the unlinked segment's space returns
+  when the last holder lets go, a view's open file included. Frames are at
+  most 96 MiB; a take's bytes are in records of at most 16 MiB. The constants
+  are not settings.
+- A compaction that fails before its checkpoint is renamed changes nothing and
+  is retried at the next built event (`tree CompactionFailed`): the carry file
+  it wrote is removed, so a failure that repeats leaves no files behind. One
+  whose unlink fails leaves the checkpoint in place, and the file that was not
+  unlinked stays in the journal's list for the next compaction to try again.
+  A failed fsync stops the actor, as a leader's fsync does: of the records at
+  or below B before the fold, of the directory after the rename, or of the
+  directory after the unlinks. A kill or a power cut at any point leaves a
+  journal that opens: `checkpoint.tmp` is ignored, a frame present both in a
+  segment and in a carry file is read once, and a carry file the checkpoint
+  does not name is removed at open, once the checkpoint's own name is durable.
+- **The switch record.** A step sets a pointer to "what step `n`'s build
+  gives". Once `n` is built, the actor appends a switch record that names the
+  pointer, the step and the commit built for it, and from that record on the
+  pointer is that commit. It is a record and no step: it has no writer, builds
+  no commit and adds to no tree's lag. The actor appends it right behind the
+  next step's record, or at the built event when no step follows, and then
+  asks the builder to build through it, so a volume at rest is built through
+  its last record. It is appended with no fsync of its own: every record that
+  names the commit comes after it, and a power cut loses a suffix of the
+  journal. A fork's branch, which its fork step sets to its upstream's step,
+  is switched once the fork step itself is built. The time a step is applied
+  with is its own record's, whatever follows it.
+- **Step heads.** A checkpoint at B keeps, for each pointer that is still a
+  step at B, that step (at most one per pointer, row chains included), because
+  a record after B may still name it: a save as its old value, a fork as its
+  branch's value, the switch record as its step. A fold from the checkpoint
+  starts such a pointer at its step, so every record after B folds the same on
+  the old checkpoint and on the new one. The built log and the builder keep
+  what resolves a kept step; a head goes at the first checkpoint at or past
+  its pointer's switch record.
+- Recovery reads the checkpoint file first: the journal's salt, the built point
+  B and the record after it come from there. It reads the carry files the
+  checkpoint names, skips records at or below B in the segments that survived,
+  but for the live frames the checkpoint names, and folds every frame after B.
+  A missing or wholly torn segment after B is judged as the first invalid
+  frame, below: the journal opens when nothing after B was durable, and
+  refuses when a later frame or the built log proves a lost record durable.
+- What compaction off the lock costs:
+  - A restart replays from B, so it takes longer while history trails.
+  - Nothing but the lag gate bounds the journal past B. Each tree's unbuilt
+    steps are held to its lag and overlay limits, so that bound grows with the
+    number of trees; a live open's calls are bounded only by the open. Once
+    the builder has failed, the gate admits everything, and the journal grows
+    until the state area's disk fills and `ENOSPC` stops recording.
+  - Each compaction reads again the records from the last checkpoint through
+    B, and holds every live open's calls while it folds them.
+  - A long-lived open whose frames were carried pins the old segment until the
+    actor's next built event.
+  - A failed compaction is reported at a built event, not at a call.
+  - Each built point at which a pointer is still at a step now built adds one
+    switch record: about 100 bytes a pointer and one append under the lock.
+    When a mounted volume goes quiet, the builder runs one more batch for the
+    last switch record: one journal fsync and one built-log entry, no commit.
+  - Record, object, open, fork and event numbers depend on when the actor saw
+    a built event. They stay unique and increasing.
 - Every frame carries the durable mark: the last record a finished fsync covered
   when the frame was written. At the first invalid frame, a later valid frame with
   this journal's salt whose mark passes the last valid record means a durable record
@@ -711,7 +820,7 @@ appends it and applies it to the saved state the views serve; it runs no git.
   `bases/`, `actor.lock`, `format` and rebuilt private checkout caches, which the workload
   never sees. A create writes an `initializing` marker first and removes it last;
   the next `init` starts a cut-short create over. The state format is
-  `agentfs-trees-13`. **Earlier state formats (12 included) do not open**, and
+  `agentfs-trees-14`. **Earlier state formats (13 included) do not open**, and
   are never converted ([upgrading](runbooks/upgrading-the-sidecar.md)).
 
 ## History trails the files
@@ -792,12 +901,14 @@ the private checkouts copied, the checked-out files' maps rebased onto them
   so a deleted pack's disk space comes back only when they let it go, at the
   latest when the volume stops; loose objects (the verification notes) are
   not rolled up.
-- No record after a checkpoint names a step the checkpoint covers: a step whose
-  pointers were read before a compaction names those values as the oids they
-  were built as, so a restart, which builds from the checkpoint, builds every
+- A restart builds from the checkpoint. A record after it that names a step
+  the checkpoint covers finds that step's head there
+  ([the journal](#the-journal), "Step heads"), so the restart builds every
   later record as an uninterrupted run would.
 - `--metrics-output` reports `history`: the built point, the last record appended,
-  the oldest unbuilt step's age, the worst tree's lag and the builder's health.
+  the oldest unbuilt step's age, the worst tree's lag, the builder's health, how
+  many pointers are still at a step (`pointers_at_steps`) and the built point
+  the compactor is done with (`compactor_through`).
 - **The lag gate.** Each tree's lag is the builder's estimated time for its unbuilt
   steps: the larger of their count at a cost per step and the bytes they write
   (the bytes a save or take leaves, plus a constant for the commit and its three
@@ -839,6 +950,15 @@ the private checkouts copied, the checked-out files' maps rebased onto them
   names) is admitted, and the calls after it wait until it is built. A failed
   builder holds nothing back here either: the overlay cannot shrink while it
   has failed.
+- **Deferred drops.** Moving onto a built point replaces saved maps and
+  shapes, and freeing one costs time in proportion to its size: a map of
+  200,000 pieces, or a base file's link to unlink. The actor hands what it
+  replaced to History in O(1) under its lock, and one thread per volume,
+  `tree-drops`, frees it: no call and no view's request thread waits for a
+  drop. Memory a catch-up let go is therefore freed a moment after the built
+  event, not at it. A shutdown waits until everything handed over is freed,
+  so no base file's link outlives the state area's lease; a drop that
+  panicked is logged then (`tree DropsFailed`) and stops nothing.
 
 ## When history cannot check a save
 
@@ -978,8 +1098,8 @@ either. The FUSE adapter uses zero entry and attribute TTLs and
 direct I/O, and negotiates neither passthrough nor the writeback cache. A read with
 no lock owner is a page fill and a write with `FUSE_WRITE_CACHE` is a page write.
 `max_background` is as high as the kernel allows, to keep a release ahead of a later
-open. One thread answers requests in order; a `FLUSH`, `FSYNC`, FSYNCDIR or `O_SYNC`
-write is answered from the journal's waiter thread once its records are durable. The queue worker takes one entry at a time, releasing the actor between takes,
+open. One thread answers requests in order; a `FLUSH` is answered at once, and an `FSYNC`, FSYNCDIR or `O_SYNC`
+write from the journal's waiter thread once its records are durable. The queue worker takes one entry at a time, releasing the actor between takes,
 and drops the kernel's pages of files a take changed. A file open for writing
 holds back that fork's syncs from its upstream until it closes; no alarm is raised
 for a waiting open. See [library/filesystem.md](library/filesystem.md).
@@ -1112,8 +1232,8 @@ rules would place a new name of the source's kind (so
 | Tracked directory | Tracked | The tree's rename; its untracked entries move with it |
 | Tracked file or link | Untracked | Moved out: its saved bytes, mode and owner are placed in the area, then its unlink is recorded |
 | Tracked directory | Untracked | `EXDEV`: `mv` copies the files across, then removes the tree's |
-| Untracked file | Tracked | Moved in: one save of the whole file under the new name, then the area's file is removed |
-| Untracked link | Tracked, no entry there | Moved in: a new link, then the area's link is removed |
+| Untracked file | Tracked | Moved in: one save of the whole file under the new name, made durable, then the area's file is removed |
+| Untracked link | Tracked, no entry there | Moved in: a new link, made durable, then the area's link is removed |
 | Untracked link | Tracked, an entry there | `EXDEV` |
 | Untracked directory, FIFO or socket | Tracked | `EXDEV` |
 | Anything untracked | Untracked | A plain rename in the area |
@@ -1200,18 +1320,21 @@ What the tree views do not support:
   any over 8 MiB; and a line map keeps every deleted line, so maps of files
   edited often grow with their edits.
 - **A call can wait.** A call that starts new work in a tree waits while that
-  tree's lag or overlay is over its limit, or while an overdue compaction waits for the
-  builder (see [History trails the files](#history-trails-the-files)); every call
+  tree's lag or overlay is over its limit
+  (see [History trails the files](#history-trails-the-files)); every call
   waits while a take lands under the actor's lock. A take waits for its entry's
   write-opens to close, so a file held open holds the takes that write it. The
   model replays do not cover the waits; the mounted cases do.
 - **Work still under the actor's lock.** A close's work is bounded
-  ([File maps](#file-maps)), but the journal's compaction copies live frames
-  forward under the lock, and every call of the volume waits meanwhile (136 ms
-  after 200,000 random writes to one open file, in one local run;
-  [performance.md](performance.md#tree-views-release-build)). Sequential writes
+  ([File maps](#file-maps)), and compaction runs off the lock
+  ([the journal](#the-journal)). What compaction leaves under it is the
+  actor's walk onto carried frames at a built event, and a page fill or
+  writeback that builds a file's image from every live open's calls
+  ([telemetry](telemetry.md#the-volume-lock), `compaction` and
+  `page_image`). Sequential writes
   are not merged into one piece, so an open of a million small appends holds a
-  million pieces (a 774 MiB peak in one local run).
+  million pieces (peaks of 774 and 885 MiB in two local runs;
+  [performance](performance.md#tree-views-release-build)).
 - **A restart copies every checkout.** Each start writes the private checkouts
   of the built point whole, so its time grows with the tree (38 to 39 s for
   100,000 files in one local run).
@@ -1264,7 +1387,12 @@ jobs in [development.md](development.md); the method is in
 - `e2e-tree-restart.sh`, `e2e-tree-recording-faults.sh`, `e2e-tree-enospc.sh`:
   view-host death, kills at each failpoint, state exhaustion.
 - `power-loss-trees.sh`: `dm-log-writes` replay on ext4 and XFS, on the upstream and
-  a fork, each checkpoint also rebuilding the refs from the journal alone.
+  a fork. At each checkpoint the volume opens, recovery saves what survived, the
+  recovered files are a prefix of the calls made that holds every call before the
+  last returned `fsync` or FSYNCDIR, and the refs rebuild from the journal alone.
+  Its legs include closes and a rename with no fsync, and an editor's temporary
+  file moved in from the untracked area, with and without an fsync. Its checker
+  first refuses planted images (`power-loss-trees-check.sh self-test`).
 - `measure-trees.sh`: plain-FUSE comparison, an hour of writes, 10,000 saves, 1 and
   100 MiB files, waits and a held log. `[phase1-measure]` in a pushed commit message
   runs them all.

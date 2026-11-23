@@ -18,15 +18,21 @@ trap cleanup EXIT
 # `start SPEC` mounts the root and the keyed fork's view (made at the first
 # mount), whose writer it attaches; `start SPEC root` the root alone. The fork's
 # one writer is spent at a clean unmount, so a remount after one leaves the
-# fork out. Keyed, the fork stays open: no end or drop moves a count.
+# fork out. Keyed, the fork stays open: no end or drop moves a count. With
+# `compact_gate` set to a directory, the mount's compactor parks at each gap of
+# every compaction until this script answers on the FIFOs there
+# (AGENTFS_COMPACT_GATE, docs/configuration.md).
+compact_gate=
 start() {
   local spec=$1 views=("$work/main")
-  local args=("$work/main")
+  local args=("$work/main" --metrics-output "$work/metrics.json")
   if [ "${2:-}" != root ]; then
     views+=("$work/fork")
     args+=(--fork-mount "$work/fork" --fork-key faults)
   fi
-  AGENTFS_FAILPOINTS="$spec" "$bin" --state "$work/state" mount "${args[@]}" >"$work/mount.log" 2>&1 & pid=$!
+  rm -f "$work/metrics.json"
+  env AGENTFS_FAILPOINTS="$spec" ${compact_gate:+AGENTFS_COMPACT_GATE="$compact_gate"} \
+    "$bin" --state "$work/state" mount "${args[@]}" >"$work/mount.log" 2>&1 & pid=$!
   for _ in $(seq 1 200); do
     local up=1 view
     for view in "${views[@]}"; do mountpoint -q "$view" || up=; done
@@ -51,14 +57,17 @@ drain_queue() {
   done
   echo 'queue did not drain' >&2; return 1
 }
-# A mount of the root alone, killed once its client's attach is built: the
-# volume stays staged (a stage then writes nothing) and the client attached (a
-# mount then rebinds it). Returns once the killed process's lease is free.
+# A mount of the root alone, killed once its client's attach is built and the
+# mount is at rest (`tree_at_rest`): the volume stays staged (a stage then writes nothing), the
+# client attached (a mount then rebinds it) and every pointer switched (a mount
+# then appends no switch record before its own first step is built). Returns
+# once the killed process's lease is free.
 leave_root_attached() {
   local before
   before=$(tree_git_root_clients "$work/state/history.git")
   start '' root
   tree_git_wait_root_attached "$work/state/history.git" "$before"
+  tree_at_rest "$work/metrics.json"
   kill -KILL "$pid"; tree_wait_exit "$pid" 2>/dev/null || true; pid=
   fusermount3 -uz "$work/main"
   flock "$work/state/actor.lock" true
@@ -91,28 +100,40 @@ PY
   # its client's attach, the two in one builder batch or two. A killed mount
   # leaves it staged with its root client attached instead.
   leave_root_attached
-  # So the mount records one step of its own first, the root client's rebind:
-  # one record, one fsync, one step and one builder batch, each a point's first
-  # hit. Its client's call meets the next.
+  # So the mount records one step of its own first, the root client's rebind,
+  # and once that step is built, the switch record for the pointers it set.
+  # Before its client's first call the mount is at rest (`tree_at_rest`) with:
+  #   appends   2  the rebind's record, the switch record
+  #   fsyncs    3  the rebind's own, and the builder's before each of its
+  #                two batches
+  #   steps     1  the rebind (a switch record is no step)
+  #   batches   2  the rebind's, the switch record's
+  # The client then opens (one append), writes (one append, no fsync), fsyncs
+  # (one fsync) and closes (one step, one batch).
   case "$point" in
-    # A write appends with no fsync: the client's fsync is the next. The open
-    # is the next record appended, the write the one after.
-    tree.wal_*fsync) spec="$point=kill@2" ;;
-    tree.wal_*) spec="$point=kill@3" ;;
-    *) spec="$point=kill@2" ;;
+    # The client's fsync is the fourth.
+    tree.wal_*fsync) spec="$point=kill@4"; meets=fsync ;;
+    # The open is the third record appended, the write the fourth.
+    tree.wal_*) spec="$point=kill@4"; meets=write ;;
+    # The close is the second step.
+    tree.before_step) spec="$point=kill@2"; meets=close ;;
+    # The close's batch is the third.
+    *) spec="$point=kill@3"; meets=close ;;
   esac
   before=$(tree_git_root_clients "$work/state/history.git")
   start "$spec" root
-  # The attach's batch built before the client's first record: else the two could
-  # share one batch, and a builder point's second hit would come later or never.
+  # The rebind's batch and the switch record's are built before the client's
+  # first record: else a counted hit would come at another record, or never.
   tree_git_wait_root_attached "$work/state/history.git" "$before"
+  tree_at_rest "$work/metrics.json"
   : > "$work/receipt"
   python3 - "$work/main/candidate" "$work/receipt" <<'PY' >"$work/client.log" 2>&1 & client=$!
 import os, sys
-fd = os.open(sys.argv[1], os.O_WRONLY, 0o600)
 def receipt(s):
     with open(sys.argv[2], 'a') as f:
         f.write(s + '\n'); f.flush(); os.fsync(f.fileno())
+fd = os.open(sys.argv[1], os.O_WRONLY, 0o600)
+receipt('open')
 n = os.write(fd, b'candidate')
 if n: receipt(f'write {n}')
 assert n == 9, f'partial write returned {n}'
@@ -125,6 +146,18 @@ PY
   tree_wait_exit "$pid" 2>/dev/null || true; pid=
   wait "$client" 2>/dev/null || true
   grep -F "agentfs failpoint $point triggered (kill)" "$work/mount.log" >/dev/null || { cat "$work/mount.log" >&2; exit 1; }
+  # The kill met the call its count names: the receipt holds every call that
+  # returned before it, and not that call. A close's step is recorded at the
+  # view's RELEASE, which the kernel sends after close(2) has returned, so the
+  # receipt may hold the close.
+  case "$meets" in
+    write) want=open ;;
+    fsync) want='open write 9' ;;
+    close) want='open write 9 fsync' ;;
+  esac
+  got=$(tr '\n' ' ' < "$work/receipt" | sed 's/ $//')
+  [ "$meets" != close ] || got=${got% close}
+  [ "$got" = "$want" ] || { echo "$spec met the wrong call: receipt '$got', expected '$want'" >&2; cat "$work/mount.log" >&2; exit 1; }
   fusermount3 -uz "$work/main"
   "$bin" --state "$work/state" init --volume t
   gitdir=$work/state/history.git
@@ -141,9 +174,9 @@ PY
   [ "$(git --git-dir="$gitdir" rev-parse root)" = "$head" ]
   printf 'PASS\t%s\t%s\n' "$point" "$(tail -n 1 "$work/receipt")" | tee -a "$work/results.tsv"
 done
-# The failpoints a mounted process cannot reach: each opening of the state area
-# passes them. Killed there, the next open still finds every returned write.
-for point in tree.after_ref_rebuild tree.compact_before_checkpoint tree.compact_before_drop; do
+# The failpoint a mounted process cannot reach: each opening of the state area
+# passes it. Killed there, the next open still finds every returned write.
+for point in tree.after_ref_rebuild; do
   rm -rf "$work/state" "$work/main" "$work/fork"
   mkdir "$work/main" "$work/fork"
   "$bin" --state "$work/state" init --volume t
@@ -162,6 +195,43 @@ for point in tree.after_ref_rebuild tree.compact_before_checkpoint tree.compact_
   git --git-dir="$gitdir" fsck --full --strict --no-progress
   tree_git_no_duplicate_opens "$gitdir"
   printf 'PASS\t%s\t-\n' "$point" | tee -a "$work/results.tsv"
+done
+# A kill while history's compactor is parked at each gap of a compaction: the
+# checkpoint not yet written, written and not renamed, renamed and its
+# directory not fsynced, in place and not yet counted, and counted with the
+# segments it covers still linked (docs/trees.md, "Recording and durability").
+# The mount's gate gives one frame per segment and a compaction at every built
+# event. `kept` was returned before the kill, so it survives whichever
+# compaction the kill met.
+for gap in covered written renamed dir_synced before_unlink; do
+  rm -rf "$work/state" "$work/main" "$work/fork" "$work/gate"
+  mkdir "$work/main" "$work/fork" "$work/gate"
+  "$bin" --state "$work/state" init --volume t
+  mkfifo "$work/gate/at" "$work/gate/go"
+  # Read and write: neither end blocks opening, nor sees end of file.
+  exec 7<>"$work/gate/at" 8<>"$work/gate/go"
+  compact_gate=$work/gate
+  start '' root
+  compact_gate=
+  printf saved > "$work/main/kept"
+  while :; do
+    IFS= read -r -t 120 reached <&7 || { echo "the compactor did not reach $gap" >&2; cat "$work/mount.log" >&2; exit 1; }
+    [ "$reached" != "$gap" ] || break
+    echo go >&8
+  done
+  kill -KILL "$pid"; tree_wait_exit "$pid" 2>/dev/null || true; pid=
+  exec 7<&- 8>&-
+  fusermount3 -uz "$work/main"
+  flock "$work/state/actor.lock" true
+  "$bin" --state "$work/state" init --volume t
+  gitdir=$work/state/history.git
+  [ "$(tree_git_file "$gitdir" root kept)" = saved ]
+  git --git-dir="$gitdir" fsck --full --strict --no-progress
+  tree_git_no_duplicate_opens "$gitdir"
+  head=$(git --git-dir="$gitdir" rev-parse root)
+  "$bin" --state "$work/state" init --volume t
+  [ "$(git --git-dir="$gitdir" rev-parse root)" = "$head" ]
+  printf 'PASS\tcompact:%s\t-\n' "$gap" | tee -a "$work/results.tsv"
 done
 # A first init killed before its `format` starts over.
 rm -rf "$work/state"

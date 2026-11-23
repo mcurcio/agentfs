@@ -37,13 +37,22 @@ thread_local! {
 }
 
 impl Journal {
-    /// A snapshot of the segments linked now: O(segments), no read.
+    /// A snapshot of the segments and carry files linked now, each as long
+    /// as it is: O(segments), no read.
     pub(in crate::tree_actor) fn call_reader(&self) -> CallReader {
         #[cfg(test)]
         READERS.with(|n| n.set(n.get() + 1));
         CallReader {
-            segments: self.segments.clone(),
-            salt: self.salt,
+            segments: self
+                .durability()
+                .segments()
+                .into_iter()
+                .map(|segment| {
+                    let length = segment.len();
+                    (segment, length)
+                })
+                .collect(),
+            salt: self.salt(),
         }
     }
 }
@@ -107,6 +116,9 @@ impl CallReader {
     ///
     /// As [`CallReader::for_each_call`].
     pub(in crate::tree_actor) fn calls(&self, handle: u64) -> Result<Vec<(u64, Call, FramePos)>> {
+        crate::tree_actor::stages::assert_unlocked(
+            crate::tree_actor::stages::Unlocked::JournalRead,
+        );
         let mut calls = Vec::new();
         self.for_each_call(handle, |seq, call, pos| {
             calls.push((seq, call, pos));
@@ -229,7 +241,7 @@ fn read_full(segment: &Segment, buf: &mut [u8], at: u64) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use crate::tree_actor::TreeId;
-    use crate::tree_actor::test_support::{ATTRS, new_actor, writer};
+    use crate::tree_actor::test_support::{ATTRS, compact_now, never_due, new_actor_with, writer};
 
     /// The reader finds an open's calls in record order, with their bytes,
     /// across a segment roll and a compaction that carried them, and none of
@@ -237,7 +249,7 @@ mod tests {
     #[test]
     fn reads_an_opens_calls_in_order_wherever_they_are() {
         let tmp = tempfile::tempdir().unwrap();
-        let mut v = new_actor(tmp.path());
+        let mut v = new_actor_with(tmp.path(), never_due());
         let h = v
             .write_open(TreeId::Root, "a", &writer("w"), Some(ATTRS))
             .unwrap();
@@ -257,8 +269,7 @@ mod tests {
             v.write(f, 0, b"x", false).unwrap();
             v.close(f).unwrap();
         }
-        v.settle().unwrap();
-        v.compact().unwrap();
+        compact_now(&v);
         v.write(h, 4, b"three", false).unwrap();
         let calls = v.journal.call_reader().calls(h).unwrap();
         let seen: Vec<(super::Call, Vec<u8>)> = calls

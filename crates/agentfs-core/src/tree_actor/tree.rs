@@ -13,6 +13,7 @@ use git2::Oid;
 
 use serde::{Deserialize, Serialize};
 
+use super::history::retired::Retired;
 use super::journal::{Change, SaveOutcome, TakeRecord, TreeLocals};
 use super::meta::{Attrs, Kind, Meta, Perm, Times};
 use super::recording::FileMap;
@@ -644,6 +645,10 @@ impl Objects {
     }
 }
 
+/// What [`Files::rebuilt`] let go, for its caller to drop: the old built
+/// layer and the changed maps the built point covers.
+type LetGo = (imbl::OrdMap<u64, Arc<FileBytes>>, Vec<Option<FileMap>>);
+
 /// The actor's saved maps by object: the builder's maps at the built point
 /// (`built`, shared, never copied) with each map this actor saved, replaced
 /// or dropped since laid over them (`changed`, read first).
@@ -742,10 +747,27 @@ impl Files {
         }
     }
 
-    /// `built`'s maps with every map changed after `through` as this has it.
-    fn rebuilt(&mut self, built: &imbl::OrdMap<u64, Arc<FileBytes>>, through: EventNumber) {
-        self.built = built.clone();
-        self.changed.retain(|_, (step, _)| *step > through);
+    /// `built`'s maps with every map changed after `through` as this has it;
+    /// answers what it let go, for the caller to drop.
+    fn rebuilt(
+        &mut self,
+        built: &imbl::OrdMap<u64, Arc<FileBytes>>,
+        through: EventNumber,
+    ) -> LetGo {
+        let old = std::mem::replace(&mut self.built, built.clone());
+        let mut changed = Vec::new();
+        self.changed = std::mem::take(&mut self.changed)
+            .into_iter()
+            .filter_map(|(object, (step, map))| {
+                if step > through {
+                    Some((object, (step, map)))
+                } else {
+                    changed.push(map);
+                    None
+                }
+            })
+            .collect();
+        (old, changed)
     }
 }
 
@@ -1723,9 +1745,15 @@ impl SavedTree {
     /// and drop every changed entry whose step <= through, keeping the rest
     /// over them. O(entries changed since the last built event). Entries noted
     /// at no step must be sealed first ([`SavedTree::seal`]), or they stay.
-    pub(super) fn rebuilt(&mut self, built: &Tree, through: EventNumber) {
-        self.shape = self.shape.rebuilt(&built.shape, through);
-        self.bytes.rebuilt(&built.bytes, through);
+    /// The maps and the shape let go are returned, never dropped here: the
+    /// caller hands them to `History::defer_drops`.
+    pub(super) fn rebuilt(&mut self, built: &Tree, through: EventNumber) -> Retired {
+        let shape = self.shape.rebuilt(&built.shape, through);
+        let old = std::mem::replace(&mut self.shape, shape);
+        let maps = self.bytes.rebuilt(&built.bytes, through);
+        let mut retired = Retired::default();
+        retired.push((old, maps));
+        retired
     }
 
     /// Every changed entry noted at no step (a save, a map, a drop) is noted
@@ -2380,7 +2408,7 @@ mod tests {
                     }
                     through = next;
                     actor.seal(EventNumber::new(seq));
-                    actor.rebuilt(&built, EventNumber::new(through));
+                    drop(actor.rebuilt(&built, EventNumber::new(through)));
                 }
                 let at = format!("seed {seed}, step {seq}, built through {through}");
                 assert_reads_equal(&actor, &oracle, &oracle_bytes, &at);

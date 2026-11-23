@@ -33,6 +33,7 @@ use crate::stale::{self, MountState};
 use agentfs_contracts::clients::{Access, Binding, FileOwner};
 use agentfs_contracts::views::{MountOptions, MountPoint, ViewError, ViewId, Views};
 use agentfs_core::session::{SessionGuard, Sessions, TreeSession};
+use agentfs_core::tree_actor::stages as measured;
 use agentfs_core::tree_actor::{
     Attrs, Error, FileMap, Kind, Meta, Node, Perm, Progress, Recording, RenameMode, Saved, SetTime,
     TreeId,
@@ -342,6 +343,8 @@ impl Views for ViewHost {
             })),
             untracked: Arc::new(Untracked::new(area, give)),
             notifier: Arc::default(),
+            #[cfg(test)]
+            in_durable: Arc::default(),
         };
         let notifier = Arc::clone(&view.notifier);
         let id = ViewId(self.next);
@@ -557,7 +560,13 @@ struct View {
     untracked: Arc<Untracked>,
     /// The view's kernel channel, once mounted.
     notifier: Arc<OnceLock<Notifier>>,
+    /// Tests: runs in place of the wait of [`View::durable_before_unlink`].
+    #[cfg(test)]
+    in_durable: Arc<Mutex<Option<DurableHook>>>,
 }
+
+#[cfg(test)]
+type DurableHook = Box<dyn Fn() -> Result<()> + Send>;
 
 struct Handles {
     next: u64,
@@ -743,7 +752,7 @@ fn sync_flags(flags: i32) -> bool {
     flags & (libc::O_SYNC | libc::O_DSYNC) != 0
 }
 
-/// A FLUSH, FSYNC or FSYNCDIR answered once its records are durable, from
+/// An FSYNC, FSYNCDIR or `O_SYNC` write answered once its records are durable, from
 /// whichever thread the durability wait ends on.
 fn answer_empty(reply: ReplyEmpty) -> agentfs_core::tree_actor::Then {
     Box::new(move |result| match result {
@@ -768,6 +777,88 @@ impl View {
     }
     fn handles(&self) -> Result<MutexGuard<'_, Handles>> {
         self.handles.lock().map_err(|_| Errno::EIO)
+    }
+    /// Every record so far made durable, on this thread and never under the
+    /// actor's lock: what a move into the tree waits for before it unlinks
+    /// the area's file. The file's bytes are then in the journal alone, and
+    /// a close no longer makes them durable, so an unlink that reached the
+    /// disk before its record would lose bytes a program had fsynced
+    /// (docs/trees.md, "Recording and durability").
+    fn durable_before_unlink(&self) -> Result<()> {
+        #[cfg(test)]
+        if let Some(hook) = &*self.in_durable.lock().map_err(|_| Errno::EIO)? {
+            return hook();
+        }
+        self.session.durable_all().map_err(errno)
+    }
+    /// A WRITE: `then` gets the bytes written, at once, or for an open with
+    /// `O_SYNC` or `O_DSYNC` once the write's records are durable, from
+    /// whichever thread that wait ends on.
+    fn write_then(
+        &self,
+        fh: FileHandle,
+        offset: u64,
+        data: &[u8],
+        write_flags: WriteFlags,
+        then: Box<dyn FnOnce(Result<u32>) + Send>,
+    ) {
+        match self.untracked_fd(fh) {
+            Ok(Some(open)) => {
+                if open.moved {
+                    return then(Err(Errno::ESTALE));
+                }
+                // A page write lands where the kernel says; a write of an
+                // `O_APPEND` open at the file's end.
+                let append = open.append && !write_flags.contains(WriteFlags::FUSE_WRITE_CACHE);
+                let writing = self.untracked.writing();
+                let written = untracked::write(&writing, &open.fd, offset, data, append);
+                return then(written.map(|()| data.len() as u32));
+            }
+            Ok(None) => {}
+            Err(e) => return then(Err(e)),
+        }
+        // The guards drop before a durability wait is queued.
+        let result = (|| {
+            let mut v = self.actor()?;
+            let handles = self.handles()?;
+            match handles.entries.get(&fh.0).ok_or(Errno::EBADF)? {
+                Open::Write { handle, sync, .. }
+                    if write_flags.contains(WriteFlags::FUSE_WRITE_CACHE) =>
+                {
+                    v.page_writeback(*handle, offset, data).map_err(errno)?;
+                    Ok(sync.then_some(*handle))
+                }
+                Open::Write {
+                    handle,
+                    append,
+                    sync,
+                    ..
+                } => {
+                    v.write(*handle, offset, data, *append).map_err(errno)?;
+                    Ok(sync.then_some(*handle))
+                }
+                _ => Err(Errno::EBADF),
+            }
+        })();
+        let written = data.len() as u32;
+        match result {
+            Ok(None) => then(Ok(written)),
+            Ok(Some(handle)) => self.session.durable_then(
+                handle,
+                Box::new(move |result| then(result.map(|()| written).map_err(errno))),
+            ),
+            Err(e) => then(Err(e)),
+        }
+    }
+    /// What a FLUSH answers, with no wait for the disk.
+    fn run_flush(&self, fh: FileHandle) -> Result<()> {
+        let handle = self
+            .handles()?
+            .entries
+            .get(&fh.0)
+            .map(open_handle)
+            .ok_or(Errno::EBADF)?;
+        handle.map_or(Ok(()), |handle| self.session.flush(handle).map_err(errno))
     }
     /// A directory inode's tree path, and whether it is untracked.
     fn dir_of(&self, v: &SessionGuard<'_>, ino: INodeNo) -> Result<(String, bool)> {
@@ -1218,6 +1309,8 @@ impl View {
                 writing.containers(&to, meta_of).map_err(untracked::io)?;
                 // Read with the actor unlocked, as a read open's snapshot is.
                 drop(v);
+                // The area's copy and its directory entry are fsynced before
+                // the tracked name's removal is recorded (`AreaWrite::place`).
                 self.untracked
                     .place(&writing, &to, &mut map.reader(), map.len(), meta)?;
                 // The actor's lock is never taken under the area's hold.
@@ -1245,10 +1338,11 @@ impl View {
                 // One step under the actor's lock: the volume's calls wait
                 // while the bytes are copied into the journal.
                 v.replace_file(&to, attrs, &mut file, len).map_err(errno)?;
-                self.untracked.unlink(&from)?;
-                self.mark_moved(untracked::file_of(&st))?;
                 let object = v.object_at(&to).map_err(errno)?;
                 drop(v);
+                self.durable_before_unlink()?;
+                self.untracked.unlink(&from)?;
+                self.mark_moved(untracked::file_of(&st))?;
                 self.invalidate(object);
                 Ok(())
             }
@@ -1261,6 +1355,8 @@ impl View {
                     gid: attr.gid,
                 };
                 v.symlink(&to, &target, owner).map_err(errno)?;
+                drop(v);
+                self.durable_before_unlink()?;
                 self.untracked.unlink(&from)
             }
         }
@@ -1323,6 +1419,7 @@ impl Filesystem for View {
         Ok(())
     }
     fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
+        let _request = measured::request(measured::Op::Lookup);
         let result = (|| {
             let v = self.actor()?;
             let (dir, up) = self.dir_of(&v, parent)?;
@@ -1338,6 +1435,7 @@ impl Filesystem for View {
         }
     }
     fn getattr(&self, _req: &Request, ino: INodeNo, fh: Option<FileHandle>, reply: ReplyAttr) {
+        let _request = measured::request(measured::Op::Getattr);
         if is_untracked(ino) {
             let result = fh
                 .map(|fh| self.untracked_fd(fh))
@@ -1358,6 +1456,7 @@ impl Filesystem for View {
         }
     }
     fn open(&self, _req: &Request, ino: INodeNo, flags: OpenFlags, reply: ReplyOpen) {
+        let _request = measured::request(measured::Op::Open);
         if is_untracked(ino) {
             let changes =
                 flags.0 & libc::O_ACCMODE != libc::O_RDONLY || flags.0 & libc::O_TRUNC != 0;
@@ -1401,6 +1500,7 @@ impl Filesystem for View {
         flags: i32,
         reply: ReplyCreate,
     ) {
+        let _request = measured::request(measured::Op::Create);
         let owner = (req.uid(), req.gid());
         let untracked = self.untracked_new(parent, name, NewKind::File, |v, path| {
             let meta_of = &mut |dir: &str| v.node(dir).ok().map(|n| n.meta);
@@ -1454,6 +1554,7 @@ impl Filesystem for View {
         flags: i32,
         reply: ReplyCreate,
     ) {
+        let _request = measured::request(measured::Op::Create);
         // An anonymous file becomes tracked by its first link; one in an
         // untracked directory would have nowhere to go.
         if is_untracked(parent) {
@@ -1514,6 +1615,7 @@ impl Filesystem for View {
         owner: Option<LockOwner>,
         reply: ReplyData,
     ) {
+        let _request = measured::request(measured::Op::Read);
         let result = (|| {
             if let Some(open) = self.untracked_fd(fh)? {
                 return untracked::read(&open.fd, offset, size);
@@ -1567,58 +1669,17 @@ impl Filesystem for View {
         _owner: Option<LockOwner>,
         reply: ReplyWrite,
     ) {
-        match self.untracked_fd(fh) {
-            Ok(Some(open)) => {
-                if open.moved {
-                    return reply.error(Errno::ESTALE);
-                }
-                // A page write lands where the kernel says; a write of an
-                // `O_APPEND` open at the file's end.
-                let append = open.append && !write_flags.contains(WriteFlags::FUSE_WRITE_CACHE);
-                let writing = self.untracked.writing();
-                return match untracked::write(&writing, &open.fd, offset, data, append) {
-                    Ok(()) => reply.written(data.len() as u32),
-                    Err(e) => reply.error(e),
-                };
-            }
-            Ok(None) => {}
-            Err(e) => return reply.error(e),
-        }
-        // The guards drop before a durability wait is queued.
-        let result = (|| {
-            let mut v = self.actor()?;
-            let handles = self.handles()?;
-            match handles.entries.get(&fh.0).ok_or(Errno::EBADF)? {
-                Open::Write { handle, sync, .. }
-                    if write_flags.contains(WriteFlags::FUSE_WRITE_CACHE) =>
-                {
-                    v.page_writeback(*handle, offset, data).map_err(errno)?;
-                    Ok(sync.then_some(*handle))
-                }
-                Open::Write {
-                    handle,
-                    append,
-                    sync,
-                    ..
-                } => {
-                    v.write(*handle, offset, data, *append).map_err(errno)?;
-                    Ok(sync.then_some(*handle))
-                }
-                _ => Err(Errno::EBADF),
-            }
-        })();
-        let written = data.len() as u32;
-        match result {
-            Ok(None) => reply.written(written),
-            Ok(Some(handle)) => self.session.durable_then(
-                handle,
-                Box::new(move |result| match result {
-                    Ok(()) => reply.written(written),
-                    Err(e) => reply.error(errno(e)),
-                }),
-            ),
-            Err(e) => reply.error(e),
-        }
+        let _request = measured::request(measured::Op::Write);
+        self.write_then(
+            fh,
+            offset,
+            data,
+            write_flags,
+            Box::new(move |written| match written {
+                Ok(written) => reply.written(written),
+                Err(e) => reply.error(e),
+            }),
+        );
     }
     fn setattr(
         &self,
@@ -1638,6 +1699,7 @@ impl Filesystem for View {
         _flags: Option<BsdFileFlags>,
         reply: ReplyAttr,
     ) {
+        let _request = measured::request(measured::Op::Other);
         let changes = AttrChanges {
             mode,
             uid,
@@ -1681,9 +1743,13 @@ impl Filesystem for View {
             setattr(self, Ok(()));
         }
     }
-    /// close(2) of a write-open: every record so far (the open's, and its
-    /// file's metadata steps) made durable before close returns. The fsync
-    /// runs off this thread; the reply comes when it ends.
+    /// close(2) of a write-open: answered at once. Each of the open's calls
+    /// was appended to the journal before it returned, and a close waits for
+    /// no fsync and returns no journal fsync's error: `EIO` only once a
+    /// failed fsync has stopped the actor. fsync, FSYNCDIR and each write of
+    /// an `O_SYNC` or `O_DSYNC` open still wait for the disk; a power cut
+    /// can lose every change since the last of them, or since the builder's
+    /// last batch (docs/trees.md, "Recording and durability").
     fn flush(
         &self,
         _req: &Request,
@@ -1692,17 +1758,10 @@ impl Filesystem for View {
         _owner: LockOwner,
         reply: ReplyEmpty,
     ) {
-        let handle = match self
-            .handles()
-            .map(|h| h.entries.get(&fh.0).map(open_handle))
-        {
-            Ok(Some(handle)) => handle,
-            Ok(None) => return reply.error(Errno::EBADF),
-            Err(e) => return reply.error(e),
-        };
-        match handle {
-            Some(handle) => self.session.durable_then(handle, answer_empty(reply)),
-            None => reply.ok(),
+        let _request = measured::request(measured::Op::Flush);
+        match self.run_flush(fh) {
+            Ok(()) => reply.ok(),
+            Err(e) => reply.error(e),
         }
     }
     /// Every record so far made durable, as FSYNCDIR does; a write-open's
@@ -1715,6 +1774,7 @@ impl Filesystem for View {
         datasync: bool,
         reply: ReplyEmpty,
     ) {
+        let _request = measured::request(measured::Op::Other);
         match self.untracked_fd(fh) {
             Ok(Some(open)) => {
                 let synced = if datasync {
@@ -1753,6 +1813,7 @@ impl Filesystem for View {
         _datasync: bool,
         reply: ReplyEmpty,
     ) {
+        let _request = measured::request(measured::Op::Other);
         // The area's directory at the same path holds the untracked names.
         let synced = self
             .actor()
@@ -1773,6 +1834,7 @@ impl Filesystem for View {
         _flush: bool,
         reply: ReplyEmpty,
     ) {
+        let _request = measured::request(measured::Op::Release);
         match self.finish(fh) {
             Ok(()) => reply.ok(),
             Err(e) => {
@@ -1788,6 +1850,7 @@ impl Filesystem for View {
     /// anonymous file, its first name; a named tracked file `EPERM`; across
     /// the halves `EXDEV`.
     fn link(&self, _req: &Request, ino: INodeNo, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
+        let _request = measured::request(measured::Op::Other);
         let untracked = (|| {
             let v = self.actor()?;
             if !v.writable() {
@@ -1845,6 +1908,7 @@ impl Filesystem for View {
         });
     }
     fn unlink(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
+        let _request = measured::request(measured::Op::Other);
         let untracked = (|| {
             let v = self.actor()?;
             let (dir, up) = self.dir_of(&v, parent)?;
@@ -1885,6 +1949,7 @@ impl Filesystem for View {
         target: &Path,
         reply: ReplyEntry,
     ) {
+        let _request = measured::request(measured::Op::Other);
         let untracked = self.untracked_new(parent, link_name, NewKind::Symlink, |v, path| {
             let meta_of = &mut |dir: &str| v.node(dir).ok().map(|n| n.meta);
             self.untracked
@@ -1914,6 +1979,7 @@ impl Filesystem for View {
         });
     }
     fn readlink(&self, _req: &Request, ino: INodeNo, reply: ReplyData) {
+        let _request = measured::request(measured::Op::Other);
         if is_untracked(ino) {
             return match self.untracked.readlink(ino) {
                 Ok(target) => reply.data(&target),
@@ -1943,6 +2009,7 @@ impl Filesystem for View {
         _rdev: u32,
         reply: ReplyEntry,
     ) {
+        let _request = measured::request(measured::Op::Other);
         let special = match mode & libc::S_IFMT {
             libc::S_IFREG => None,
             libc::S_IFIFO => Some(NewKind::Fifo),
@@ -2004,6 +2071,7 @@ impl Filesystem for View {
         _umask: u32,
         reply: ReplyEntry,
     ) {
+        let _request = measured::request(measured::Op::Other);
         let untracked = self.untracked_new(parent, name, NewKind::Dir, |v, path| {
             if v.node(path).is_ok() {
                 return Err(Errno::EEXIST);
@@ -2036,6 +2104,7 @@ impl Filesystem for View {
         });
     }
     fn rmdir(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
+        let _request = measured::request(measured::Op::Other);
         let untracked = (|| {
             let v = self.actor()?;
             let (dir, up) = self.dir_of(&v, parent)?;
@@ -2089,6 +2158,7 @@ impl Filesystem for View {
         flags: RenameFlags,
         reply: ReplyEmpty,
     ) {
+        let _request = measured::request(measured::Op::Other);
         // RENAME_EXCHANGE and RENAME_WHITEOUT are not supported.
         let mode = if flags.is_empty() {
             RenameMode::Replace
@@ -2129,6 +2199,7 @@ impl Filesystem for View {
         offset: u64,
         mut reply: ReplyDirectory,
     ) {
+        let _request = measured::request(measured::Op::Readdir);
         let result = self.listing(ino, offset);
         match result {
             Ok(entries) => {
@@ -2222,6 +2293,7 @@ mod tests {
             })),
             untracked: Arc::new(Untracked::new(area, false)),
             notifier: Arc::default(),
+            in_durable: Arc::default(),
         }
     }
 
@@ -2554,6 +2626,125 @@ mod tests {
         );
     }
 
+    /// close(2) through the view waits for no fsync, and a write waits for
+    /// one exactly when its open has `O_SYNC` or `O_DSYNC`: the write is
+    /// answered once the journal's mark covers it. The opens stay open, so
+    /// the builder has no step to make durable.
+    #[test]
+    fn a_close_waits_for_no_fsync_and_a_sync_opens_write_waits() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut sessions = Sessions::new(new_actor(tmp.path()));
+        let view = view(writing(&mut sessions, "client"));
+        let durability = Arc::clone(sessions.recording().actor().unwrap().durability());
+        let open = |name: &str, flags: i32| {
+            let mut volume = view.actor().unwrap();
+            let flags = libc::O_WRONLY | libc::O_CREAT | flags;
+            FileHandle(
+                view.open_file(&mut volume, name, flags, Some(ATTRS))
+                    .unwrap(),
+            )
+        };
+        let write = |fh: FileHandle| {
+            let (answered, answer) = std::sync::mpsc::channel();
+            let mark = Arc::clone(&durability);
+            view.write_then(
+                fh,
+                0,
+                b"bytes",
+                WriteFlags::empty(),
+                Box::new(move |written| answered.send((written, mark.mark())).unwrap()),
+            );
+            answer.recv_timeout(Duration::from_secs(10)).unwrap()
+        };
+        let plain = open("plain", 0);
+        let (written, mark) = write(plain);
+        assert_eq!(written, Ok(5));
+        assert!(mark < durability.appended(), "a plain write waited");
+        view.run_flush(plain).unwrap();
+        assert!(
+            durability.mark() < durability.appended(),
+            "the close made an fsync"
+        );
+        for (name, flags) in [("sync", libc::O_SYNC), ("dsync", libc::O_DSYNC)] {
+            let fh = open(name, flags);
+            let (written, mark) = write(fh);
+            assert_eq!(written, Ok(5), "{name}");
+            assert_eq!(
+                mark,
+                durability.appended(),
+                "{name}: answered before the disk"
+            );
+            view.run_flush(fh).unwrap();
+        }
+        assert_eq!(view.run_flush(FileHandle(99)), Err(Errno::EBADF));
+    }
+
+    /// A move into the tree unlinks the area's file only once its record is
+    /// durable: the file is there while the wait runs, and stays when the
+    /// wait fails, for a file and for a link.
+    #[test]
+    fn a_move_into_the_tree_keeps_the_area_file_until_its_record_is_durable() {
+        let tmp = tempfile::tempdir().unwrap();
+        drop(new_actor(tmp.path()));
+        let info = tmp.path().join("history.git/info");
+        std::fs::create_dir_all(&info).unwrap();
+        std::fs::write(info.join("exclude"), "*.tmp\n").unwrap();
+        let recording = Recording::open(tmp.path(), &PodContext::default()).unwrap();
+        let mut sessions = Sessions::new(recording);
+        let view = view(writing(&mut sessions, "client"));
+        let area = view.session.untracked_area().unwrap();
+        std::fs::write(area.path().join("a.tmp"), b"edited\n").unwrap();
+        std::os::unix::fs::symlink("target", area.path().join("l.tmp")).unwrap();
+        let root = INodeNo(1);
+        // A link moves only to a new name, so its second move has another.
+        for (from, to, again) in [
+            ("a.tmp", "notes.md", "notes.md"),
+            ("l.tmp", "link", "link2"),
+        ] {
+            let source = area.path().join(from);
+            // The wait finds the tree's entry recorded and the area's file
+            // still there, and fails.
+            let seen = Arc::new(Mutex::new(Vec::new()));
+            let (waits, there, session) = (Arc::clone(&seen), source.clone(), view.session.clone());
+            *view.in_durable.lock().unwrap() = Some(Box::new(move || {
+                let recorded = session.lock().is_ok_and(|v| v.node(to).is_ok());
+                waits
+                    .lock()
+                    .unwrap()
+                    .push((recorded, there.symlink_metadata().is_ok()));
+                Err(Errno::EIO)
+            }));
+            let moved = view.run_move(
+                root,
+                OsStr::new(from),
+                root,
+                OsStr::new(to),
+                RenameMode::Replace,
+            );
+            assert_eq!(moved, Err(Errno::EIO), "{from}");
+            assert_eq!(*seen.lock().unwrap(), [(true, true)], "{from}");
+            assert!(source.symlink_metadata().is_ok(), "{from} stays");
+            // The real wait: the move's record durable, then the unlink.
+            *view.in_durable.lock().unwrap() = None;
+            let durability = Arc::clone(sessions.recording().actor().unwrap().durability());
+            let before = durability.appended();
+            view.run_move(
+                root,
+                OsStr::new(from),
+                root,
+                OsStr::new(again),
+                RenameMode::Replace,
+            )
+            .unwrap();
+            assert!(source.symlink_metadata().is_err(), "{from} is gone");
+            assert!(durability.mark() > before, "{from}'s record is durable");
+        }
+        let v = view.actor().unwrap();
+        assert_eq!(v.read("notes.md").unwrap(), b"edited\n");
+        assert_eq!(v.readlink("link").unwrap(), b"target");
+        assert_eq!(v.readlink("link2").unwrap(), b"target");
+    }
+
     /// A rename's plan follows its source's half and kind and its target's
     /// class; moving a file in replaces the tracked one and marks the opens
     /// of the area's file moved, and moving it out places its bytes and
@@ -2772,9 +2963,10 @@ mod tests {
             matches!(stale::mount_state(at).unwrap(), MountState::Stale { .. }),
             "the killed worker's view is stale"
         );
-        assert_eq!(
-            rustix::fs::statfs(at).map(|_| ()),
-            Err(rustix::io::Errno::NOTCONN)
+        let answer = rustix::fs::statfs(at).map(|_| ());
+        assert!(
+            answer.is_err_and(stale::is_disconnected),
+            "the stale view answers as a dead connection: {answer:?}"
         );
     }
 

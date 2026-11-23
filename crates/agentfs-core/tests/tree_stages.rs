@@ -8,7 +8,7 @@ use std::sync::{Mutex, PoisonError};
 
 use agentfs_contracts::pod::PodContext;
 use agentfs_core::tree_actor::stages::Stages;
-use agentfs_core::tree_actor::{Recording, Saved, TreeActor, TreeId};
+use agentfs_core::tree_actor::{Recording, Saved, Took, TreeActor, TreeId};
 use trees::{ATTRS, identity, new_actor, reopen, rowless_fork, writer};
 
 #[path = "support/trees.rs"]
@@ -254,6 +254,222 @@ fn each_hold_of_the_actor_lock_is_counted() {
     let after = Stages::current().actor_lock;
     assert_eq!(after.count - before.count, 4);
     assert!(after.max_nanos >= 20_000_000, "the longest hold: {after:?}");
+}
+
+/// The holds of the actor's lock each kind of work ran in during `work`,
+/// by kind, and the waits to take the lock.
+fn holds_during(work: impl FnOnce()) -> (Vec<(&'static str, u64)>, u64) {
+    let before = Stages::current();
+    work();
+    let after = Stages::current();
+    let kinds = after
+        .lock_hold
+        .by_kind()
+        .into_iter()
+        .zip(before.lock_hold.by_kind())
+        .map(|((kind, a), (_, b))| (kind, a.count - b.count))
+        .collect();
+    (kinds, after.lock_wait.count - before.lock_wait.count)
+}
+
+/// How many of this process's threads are named `name`.
+fn threads_named(name: &str) -> usize {
+    std::fs::read_dir("/proc/self/task")
+        .unwrap()
+        .filter(|task| {
+            let comm = task.as_ref().unwrap().path().join("comm");
+            std::fs::read_to_string(comm).is_ok_and(|n| n.trim_end() == name)
+        })
+        .count()
+}
+
+/// The holds of `kind` in `kinds`.
+fn of(kinds: &[(&'static str, u64)], kind: &str) -> u64 {
+    kinds
+        .iter()
+        .find(|(k, _)| *k == kind)
+        .map(|(_, n)| *n)
+        .unwrap_or_else(|| panic!("no kind {kind}"))
+}
+
+/// Each kind of work under the actor's lock is recorded in the hold it
+/// runs in (docs/telemetry.md, "The volume lock"): a plain call is
+/// `other` only, a close is `close`, a built point reached is `catch_up`,
+/// a fork is `fork_copy`, and a take is `take`. Every hold is also one wait
+/// to take the lock. No drop runs under the lock: what a catch-up lets go
+/// drops on the volume's `tree-drops` thread, so `drops` stays zero.
+/// Compaction runs off the lock, on history's compactor: `compaction` counts
+/// only the actor's walk onto carried frames, which a volume with nothing
+/// carried never makes.
+#[test]
+fn each_kind_of_hold_is_recorded_when_its_work_runs() {
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(PoisonError::into_inner);
+    let tmp = tempfile::tempdir().unwrap();
+    let rec = Recording::create(
+        &tmp.path().join("state"),
+        &identity(),
+        None,
+        &PodContext::default(),
+    )
+    .unwrap();
+    rec.settle().unwrap();
+    let w = writer("test-writer");
+
+    let (kinds, waits) = holds_during(|| drop(rec.actor().unwrap()));
+    assert_eq!(
+        kinds,
+        vec![
+            ("compaction", 0),
+            ("catch_up", 0),
+            ("drops", 0),
+            ("close", 0),
+            ("take", 0),
+            ("fork_copy", 0),
+            ("page_image", 0),
+            ("other", 1),
+        ]
+    );
+    assert_eq!(waits, 1);
+
+    let h = rec
+        .actor()
+        .unwrap()
+        .write_open(TreeId::Root, "a", &w, Some(ATTRS))
+        .unwrap();
+    rec.actor().unwrap().write(h, 0, b"base\n", false).unwrap();
+    // The close's step is built after its hold or, rarely, within it:
+    // either that hold or the built event's catches up.
+    let (kinds, _) = holds_during(|| {
+        rec.close_with(h, |_| Ok(())).unwrap();
+        rec.settle().unwrap();
+        rec.progress().unwrap();
+    });
+    assert!(of(&kinds, "close") >= 1, "{kinds:?}");
+    assert!(of(&kinds, "catch_up") >= 1, "{kinds:?}");
+    assert_eq!(of(&kinds, "drops"), 0, "{kinds:?}");
+    assert!(
+        threads_named("tree-drops") >= 1,
+        "the volume's drop thread runs"
+    );
+    assert_eq!(of(&kinds, "take") + of(&kinds, "fork_copy"), 0);
+    assert_eq!(of(&kinds, "compaction"), 0);
+
+    let mut fork = TreeId::Root;
+    let (kinds, _) = holds_during(|| fork = rowless_fork(&mut rec.actor().unwrap()));
+    assert_eq!(of(&kinds, "fork_copy"), 1, "{kinds:?}");
+
+    let h = rec
+        .actor()
+        .unwrap()
+        .write_open(fork, "a", &w, Some(ATTRS))
+        .unwrap();
+    rec.actor()
+        .unwrap()
+        .write(h, 0, b"base\nfork\n", false)
+        .unwrap();
+    rec.close_with(h, |_| Ok(())).unwrap();
+    let (kinds, _) = holds_during(|| {
+        assert_eq!(rec.take_next(TreeId::Root).unwrap(), Took::Taken);
+    });
+    assert!(of(&kinds, "take") >= 1, "{kinds:?}");
+
+    // Past the compaction threshold: the close's built event compacts, on
+    // history's thread, and no hold of the lock is a compaction's.
+    let generation = rec.history().checkpointed().generation;
+    let before = Stages::current().checkpoints;
+    let h = rec
+        .actor()
+        .unwrap()
+        .write_open(TreeId::Root, "big", &w, Some(ATTRS))
+        .unwrap();
+    let chunk = vec![b'x'; 33 << 20];
+    for _ in 0..2 {
+        rec.actor().unwrap().write(h, 0, &chunk, true).unwrap();
+    }
+    rec.actor().unwrap().truncate(h, 1).unwrap();
+    let (kinds, _) = holds_during(|| {
+        rec.close_with(h, |_| Ok(())).unwrap();
+        rec.settle().unwrap();
+        let published = rec.history().wait_checkpointed(generation).unwrap();
+        rec.history().wait_compacted(published.generation).unwrap();
+        rec.progress().unwrap();
+    });
+    assert!(Stages::current().checkpoints > before, "it compacted");
+    assert_eq!(of(&kinds, "compaction"), 0, "{kinds:?}");
+}
+
+/// A page fill that builds a file's image from a live open's calls reads the
+/// journal under the actor's lock: a named hold of its own, `page_image`,
+/// and so one the lock's guard lets read (a debug build panics on a journal
+/// read under the lock in any hold that is not named for it).
+#[test]
+fn a_page_fill_under_the_lock_is_a_page_image_hold() {
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(PoisonError::into_inner);
+    let tmp = tempfile::tempdir().unwrap();
+    let rec = Recording::create(
+        &tmp.path().join("state"),
+        &identity(),
+        None,
+        &PodContext::default(),
+    )
+    .unwrap();
+    let w = writer("test-writer");
+    let h = rec
+        .actor()
+        .unwrap()
+        .write_open(TreeId::Root, "a", &w, Some(ATTRS))
+        .unwrap();
+    rec.actor().unwrap().write(h, 0, b"calls", false).unwrap();
+    let object = rec.actor().unwrap().open_object(h).unwrap();
+    let (kinds, _) = holds_during(|| {
+        let filled = rec
+            .actor()
+            .unwrap()
+            .page_fill(TreeId::Root, object, 0, 4096)
+            .unwrap();
+        assert_eq!(filled, b"calls");
+    });
+    assert_eq!(of(&kinds, "page_image"), 1, "{kinds:?}");
+    rec.close_with(h, |_| Ok(())).unwrap();
+}
+
+/// A call held at the lag gate is counted under the cause that held it,
+/// from its hold to the built event that admits it: here the overlay limit.
+#[test]
+fn a_gate_wait_is_recorded_by_its_cause() {
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(PoisonError::into_inner);
+    let tmp = tempfile::tempdir().unwrap();
+    let rec = Recording::create(
+        &tmp.path().join("state"),
+        &identity(),
+        None,
+        &PodContext::default(),
+    )
+    .unwrap();
+    rec.settle().unwrap();
+    rec.set_overlay_limit(1);
+    let h = rec
+        .actor()
+        .unwrap()
+        .write_open(TreeId::Root, "a", &writer("test-writer"), Some(ATTRS))
+        .unwrap();
+    rec.actor().unwrap().write(h, 0, b"a\n", false).unwrap();
+    rec.close_with(h, |_| Ok(())).unwrap();
+    let before = Stages::current().gate_wait;
+    let (tx, rx) = std::sync::mpsc::channel();
+    rec.admit_then(
+        TreeId::Root,
+        Box::new(move |admitted| tx.send(admitted).unwrap()),
+    );
+    assert!(rx.try_recv().is_err(), "held: the overlay is over 1 byte");
+    // Built, then the actor moves onto the built point: the overlay is gone.
+    rec.settle().unwrap();
+    rec.progress().unwrap();
+    rx.recv().unwrap().unwrap();
+    let after = Stages::current().gate_wait;
+    assert_eq!(after.overlay.count - before.overlay.count, 1);
+    assert_eq!(after.lag.count - before.lag.count, 0);
+    assert!(after.overlay.nanos > before.overlay.nanos);
 }
 
 /// Calls are appended with no fsync, and a FLUSH makes all of an open's

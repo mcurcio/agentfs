@@ -860,9 +860,10 @@ impl Supervisor {
         let target = &view.target;
         fs::create_dir_all(target).or_else(|e| {
             // A stale mount there: `mkdir` fails with EEXIST, and
-            // create_dir_all then cannot stat it (ENOTCONN).
+            // create_dir_all then cannot stat it (ENOTCONN, or ECONNABORTED
+            // while the connection is being aborted).
             if e.kind() == io::ErrorKind::AlreadyExists
-                || e.raw_os_error() == Some(rustix::io::Errno::NOTCONN.raw_os_error())
+                || agentfs_fuse::stale::is_disconnected_io(&e)
             {
                 Ok(())
             } else {

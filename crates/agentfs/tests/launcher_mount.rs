@@ -423,3 +423,52 @@ fn recover_never_stacks_a_new_fork_over_a_crashed_one() {
     agentfs_fuse::stale::detach_stale_layers(&fork, 16).unwrap();
     agentfs_fuse::stale::detach_stale_layers(&v.root(), 16).unwrap();
 }
+
+/// (i) The tree view's requests are measured at the FUSE edge, by op, and
+/// every hold of the volume lock is one wait to take it (docs/telemetry.md,
+/// "The volume lock"): a command that creates, writes, reads and lists in
+/// the mount leaves each op counted in the metrics file written at unmount,
+/// each request in the histogram bucket of its time.
+#[test]
+#[ignore = "needs root and /dev/fuse: ci/fuse-tests.sh"]
+fn requests_are_measured_by_op_at_the_fuse_edge() {
+    let Some(v) = Volume::new() else { return };
+    let metrics = v.p("metrics.json");
+    let root = v.root().display().to_string();
+    let script = format!("echo x > {root}/a && cat {root}/a >/dev/null && ls {root} >/dev/null");
+    let out = v.mount(&[
+        "--metrics-output",
+        metrics.to_str().unwrap(),
+        "--",
+        "sh",
+        "-c",
+        &script,
+    ]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    let file: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&metrics).unwrap()).unwrap();
+    let stages = &file["stages"];
+    for op in [
+        "lookup", "getattr", "create", "write", "flush", "release", "read", "readdir",
+    ] {
+        let op_figure = &stages["requests"][op];
+        let count = op_figure["count"].as_u64().unwrap();
+        assert!(count > 0, "{op}: {op_figure}");
+        let bucketed: u64 = op_figure["buckets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|n| n.as_u64().unwrap())
+            .sum();
+        assert_eq!(bucketed, count, "{op}: {op_figure}");
+    }
+    // One wait per hold; the snapshot is read inside a hold, so that one
+    // hold's wait is counted and the hold itself not yet.
+    let waits = stages["lock_wait"]["count"].as_u64().unwrap();
+    let holds = stages["actor_lock"]["count"].as_u64().unwrap();
+    assert!(
+        holds > 0 && waits - holds <= 1,
+        "{waits} waits, {holds} holds"
+    );
+    assert!(stages["lock_hold"]["close"]["count"].as_u64().unwrap() > 0);
+}

@@ -99,14 +99,28 @@ head=$(git --git-dir="$gitdir" rev-parse root)
 "$bin" --state "$work/volume/state" init --volume t
 [ "$(git --git-dir="$gitdir" rev-parse root)" = "$head" ]
 printf 'PASS\tenospc\twrite fsync\n' | tee "$work/results.tsv"
-# Run a rename held at `point` while the real filesystem fills, then release it.
-# Filling must finish before the stalled rename is released. Main only: with no
-# fork, no queue entry can take the failpoint before the rename does.
-rename_while_full() {
-  local point=$1 log=$work/$1.log client
+# A new volume with `source` saved, left by a mount of the root alone that was
+# killed once the save was built and the mount at rest: the volume stays
+# staged (a stage then writes nothing), its root client attached (a mount then
+# rebinds it) and every pointer switched (a mount then appends no switch
+# record before its own first step is built). A clean exit would release the
+# volume, and the next mount's stage and attach be two steps, in one builder
+# batch or two. So the next mount of the root alone records one step of its
+# own first, its root client's rebind, and once that step is built, the
+# switch record for the pointers it set. Before its client's first call that
+# mount is at rest (`tree_at_rest`) with:
+#   fsyncs    3  the rebind's own, and the builder's before each of its
+#                two batches
+#   steps     1  the rebind (a switch record is no step)
+#   batches   2  the rebind's, the switch record's
+# The metrics file is off the volume: a full state area does not stop it being
+# written.
+leave_root_attached() {
   rm -rf "$work/volume/state"
+  rm -f "$work/metrics.json"
   "$bin" --state "$work/volume/state" init --volume t
-  "$bin" --state "$work/volume/state" mount "$work/main" >"$work/setup-mount.log" 2>&1 & pid=$!
+  "$bin" --state "$work/volume/state" mount "$work/main" --metrics-output "$work/metrics.json" \
+    >"$work/setup-mount.log" 2>&1 & pid=$!
   wait_mounted "$work/main"
   python3 - "$work/main/source" <<'PY'
 import os, sys
@@ -115,26 +129,45 @@ assert os.write(fd, b'git-acknowledged') == 16
 os.fsync(fd)
 os.close(fd)
 PY
-  # Killed once the save is built, the mount leaves the volume staged (a stage
-  # then writes nothing) and its root client attached (a mount then rebinds it).
-  # A clean exit would release the volume, and the next mount's stage and attach
-  # be two steps, in one builder batch or two.
   for _ in $(seq 1 300); do
     tree_git_file "$work/volume/state/history.git" root source >/dev/null 2>&1 && break
     kill -0 "$pid"; sleep .1
   done
   tree_git_file "$work/volume/state/history.git" root source >/dev/null
+  tree_at_rest "$work/metrics.json"
   kill -KILL "$pid"; tree_wait_exit "$pid" 2>/dev/null || true; pid=
   fusermount3 -uz "$work/main"
   flock "$work/volume/state/actor.lock" true
-  # The mount's own step comes first (its root client's rebind: one step, one
-  # builder batch, each the point's first hit), built before the rename starts,
-  # so the rename meets the point's second hit.
+}
+# mount_counted SPEC LOG: mounts the root of the volume `leave_root_attached`
+# left with the failpoints SPEC, and returns once the mount is at rest, with
+# its own hits made. A count that one of those hits meets fails here, not as a
+# wait that is never met.
+mount_counted() {
+  local spec=$1 log=$2 before
   before=$(tree_git_root_clients "$work/volume/state/history.git")
-  AGENTFS_FAILPOINTS="$point=sleep(30000)@2" "$bin" --state "$work/volume/state" mount "$work/main" >"$log" 2>&1 & pid=$!
+  rm -f "$work/metrics.json"
+  AGENTFS_FAILPOINTS="$spec" "$bin" --state "$work/volume/state" mount "$work/main" \
+    --metrics-output "$work/metrics.json" >"$log" 2>&1 & pid=$!
   wait_mounted "$work/main"
   tree_git_wait_root_attached "$work/volume/state/history.git" "$before"
-  python3 - "$work/main/source" "$work/main/destination" "$2" <<'PY' >"$work/rename.log" 2>&1 & client=$!
+  tree_at_rest "$work/metrics.json"
+  if grep -Fq "agentfs failpoint ${spec%%=*} triggered" "$log"; then
+    echo "$spec was met before the client's first call" >&2; cat "$log" >&2; exit 1
+  fi
+}
+# rename_while_full POINT HIT ERRNO NAME [held|behind]: a rename held at POINT's
+# hit HIT while the real filesystem fills, then released. Filling must finish
+# before the stalled rename is released. Main only: with no fork, no queue
+# entry can take the failpoint before the rename does. The rename is the
+# mount's second step, and its batch the builder's third: HIT is 2 for a point
+# at the step and 3 for a point of the builder.
+rename_while_full() {
+  local point=$1 hit=$2 log=$work/$1.log client
+  shift 2
+  leave_root_attached
+  mount_counted "$point=sleep(30000)@$hit" "$log"
+  python3 - "$work/main/source" "$work/main/destination" "$1" <<'PY' >"$work/rename.log" 2>&1 & client=$!
 import errno, os, sys
 source, destination, want = sys.argv[1:]
 got = 0
@@ -163,11 +196,11 @@ with open(sys.argv[1], 'wb', buffering=0) as f:
         assert e.errno == errno.ENOSPC, e
 PY
   # A call waits at a call-path point; the builder's points are behind the call.
-  [ "${4:-held}" != held ] || kill -0 "$client" || { echo 'rename returned before filesystem was filled' >&2; exit 1; }
+  [ "${3:-held}" != held ] || kill -0 "$client" || { echo 'rename returned before filesystem was filled' >&2; exit 1; }
   if ! wait "$client"; then cat "$work/rename.log" >&2; exit 1; fi
   # The builder's point: keep the filesystem full until the builder, woken from
   # the failpoint, has tried its copies.
-  if [ "${4:-held}" != held ]; then
+  if [ "${3:-held}" != held ]; then
     for _ in $(seq 1 600); do grep -Fq 'tree CopyStale' "$log" && break; sleep .1; done
   fi
   rm "$work/volume/filler"
@@ -176,10 +209,10 @@ PY
   tree_wait_exit "$pid"; pid=
   "$bin" --state "$work/volume/state" init --volume t
   gitdir=$work/volume/state/history.git
-  if [ "$3" = either ]; then
+  if [ "$2" = either ]; then
     [ "$(tree_git_file "$gitdir" root source 2>/dev/null || tree_git_file "$gitdir" root destination)" = git-acknowledged ]
   else
-    [ "$(tree_git_file "$gitdir" root "$3")" = git-acknowledged ]
+    [ "$(tree_git_file "$gitdir" root "$2")" = git-acknowledged ]
   fi
   git --git-dir="$gitdir" fsck --full --strict --no-progress
   tree_git_no_duplicate_opens "$gitdir"
@@ -189,21 +222,19 @@ PY
 }
 # A full state area at the step: its record is one small frame, which may still fit
 # the journal's last page (recorded, the destination) or not (ENOSPC, the source).
-rename_while_full tree.before_step ANY either
+rename_while_full tree.before_step 2 ANY either
 printf 'PASS\tenospc-before-commit-point\trename 0 or ENOSPC; one name holds it\n' | tee -a "$work/results.tsv"
 # The record stands and only the builder's copies fail: the call succeeded.
-rename_while_full tree.build_after_built_log NONE destination behind
+rename_while_full tree.build_after_built_log 3 NONE destination behind
 grep -Fq 'tree CopyStale' "$work/tree.build_after_built_log.log" || { cat "$work/tree.build_after_built_log.log" >&2; exit 1; }
 printf 'PASS\tenospc-after-commit-point\trename 0; destination\n' | tee -a "$work/results.tsv"
-# Only a failed fsync stops the actor: the file can no longer be trusted. A
-# write appends with no fsync; the first journal fsync after the mount's own two
-# (its stage, then its root client's attach) fails, the client's own or the
-# builder's behind the create, and every call after it answers EIO.
-rm -rf "$work/volume/state"
-"$bin" --state "$work/volume/state" init --volume t
-AGENTFS_FAILPOINTS='tree.wal_before_fsync=error@3' "$bin" --state "$work/volume/state" mount "$work/main" >"$work/fsync-mount.log" 2>&1 & pid=$!
-wait_mounted "$work/main"
-python3 - "$work/main/synced" "$work/main/after-fsync" <<'PY'
+# Only a failed fsync stops the actor: the file can no longer be trusted. The
+# mount's own three journal fsyncs are made before it is at rest. The client
+# opens and writes a file that exists (two records, no step, no fsync), so the
+# fourth is its own fsync. Every call after it answers EIO.
+leave_root_attached
+mount_counted 'tree.wal_before_fsync=error@4' "$work/fsync-mount.log"
+python3 - "$work/main/source" "$work/main/after-fsync" <<'PY'
 import errno, os, sys
 def expect_eio(what, call):
     try:
@@ -212,18 +243,11 @@ def expect_eio(what, call):
         assert e.errno == errno.EIO, (what, e)
     else:
         raise AssertionError(f'{what} succeeded after a failed fsync')
-fd = None
-try:
-    fd = os.open(sys.argv[1], os.O_CREAT | os.O_WRONLY, 0o600)
-    assert os.write(fd, b'x') == 1
-    os.fsync(fd)
-except OSError as e:
-    assert e.errno == errno.EIO, e
-else:
-    raise AssertionError('no call failed after the journal fsync failed')
-if fd is not None:
-    try: os.close(fd)
-    except OSError as e: assert e.errno == errno.EIO, e
+fd = os.open(sys.argv[1], os.O_WRONLY)
+assert os.write(fd, b'x') == 1
+expect_eio('fsync', lambda: os.fsync(fd))
+try: os.close(fd)
+except OSError as e: assert e.errno == errno.EIO, e
 expect_eio('create', lambda: os.close(os.open(sys.argv[2], os.O_CREAT | os.O_WRONLY, 0o600)))
 PY
 fusermount3 -u "$work/main"

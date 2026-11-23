@@ -1,36 +1,61 @@
 //! The journal's segment files: `journal/<first record:020>.seg`, each about
-//! 64 MiB, a frame never spanning two (docs/trees.md, "Recording and
-//! durability"). A segment is shared as `Arc<Segment>`: a reader holding one
-//! keeps reading it after the journal unlinks it, and its space returns when
-//! the last holder lets go. A frame is named by its record and an offset into
-//! its tail ([`FramePos::key`]), wherever compaction carries it; the journal's
-//! [`Relocations`] say where a carried frame now is, and each holder moves its
-//! positions there ([`FramePos::relocated`]), letting go of the old segment.
+//! 64 MiB by default, a frame never spanning two (docs/trees.md, "Recording
+//! and durability"), and the carry files `journal/carry-<built:020>` that
+//! compaction copies live frames into. A segment is shared as `Arc<Segment>`:
+//! a reader holding one keeps reading it after the journal unlinks it, and its
+//! space returns when the last holder lets go. A frame is named by its record
+//! and an offset into its tail ([`FramePos::key`]), wherever compaction
+//! carries it; the journal's [`Relocations`] say where a carried frame now is,
+//! and each holder moves its positions there ([`FramePos::relocated`]),
+//! letting go of the old file. Two segments are the same file when their
+//! paths are equal ([`Segment::same_file`]): every carry file's `first` is
+//! [`RecordNo::ZERO`].
 
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
 use std::io;
 use std::os::unix::fs::{FileExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use super::durable::RecordNo;
 
-/// The length past which the journal starts a new segment before a frame.
-/// A frame longer than this has a segment of its own.
+/// The default length past which the journal starts a new segment before a
+/// frame (`Upkeep::segment_bytes`). A frame longer than this has a segment of
+/// its own.
 pub(in crate::tree_actor) const SEGMENT_BYTES: u64 = 64 << 20;
 
-/// One segment file, open for reading and appending.
+/// One segment or carry file, open for reading and appending.
 pub(in crate::tree_actor) struct Segment {
     first: RecordNo,
     path: PathBuf,
     file: File,
+    /// The bytes written to it: what the journal's length counts.
+    len: AtomicU64,
 }
 
 impl std::fmt::Debug for Segment {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "Segment({})", self.first.get())
+        let name = self
+            .path
+            .file_name()
+            .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
+        write!(f, "Segment({name})")
     }
+}
+
+/// A carry file's name: the built point of the compaction that wrote it.
+pub(in crate::tree_actor) fn carry_name(built: RecordNo) -> String {
+    format!("carry-{:020}", built.get())
+}
+
+/// The built point a carry file's name gives; `None` for another name.
+pub(in crate::tree_actor) fn carry_built(path: &Path) -> Option<RecordNo> {
+    let digits = path.file_name()?.to_str()?.strip_prefix("carry-")?;
+    (digits.len() == 20 && digits.bytes().all(|b| b.is_ascii_digit()))
+        .then(|| digits.parse().ok().map(RecordNo::new))
+        .flatten()
 }
 
 /// A segment's file name: its first record, zero-padded so names sort.
@@ -59,6 +84,19 @@ pub(in crate::tree_actor) fn list(dir: &Path) -> io::Result<Vec<(RecordNo, PathB
     Ok(found)
 }
 
+/// The carry files in `dir`, by the built point each name gives.
+pub(in crate::tree_actor) fn list_carries(dir: &Path) -> io::Result<Vec<(RecordNo, PathBuf)>> {
+    let mut found = Vec::new();
+    for entry in fs::read_dir(dir)? {
+        let path = entry?.path();
+        if let Some(built) = carry_built(&path) {
+            found.push((built, path));
+        }
+    }
+    found.sort();
+    Ok(found)
+}
+
 impl Segment {
     /// A new, empty segment whose first record will be `first`. Its directory
     /// entry is not yet durable: [`super::durable::Durability`] fsyncs the
@@ -71,23 +109,72 @@ impl Segment {
             .create_new(true)
             .mode(0o600)
             .open(&path)?;
-        Ok(Arc::new(Self { first, path, file }))
+        Ok(Arc::new(Self {
+            first,
+            path,
+            file,
+            len: AtomicU64::new(0),
+        }))
     }
 
-    /// An existing segment.
+    /// A new, empty carry file for a compaction at `built`, outside the
+    /// segment table: its `first` is [`RecordNo::ZERO`]. One that a failed
+    /// compaction at the same point left, named by no checkpoint, is
+    /// replaced.
+    pub fn create_carry(dir: &Path, built: RecordNo) -> io::Result<Arc<Self>> {
+        let path = dir.join(carry_name(built));
+        match fs::remove_file(&path) {
+            Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
+            _ => {}
+        }
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)?;
+        Ok(Arc::new(Self {
+            first: RecordNo::ZERO,
+            path,
+            file,
+            len: AtomicU64::new(0),
+        }))
+    }
+
+    /// An existing segment (or, with `first` zero, a carry file or the
+    /// checkpoint file), its length the file's.
     pub fn open(first: RecordNo, path: &Path) -> io::Result<Arc<Self>> {
         let file = OpenOptions::new().read(true).write(true).open(path)?;
+        let len = file.metadata()?.len();
         Ok(Arc::new(Self {
             first,
             path: path.to_owned(),
             file,
+            len: AtomicU64::new(len),
         }))
     }
 
-    /// The record its name gives: no record in it is older, except a
-    /// checkpoint's and carried frames.
+    /// The record its name gives: no record in it is older. Zero for a carry
+    /// file, which is outside the segment table.
     pub fn first(&self) -> RecordNo {
         self.first
+    }
+
+    /// The same file: paths equal. Carry files all have `first` zero, so
+    /// `first` never tells two apart.
+    pub fn same_file(&self, other: &Segment) -> bool {
+        self.path == other.path
+    }
+
+    /// The bytes written to it so far.
+    pub fn len(&self) -> u64 {
+        self.len.load(Ordering::Acquire)
+    }
+
+    /// Its writer (the actor appending, the compactor carrying, recovery
+    /// cutting a torn tail) set its length to `len`.
+    pub fn set_len(&self, len: u64) {
+        self.len.store(len, Ordering::Release);
     }
 
     pub fn path(&self) -> &Path {
@@ -101,6 +188,7 @@ impl Segment {
     /// `fdatasync`: its records and its length on disk. Every fsync of a
     /// segment goes through here.
     pub fn sync(&self) -> io::Result<()> {
+        crate::tree_actor::stages::assert_unlocked(crate::tree_actor::stages::Unlocked::Fsync);
         #[cfg(test)]
         SYNCS.with(|n| n.set(n.get() + 1));
         self.file.sync_data()
@@ -171,7 +259,7 @@ impl FramePos {
     /// from the segment this position reads.
     pub(in crate::tree_actor) fn relocated(&self, moved: &Relocations) -> Option<Self> {
         let (segment, tail) = moved.find(self.record)?;
-        (segment.first != self.segment.first).then(|| Self {
+        (!segment.same_file(&self.segment)).then(|| Self {
             segment,
             record: self.record,
             tail,
@@ -215,10 +303,10 @@ impl std::fmt::Debug for FramePos {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "{}+{}@{}",
+            "{}+{}@{:?}",
             self.record.get(),
             self.offset,
-            self.segment.first.get()
+            self.segment
         )
     }
 }
@@ -230,29 +318,68 @@ impl std::fmt::Debug for FramePos {
 #[derive(Clone, Default)]
 pub(in crate::tree_actor) struct Relocations(Arc<Mutex<Moved>>);
 
-/// Each carried record's segment and tail now.
-type Moved = BTreeMap<RecordNo, (Arc<Segment>, u64)>;
+/// Where a carried frame is: its carry file and its tail there.
+pub(in crate::tree_actor) type Place = (Arc<Segment>, u64);
+
+/// Each carried record's file and tail now, and how many times that table
+/// changed.
+#[derive(Default)]
+struct Moved {
+    table: BTreeMap<RecordNo, Place>,
+    generation: u64,
+}
 
 impl Relocations {
-    fn table(&self) -> std::sync::MutexGuard<'_, Moved> {
-        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    fn moved_table(&self) -> crate::tree_actor::stages::InnerLock<'_, Moved> {
+        crate::tree_actor::stages::InnerLock::lock(&self.0)
     }
 
     /// `record`'s frame is now at `tail` of `segment`.
-    pub(super) fn moved(&self, record: RecordNo, segment: &Arc<Segment>, tail: u64) {
-        self.table().insert(record, (Arc::clone(segment), tail));
+    /// With where it was carried before, for [`Relocations::put_back`].
+    pub(super) fn moved(
+        &self,
+        record: RecordNo,
+        segment: &Arc<Segment>,
+        tail: u64,
+    ) -> Option<Place> {
+        let mut moved = self.moved_table();
+        moved.generation += 1;
+        moved.table.insert(record, (Arc::clone(segment), tail))
     }
 
-    /// `segment` is dropped: the frames it held that no copy names are no
-    /// longer anywhere.
+    /// `record`'s copy in a carry file no checkpoint came to name is let
+    /// go: its frame is where it was before that copy, `earlier` (an older
+    /// carry file) or its own segment.
+    pub(super) fn put_back(&self, record: RecordNo, earlier: Option<Place>) {
+        let mut moved = self.moved_table();
+        moved.generation += 1;
+        match earlier {
+            Some(earlier) => moved.table.insert(record, earlier),
+            None => moved.table.remove(&record),
+        };
+    }
+
+    /// `segment` is unlinked: the frames carried into it that no later copy
+    /// names are no longer anywhere. The table changes only for a carry
+    /// file; a segment that held no carried frame moves no holder.
     pub(super) fn dropped(&self, segment: &Segment) {
-        self.table()
-            .retain(|_, (held, _)| held.first != segment.first);
+        let mut moved = self.moved_table();
+        let before = moved.table.len();
+        moved.table.retain(|_, (held, _)| !held.same_file(segment));
+        if moved.table.len() != before {
+            moved.generation += 1;
+        }
     }
 
     /// Where `record`'s frame was carried, if it was.
-    pub fn find(&self, record: RecordNo) -> Option<(Arc<Segment>, u64)> {
-        self.table().get(&record).cloned()
+    pub fn find(&self, record: RecordNo) -> Option<Place> {
+        self.moved_table().table.get(&record).cloned()
+    }
+
+    /// How many times frames were carried or let go: a holder that saw
+    /// this value has moved to every copy made before it. O(1).
+    pub(in crate::tree_actor) fn generation(&self) -> u64 {
+        self.moved_table().generation
     }
 }
 
@@ -273,6 +400,7 @@ pub(in crate::tree_actor) fn scratch(bytes: &[u8]) -> (tempfile::TempDir, FrameP
         .file
         .write_all_at(bytes, 0)
         .unwrap_or_else(|e| panic!("{e}"));
+    segment.set_len(bytes.len() as u64);
     (dir, FramePos::new(segment, RecordNo::new(1), 0))
 }
 

@@ -7,7 +7,9 @@
 //!
 //! An agentfs mount is a FUSE mount whose source starts `agentfs:`
 //! ([`agentfs_core::mountinfo`]); [`source_volume`] reads the volume it names.
-//! A daemon that dies leaves its mount answering `ENOTCONN`. Stacking mounts
+//! A daemon that dies leaves its mount answering `ENOTCONN`, or
+//! `ECONNABORTED` for a request caught by the abort ([`is_disconnected`]).
+//! Stacking mounts
 //! FUSE at a private empty directory, bind-mounts it over the stale mount
 //! (made shared, so propagation carries it into every copy of the stale
 //! mount point: workload containers, subPath binds of the mount point itself;
@@ -45,7 +47,7 @@ pub fn source_volume(source: &str) -> Option<&str> {
 pub enum MountState {
     /// An agentfs mount whose daemon answers.
     Live { source: String },
-    /// An agentfs mount whose daemon is gone (`ENOTCONN`).
+    /// An agentfs mount whose daemon is gone ([`is_disconnected`]).
     Stale { source: String },
     /// Nothing is mounted at the path itself.
     NotMounted,
@@ -112,10 +114,35 @@ fn mount_state_in(entries: &[MountEntry], path: &Path) -> io::Result<MountState>
             fstype: entry.fstype.clone(),
         });
     }
-    let source = entry.source.clone();
-    match rustix::fs::statfs(&resolved) {
-        Ok(_) => Ok(MountState::Live { source }),
-        Err(rustix::io::Errno::NOTCONN) => Ok(MountState::Stale { source }),
+    agentfs_state(
+        entry.source.clone(),
+        rustix::fs::statfs(&resolved).map(|_| ()),
+    )
+}
+
+/// Whether `errno` is a dead FUSE connection's answer: `ENOTCONN` once the
+/// kernel has disconnected the mount, and `ECONNABORTED` for a request that
+/// was queued or in flight when the connection was aborted (the daemon's
+/// last `/dev/fuse` file closed, which a child it forked can hold for a
+/// moment after the daemon itself is gone). The one judge of that rule:
+/// every probe of a possibly dead agentfs mount asks it.
+#[must_use]
+pub fn is_disconnected(errno: rustix::io::Errno) -> bool {
+    errno == rustix::io::Errno::NOTCONN || errno == rustix::io::Errno::CONNABORTED
+}
+
+/// [`is_disconnected`] for a std error.
+#[must_use]
+pub fn is_disconnected_io(e: &io::Error) -> bool {
+    rustix::io::Errno::from_io_error(e).is_some_and(is_disconnected)
+}
+
+/// The state of an agentfs mount whose source is `source`, from its
+/// answer to `statfs`.
+fn agentfs_state(source: String, statfs: rustix::io::Result<()>) -> io::Result<MountState> {
+    match statfs {
+        Ok(()) => Ok(MountState::Live { source }),
+        Err(e) if is_disconnected(e) => Ok(MountState::Stale { source }),
         Err(e) => Err(e.into()),
     }
 }
@@ -248,6 +275,34 @@ mod tests {
 
     use super::*;
 
+    /// A dead mount answers `ENOTCONN` once disconnected and `ECONNABORTED`
+    /// to a request the abort caught: both are stale, anything else is an
+    /// error, and an answer is live.
+    #[test]
+    fn an_aborted_connection_is_stale_like_a_disconnected_one() {
+        use rustix::io::Errno;
+        let state = |answer| agentfs_state("agentfs:v".into(), answer);
+        let stale = MountState::Stale {
+            source: "agentfs:v".into(),
+        };
+        assert_eq!(state(Err(Errno::NOTCONN)).unwrap(), stale);
+        assert_eq!(state(Err(Errno::CONNABORTED)).unwrap(), stale);
+        assert_eq!(
+            state(Ok(())).unwrap(),
+            MountState::Live {
+                source: "agentfs:v".into()
+            }
+        );
+        assert_eq!(
+            state(Err(Errno::IO)).unwrap_err().raw_os_error(),
+            Some(Errno::IO.raw_os_error())
+        );
+        assert!(is_disconnected_io(&io::Error::from(Errno::CONNABORTED)));
+        assert!(is_disconnected_io(&io::Error::from(Errno::NOTCONN)));
+        assert!(!is_disconnected_io(&io::Error::from(Errno::NOENT)));
+        assert!(!is_disconnected_io(&io::Error::other("not an errno")));
+    }
+
     #[test]
     fn a_source_names_its_volume() {
         assert_eq!(source_volume("agentfs:t"), Some("t"));
@@ -304,8 +359,8 @@ mod tests {
             }
         );
         // The directory answers statfs here, so an agentfs entry is live;
-        // the stale case (ENOTCONN) needs a real dead mount (tree_view.rs's
-        // root-only stale_view tests).
+        // the stale case end to end needs a real dead mount (tree_view.rs's
+        // root-only stale_view tests), and agentfs_state is tested alone.
         let stack = [entry("tmpfs", "tmpfs"), entry("fuse.agentfs", "agentfs:v")];
         assert_eq!(
             mount_state_in(&stack, &mnt).unwrap(),

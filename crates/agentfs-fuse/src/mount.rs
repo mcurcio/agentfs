@@ -384,7 +384,7 @@ pub fn preflight(
     kind: MountKind,
 ) -> Result<(PathBuf, PathBuf), PreflightError> {
     if let Err(e) = rustix::fs::stat(mountpoint)
-        && e == rustix::io::Errno::NOTCONN
+        && crate::stale::is_disconnected(e)
     {
         return Err(PreflightError::StaleMount(mountpoint.to_path_buf()));
     }
@@ -404,7 +404,7 @@ pub fn preflight_overlay(main: &Path, overlay: &Path) -> Result<PathBuf, Preflig
     // with ENOTCONN, and a mount point not yet created with ENOENT: each
     // is resolved through its parent.
     let overlay = match rustix::fs::stat(overlay) {
-        Err(e) if e == rustix::io::Errno::NOTCONN || e == rustix::io::Errno::NOENT => {
+        Err(e) if crate::stale::is_disconnected(e) || e == rustix::io::Errno::NOENT => {
             canonical_any(overlay)
         }
         _ => canonical_dir(OVERLAY, overlay)?,

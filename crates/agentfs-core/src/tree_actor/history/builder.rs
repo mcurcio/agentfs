@@ -559,6 +559,8 @@ impl BuildState {
                 pointers,
                 rows,
             } => self.step(record, tail, by, (change, rows), pointers, ctx, batch)?,
+            // The builder's pointers are built values already.
+            Entry::Switch { .. } => {}
         }
         Ok(())
     }
@@ -808,14 +810,15 @@ impl BuildState {
                             .get(&(id, open.object))
                             .map(|runs| runs.iter().cloned().collect())
                             .unwrap_or_default();
-                        let own: Vec<(u64, Call, FramePos)> = open.calls.iter().cloned().collect();
                         let t = self.trees.get_mut(&id).ok_or(Error::Format)?;
                         let saved = t.bytes.get(&open.object).ok_or_else(|| disagrees(seq))?;
-                        let replayed = Layout::replay(saved.len(), &own, &writes, pieces)?;
+                        // The open's calls are read where they are held.
+                        let replayed =
+                            Layout::replay(saved.len(), open.calls.iter(), &writes, pieces)?;
                         // Each place from the calls and runs tracked here,
                         // else from the journal by its record.
                         let mut known = Positions::default();
-                        for (_, _, pos) in &own {
+                        for (_, _, pos) in open.calls.iter() {
                             known.add(pos);
                         }
                         for (_, run) in &writes {
@@ -878,7 +881,7 @@ impl BuildState {
                                 object: open.object,
                                 path: &path,
                                 before_len,
-                                own: &own,
+                                own: &open.calls,
                                 writes: &writes,
                                 pieces,
                                 recorded: &recorded,
@@ -1523,8 +1526,9 @@ impl Builder {
             }
             _ => through,
         };
-        // No record after the checkpoint names a step it covers
-        // (`TreeActor::resolve_compacted`): those heads are never read again.
+        // `checkpointed` never passes the record before the checkpoint's
+        // oldest step head, so every head a record after it may still name
+        // (a fork's target, a save's `old`, a switch record's step) stays.
         if self
             .state
             .heads

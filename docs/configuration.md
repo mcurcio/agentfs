@@ -1001,7 +1001,7 @@ templates' variables, the commit trailers and the telemetry resource:
 | `--fork-writer LABEL` | | `fork-client` | `mount`: the fork's client label, as `--writer`; requires `--fork-mount` |
 | `--read-only` | | read-write | `mount`: the root's client is read-only; its view is mounted read-only and every write answers `EROFS` |
 | `--fork-read-only` | | read-write | `mount`: the fork's client is read-only, with the default label; requires `--fork-mount`, excludes `--fork-writer`. How a keyed fork whose writer has gone (a clean unmount ends it) is mounted again: a fork has one writer for life, and a second read-write mount exits 1 |
-| `--metrics-output FILE` | | no metrics file | `mount`: replace a JSON snapshot of process-local save, take and wait counters, the journal's length, and runs, time and Git children by actor stage, with the objects handed to Git's store and the fsyncs of its `objects/` directory (`stages`, process-wide: see `tree_actor/stages.rs`) at each history built or failed event, at least every 100 ms, and at unmount, each file numbered by `seq` (one more each time) and renamed into place; the existing parent directory must be outside state and views; collection errors are reported after unmount |
+| `--metrics-output FILE` | | no metrics file | `mount`: replace a JSON snapshot of process-local save, take and wait counters, the journal's length, and runs, time and Git children by actor stage, with the objects handed to Git's store, the fsyncs of its `objects/` directory, the volume lock's holds by kind of work and the waits to take it, the lag gate's waits by cause and the tree views' FUSE requests by op (`stages`, process-wide: see `tree_actor/stages.rs` and [telemetry](telemetry.md#the-volume-lock)) at each history built or failed event, at least every 100 ms, and at unmount, each file numbered by `seq` (one more each time) and renamed into place; the existing parent directory must be outside state and views; collection errors are reported after unmount |
 | `--on-stale-mount refuse\|hold\|recover` | `AGENTFS_ON_STALE_MOUNT` | `refuse` | `mount`: when a view's mount point is an agentfs mount whose daemon died, `refuse` exits 1 naming the fix, `hold` mounts nothing and takes no lock, waits for SIGTERM, detaches every stale layer and exits 1, `recover` stacks each view over its stale mount of this volume (needs `CAP_SYS_ADMIN`; a stale mount of another volume exits 1) ([trees](trees.md#restarting-after-a-crash)) |
 | `--seal-mountpoint` | `AGENTFS_SEAL_MOUNTPOINT` | off | `mount`: before mounting, make each bare mount point root's with mode 0000, so a non-root workload that reaches it while no view is mounted (a `subPath` bound while a sidecar restarts) gets `EACCES` instead of writing unrecorded; needs root |
 
@@ -1138,7 +1138,12 @@ in `+failpoints`, and it warns at start when the variable is set); release
 builds and the image have no failpoints and ignore it. Never set it in
 production. In the same builds, `AGENTFS_TAKE_GATE=<dir>` stops `mount`'s
 queue worker: it takes only when a test asks through the fifos `go` and `took`
-in that directory (`agentfs_core::failpoints::TakeGate`).
+in that directory (`agentfs_core::failpoints::TakeGate`). `AGENTFS_COMPACT_GATE`, set to a directory,
+gives every tree volume the binary opens (`mount`, `host`, `init`, `fork end`) a
+compaction gate on the fifos `at` and `go` in that directory: one journal frame per
+segment, a compaction at every built event, and the compactor parked at each of its
+five gaps until a test answers `go` or `fail`; an empty line ends the gate
+(`agentfs_core::failpoints::FifoGate`, [trees](trees.md#recording-and-durability)).
 
 **Telemetry** (see [telemetry](telemetry.md)). Every command with pod flags but `status` (`restore` and `revert` only
 without a mount) exports OpenTelemetry metrics, traces

@@ -481,7 +481,11 @@ What a replay decides, each reported rather than hidden:
   directory or link owned by anyone but the harness (root), or a directory mode `mkdir(2)` drops (set-user-ID,
   set-group-ID). The take gate (`AGENTFS_TAKE_GATE`, a failpoints build) runs each
   take at the trace's point and answers by a fifo, and a synchronous request after `close(2)` proves its `RELEASE`
-  ran, so the replay has no poll and no timer but the wait for a mount to appear.
+  ran, so the replay has no poll and no timer but the wait for a mount to appear. The compaction gate
+  (`AGENTFS_COMPACT_GATE`, the same build) makes the mount compact its journal at every built event and parks its
+  compactor at each of a compaction's five gaps in turn while one whole replayed call runs, so the replay covers
+  compaction across the model's steps and its crashes. The library replay does the same through its volume's
+  `Upkeep` (`compact_turns.rs`).
 
 | Rule | Replay | Where else |
 |---|---|---|

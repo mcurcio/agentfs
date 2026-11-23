@@ -7,7 +7,9 @@
 use std::fs::File;
 use std::io;
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, Weak};
+use std::sync::{Arc, Condvar, Mutex, PoisonError, Weak};
+
+use crate::tree_actor::stages::{InnerLock, Unlocked, assert_unlocked};
 
 use serde::{Deserialize, Serialize};
 
@@ -57,7 +59,7 @@ pub enum DurableError {
 }
 
 impl DurableError {
-    /// The errno a file call (FLUSH, FSYNC, FSYNCDIR) answers with.
+    /// The errno a file call (FSYNC, FSYNCDIR, an `O_SYNC` write) answers with.
     pub fn errno(&self) -> i32 {
         match self {
             Self::Io(errno) => *errno,
@@ -67,8 +69,9 @@ impl DurableError {
 }
 
 /// The journal's group commit, shared by the actor (the one appender) and by
-/// every caller that waits for durability: FLUSH, FSYNC, FSYNCDIR, an
-/// `O_SYNC` write, the builder before it reads a batch. Callable from any
+/// every caller that waits for durability: FSYNC, FSYNCDIR, an `O_SYNC`
+/// write, a move out of the untracked area, the builder before it reads a
+/// batch. A FLUSH does not wait. Callable from any
 /// thread; it takes the actor's lock never.
 ///
 /// Invariants: [`Durability::mark`] only rises; it rises to a record only
@@ -88,9 +91,21 @@ pub struct Durability {
 }
 
 struct State {
-    /// Every linked segment, in order: the leader fsyncs those that may hold
-    /// records past the mark.
+    /// The segment table: every linked segment, in order. The leader fsyncs
+    /// those that may hold records past the mark; the actor adds one before
+    /// it appends to it (the roll), and the compactor removes the covered
+    /// ones (docs/trees.md, "Recording and durability").
     segments: Vec<Arc<Segment>>,
+    /// The carry files the newest checkpoint names, and one being made: each
+    /// fsynced before any checkpoint names it.
+    carries: Vec<Arc<Segment>>,
+    /// Segments and carry files unlinked that a reader may still hold: their
+    /// bytes count in [`Durability::len`] until the last holder lets go.
+    unlinked: Vec<Weak<Segment>>,
+    /// Segments removed from the table since open.
+    removed: u64,
+    /// Bytes written to carry files since open.
+    carried: u64,
     /// The journal's directory.
     dir: Arc<File>,
     /// A segment was created since the directory's last fsync: its entry is
@@ -146,6 +161,10 @@ impl Durability {
             Self {
                 state: Mutex::new(State {
                     segments,
+                    carries: Vec::new(),
+                    unlinked: Vec::new(),
+                    removed: 0,
+                    carried: 0,
                     dir: Arc::new(dir),
                     // A segment found at open may be one whose entry no fsync
                     // of the directory covered yet: the first leader syncs it.
@@ -169,9 +188,8 @@ impl Durability {
         &self.relocations
     }
 
-    fn state(&self) -> MutexGuard<'_, State> {
-        // Every holder leaves the state whole: a poisoned lock is still sound.
-        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    fn state(&self) -> InnerLock<'_, State> {
+        InnerLock::lock(&self.state)
     }
 
     /// The highest record every finished fsync covers: the durable mark.
@@ -179,9 +197,74 @@ impl Durability {
         self.state().mark
     }
 
-    /// The linked segments, in order: what the builder's reader moves along.
+    /// The linked segments in order, then the carry files: what the
+    /// builder's reader moves along (a carry file's `first` is zero, so it
+    /// never follows a segment) and what a call reader reads.
     pub(in crate::tree_actor) fn segments(&self) -> Vec<Arc<Segment>> {
+        let state = self.state();
+        state
+            .segments
+            .iter()
+            .chain(&state.carries)
+            .cloned()
+            .collect()
+    }
+
+    /// The segment table alone, in order: what compaction's coverage rule
+    /// reads.
+    pub(in crate::tree_actor) fn table(&self) -> Vec<Arc<Segment>> {
         self.state().segments.clone()
+    }
+
+    /// The carry files linked now.
+    pub(in crate::tree_actor) fn carries(&self) -> Vec<Arc<Segment>> {
+        self.state().carries.clone()
+    }
+
+    /// The linked files' length: every segment in the table and every carry
+    /// file. What compaction is due by: an unlinked file a reader still
+    /// holds is on its way out, and counting it would raise the next due
+    /// length by bytes no compaction can free.
+    pub(in crate::tree_actor) fn linked(&self) -> u64 {
+        let state = self.state();
+        state
+            .segments
+            .iter()
+            .chain(&state.carries)
+            .map(|s| s.len())
+            .sum()
+    }
+
+    /// The journal's length on disk: every linked segment, every carry file,
+    /// and every unlinked file a reader still holds.
+    /// `Metrics::journal_bytes`.
+    pub(in crate::tree_actor) fn len(&self) -> u64 {
+        let mut state = self.state();
+        state.unlinked.retain(|held| held.strong_count() > 0);
+        let held: u64 = state
+            .unlinked
+            .iter()
+            .filter_map(Weak::upgrade)
+            .map(|s| s.len())
+            .sum();
+        state
+            .segments
+            .iter()
+            .chain(&state.carries)
+            .map(|s| s.len())
+            .sum::<u64>()
+            + held
+    }
+
+    /// Segments removed from the table since open: `Metrics::journal_dropped`.
+    pub(in crate::tree_actor) fn removed(&self) -> u64 {
+        self.state().removed
+    }
+
+    /// Bytes written to carry files since open:
+    /// `Metrics::journal_carried_bytes`.
+    pub(in crate::tree_actor) fn carried(&self) -> u64 {
+        self.state().carried
     }
 
     /// The highest record appended so far (in the kernel, maybe not on disk).
@@ -212,10 +295,7 @@ impl Durability {
             if !state.leading {
                 break;
             }
-            state = self
-                .ended
-                .wait(state)
-                .unwrap_or_else(PoisonError::into_inner);
+            state = state.wait(&self.ended);
         }
         state.leading = true;
         let target = state.appended;
@@ -294,19 +374,49 @@ impl Durability {
         state.dir_unsynced = true;
     }
 
-    /// Compaction, under the actor lock, after every segment and the
-    /// directory are fsynced: every record through `last` is on disk.
-    pub(in crate::tree_actor) fn covered(&self, last: RecordNo) {
+    /// A carry file the compactor wrote and fsynced, `bytes` long: linked
+    /// until a checkpoint that does not name it is published.
+    pub(in crate::tree_actor) fn add_carry(&self, carry: Arc<Segment>, bytes: u64) {
         let mut state = self.state();
-        state.appended = state.appended.max(last);
-        state.mark = state.mark.max(last);
-        drop(state);
-        self.ended.notify_all();
+        state.carried = state.carried.saturating_add(bytes);
+        state.carries.push(carry);
     }
 
-    /// A dropped segment, under the actor lock: all its records are built.
-    pub(in crate::tree_actor) fn remove_segment(&self, first: RecordNo) {
-        self.state().segments.retain(|s| s.first() != first);
+    /// A covered segment leaves the table, O(segments), once the compactor
+    /// has unlinked it with no lock held: the segment, if the table had it.
+    pub(in crate::tree_actor) fn remove_segment(&self, first: RecordNo) -> Option<Arc<Segment>> {
+        let mut state = self.state();
+        let at = state.segments.iter().position(|s| s.first() == first)?;
+        let segment = state.segments.remove(at);
+        state.unlinked.push(Arc::downgrade(&segment));
+        state.removed += 1;
+        Some(segment)
+    }
+
+    /// A carry file no published checkpoint names leaves the list, at the
+    /// compactor's unlink of it: whether the list had it.
+    pub(in crate::tree_actor) fn remove_carry(&self, carry: &Segment) -> bool {
+        let mut state = self.state();
+        let Some(at) = state.carries.iter().position(|c| c.same_file(carry)) else {
+            return false;
+        };
+        let carry = state.carries.remove(at);
+        state.unlinked.push(Arc::downgrade(&carry));
+        true
+    }
+
+    /// Unlinks `file`, a segment or carry file, with no lock held (design
+    /// rule 1).
+    ///
+    /// # Errors
+    ///
+    /// The failed unlink.
+    pub(in crate::tree_actor) fn unlink(file: &Segment) -> io::Result<()> {
+        assert_unlocked(Unlocked::Unlink);
+        match std::fs::remove_file(file.path()) {
+            Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
+            _ => Ok(()),
+        }
     }
 
     /// Queues `then` on the waiter thread (started by `new`): one fsync
@@ -482,7 +592,8 @@ mod tests {
         assert_eq!(d.make_all_durable(), Ok(RecordNo::new(2)));
         assert!(!d.state().dir_unsynced);
         assert_eq!(d.segments().len(), 2);
-        d.remove_segment(RecordNo::new(1));
+        assert!(d.remove_segment(RecordNo::new(1)).is_some());
         assert_eq!(d.segments()[0].first(), RecordNo::new(2));
+        assert_eq!(d.removed(), 1);
     }
 }

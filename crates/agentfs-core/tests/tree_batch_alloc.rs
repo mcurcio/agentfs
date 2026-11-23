@@ -62,8 +62,22 @@ fn create(v: &mut TreeActor, path: &str) {
     v.close(h).unwrap();
 }
 
-/// Bytes allocated while `BATCH` creates are recorded and built, on a volume
-/// that already holds `n` files.
+/// One create whose two steps are each built before the next record: the
+/// builder is idle at each step, so each is one batch, whatever the timing.
+/// How the builder would group steps appended while it works is a race this
+/// test must not measure: one more batch costs about as much as ten creates.
+fn create_in_two_batches(v: &mut TreeActor, path: &str) {
+    let h = v
+        .write_open(TreeId::Root, path, &writer("w"), Some(ATTRS))
+        .unwrap();
+    v.settle().unwrap();
+    v.write(h, 0, path.as_bytes(), false).unwrap();
+    v.close(h).unwrap();
+    v.settle().unwrap();
+}
+
+/// Bytes allocated while `BATCH` creates are recorded and built, each step in
+/// a batch of its own, on a volume that already holds `n` files.
 fn batch_bytes(n: usize) -> u64 {
     let tmp = tempfile::tempdir().unwrap();
     let mut v = new_actor(&tmp.path().join("state"));
@@ -71,16 +85,15 @@ fn batch_bytes(n: usize) -> u64 {
         create(&mut v, &format!("f{i:06}"));
     }
     v.settle().unwrap();
-    // One batch first, so the measured one starts from a builder at rest.
+    // The same batches first, so the measured ones start from a builder at
+    // rest.
     for i in 0..BATCH {
-        create(&mut v, &format!("warm{i:03}"));
+        create_in_two_batches(&mut v, &format!("warm{i:03}"));
     }
-    v.settle().unwrap();
     let before = ALLOCATED.load(Ordering::Relaxed);
     for i in 0..BATCH {
-        create(&mut v, &format!("new{i:03}"));
+        create_in_two_batches(&mut v, &format!("new{i:03}"));
     }
-    v.settle().unwrap();
     ALLOCATED.load(Ordering::Relaxed) - before
 }
 
@@ -88,12 +101,17 @@ fn batch_bytes(n: usize) -> u64 {
 fn a_batch_allocates_in_proportion_to_the_batch_not_the_volume() {
     let small = batch_bytes(2_000);
     let large = batch_bytes(20_000);
-    eprintln!("batch of {BATCH} creates: {small} B at 2,000 files, {large} B at 20,000");
+    eprintln!(
+        "{BATCH} creates in {} batches: {small} B at 2,000 files, {large} B at 20,000",
+        2 * BATCH
+    );
     // A change to a persistent map copies its path, which grows with the
-    // log of the volume: about 1.34 times from 2,000 files to 20,000. A copy
-    // of one tree map sized to the volume, once a batch, makes it about 1.8.
+    // log of the volume: about 1.45 times from 2,000 files to 20,000 over
+    // these batches (26.3 MB and 38.5 MB in six local runs, within 2%). A
+    // copy of one tree map sized to the volume, once a batch, makes it over
+    // 2.5.
     assert!(
-        2 * large <= 3 * small,
-        "a batch at 20,000 files allocated {large} B, over 1.5 times the {small} B at 2,000"
+        4 * large <= 7 * small,
+        "batches at 20,000 files allocated {large} B, over 1.75 times the {small} B at 2,000"
     );
 }
