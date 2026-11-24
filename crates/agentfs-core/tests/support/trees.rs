@@ -22,6 +22,40 @@ pub const ATTRS: Attrs = Attrs {
     },
 };
 
+/// The variable that picks the slow tree tests' volume sizes: `small` (the
+/// default, unset) or `full`, which CI sets (docs/development.md, "Running
+/// tests").
+pub const VOLUMES_VAR: &str = "AGENTFS_TEST_VOLUMES";
+
+/// The volume sizes a slow tree test builds: `Small` locally, `Full` in CI.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Volumes {
+    Small,
+    Full,
+}
+
+impl Volumes {
+    /// The sizes [`VOLUMES_VAR`] names; `Small` when it is unset. Any other
+    /// value, empty included, panics: a typo never quietly runs the small
+    /// sizes.
+    pub fn from_env() -> Volumes {
+        match std::env::var(VOLUMES_VAR) {
+            Err(std::env::VarError::NotPresent) => Volumes::Small,
+            Ok(v) if v == "small" => Volumes::Small,
+            Ok(v) if v == "full" => Volumes::Full,
+            other => panic!("{VOLUMES_VAR} is `small` or `full`, not {other:?}"),
+        }
+    }
+
+    /// `small` or `full` files, by these sizes.
+    pub fn files(self, small: usize, full: usize) -> usize {
+        match self {
+            Volumes::Small => small,
+            Volumes::Full => full,
+        }
+    }
+}
+
 /// The identity [`new_actor`] gives: `test`, with a fixed id.
 pub fn identity() -> VolumeIdentity {
     VolumeIdentity {

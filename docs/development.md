@@ -83,6 +83,18 @@ test that runs past a minute, every minute, and stop it at 15 minutes.
 with `NEXTEST_PROFILE: ci`, also runs on after the first failure and prints
 each failure when it happens and again at the end.
 
+Three slow tree tests build smaller volumes locally than in CI:
+`tree_batch_alloc` compares 1,000 and 10,000 files (2,000 and 20,000 in
+CI), and two `tree_stages` layout tests fill 1,000 files (10,000 in CI).
+`AGENTFS_TEST_VOLUMES` picks the sizes: unset or `small` for the local
+ones, `full` for CI's, which the workflows set beside `NEXTEST_PROFILE`;
+any other value fails the test. Each test's comment says what the local
+sizes do not catch. To run CI's sizes locally:
+
+```sh
+AGENTFS_TEST_VOLUMES=full cargo nextest run -p agentfs-core --test tree_batch_alloc --test tree_stages
+```
+
 `cargo test --no-run` is still used where a script builds a test program
 and then runs it itself: `ci/fuse-tests.sh` runs it under sudo with
 libtest's flags, and `ci/model-digest.sh` and `ci/replay-seeds.sh` run one

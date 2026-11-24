@@ -9,7 +9,7 @@ use std::sync::{Mutex, PoisonError};
 use agentfs_contracts::pod::PodContext;
 use agentfs_core::tree_actor::stages::Stages;
 use agentfs_core::tree_actor::{Recording, Saved, Took, TreeActor, TreeId};
-use trees::{ATTRS, identity, new_actor, reopen, rowless_fork, writer};
+use trees::{ATTRS, Volumes, identity, new_actor, reopen, rowless_fork, writer};
 
 #[path = "support/trees.rs"]
 mod trees;
@@ -541,6 +541,15 @@ fn stored(state: &Path) -> BTreeSet<String> {
         .collect()
 }
 
+/// The larger tree of the layout tests: 1,000 files locally, 10,000 in CI,
+/// which sets `AGENTFS_TEST_VOLUMES=full` (docs/development.md, "Running
+/// tests").
+fn many() -> usize {
+    let files = Volumes::from_env().files(1_000, 10_000);
+    eprintln!("the larger tree: {files} files");
+    files
+}
+
 /// A volume whose root holds `files` files, `f0` to `f<files - 1>`, then `a`,
 /// all built. The creates are recorded back to back and built in batches.
 fn filled(state: &Path, files: usize) -> TreeActor {
@@ -555,16 +564,16 @@ fn filled(state: &Path, files: usize) -> TreeActor {
 
 /// A save's cost grows with its change, not the tree (Q1-A, hashed
 /// sub-folders; docs/trees.md, "What a commit holds"): one changed file in a
-/// tree of 100 files and in one of 1,000 stores the same objects, feeds the
-/// builder the same, and starts the same Git children. The counts are exact,
-/// so any cost that grows with the tree shows at either size. The expected
-/// counts already pin the two fixed levels at 100 files; the larger size
-/// guards against a cost or a layout that changes with the tree's size. The
-/// accepted gap: a change that sets in only between 1,001 and 10,000 files
-/// (a third level past some threshold) is not exercised here, because 10,000
-/// files cost 50 s of creates.
+/// tree of 100 files and in one of [`many`] stores the same objects, feeds
+/// the builder the same, and starts the same Git children. The counts are
+/// exact, so any cost that grows with the tree shows at either size. The
+/// expected counts already pin the two fixed levels at 100 files; the larger
+/// size guards against a cost or a layout that changes with the tree's size.
+/// The accepted gap, in a local run only: a change that sets in only between
+/// 1,001 and 10,000 files (a third level past some threshold) is not
+/// exercised, because 10,000 files cost 50 s of creates. CI runs 10,000.
 #[test]
-fn a_save_stores_the_same_objects_at_100_and_1000_files() {
+fn a_save_stores_the_same_objects_at_100_files_and_at_many() {
     let _one = ONE_AT_A_TIME.lock().unwrap_or_else(PoisonError::into_inner);
     let cost = |files: usize| {
         let tmp = tempfile::tempdir().unwrap();
@@ -581,8 +590,9 @@ fn a_save_stores_the_same_objects_at_100_and_1000_files() {
         )
     };
     let expect = (STORED_PER_SAVE, OBJECTS_PER_SAVE, CHILDREN_PER_SAVE);
+    let many = many();
     assert_eq!(cost(100), expect, "at 100 files");
-    assert_eq!(cost(1_000), expect, "at 1,000 files");
+    assert_eq!(cost(many), expect, "at {many} files");
 }
 
 /// A file's first bytes are all new lines: the builder takes them as the
@@ -712,12 +722,13 @@ fn fanout_matches_git_hash_object() {
 }
 
 /// A file's path depends on its name alone: the same at 10 files and at
-/// 1,000 (two fixed levels of 256, never a fan-out that grows; docs/trees.md,
-/// "What a commit holds"). The expected path pins the two levels at 10
-/// files; the larger size guards against a layout that changes with the
-/// tree's size, such as a fan-out that adds a level when a level passes 256
-/// entries. The accepted gap: a change that sets in only between 1,001 and
-/// 10,000 files is not exercised, because 10,000 files cost 50 s of creates.
+/// [`many`] (two fixed levels of 256, never a fan-out that grows;
+/// docs/trees.md, "What a commit holds"). The expected path pins the two
+/// levels at 10 files; the larger size guards against a layout that changes
+/// with the tree's size, such as a fan-out that adds a level when a level
+/// passes 256 entries. The accepted gap, in a local run only: a change that
+/// sets in only between 1,001 and 10,000 files is not exercised, because
+/// 10,000 files cost 50 s of creates. CI runs 10,000.
 #[test]
 fn a_files_path_never_changes_when_siblings_are_added() {
     let _one = ONE_AT_A_TIME.lock().unwrap_or_else(PoisonError::into_inner);
@@ -732,8 +743,9 @@ fn a_files_path_never_changes_when_siblings_are_added() {
     };
     let hex = hash_object("a");
     let expect = format!("files/{}/{}/a", &hex[..2], &hex[2..4]);
-    assert_eq!(path(10), expect);
-    assert_eq!(path(1_000), expect);
+    let many = many();
+    assert_eq!(path(10), expect, "at 10 files");
+    assert_eq!(path(many), expect, "at {many} files");
 }
 
 /// A save on the root and the sync that carries it to a sandbox must cost the same

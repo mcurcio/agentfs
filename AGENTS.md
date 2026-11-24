@@ -119,7 +119,7 @@ cargo nextest run -p <crate> -p <crate>   # add --features failpoints where the 
 cargo test --doc -p <crate>               # only for a crate with doctests: nextest does not run them
 ```
 
-Tests run with [cargo-nextest](https://nexte.st), each in its own process, all programs at once; `.config/nextest.toml` sets its profiles, and CI uses `--profile ci`. Where it is missing, install the release CI pins (the archive's SHA-256 is in `ci/dev-image.sh`):
+Tests run with [cargo-nextest](https://nexte.st), each in its own process, all programs at once; `.config/nextest.toml` sets its profiles, and the workflows select the `ci` profile with `NEXTEST_PROFILE: ci`, beside `AGENTFS_TEST_VOLUMES: full` for the slow tree tests' full sizes ([development](docs/development.md#running-tests)). Where it is missing, install the release CI pins (the archive's SHA-256 is in `ci/dev-image.sh`):
 
 ```sh
 curl -LsSf https://get.nexte.st/0.9.152/linux | tar zxf - -C ~/.cargo/bin

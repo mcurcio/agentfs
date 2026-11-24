@@ -16,6 +16,8 @@ env:
   RUST_BACKTRACE: 1
   # cargo-nextest's ci profile (.config/nextest.toml): every failure, no retries.
   NEXTEST_PROFILE: ci
+  # The slow tree tests at their full volume sizes (docs/development.md).
+  AGENTFS_TEST_VOLUMES: full
 
 jobs:
   lint:
