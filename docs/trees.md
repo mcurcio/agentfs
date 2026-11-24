@@ -1467,7 +1467,7 @@ jobs in [development.md](development.md); the method is in
   metadata, each collision's lost lines and each loss's cause by rules 13 and 14,
   with invariants read from git (D1 among them: every entry's parent has a `dirs/`
   record). The rules' scenarios for directories, metadata and links are also kept
-  as traces in `crates/agentfs-conformance/tests/rules/`, which `cargo test`
+  as traces in `crates/agentfs-conformance/tests/rules/`, which `cargo nextest run`
   replays on the model and the library. A mount makes only the calls one system
   call can: a chmod and a chown are two changes on Linux, so a trace that changes
   both at once, or makes a directory or link owned by another user, replays on the

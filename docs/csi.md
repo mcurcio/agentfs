@@ -528,7 +528,7 @@ Each node keeps its volumes under its own `--base-path`, on its own disk.
 
 ## 13. How it is tested
 
-- **Unit and integration tests** (`cargo test -p agentfs-csi`): parameters
+- **Unit and integration tests** (`cargo nextest run -p agentfs-csi`): parameters
   (static PV attributes and every refusal), layout, records, the host client
   and the supervisor with a fake launcher and mounter (one pod per claim,
   restarts with backoff and views replayed, reconcile after a plugin restart).
