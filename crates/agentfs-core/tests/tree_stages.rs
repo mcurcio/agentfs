@@ -557,10 +557,12 @@ fn filled(state: &Path, files: usize) -> TreeActor {
 /// sub-folders; docs/trees.md, "What a commit holds"): one changed file in a
 /// tree of 100 files and in one of 1,000 stores the same objects, feeds the
 /// builder the same, and starts the same Git children. The counts are exact,
-/// so any cost that grows with the tree shows at either size. 1,000 names are
-/// more than one level of 256 folders holds, so a fan-out that grew a level
-/// with the tree would have grown; 10,000 cost 50 s of creates and showed
-/// nothing more.
+/// so any cost that grows with the tree shows at either size. The expected
+/// counts already pin the two fixed levels at 100 files; the larger size
+/// guards against a cost or a layout that changes with the tree's size. The
+/// accepted gap: a change that sets in only between 1,001 and 10,000 files
+/// (a third level past some threshold) is not exercised here, because 10,000
+/// files cost 50 s of creates.
 #[test]
 fn a_save_stores_the_same_objects_at_100_and_1000_files() {
     let _one = ONE_AT_A_TIME.lock().unwrap_or_else(PoisonError::into_inner);
@@ -711,9 +713,11 @@ fn fanout_matches_git_hash_object() {
 
 /// A file's path depends on its name alone: the same at 10 files and at
 /// 1,000 (two fixed levels of 256, never a fan-out that grows; docs/trees.md,
-/// "What a commit holds"). 1,000 names are more than one level of 256
-/// folders holds, so a fan-out that grew a level with the tree would have
-/// grown by then.
+/// "What a commit holds"). The expected path pins the two levels at 10
+/// files; the larger size guards against a layout that changes with the
+/// tree's size, such as a fan-out that adds a level when a level passes 256
+/// entries. The accepted gap: a change that sets in only between 1,001 and
+/// 10,000 files is not exercised, because 10,000 files cost 50 s of creates.
 #[test]
 fn a_files_path_never_changes_when_siblings_are_added() {
     let _one = ONE_AT_A_TIME.lock().unwrap_or_else(PoisonError::into_inner);

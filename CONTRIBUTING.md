@@ -37,8 +37,13 @@ Every commit passes these, as CI's `lint` and `test` jobs run them:
 ```sh
 cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace
+cargo nextest run --workspace
+cargo test --doc --workspace
 ```
+
+Tests run under [cargo-nextest](https://nexte.st), which does not run
+doctests; [Running tests](docs/development.md#running-tests) says why and
+how.
 
 The documentation is tested against the code:
 [docs/configuration.md](docs/configuration.md) must list every key, flag
@@ -79,7 +84,7 @@ registry in named volumes so they survive between runs:
 ```sh
 docker run --rm -v "$PWD":/src -v agentfs-target:/target \
   -v agentfs-cargo:/usr/local/cargo/registry -e CARGO_TARGET_DIR=/target \
-  -w /src agentfs-dev cargo test --workspace
+  -w /src agentfs-dev cargo nextest run --workspace
 ```
 
 The build output and the registry stay in the container engine's storage, so

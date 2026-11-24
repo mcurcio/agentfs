@@ -10,7 +10,7 @@ check (FUSE, root, kind, Helm) and what is untested. -->
 ## Checklist
 
 - [ ] The title follows [Conventional Commits](https://www.conventionalcommits.org/) (`type(scope): subject`).
-- [ ] `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings` and `cargo test --workspace` pass.
+- [ ] `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo nextest run --workspace` and `cargo test --doc --workspace` pass.
 - [ ] Behaviour changes are in the library and human docs (a built slice's design page is deleted), new keys or flags in `docs/configuration.md`, and new failure modes have a runbook.
 - [ ] User-visible changes are under **Unreleased** in `CHANGELOG.md`.
 - [ ] The `ci`, `image`, `helm` and `docs` runs are green.
