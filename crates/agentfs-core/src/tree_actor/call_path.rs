@@ -458,6 +458,11 @@ pub struct Recording {
     /// Tests: runs inside every [`ActorGuard::unlocked`], lock released.
     #[cfg(test)]
     in_unlocked: Mutex<Option<Box<dyn Fn() + Send>>>,
+    /// Tests: runs as a settle begins to wait for the builder, after it
+    /// has asked for its records: a built or failed event from here on
+    /// answers that wait.
+    #[cfg(test)]
+    in_settle_build: Mutex<Option<Box<dyn Fn() + Send>>>,
     /// Each file's [`Recording::when_saved_then`] callbacks, each with the
     /// record its refusal waits below, run once no save of the file begun
     /// before that record is in flight. Locked only under the actor's lock.
@@ -538,6 +543,8 @@ impl Recording {
             in_wait: Mutex::new(None),
             #[cfg(test)]
             in_unlocked: Mutex::new(None),
+            #[cfg(test)]
+            in_settle_build: Mutex::new(None),
             waiters: Mutex::default(),
             epoch: Mutex::new(0),
             epoch_moved: Condvar::new(),
@@ -806,6 +813,15 @@ impl Recording {
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Box::new(hook));
     }
 
+    /// Tests: `hook` runs as a settle begins to wait for the builder.
+    #[cfg(test)]
+    fn on_settle_build_with(&self, hook: impl Fn() + Send + 'static) {
+        *self
+            .in_settle_build
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(Box::new(hook));
+    }
+
     /// Tests: `hook` runs whenever a close or a settle begins to wait on
     /// the close epoch.
     #[cfg(test)]
@@ -1013,13 +1029,13 @@ impl Recording {
     ///
     /// # Errors
     ///
-    /// As [`History::wait_built`], as an [`Error`].
+    /// [`Error::Stopped`] once the actor has stopped, at whichever wait the
+    /// stop finds it: the stop is the one answer, whatever the builder
+    /// said of it. Else as [`History::wait_built`], as an [`Error`].
     pub fn settle(&self) -> Result<RecordNo, Error> {
         let mut before = None;
         loop {
-            let Ok(mut actor) = self.actor() else {
-                return Ok(self.history.wait_built(self.durability.appended())?);
-            };
+            let mut actor = self.actor()?;
             // Read under the lock: every close begun so far has its record.
             let before = *before.get_or_insert_with(|| self.durability.appended().next());
             if actor.saves_in_flight(before) {
@@ -1038,7 +1054,23 @@ impl Recording {
                 return Ok(through);
             }
             drop(actor);
-            self.history.wait_built(through)?;
+            #[cfg(test)]
+            if let Some(hook) = &*self
+                .in_settle_build
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+            {
+                hook();
+            }
+            if let Err(e) = self.history.wait_built(through) {
+                // A stop fails the builder too (a failed fsync): the stop
+                // answers, as every other waiter of the volume hears it.
+                return Err(if self.is_stopped() {
+                    Error::Stopped
+                } else {
+                    e.into()
+                });
+            }
         }
     }
 }
@@ -1566,12 +1598,54 @@ mod tests {
             .fsync_failed(&std::io::Error::from_raw_os_error(libc::EIO));
         release.send(()).unwrap();
         assert!(matches!(first.join().unwrap(), Err(Error::Stopped)));
-        let mut heard = [
+        let heard = [
             answered.recv_timeout(HANG).expect("a waiter woke"),
             answered.recv_timeout(HANG).expect("both waiters woke"),
         ];
-        heard.sort_by_key(Result::is_ok);
-        assert!(matches!(heard[0], Err(Error::Stopped)), "{heard:?}");
+        assert!(
+            heard.iter().all(|r| matches!(r, Err(Error::Stopped))),
+            "each waiter hears the stop, and only it: {heard:?}"
+        );
+    }
+
+    /// The other ordering: the stop finds a settle waiting for the
+    /// builder, not for a save. The stop fails the builder's batch too
+    /// (its fsync), and the settle answers the stop, not that failure.
+    #[test]
+    fn a_stop_while_settle_waits_for_the_builder_is_its_answer() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rec = Recording::serve(new_actor(tmp.path())).unwrap();
+        rec.settle().unwrap();
+        // Every batch from here waits at its start until `resume` is dropped.
+        let (resume, held) = mpsc::channel::<()>();
+        let held = Mutex::new(held);
+        rec.history().on_batch_read(move |_| {
+            let _ = held.lock().map(|h| h.recv());
+        });
+        {
+            let mut actor = rec.actor().unwrap();
+            let h = actor
+                .write_open(TreeId::Root, "a", &writer("w"), Some(ATTRS))
+                .unwrap();
+            actor.close(h).unwrap();
+        }
+        let (waiting, waits) = mpsc::channel::<()>();
+        let waiting = Mutex::new(waiting);
+        rec.on_settle_build_with(move || {
+            let _ = waiting.lock().map(|w| w.send(()));
+        });
+        let settling = {
+            let rec = Arc::clone(&rec);
+            std::thread::spawn(move || rec.settle())
+        };
+        waits
+            .recv_timeout(HANG)
+            .expect("the settle waits for the builder");
+        rec.durability
+            .fsync_failed(&std::io::Error::from_raw_os_error(libc::EIO));
+        drop(resume);
+        let heard = settling.join().unwrap();
+        assert!(matches!(heard, Err(Error::Stopped)), "{heard:?}");
     }
 
     /// The overlay is let go once the builder catches up, though the last
