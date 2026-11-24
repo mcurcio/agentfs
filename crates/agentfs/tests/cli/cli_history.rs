@@ -10,7 +10,7 @@ use std::process::{Child, Command, ExitStatus, Output, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-#[path = "../../agentfs-core/tests/support/queue_patch.rs"]
+#[path = "../../../agentfs-core/tests/support/queue_patch.rs"]
 mod queue_patch;
 
 use agentfs_core::events::NullSink;

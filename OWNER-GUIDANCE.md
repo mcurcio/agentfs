@@ -22,6 +22,7 @@ on his answer.
 - **Guidance**, 2026-11-13. "i only want one PR at the end". [The one-engine plan, PR #38, was folded into the module-cut step 6 PR.]
 - **Guidance**, 2026-11-13. Asked where "one PR at the end" stops, after module cut 5.3 or on until the baseline: "Keep going". [The module cut's step 6 PR carries the one-engine milestones until the baseline, the Hermes sidecar on the tree views in CI.] Applies to: `docs/target-architecture/future/one-engine.md`.
 - **Guidance**, 2026-11-13. On pinning Rust in CI: "sure. just do it in this PR. i want one PR". [Rust is pinned in `rust-toolchain.toml`, which CI, the Dockerfiles and the model's image read.] Applies to: `rust-toolchain.toml`, `.github/workflows/`, the Dockerfiles.
+- **Guidance**, 2026-11-24. Asked as general guidance, after a CI job's anonymous pull from Docker Hub hit its rate limit (`toomanyrequests` pulling `docker:dind`): pull Docker Hub through Google's mirror, mirror.gcr.io? "Yes, use the google mirror where possible". Applies to: every Docker daemon CI pulls with, `ci/docker-hub-mirror.sh`, `.github/workflows/`. [The examples and charts users run keep Docker Hub.]
 
 ## Terms
 

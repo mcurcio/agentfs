@@ -22,6 +22,10 @@ on:
       - ci/k8s-csi/driver/**
       - ci/kind/**
       - ci/install-kind.sh
+      - ci/kind-cluster.sh
+      - ci/docker-hub-mirror.sh
+      - ci/docker/daemon.json
+      - .github/actions/docker-hub-mirror/**
       - deploy/examples/hermes/**
       - deploy/sidecar/**
       - deploy/csi/**
@@ -49,7 +53,9 @@ jobs:
           for d in sidecar fence before csi csi-driver; do
             kubectl kustomize --load-restrictor LoadRestrictionsNone "ci/hermes/k8s/$d" >/dev/null
           done
-      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - uses: ./.github/actions/docker-hub-mirror
+        with:
+          buildx: true
       # Reads the image workflow's layer cache and writes none, so the two
       # workflows never race on it.
       - name: build
@@ -78,6 +84,7 @@ jobs:
         mode: [sidecar, fence, csi]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: ./.github/actions/docker-hub-mirror
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: agentfs-image-hermes
@@ -92,8 +99,7 @@ jobs:
           echo "$RUNNER_TEMP/kind/bin" >>"$GITHUB_PATH"
       - name: create the cluster
         run: |
-          kind create cluster --name agentfs-hermes --config ci/kind/cluster.yaml \
-            --image "$KIND_NODE_IMAGE" --wait 120s
+          ci/kind-cluster.sh agentfs-hermes ci/kind/cluster.yaml 120s
           kind load image-archive "$RUNNER_TEMP/agentfs-image.tar" --name agentfs-hermes
           kubectl get nodes -o wide
       - run: ci/e2e-hermes-kind.sh ${{ matrix.mode }}

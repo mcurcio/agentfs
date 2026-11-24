@@ -109,14 +109,16 @@ When you learn something durable, write it to its home in the same commit. Never
 
 ## Local gates (every commit)
 
+Run fmt, then clippy and the tests of the packages the change touches; CI is the full gate (owner, 2026-11-24: "Agreed", in [OWNER-GUIDANCE.md](OWNER-GUIDANCE.md)).
+
 ```sh
 . ~/.devenv   # if the container uses the no-root toolchain (see below)
 cargo fmt --all --check
-cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace
+cargo clippy -p <crate> -p <crate> --all-targets -- -D warnings
+cargo test -p <crate> -p <crate>   # add --features failpoints where the change touches failpoints
 ```
 
-`--all-features` needs OpenSSL and libssh2. CI builds it; a minimal container may not be able to.
+A doc change also runs `cargo test -p agentfs-core --test docs_reference`. Run one module of a merged test program with `--test it tree_actor::` ([development](docs/development.md#test-programs)). `--all-features` needs OpenSSL and libssh2. CI builds it; a minimal container may not be able to.
 
 ## What only CI can test
 

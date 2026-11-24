@@ -85,6 +85,9 @@ services:
     command: [dockerd, --host=tcp://0.0.0.0:2375, --host=unix:///var/run/docker.sock, --tls=false]
     volumes:
       - *mount
+      # CI's daemon settings: Docker Hub through mirror.gcr.io
+      # (ci/docker-hub-mirror.sh).
+      - ../../ci/docker/daemon.json:/etc/docker/daemon.json:ro
     healthcheck:
       test: [CMD, docker, info]
       interval: 10s

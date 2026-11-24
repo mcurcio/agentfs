@@ -16,8 +16,7 @@ use agentfs_core::tree_actor::{Attrs, Error, Kind, Perm, Saved, SetTime, TreeAct
 use agentfs_core::tree_git::TreeGit;
 use trees::{ATTRS, fanned, new_actor, reopen, rowless_fork, writer};
 
-#[path = "support/trees.rs"]
-mod trees;
+use crate::trees;
 
 const ROOT: TreeId = TreeId::Root;
 

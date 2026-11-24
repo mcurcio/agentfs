@@ -32,6 +32,13 @@ on_exit() { # command
   trap "case \$BASHPID in $BASHPID) $1 ;; esac" EXIT
 }
 
+# In GitHub Actions, fails unless the runner's dockerd pulls Docker Hub
+# through mirror.gcr.io (ci/docker-hub-mirror.sh): a script that pulls calls
+# it first. A no-op elsewhere: the mirror is CI's setup, not a user's.
+require_docker_hub_mirror() {
+  [ -z "${GITHUB_ACTIONS:-}" ] || "$(dirname "${BASH_SOURCE[0]}")/docker-hub-mirror.sh" check
+}
+
 # Operator runbooks run as written: the fenced block after
 # `<!-- ci: <name> -->` in docs/runbooks/<runbook>.
 RUNBOOKS=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/docs/runbooks

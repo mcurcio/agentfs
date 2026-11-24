@@ -71,11 +71,11 @@ protox = "0.10.0"
 tonic-prost-build = { version = "0.14.6", default-features = false }
 
 [dev-dependencies]
-# The Volume domain over the real state area (tests/state_area.rs).
+# The Volume domain over the real state area (tests/it/state_area.rs).
 agentfs-volume = { version = "0.1.0", path = "../agentfs-volume" }
-# The Trees domain over the store adapter (tests/tree_store.rs).
+# The Trees domain over the store adapter (tests/it/tree_store.rs).
 agentfs-trees = { version = "0.1.0", path = "../agentfs-trees" }
-# The Clients domain over the store adapter and sessions (tests/tree_clients.rs).
+# The Clients domain over the store adapter and sessions (tests/it/tree_clients.rs).
 agentfs-clients = { version = "0.1.0", path = "../agentfs-clients" }
 # In-memory exporters for the telemetry tests.
 opentelemetry_sdk = { version = "0.33.1", default-features = false, features = ["testing"] }

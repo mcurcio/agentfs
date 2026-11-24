@@ -63,6 +63,71 @@ The container image:
 docker build -t agentfs:dev .                 # https, ssh and otlp-tls features, Debian trixie
 ```
 
+### Test programs
+
+Cargo links one program per file in a crate's `tests/`. To link fewer,
+`agentfs-core` and `agentfs` put the integration tests that can share a
+process in one program each, a module per file: `tests/it/` and
+`tests/cli/`. Run one file's tests by its module:
+
+```sh
+cargo test -p agentfs-core --test it tree_actor::
+cargo test -p agentfs --test cli cli_fork::
+```
+
+A test file stays a program of its own when it needs the process to
+itself or CI runs it by name: `tree_stages` and `tree_close` read
+process-wide counters, `tree_batch_alloc` and `tree_overlay_alloc` set
+their own allocator, `docs_reference`, `crash_points`, `crash_daemon`,
+`launcher_mount`, `launcher_host` and `csi_trees` are named by CI, and
+`history_service`'s timings are kept apart from the other tests' load. A
+test that runs another test of its program in a child process names it with
+`test_name!`, which adds the module path that `--exact` needs.
+
+### Build settings
+
+The workspace's `Cargo.toml` sets the development and test profile:
+
+- **Line tables only** (`debug = "line-tables-only"`) for the workspace's
+  crates, so a panic's backtrace still names file and line, and **no debug
+  info** for dependencies. A debugger shows no local variables in such a
+  build. Release builds are unchanged.
+- **Dependencies stay unoptimised.** `opt-level = 1` for dependencies was
+  measured and not taken: the cold build took 400 s instead of 232 s, and
+  `agentfs-core`'s tests ran in 216 s instead of 217 s.
+
+The first `cargo test -p <crate>` after a `cargo build --workspace` compiles
+some dependencies again (88 s for `agentfs-core` below): a package alone
+turns on fewer features of tokio and others than the workspace does. Both
+builds stay in the target directory, so this is paid once.
+
+Each worktree has its own target directory. Don't share one build
+directory (`CARGO_BUILD_BUILD_DIR`) between worktrees of this repository:
+the hash cargo files a workspace crate's build under does not include the
+checkout's path, so two worktrees build into the same place. One worktree's test then
+runs the other's code, and `CARGO_BIN_EXE_agentfs` names the other
+worktree's binary.
+
+Measured on 2026-11-24 in a container with 4 shared CPUs and 16 GB, at
+`-j 2`, one build at a time, each column from an empty target directory:
+
+| Step | Before | Line tables only | And merged test programs |
+|---|---|---|---|
+| `cargo build --workspace --all-targets`, cold | 296 s | 232 s | 217 s |
+| Then `cargo test -p agentfs-core --no-run` | 154 s | 97 s | 88 s |
+| Target directory after these | 26 GB | 9.3 GB | 6.6 GB |
+| Test programs in the workspace | 70 | 70 | 34 |
+| `cargo test -p agentfs-core`, run only | 233 s | 217 s | 218 s |
+| One edit in `tree_actor/recording/`, then `cargo test -p agentfs-core --no-run` | 27 s | 16 s | 9 s |
+| One edit in `volume.rs`, the same | 29 s | 15 s | 9 s |
+| `cargo test -p agentfs`, its build and run | 143 s | 101 s | 85 s |
+| Of which the run | 32 s | 25 s | 16 s |
+| Target directory at the end | 33 GB | 12 GB | 8.0 GB |
+
+`agentfs-core`'s test run is mostly three programs, one after another:
+`tree_batch_alloc` (71 s, one test), `tree_stages` (about 60 s) and the
+unit tests (about 50 s).
+
 ## CI
 
 Every push runs [`.github/workflows/ci.yml`](../.github/workflows/ci.yml):
@@ -72,11 +137,11 @@ Every push runs [`.github/workflows/ci.yml`](../.github/workflows/ci.yml):
   set links.
 - **test:** the workspace tests, with default and all features. They
   include `restore` and `revert` without a mount
-  ([`cli_restore.rs`](../crates/agentfs/tests/cli_restore.rs)), and the
+  ([`cli_restore.rs`](../crates/agentfs/tests/cli/cli_restore.rs)), and the
   `.gitmodules` checks against the runner's `git` (the parser against
   `git config --list`, the checks against `git fsck`), Git LFS through the
   CLI with local and `file://` remotes and `git lfs pull` of a clone
-  ([`cli_lfs.rs`](../crates/agentfs/tests/cli_lfs.rs)), and the managed
+  ([`cli_lfs.rs`](../crates/agentfs/tests/cli/cli_lfs.rs)), and the managed
   `.gitattributes` block against `git check-attr`.
 - **e2e telemetry** ([`ci/e2e-telemetry.sh`](../ci/e2e-telemetry.sh)): a
   tree volume whose operator settings name a remote and a patch source,
@@ -246,11 +311,11 @@ them to where they run. The CI jobs are described above.
 | Nested repositories: a clone, a bare clone and `git init` at the root behave as documented, and nesting deletes nothing from history | the unit tests of `agentfs-rules` (names inside a nested repository stay untracked); not tested through a mount or a front |
 | Remotes: interval pushes reach two remotes, and an unreachable remote, a refused push and a non-fast-forward each raise an alarm while the filesystem keeps working | the unit tests of `push.rs`, `cli_push.rs`, the `crash` job's diverged remote |
 | Pre-commit checks: a path git's fsck or a remote limit would refuse is not recorded, and raises an alarm | the unit tests of `checks.rs` (the recording engine) |
-| Shared repositories: two volumes push on their own refs without contending, a rival writer is detected as divergence, identities follow the templates | the unit tests of `push.rs`, `crates/agentfs/tests/cli_identity.rs` |
-| Recovery: a file and a whole commit are restored, and the restore is recorded | `crates/agentfs/tests/cli_restore.rs` |
+| Shared repositories: two volumes push on their own refs without contending, a rival writer is detected as divergence, identities follow the templates | the unit tests of `push.rs`, `crates/agentfs/tests/cli/cli_identity.rs` |
+| Recovery: a file and a whole commit are restored, and the restore is recorded | `crates/agentfs/tests/cli/cli_restore.rs` |
 | Telemetry: the metrics are exported and move as expected | `cli_telemetry.rs` without a collector; `ci/e2e-telemetry.sh` (a tree mount's `agentfs.not_built`) against a real collector. The export of these counters is not tested, though the behaviour each counts is: `agentfs.history_service.superseded` and `.resyncs`, `agentfs.fuse.create_as_caller_fallbacks` and `.racy_rechecks`, `agentfs.reconcile.records` and `.failures`, `agentfs.nested.gitdir_heuristic` |
 | Performance of tree views is recorded for the many-file create and the other release workloads on XFS and ext4 | `ci/e2e-trees-tracer.sh --figures` in the `image` workflow ([performance.md](performance.md#tree-views-release-build)) |
-| LFS content is readable through `git clone` plus `git lfs pull` | `crates/agentfs/tests/cli_lfs.rs` |
+| LFS content is readable through `git clone` plus `git lfs pull` | `crates/agentfs/tests/cli/cli_lfs.rs` |
 | The patch queue: a conflicting patch is set aside and the rest go on, the volume mounts, and a crash and replay never applies a patch twice | the unit tests of `agentfs_core::patch`, `cli_patch.rs` |
 | Several pods on one node (the recording engine): each pod's changes carry its own committer identity and history keeps every boundary | `history_service.rs` |
 | A CSI claim serves one pod, its saves carry that pod's trailers, a crashed host comes back live | `crates/agentfs/tests/csi_trees.rs`, `ci/e2e-csi.sh` on kind |
@@ -320,6 +385,21 @@ evidence. CI scripts judge the build:
   `ubuntu-24.04`, never `ubuntu-latest`, so the kernel, FUSE, kind and nginx
   the tests rely on change only when the pin does.
   `crates/agentfs-core/tests/docs_reference.rs` fails on any other runner.
+- **CI pulls Docker Hub through mirror.gcr.io**, Google's pull-through
+  cache, because anonymous pulls from shared runners hit Docker Hub's rate
+  limit. The mirror's one home is
+  [`ci/docker/daemon.json`](../ci/docker/daemon.json).
+  [`ci/docker-hub-mirror.sh`](../ci/docker-hub-mirror.sh) applies it to each
+  daemon that pulls: the runner's dockerd and the buildx builder's BuildKit
+  through the [`docker-hub-mirror`](../.github/actions/docker-hub-mirror/action.yml)
+  action, every kind node's containerd through
+  [`ci/kind-cluster.sh`](../ci/kind-cluster.sh), and the docker-in-docker
+  daemons of `ci/hermes` by mounting the file. Images stay pinned by digest,
+  and each daemon falls back to Docker Hub when the mirror fails. A test
+  (`workflows_pull_docker_hub_through_the_mirror`) refuses a workflow that
+  sets up buildx or creates a kind cluster around these helpers, or a job
+  that pulls without the action. The examples and charts users run keep
+  Docker Hub as their default.
 - **The image is published after the kind jobs pass.** The `image`
   workflow publishes to `ghcr.io/mcurcio/agentfs` as the commit sha and
   `latest`, only from main and only after both kind end-to-end jobs

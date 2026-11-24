@@ -55,6 +55,7 @@ out=$W/out.log
 
 if [ "$MODE" = docker ]; then
   IMAGE=${AGENTFS_IMAGE:-ghcr.io/mcurcio/agentfs:latest}
+  require_docker_hub_mirror
   MNT=examples/docker/mnt-run
   ! docker volume inspect agentfs-example >/dev/null 2>&1 ||
     fail "the Docker volume agentfs-example exists: the quick start would reuse it"

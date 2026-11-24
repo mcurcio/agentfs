@@ -21,9 +21,12 @@ use agentfs_contracts::host::{
 };
 use agentfs_contracts::name::{ClientLabel, ForkKey, Label};
 use agentfs_contracts::pod::PodContext;
+use agentfs_contracts::ports::ForkStore as _;
 use agentfs_contracts::tree::TreeId;
 use agentfs_contracts::trees::{ForkSettings, Landing};
 use agentfs_core::file_lock::{FileLock, Mode};
+use agentfs_core::store::TreeStore;
+use agentfs_core::tree_actor::Recording;
 use agentfs_fuse::stale::{MountState, mount_state};
 
 struct Volume {
@@ -399,28 +402,7 @@ fn forks_by_key_and_the_drain() {
         "{approval:?}"
     );
     let two = forked(&host.ask(&fork_create(TreeRef::Root, "k4", Landing::Automatic)));
-
-    // The same steps on another volume, without the approval: the same
-    // numbers, so the refused create wrote nothing.
-    let control = Volume::new();
-    let mut other = control.host(&[]);
-    other.hello();
-    assert_eq!(
-        forked(&other.ask(&fork_create(TreeRef::Root, "k1", Landing::Automatic))),
-        one
-    );
-    other.ask(&fork_create(
-        TreeRef::Fork(key("k1")),
-        "k2",
-        Landing::Automatic,
-    ));
-    assert_eq!(
-        forked(&other.ask(&fork_create(TreeRef::Root, "k4", Landing::Automatic))),
-        two,
-        "the refused approval took a fork number"
-    );
-    let (status, log) = other.eof();
-    assert!(status.success(), "{log}");
+    assert_ne!(one, two);
 
     assert_eq!(host.ask(&Request::ForkEnd { key: key("k1") }), Reply::Ended);
     assert_eq!(
@@ -466,6 +448,20 @@ fn forks_by_key_and_the_drain() {
         .output()
         .unwrap();
     assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+
+    // The refused creates wrote nothing: the forks' rows, dropped ones
+    // included, are k1's and k4's. (A fork's number is its step's record
+    // number, which a built point's switch record also takes, at a time
+    // the builder decides: numbers do not show what a refusal wrote.)
+    let recording = Recording::open(&v.state(), &PodContext::default()).unwrap();
+    let mut keys: Vec<Option<ForkKey>> = TreeStore::new(recording)
+        .load()
+        .unwrap()
+        .into_iter()
+        .map(|row| row.value.key)
+        .collect();
+    keys.sort();
+    assert_eq!(keys, [Some(key("k1")), Some(key("k4"))], "{keys:?}");
 }
 
 /// (f2) A killed host's lease outlives it while a process that shares it

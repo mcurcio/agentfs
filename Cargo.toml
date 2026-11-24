@@ -12,3 +12,13 @@ repository = "https://github.com/mcurcio/agentfs"
 
 [patch.crates-io]
 fuser = { path = "vendor/fuser" }
+
+# Development and test builds keep line tables, so a panic's backtrace still
+# names file and line, and drop the rest of the debug info: smaller objects,
+# faster links, a smaller target directory. Dependencies carry none. Release
+# builds are unchanged (docs/development.md, "Build settings").
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false

@@ -8,8 +8,7 @@ use std::path::Path;
 use agentfs_core::tree_actor::{TreeActor, TreeId};
 use trees::{ATTRS, checkout, new_actor, reopen, rowless_fork, writer};
 
-#[path = "support/trees.rs"]
-mod trees;
+use crate::trees;
 
 const PAGE: u64 = 4096;
 const TREE: TreeId = TreeId::Root;

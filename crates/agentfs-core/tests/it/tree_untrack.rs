@@ -14,8 +14,7 @@ use agentfs_contracts::clients::FileOwner;
 use agentfs_core::tree_actor::{Attrs, Perm, TreeActor, TreeId};
 use trees::{ATTRS, new_actor, reopen, rowless_fork, writer};
 
-#[path = "support/trees.rs"]
-mod trees;
+use crate::trees;
 
 const ROOT: TreeId = TreeId::Root;
 

@@ -412,6 +412,95 @@ fn workflows_pin_runners() {
     assert!(problems.is_empty(), "{}", problems.join("\n"));
 }
 
+/// CI pulls Docker Hub through mirror.gcr.io (docs/development.md,
+/// "Runners, images and runbooks"). A workflow sets up buildx only through
+/// `.github/actions/docker-hub-mirror`, whose BuildKit pulls through the
+/// mirror, and creates kind clusters only with `ci/kind-cluster.sh`, whose
+/// nodes do; a job that pulls with the runner's daemon uses the action.
+/// Scripts that pull check the daemon themselves (`require_docker_hub_mirror`
+/// in `ci/lib.sh`).
+#[test]
+fn workflows_pull_docker_hub_through_the_mirror() {
+    const ACTION: &str = "uses: ./.github/actions/docker-hub-mirror";
+    let pulls = |line: &str| {
+        [
+            "docker run",
+            "docker build",
+            "docker pull",
+            "docker compose",
+        ]
+        .iter()
+        .any(|c| line.contains(c))
+            || line.contains("ci/kind-cluster.sh")
+            || line.contains("docker/build-push-action")
+    };
+    let dir = workspace().join(".github/workflows");
+    let mut problems = Vec::new();
+    let mut pulling_jobs = 0;
+    for entry in std::fs::read_dir(&dir).unwrap() {
+        let path = entry.unwrap().path();
+        if !path.extension().is_some_and(|e| e == "yml" || e == "yaml") {
+            continue;
+        }
+        let text = std::fs::read_to_string(&path).unwrap();
+        let name = path.file_name().unwrap().to_string_lossy().into_owned();
+        // (job, first pulling line, uses the action)
+        let mut jobs: Vec<(String, Option<usize>, bool)> = Vec::new();
+        let mut in_jobs = false;
+        for (n, line) in text.lines().enumerate() {
+            let trimmed = line.trim();
+            if trimmed.starts_with('#') {
+                continue;
+            }
+            if !line.starts_with(' ') && !trimmed.is_empty() {
+                in_jobs = line == "jobs:";
+                continue;
+            }
+            if !in_jobs {
+                continue;
+            }
+            if line.starts_with("  ") && !line.starts_with("   ") && trimmed.ends_with(':') {
+                jobs.push((trimmed.trim_end_matches(':').to_owned(), None, false));
+                continue;
+            }
+            let at = format!("{name}:{}", n + 1);
+            if line.contains("docker/setup-buildx-action") {
+                problems.push(format!(
+                    "{at}: set up buildx with the docker-hub-mirror action's `buildx: true`"
+                ));
+            }
+            if line.contains("kind create cluster") {
+                problems.push(format!(
+                    "{at}: create kind clusters with ci/kind-cluster.sh"
+                ));
+            }
+            let Some(job) = jobs.last_mut() else {
+                continue;
+            };
+            if trimmed.trim_start_matches("- ") == ACTION {
+                job.2 = true;
+            }
+            if job.1.is_none() && pulls(line) {
+                job.1 = Some(n + 1);
+            }
+        }
+        for (job, pulling, mirrored) in jobs {
+            let Some(line) = pulling else { continue };
+            pulling_jobs += 1;
+            if !mirrored {
+                problems.push(format!(
+                    "{name}:{line}: job {job} pulls images without {ACTION}"
+                ));
+            }
+        }
+    }
+    assert!(
+        pulling_jobs > 5,
+        "only {pulling_jobs} pulling jobs found: is the parser broken?"
+    );
+    assert!(problems.is_empty(), "{}", problems.join("\n"));
+}
+
 /// Every shell script under `ci/` registers its EXIT cleanup with `on_exit`
 /// (`ci/lib.sh`), which runs it only in the shell that set it: under bash
 /// 5.2 a bare `trap ... EXIT` also runs in a forked child that gets a fatal

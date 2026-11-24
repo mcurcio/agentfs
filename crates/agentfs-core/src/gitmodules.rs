@@ -6,7 +6,7 @@
 //!
 //! This is a port of the parts of git that fsck uses, kept close to git's C
 //! so its behaviour can be compared line by line, and checked against the
-//! `git` binary by `tests/gitmodules_git.rs`:
+//! `git` binary by `tests/it/gitmodules_git.rs`:
 //!
 //! - **The config parser** (`config.c`: `git_parse_source`, `get_base_var`,
 //!   `get_extended_base_var`, `get_value`, `parse_value`): a UTF-8 BOM,

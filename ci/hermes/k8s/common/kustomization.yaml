@@ -2,8 +2,9 @@
 # the Service `model`, Hermes' CI config (ci/hermes/hermes/config.yaml),
 # Hermes and its docker-in-docker sidecar added to each scenario's
 # Deployment (hermes.yaml; each scenario mounts the volume its own way),
-# and the image pins. Build with --load-restrictor LoadRestrictionsNone:
-# the files live in ci/hermes and deploy/examples/hermes.
+# with CI's daemon settings (ci/docker/daemon.json), and the image pins.
+# Build with --load-restrictor LoadRestrictionsNone: the files live in
+# ci/hermes, ci/docker and deploy/examples/hermes.
 apiVersion: kustomize.config.k8s.io/v1alpha1
 kind: Component
 
@@ -18,6 +19,9 @@ configMapGenerator:
   - name: hermes-config
     files:
       - ../../hermes/config.yaml
+  - name: dind-daemon
+    files:
+      - ../../../docker/daemon.json
 
 patches:
   # The Deployments of the scenarios: sidecar and fence (agentfs-example,

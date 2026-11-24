@@ -28,8 +28,7 @@ use agentfs_core::tree_actor::{Error, Recording, TreeActor};
 use agentfs_volume::VolumeService;
 use std::sync::Arc;
 
-#[path = "support/trees.rs"]
-mod trees;
+use crate::trees;
 use trees::ATTRS;
 
 struct NoClients;
@@ -292,7 +291,11 @@ fn stage_worker() {
 fn run_killed(root: &Path, spec: &str) {
     use std::os::unix::process::ExitStatusExt;
     let output = std::process::Command::new(std::env::current_exe().unwrap())
-        .args(["--exact", "stage_worker", "--nocapture"])
+        .args([
+            "--exact",
+            test_name!("stage_worker").as_str(),
+            "--nocapture",
+        ])
         .env(WORKER, root)
         .env(agentfs_core::failpoints::ENV_VAR, spec)
         .output()

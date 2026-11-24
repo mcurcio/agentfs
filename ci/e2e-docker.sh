@@ -107,6 +107,7 @@ agentfs_exit() { docker inspect -f '{{.State.ExitCode}}' "$1"; }
 
 step "start the $EXAMPLE example"
 docker version --format 'docker {{.Server.Version}}'
+require_docker_hub_mirror
 docker compose version
 case "$EXAMPLE" in
 run)

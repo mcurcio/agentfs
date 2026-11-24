@@ -5,7 +5,7 @@
 //! a flag stands, 75 while the volume is held. No FUSE.
 //!
 //! The flag needs the `failpoints` feature: `cargo test -p agentfs
-//! --features failpoints --test cli_verify`.
+//! --features failpoints --test cli cli_verify::`.
 #![allow(
     clippy::disallowed_methods,
     reason = "a test reads the notes History writes"

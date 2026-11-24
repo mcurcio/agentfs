@@ -7,7 +7,7 @@
 #                            receivers accept
 #   other-ca.pem             another CA, which trusts none of these
 #
-# Used by the TLS tests in crates/agentfs/tests/cli_telemetry.rs and by the
+# Used by the TLS tests in crates/agentfs/tests/cli/cli_telemetry.rs and by the
 # collector in CI (ci/otelcol.yaml). Keys are left readable (0644): the
 # collector container runs as another user. Test material only.
 set -euo pipefail
