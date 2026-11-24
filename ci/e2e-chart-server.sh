@@ -86,7 +86,7 @@ cleanup() {
   [ -z "$PF" ] || kill "$PF" 2>/dev/null || true
   rm -rf "$WORK"
 }
-trap cleanup EXIT
+on_exit cleanup
 
 # Waits up to <seconds> for <command...> to succeed.
 until_ok() { # seconds message command...

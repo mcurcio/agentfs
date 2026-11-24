@@ -45,7 +45,7 @@ PROM_LOG=$PROM_DIR/prometheus.log
 "$PROMETHEUS" --config.file="$PROM_DIR/prometheus.yml" --storage.tsdb.path="$PROM_DIR/data" \
   --web.listen-address=127.0.0.1:9090 --web.enable-otlp-receiver >"$PROM_LOG" 2>&1 &
 PROM_PID=$!
-trap 'kill "$PROM_PID" 2>/dev/null || true' EXIT
+on_exit 'kill "$PROM_PID" 2>/dev/null || true'
 wait_for 60 curl -fs "$PROM/-/ready" || { cat "$PROM_LOG"; fail "prometheus never became ready"; }
 pass "prometheus is ready with the rules loaded"
 
@@ -73,7 +73,7 @@ step "a tree mount whose settings name a remote"
 MOUNT_LOG=$WORK/mount.log
 "$AGENTFS_BIN" --state "$STATE" mount "$WORK/mnt" --no-allow-other >"$MOUNT_LOG" 2>&1 &
 MOUNT=$!
-trap 'kill "$MOUNT" "$PROM_PID" 2>/dev/null || true' EXIT
+on_exit 'kill "$MOUNT" "$PROM_PID" 2>/dev/null || true'
 wait_for 30 grep '^mounted volume alerts' "$MOUNT_LOG" || { cat "$MOUNT_LOG"; fail "the mount never served"; }
 assert_contains "$(cat "$MOUNT_LOG")" "not built: remote.origin.url (push): " "the mount logs the remote as not built"
 
@@ -107,5 +107,5 @@ pass "AgentfsNotBuilt"
 
 kill -TERM "$MOUNT"
 wait "$MOUNT" || { cat "$MOUNT_LOG"; fail "the mount did not exit cleanly"; }
-trap 'kill "$PROM_PID" 2>/dev/null || true' EXIT
+on_exit 'kill "$PROM_PID" 2>/dev/null || true'
 pass "the mount drained"

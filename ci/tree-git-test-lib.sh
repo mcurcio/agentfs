@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+. "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 # Read published tree contents by the commit's format marker, including legacy roots.
 
 # A file's place in a commit or checkout, <aa>/<bb>/<name>: aa and bb are hex
@@ -141,24 +142,27 @@ tree_kill_mount() {
 }
 
 # tree_unmount_dead MOUNTPOINT...: after a mount's agentfs died, unmounts each
-# MOUNTPOINT (a canonical path: a dead mount cannot be resolved) while
-# /proc/self/mounts lists it. One it no longer lists is said on stderr: a
-# daemon's death leaves its mount (docs/trees.md), so an entry gone is
-# evidence to keep for the open errata entry, not a failure of the case.
+# MOUNTPOINT (a canonical path: a dead mount cannot be resolved). A daemon's
+# death leaves its mount (docs/trees.md), so one /proc/self/mounts no longer
+# lists is a failure, said with the mount table: something unmounted it. (The
+# script's own cleanup run in a child shell was one such thing, before every
+# EXIT trap went through on_exit in ci/lib.sh.)
 tree_unmount_dead() {
   local m
   for m in "$@"; do
-    if awk -v m="$m" '$2 == m { found = 1 } END { exit !found }' /proc/self/mounts; then
-      fusermount3 -uz "$m"
-    else
-      echo "warning: $m's mount entry was gone after its agentfs died" >&2
+    if ! awk -v m="$m" '$2 == m { found = 1 } END { exit !found }' /proc/self/mounts; then
+      echo "$m's mount entry was gone after its agentfs died" >&2
+      cat /proc/self/mounts >&2
+      return 1
     fi
+    fusermount3 -uz "$m"
   done
 }
 
 # tree_stop PID: SIGTERM, then tree_wait_exit with a short bound: a cleanup
-# trap never hangs on a mount whose drain does not finish.
+# trap never hangs on a mount whose drain does not finish, and says so on
+# stderr when the bound ran out.
 tree_stop() {
   kill "$1" 2>/dev/null || true
-  tree_wait_exit "$1" 30 2>/dev/null || true
+  tree_wait_exit "$1" 30 || true
 }

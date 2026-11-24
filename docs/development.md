@@ -333,3 +333,18 @@ evidence. CI scripts judge the build:
   to refs under `refs/agentfs/`. The one way a branch is replaced is
   `agentfs push --force-with-lease`, by an operator
   ([history-rewrite](runbooks/history-rewrite.md)).
+- **A script's cleanup runs only in its own shell.** Every shell script
+  under `ci/` registers its EXIT cleanup with `on_exit` from `ci/lib.sh`
+  (`ci/tree-git-test-lib.sh` sources it), never a bare `trap ... EXIT`.
+  Under bash 5.2 a forked child (a `( ... ) &` subshell, or `cmd &` before
+  it execs) that gets a fatal signal before it resets its traps runs the
+  EXIT trap it inherited, so a script's cleanup could run in that child and
+  unmount or kill what the script still used. `on_exit` compares the exiting
+  shell's `$BASHPID` with the one that registered it (`$$` is the parent's
+  inside a subshell), so the cleanup runs once, in its own shell, and a
+  subshell may register its own. A test
+  (`ci_exit_traps_run_in_their_own_shell`) refuses a bare EXIT trap under
+  `ci/`. A killed mount is killed with `tree_kill_mount`, which fails loudly
+  when the daemon ended before the kill, exits other than by the kill, or
+  left no mount entry, and `tree_wait_exit`'s message and status are never
+  hidden.

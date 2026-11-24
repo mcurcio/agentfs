@@ -412,6 +412,63 @@ fn workflows_pin_runners() {
     assert!(problems.is_empty(), "{}", problems.join("\n"));
 }
 
+/// Every shell script under `ci/` registers its EXIT cleanup with `on_exit`
+/// (`ci/lib.sh`), which runs it only in the shell that set it: under bash
+/// 5.2 a bare `trap ... EXIT` also runs in a forked child that gets a fatal
+/// signal before it resets its traps (docs/development.md, "Runners,
+/// images and runbooks"). The one bare trap is `on_exit`'s own.
+#[test]
+fn ci_exit_traps_run_in_their_own_shell() {
+    fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                walk(&path, out);
+            } else if path.extension().is_some_and(|e| e == "sh") {
+                out.push(path);
+            }
+        }
+    }
+    let ci = workspace().join("ci");
+    let mut scripts = Vec::new();
+    walk(&ci, &mut scripts);
+    scripts.sort();
+    let mut problems = Vec::new();
+    let mut registered = 0;
+    for path in &scripts {
+        let text = std::fs::read_to_string(path).unwrap();
+        let own = path.file_name().is_some_and(|n| n == "lib.sh");
+        for (n, line) in text.lines().enumerate() {
+            let code = line.trim_start();
+            if code.starts_with('#') {
+                continue;
+            }
+            let words: Vec<&str> = code
+                .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                .collect();
+            if words.first() == Some(&"on_exit") {
+                registered += 1;
+            }
+            if words.contains(&"trap")
+                && words.contains(&"EXIT")
+                && !(own && code.contains("BASHPID"))
+            {
+                problems.push(format!(
+                    "{}:{}: a bare EXIT trap; register it with on_exit (ci/lib.sh)",
+                    path.strip_prefix(&ci).unwrap_or(path).display(),
+                    n + 1
+                ));
+            }
+        }
+    }
+    assert!(
+        registered > 0,
+        "no on_exit registrations under {}",
+        ci.display()
+    );
+    assert!(problems.is_empty(), "{}", problems.join("\n"));
+}
+
 /// `rust-toolchain.toml` is the one pin of the Rust release: no workflow names
 /// its own toolchain, and the Dockerfile's Rust image, which the development
 /// image builds from too, is that release (docs/development.md, "The Rust

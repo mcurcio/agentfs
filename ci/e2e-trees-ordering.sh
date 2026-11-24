@@ -13,7 +13,7 @@ cleanup() {
     if [ "$status" != 0 ]; then cat "$work/mount.log" 2>/dev/null || true; fi
     rm -rf "$work"
 }
-trap cleanup EXIT
+on_exit cleanup
 mkdir "$work/main" "$work/fork"
 "$bin" --state "$work/state" init --volume t
 "$bin" --state "$work/state" mount "$work/main" --fork-mount "$work/fork" >"$work/mount.log" 2>&1 &
