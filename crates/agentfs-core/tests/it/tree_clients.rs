@@ -31,8 +31,7 @@ use agentfs_core::tree_actor::{Error, Recording, RenameMode, Saved, TreeId};
 use agentfs_trees::TreesService;
 use trees::{ATTRS, identity};
 
-#[path = "support/trees.rs"]
-mod trees;
+use crate::trees;
 
 const ROOT: TreeId = TreeId::Root;
 

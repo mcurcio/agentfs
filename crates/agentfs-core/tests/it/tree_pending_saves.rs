@@ -26,8 +26,7 @@ use agentfs_core::tree_actor::{
 };
 use trees::{ATTRS, fanned, identity, rowless_fork, writer};
 
-#[path = "support/trees.rs"]
-mod trees;
+use crate::trees;
 
 const ROOT: TreeId = TreeId::Root;
 

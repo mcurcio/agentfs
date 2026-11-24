@@ -63,6 +63,27 @@ The container image:
 docker build -t agentfs:dev .                 # https, ssh and otlp-tls features, Debian trixie
 ```
 
+### Test programs
+
+Cargo links one program per file in a crate's `tests/`. To link fewer,
+`agentfs-core` and `agentfs` put the integration tests that can share a
+process in one program each, a module per file: `tests/it/` and
+`tests/cli/`. Run one file's tests by its module:
+
+```sh
+cargo test -p agentfs-core --test it tree_actor::
+cargo test -p agentfs --test cli cli_fork::
+```
+
+A test file stays a program of its own when it needs the process to
+itself or CI runs it by name: `tree_stages` and `tree_close` read
+process-wide counters, `tree_batch_alloc` and `tree_overlay_alloc` set
+their own allocator, `docs_reference`, `crash_points`, `crash_daemon`,
+`launcher_mount`, `launcher_host` and `csi_trees` are named by CI, and
+`history_service`'s timings are kept apart from the other tests' load. A
+test that runs another test of its program in a child process names it with
+`test_name!`, which adds the module path that `--exact` needs.
+
 ## CI
 
 Every push runs [`.github/workflows/ci.yml`](../.github/workflows/ci.yml):
@@ -72,11 +93,11 @@ Every push runs [`.github/workflows/ci.yml`](../.github/workflows/ci.yml):
   set links.
 - **test:** the workspace tests, with default and all features. They
   include `restore` and `revert` without a mount
-  ([`cli_restore.rs`](../crates/agentfs/tests/cli_restore.rs)), and the
+  ([`cli_restore.rs`](../crates/agentfs/tests/cli/cli_restore.rs)), and the
   `.gitmodules` checks against the runner's `git` (the parser against
   `git config --list`, the checks against `git fsck`), Git LFS through the
   CLI with local and `file://` remotes and `git lfs pull` of a clone
-  ([`cli_lfs.rs`](../crates/agentfs/tests/cli_lfs.rs)), and the managed
+  ([`cli_lfs.rs`](../crates/agentfs/tests/cli/cli_lfs.rs)), and the managed
   `.gitattributes` block against `git check-attr`.
 - **e2e telemetry** ([`ci/e2e-telemetry.sh`](../ci/e2e-telemetry.sh)): a
   tree volume whose operator settings name a remote and a patch source,
@@ -246,11 +267,11 @@ them to where they run. The CI jobs are described above.
 | Nested repositories: a clone, a bare clone and `git init` at the root behave as documented, and nesting deletes nothing from history | the unit tests of `agentfs-rules` (names inside a nested repository stay untracked); not tested through a mount or a front |
 | Remotes: interval pushes reach two remotes, and an unreachable remote, a refused push and a non-fast-forward each raise an alarm while the filesystem keeps working | the unit tests of `push.rs`, `cli_push.rs`, the `crash` job's diverged remote |
 | Pre-commit checks: a path git's fsck or a remote limit would refuse is not recorded, and raises an alarm | the unit tests of `checks.rs` (the recording engine) |
-| Shared repositories: two volumes push on their own refs without contending, a rival writer is detected as divergence, identities follow the templates | the unit tests of `push.rs`, `crates/agentfs/tests/cli_identity.rs` |
-| Recovery: a file and a whole commit are restored, and the restore is recorded | `crates/agentfs/tests/cli_restore.rs` |
+| Shared repositories: two volumes push on their own refs without contending, a rival writer is detected as divergence, identities follow the templates | the unit tests of `push.rs`, `crates/agentfs/tests/cli/cli_identity.rs` |
+| Recovery: a file and a whole commit are restored, and the restore is recorded | `crates/agentfs/tests/cli/cli_restore.rs` |
 | Telemetry: the metrics are exported and move as expected | `cli_telemetry.rs` without a collector; `ci/e2e-telemetry.sh` (a tree mount's `agentfs.not_built`) against a real collector. The export of these counters is not tested, though the behaviour each counts is: `agentfs.history_service.superseded` and `.resyncs`, `agentfs.fuse.create_as_caller_fallbacks` and `.racy_rechecks`, `agentfs.reconcile.records` and `.failures`, `agentfs.nested.gitdir_heuristic` |
 | Performance of tree views is recorded for the many-file create and the other release workloads on XFS and ext4 | `ci/e2e-trees-tracer.sh --figures` in the `image` workflow ([performance.md](performance.md#tree-views-release-build)) |
-| LFS content is readable through `git clone` plus `git lfs pull` | `crates/agentfs/tests/cli_lfs.rs` |
+| LFS content is readable through `git clone` plus `git lfs pull` | `crates/agentfs/tests/cli/cli_lfs.rs` |
 | The patch queue: a conflicting patch is set aside and the rest go on, the volume mounts, and a crash and replay never applies a patch twice | the unit tests of `agentfs_core::patch`, `cli_patch.rs` |
 | Several pods on one node (the recording engine): each pod's changes carry its own committer identity and history keeps every boundary | `history_service.rs` |
 | A CSI claim serves one pod, its saves carry that pod's trailers, a crashed host comes back live | `crates/agentfs/tests/csi_trees.rs`, `ci/e2e-csi.sh` on kind |

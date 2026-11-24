@@ -17,8 +17,7 @@ use trees::{ATTRS, checkout, fanned, new_actor, reopen, reopen_after_kill, rowle
 const ROOT: TreeId = TreeId::Root;
 use agentfs_core::tree_git::TreeGit;
 
-#[path = "support/trees.rs"]
-mod trees;
+use crate::trees;
 
 fn repo(root: &std::path::Path) -> TreeGit {
     TreeGit::open(root.join("history.git")).unwrap()
@@ -540,7 +539,11 @@ fn killed_actor_replays_acknowledged_calls() {
     use std::process::{Command, Stdio};
     let tmp = tempfile::tempdir().unwrap();
     let mut child = Command::new(std::env::current_exe().unwrap())
-        .args(["--exact", "crash_worker", "--nocapture"])
+        .args([
+            "--exact",
+            test_name!("crash_worker").as_str(),
+            "--nocapture",
+        ])
         .env("AGENTFS_TREE_ACTOR_CRASH_TEST", tmp.path())
         .stdout(Stdio::piped())
         .spawn()
@@ -590,7 +593,11 @@ fn incoming_object_survives_kill_and_replays_later_open() {
     use std::process::{Command, Stdio};
     let tmp = tempfile::tempdir().unwrap();
     let mut child = Command::new(std::env::current_exe().unwrap())
-        .args(["--exact", "incoming_crash_worker", "--nocapture"])
+        .args([
+            "--exact",
+            test_name!("incoming_crash_worker").as_str(),
+            "--nocapture",
+        ])
         .env("AGENTFS_INCOMING_CRASH_TEST", tmp.path())
         .stdout(Stdio::piped())
         .spawn()
@@ -1508,7 +1515,7 @@ fn a_record_in_a_segment_whose_entry_is_not_fsynced_is_never_marked_durable() {
 fn run_killed_worker(worker: &str, root: &std::path::Path, spec: &str) -> u64 {
     use std::process::{Command, Stdio};
     let output = Command::new(std::env::current_exe().unwrap())
-        .args(["--exact", worker, "--nocapture"])
+        .args(["--exact", test_name!(worker).as_str(), "--nocapture"])
         .env("AGENTFS_TREE_STEP_WORKER", root)
         .env(agentfs_core::failpoints::ENV_VAR, spec)
         .stdout(Stdio::piped())
@@ -2487,7 +2494,11 @@ const FEW_DESCRIPTORS: u64 = 512;
 fn a_volume_of_more_files_than_descriptors_opens_and_reads() {
     let tmp = tempfile::tempdir().unwrap();
     let output = std::process::Command::new(std::env::current_exe().unwrap())
-        .args(["--exact", "descriptors_worker", "--nocapture"])
+        .args([
+            "--exact",
+            test_name!("descriptors_worker").as_str(),
+            "--nocapture",
+        ])
         .env("AGENTFS_TREE_DESCRIPTORS_WORKER", tmp.path())
         .output()
         .unwrap();

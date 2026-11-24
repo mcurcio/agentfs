@@ -5,8 +5,7 @@
 //! every tree's entries and metadata with the library, and each collision's
 //! cause and path from git.
 
-#[path = "support/trees.rs"]
-mod trees;
+use crate::trees;
 
 use std::path::Path;
 use std::process::Command;

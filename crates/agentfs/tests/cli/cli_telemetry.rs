@@ -18,9 +18,9 @@ use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
 use opentelemetry_proto::tonic::common::v1::{KeyValue, any_value};
 use prost::Message;
 
-mod fork_setup;
+use crate::fork_setup;
 
-#[path = "../../agentfs-core/tests/support/closed_port.rs"]
+#[path = "../../../agentfs-core/tests/support/closed_port.rs"]
 mod closed_port;
 use closed_port::ClosedPort;
 

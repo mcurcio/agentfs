@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 
 use git2::{Oid, Repository};
 
-mod fork_setup;
+use crate::fork_setup;
 
 use fork_setup::{Setup, have_git, text};
 

@@ -3,8 +3,7 @@
 //! each recorded, applied as POSIX answers, kept in history where history
 //! keeps it, and the same after a restart and a compaction.
 
-#[path = "support/trees.rs"]
-mod trees;
+use crate::trees;
 
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;

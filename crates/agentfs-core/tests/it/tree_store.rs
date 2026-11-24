@@ -26,8 +26,7 @@ use agentfs_core::tree_actor::{Chain, Recording, RowDomain, TreeId};
 use agentfs_trees::TreesService;
 use trees::{ATTRS, identity, writer};
 
-#[path = "support/trees.rs"]
-mod trees;
+use crate::trees;
 
 const ROOT: TreeId = TreeId::Root;
 const WORKER: &str = "AGENTFS_TREE_STORE_WORKER";
@@ -120,7 +119,7 @@ fn refs_on_disk(dir: &Path) -> String {
 fn run_killed(worker: &str, dir: &Path, spec: &str) {
     use std::os::unix::process::ExitStatusExt;
     let output = Command::new(std::env::current_exe().unwrap())
-        .args(["--exact", worker, "--nocapture"])
+        .args(["--exact", test_name!(worker).as_str(), "--nocapture"])
         .env(WORKER, dir)
         .env(agentfs_core::failpoints::ENV_VAR, spec)
         .output()

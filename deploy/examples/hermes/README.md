@@ -14,6 +14,6 @@ To use them, replace the files in [`../../sidecar/config/`](../../sidecar/config
 Hermes, and the one-time migration Job that copies its existing data in
 through the mount, are in [docs/deployment.md](../../../docs/deployment.md#10-hermes).
 
-`crates/agentfs/tests/deploy_examples.rs` checks these rules against a
+`crates/agentfs/tests/cli/deploy_examples.rs` checks these rules against a
 representative Hermes layout. Check the profile layout against the Hermes
 version you run before relying on them.

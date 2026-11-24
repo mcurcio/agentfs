@@ -10,8 +10,7 @@ use trees::{ATTRS, fanned, new_actor, rowless_fork, writer};
 const ROOT: TreeId = TreeId::Root;
 use agentfs_core::tree_git::TreeGit;
 
-#[path = "support/trees.rs"]
-mod trees;
+use crate::trees;
 
 const BASE: &[u8] = b"-\n-\n-\n-\n-\n-\n";
 const PARENT: &[u8] = b"-\nm1.1\n-\n-\n-\n-\n";

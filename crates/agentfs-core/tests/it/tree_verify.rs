@@ -6,7 +6,7 @@
 //!
 //! The flags are made with the failpoint `tree.build_replay_skew`, so most
 //! tests need the `failpoints` feature: `cargo test -p agentfs-core
-//! --features failpoints --test tree_verify`.
+//! --features failpoints --test it tree_verify::`.
 #![allow(
     clippy::disallowed_methods,
     reason = "a test reads the store History writes"
@@ -31,8 +31,7 @@ use agentfs_core::tree_git::{RefUpdate, TreeGit};
 use git2::Oid;
 use trees::{ATTRS, fanned, new_actor, reopen, writer};
 
-#[path = "support/trees.rs"]
-mod trees;
+use crate::trees;
 
 const ROOT: TreeId = TreeId::Root;
 
@@ -308,7 +307,12 @@ fn a_start_under_another_release_checks_a_flag() {
         .unwrap();
     assert!(copied.success());
     let out = Command::new(&other)
-        .args(["verify_child", "--exact", "--test-threads", "1"])
+        .args([
+            test_name!("verify_child").as_str(),
+            "--exact",
+            "--test-threads",
+            "1",
+        ])
         .env("TREE_VERIFY_CHILD", &root)
         .env_remove(agentfs_core::failpoints::ENV_VAR)
         .output()

@@ -13,8 +13,7 @@ use agentfs_contracts::clients::FileOwner;
 use agentfs_core::tree_actor::{Error, Kind, Meta, Perm, RenameMode, TreeActor, TreeId};
 use trees::{ATTRS, new_actor, reopen, rowless_fork, writer};
 
-#[path = "support/trees.rs"]
-mod trees;
+use crate::trees;
 
 /// Writes the operator's rule files into a volume's git directory.
 fn rules(dir: &Path, exclude: &str, attributes: &str) {
@@ -618,7 +617,7 @@ fn a_fork_killed_at_any_point_of_its_copy_has_its_whole_area_or_none() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("state");
         let output = std::process::Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", "copy_worker", "--nocapture"])
+            .args(["--exact", test_name!("copy_worker").as_str(), "--nocapture"])
             .env("AGENTFS_TREE_COPY_WORKER", &dir)
             .env(agentfs_core::failpoints::ENV_VAR, spec)
             .output()

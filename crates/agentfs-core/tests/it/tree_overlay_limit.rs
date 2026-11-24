@@ -10,8 +10,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use agentfs_core::tree_actor::{Recording, TreeId};
 use trees::{ATTRS, identity, writer};
 
-#[path = "support/trees.rs"]
-mod trees;
+use crate::trees;
 
 /// The limit the test sets: small, so a few hundred creates reach it.
 const LIMIT: u64 = 256 << 10;
