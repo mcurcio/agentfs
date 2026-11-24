@@ -64,7 +64,7 @@ cycle of nine: journal, durability, saved state, recording, referee, queue and l
                          |
                       agentfs            the library's one name: re-exports only
                      /       \
-     (feature fuse) /         \
+ (feature fuse, Q1) /         \
        agentfs-fuse            \           agentfs-cli (binary `agentfs`)   agentfs-csi   agentfs-conformance
              \                  \               |   (each depends on the crates it uses, never on the front)
               +------------- agentfs-tree-engine ---------------------+
@@ -86,27 +86,29 @@ cycle of nine: journal, durability, saved state, recording, referee, queue and l
 
 | Crate | Public surface | Comes from |
 |---|---|---|
-| agentfs | re-exports: the tree engine's consumer API at its root; `agentfs::fuse` behind the `fuse` feature (Q1). No code of its own but docs | new, `crates/agentfs` |
+| agentfs | re-exports: the tree engine's consumer API at its root; `agentfs::fuse` behind a `fuse` feature once Q1 allows it. No code of its own but docs | new, `crates/agentfs` |
 | agentfs-cli | the `agentfs` binary, unchanged: its name, subcommands and features | today's `crates/agentfs` package, renamed |
 | agentfs-base | what those six leaves expose today, plus `init_libgit2`, `PACK_CONFIG`, `parse_size` | core's shared leaves |
 | agentfs-git | `TreeGit` (objects, the ref copy, checkout), its `Error`, two counters | `tree_git.rs` |
 | agentfs-lines | `LineMap<V>`, `Image`, `Expanded`, `Line`, `Id`, `Error`, all already `pub` | `tree_reconcile.rs`; beside agentfs-align, since the model uses align and not line maps |
-| agentfs-mark | `Waiters`, `OwnerGuard`, `Executor`, `Answer`, `WaitError`, `StopReason` (the waiting-marks design), the lock-discipline checks | new, plus `stages.rs:660-749` |
-| agentfs-referee | `land` (a `Decision`) and `sync` over snapshots; `Cut`, `Key`, `Upstreams`; the values `EventNumber`, `LineVersion`, `MergeFileIdentity`, `NameHistory`, `Meta` | `referee/`, `queue.rs`, `upstreams.rs`, `meta.rs`, the value half of `tree.rs`. No git2, no `std::fs`: the compiler checks the referee's purity |
+| agentfs-mark | `Waiters`, `OwnerGuard`, `Executor`, `Answer`, `WaitError`, `StopReason` (the waiting-marks design). Not the lock discipline: `InnerLock`, `Unlocked` and `assert_unlocked` (`stages.rs:660-780`) name the actor's work and read stages' holds, so they stay with stages | new |
+| agentfs-referee | `land` (a `Decision`) and `sync` over snapshots; `Cut`, `Key`, `Upstreams`; the values `EventNumber`, `LineVersion`, `MergeFileIdentity`, `NameHistory`, `Meta` | `referee/`, `queue.rs`, `upstreams.rs`, `meta.rs`, the value half of `tree.rs`. No git2 dependency, which the compiler checks; no `std::fs`, which the crate's `clippy.toml` (`disallowed_types`, `disallowed_methods`) checks under `-D warnings` |
 | agentfs-journal | `Journal` (append, read back, compaction's file side), `Durability` with the durable mark, records (`Entry`, `Change`, `Call`), `FileMap`, `Layout`, `SavedTree`, `fold`, stages | `journal/`, the state half of `tree.rs`, `pointers.rs`, `rows.rs`, `file_map.rs`, `layout.rs`, `stages.rs` |
 | agentfs-history | `History` (the built point and `BuiltSnapshot`; the checkpointed and compacted marks), `Builder`, `Compactor`, `Repacker`, `TreeMoved` | `history/`, without `take.rs` and `upstreams.rs` |
 | agentfs-tree-engine | `Recording` (the call path), `TreeActor`, `Sessions` and `TreeSession`, `TreeStore`, `TreeStateArea`, operator settings | the rest; the contracts adapters stay here, at the edge |
 
 **The front (design choices).**
-- **Why a front, not a renamed engine crate.** Consumers write `agentfs` once; the engine's crates keep splitting
-  (PR 4, PR 5) and `agentfs-core` is deleted at M9 without changing a consumer's imports. Prior art: `wasmtime` and
-  `wasmtime-cli`, `gix` over gitoxide's crates, `bevy` over `bevy_*`.
+- **Why a front, not a renamed engine crate.** Consumers write `agentfs` once, and the internal crates keep names that
+  say what they hold (`agentfs-tree-engine` can become `agentfs-engine` once there is one engine) without touching a
+  consumer's imports. The front is small: re-exports of the tree engine's consumer API, and docs. Prior art:
+  `wasmtime` and `wasmtime-cli`, `gix` over gitoxide's crates, `bevy` over `bevy_*`.
 - **Why not one package that is both library and binary.** Cargo sets dependencies per package: library consumers
   would pull clap, the OTLP exporters, tokio and rustls unless every one sat behind a feature.
 - **Workspace crates never depend on the front**: it depends on agentfs-fuse, so fuse using it would be a cycle, and
   a workspace crate names the crate that owns what it uses.
 - **The recording engine is not re-exported.** M9 deletes it; until then a consumer that needs `volume`, `push` or
-  `restore` depends on `agentfs-core` by name. AGENTS.md principle 10's mapping and `docs/library/` change with PR 2:
+  `restore` depends on `agentfs-core` by name. agentfs-fuse still links and exposes it (`boundary.rs:42-43` uses
+  `record` and `volume`; `lib.rs` makes `boundary`, `ops` and `overlay` public), which is why Q1 matters. AGENTS.md principle 10's mapping and `docs/library/` change with PR 2:
   the library is `agentfs`, over the tree engine's crates.
 - **crates.io.** The name `agentfs` there belongs to an unrelated project. Git and path dependencies are unaffected;
   publishing would need another registry name (no publishing is planned).
@@ -118,10 +120,16 @@ cycle of nine: journal, durability, saved state, recording, referee, queue and l
   (`failpoints.rs:142-177`) and the three tree observers (`telemetry.rs:648`, `:683`, `:799`) as functions over a
   `Meter`. `sha256_at` (`confined.rs:29`) beside its one caller, `restore.rs:735`.
 - `tree_git.rs:69`, `:75`: two counters become `pub`; `tree_reconcile` needs nothing. Optional: `config::validate_name`,
-  `parse_duration`, `shared_fs` with `mountinfo`, `listening_socket`, `allocator` (0.8k) to base, so agentfs-csi stops
-  depending on the recording engine.
+  `parse_duration`, `shared_fs` with `mountinfo`, `listening_socket`, `allocator` (0.8k) to base. This does not free
+  agentfs-csi from the recording engine: it depends on agentfs-fuse, which links it, until M9.
 - The CLI's rename: about 85 references (`-p agentfs` and `--features agentfs/...` in workflows, the Dockerfile,
-  `ci/*.sh`, README, docs). `CARGO_BIN_EXE_agentfs` and the installed binary keep their name.
+  `ci/*.sh`, README, docs). `CARGO_BIN_EXE_agentfs` and the installed binary keep their name. **Order inside PR 2:**
+  the rename lands in a commit where no package named `agentfs` exists, so a missed `-p agentfs` fails CI instead of
+  quietly building the front (and `ci/check-deps.sh` checking the front's tree); the front comes in a later commit.
+- `tree_actor` stays one module inside agentfs-tree-engine, so its ~660 `pub(in crate::tree_actor)` paths compile
+  unchanged. That is what makes PR 2 moves only.
+- **Workspace-wide tests leave core,** which M9 deletes: `docs_reference.rs` (it lists every crate and reads the
+  Dockerfile) and the source scan at `failpoints.rs:698` move to agentfs-cli's tests, the crate at the top that M9 keeps.
 
 **Needs a design change first.**
 - **One error:** each crate gets its own enum; the engine's `Error` wraps them with `From` and keeps `errno()`, the one
@@ -130,6 +138,9 @@ cycle of nine: journal, durability, saved state, recording, referee, queue and l
 - **Types out of `tree.rs`:** values down to the referee; `Call`, `FileMap`, `Layout`, `Objects` (`fold.rs:17`) and
   `Retired` (`tree.rs:16`) down to the journal. **Inversions:** `stages.rs:517`'s counter moves into stages and the feed
   bumps it; `lag.rs:24`'s constant moves to lag and settings reads it.
+- **The referee's two upward edges:** `queue::held` takes `&Shape` (`queue.rs:7`, `:50`), from the state half of
+  `tree.rs` bound for the journal; `Upstreams::merges` calls `refs::branch` (`upstreams.rs:69`), in history. `held`
+  moves up to its caller, and ref naming moves down beside the values or `merges` moves up.
 - **Tests:** the compactor's and repack's tests build a whole actor (`test_support::new_actor`); they move to the
   engine's tests or get a fake.
 
@@ -142,18 +153,26 @@ fields (`mod.rs:413-426`); Rust allows those methods only in `TreeActor`'s crate
 
 PR #43 cut most of the rebuild time [measured]: one edit in `tree_actor/recording/` or `volume.rs`, then
 `cargo test -p agentfs-core --no-run`, takes 9 s (27 s before). A crate boundary now saves little edit-to-test time;
-the gains are mostly the compiler checking the layering, and fewer crates for a consumer or the CSI driver to build.
+the gains are mostly the compiler checking the layering, and a consumer building only the engine it uses.
+
+**Test-run time is not this design's to cut.** The owner's goal (2026-11-24: agents spend about 30% of their time in
+cargo test) is now mostly the run: `cargo test -p agentfs-core` runs 218 s against a 9 s rebuild, and two programs,
+`tree_batch_alloc` (71 s) and `tree_stages` (about 60 s), are most of it. They run on every tree edit before and after
+every PR here. What would deliver it (cheaper fixtures for those two, or running them in CI only) is a separate
+piece of work, not a crate boundary; PR 2 reports each crate's run time beside its build time.
 
 | # | Crates | Lines | Effort | Risk | Gain |
 |---|---|---|---|---|---|
 | 1 | agentfs, agentfs-cli, agentfs-base, agentfs-tree-engine, agentfs-git, agentfs-lines (PR 2) | 0.1k, rename, 2.1k, 38k, 1.4k, 1.4k | one session, about 90 moved files and 85 renamed references | low | consumers' one name; neither engine links the other's code; core's tree tests (about 20 programs' worth, now merged) leave core |
-| 2 | agentfs-mark | about 0.5k | none beyond the waiting-marks PR | low | "no lock, thread or number of its own" becomes a compile-time fact |
-| 3 | agentfs-journal and agentfs-referee | ~10k, ~4k | 3 to 4 days | medium (the commit point; one `phase-1.yml` dispatch, as module cut 5.3) | the referee's tests link only pure code; journal and referee stop rebuilding on edits above them |
+| 2 | agentfs-mark | about 0.5k | none beyond the waiting-marks PR | low | depends on nothing in the engine, which the compiler checks; its tests link none of it. Fails the deletion test if that is all: it may stay in agentfs-journal (for the waiting-marks code architect) |
+| 3 | agentfs-journal and agentfs-referee | ~10k, ~4k | 4 to 5 days (the referee's two upward edges) | medium (the commit point; one `phase-1.yml` dispatch, as module cut 5.3; without release `lto`, calls across the new boundary on the hot path are no longer inlined unless generic or `#[inline]`, so PR 4 re-runs the release figures) | the referee's tests link only pure code; journal and referee stop rebuilding on edits above them |
 | 4 | agentfs-history | ~11.5k | 2 to 3 days | medium | history behind its own surface |
 | 5 | recording out of the engine | ~6k | with #2 | high | an actor edit stops recompiling recording |
 
 PR 2 re-runs the "Build settings" table, so a figure claimed is a figure measured.
 
+- **Not delivered here:** the two duplicates of section 1 (a fork's upstream in two homes; "no forks of forks"
+  checked twice). They cross the Trees domain and the engine, not a crate line; they are their own work item.
 - **Not done:** splitting the recording engine (owner: "ok" to keeping it whole until M9); a landing crate (1.3k,
   3 commits); an adapters crate (0.8k); a stages crate (M5's); a replication crate (M4 re-homes the transports).
 
@@ -178,8 +197,9 @@ PR 1 speed (#43, merged) -> PR 2 the front, the CLI rename, base, tree-engine, g
 
 | Option | Gives | Costs |
 |---|---|---|
-| A. The library by default, `agentfs::fuse` behind a `fuse` feature (recommended) | one name for both layers a consumer links; the default build has no FUSE | the front depends on agentfs-fuse, optionally |
-| B. The library only; agentfs-fuse keeps its own name | the front stays one layer | two names for a consumer that mounts |
+| A. `agentfs::fuse` behind a `fuse` feature now | one name for both layers a consumer links; the default build has no FUSE | agentfs-fuse links and exposes the recording engine (`boundary.rs:42-43`), so with the feature on the front re-exports `record` and `volume` types and links agentfs-core, until M9 |
+| B. The library only until M9, then the `fuse` feature (recommended) | the front never carries the engine M9 deletes | a consumer that mounts names agentfs-fuse until M9 |
+| C. As A, after splitting agentfs-fuse's recording-engine front out first | A without the recording engine | moves in agentfs-fuse for code M9 deletes |
 
 The CSI driver stays its own crate either way: it is deployed, not linked. The answer sets the front's features.
 
