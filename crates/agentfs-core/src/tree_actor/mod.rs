@@ -1813,10 +1813,8 @@ impl TreeActor {
         }
     }
 
-    /// A built event the actor has not applied, taken by the volume's
-    /// built-event follower (`Recording::serve`), or a built or failed event
-    /// a host's take worker reached (`Recording::progress`): what the actor
-    /// does at once, without waiting for its next step. Bounded:
+    /// A built or failed event reached the view's worker (`Recording::progress`):
+    /// what the actor does at once, without waiting for its next step. Bounded:
     /// O(1) plus the batch's maps and what changed since the last built point.
     /// Lock order: the actor, then History.
     pub(in crate::tree_actor) fn on_built(&mut self) {
@@ -1868,7 +1866,6 @@ impl TreeActor {
         }
         self.history.defer_drops(retired);
         self.rebuilt = through;
-        self.history.rebuilt(through);
         if left && last.get() > through.get() {
             self.history.want_through(RecordNo::new(last.get()));
         }
@@ -1885,9 +1882,8 @@ impl TreeActor {
     /// leaves history built through the last record. Once only; what a drop
     /// runs.
     pub(in crate::tree_actor) fn shut_down(&mut self) {
-        // Stopped first: a built event the volume's follower took before
-        // the shutdown finds the actor stopped once it has the lock, and
-        // applies nothing after the builder has gone.
+        // Stopped first: from here the actor answers `Stopped`, so nothing
+        // is applied to it after its builder has gone.
         self.stopped = true;
         let appended = self.journal.durability().appended();
         self.history.stop(appended);
@@ -2625,12 +2621,10 @@ mod tests {
         assert_eq!(v.read(ROOT, "big").unwrap().len(), 66 << 20);
     }
 
-    /// A built event applied takes the builder's map read from the
-    /// checkout, with no further step and no host's `progress`: once the
-    /// volume is at rest (`Recording::settle`, every built event applied),
-    /// the saved map has let go of its journal frames. That the follower
-    /// applies a built event with no caller at all is
-    /// `a_call_held_at_the_overlay_limit_is_admitted_with_no_take_worker`'s.
+    /// The built event wakes the actor: once a close's save is built, one
+    /// `progress` (what a view's worker runs at each built event) takes the
+    /// builder's map read from the checkout, with no further step, and the
+    /// saved map lets go of its journal frames.
     #[test]
     fn a_built_event_lets_the_saved_map_go_of_its_frames_without_a_step() {
         let tmp = tempfile::tempdir().unwrap();
@@ -2647,14 +2641,14 @@ mod tests {
         rec.actor().unwrap().write(h, 0, b"bytes", false).unwrap();
         rec.actor().unwrap().close(h).unwrap();
         rec.settle().unwrap();
-        {
+        let on_frames = || {
             let actor = rec.actor().unwrap();
             let object = actor.object_at(ROOT, "a").unwrap();
-            assert!(
-                !actor.trees[&ROOT].bytes[&object].on_frames(),
-                "the built event took the built map"
-            );
-        }
+            actor.trees[&ROOT].bytes[&object].on_frames()
+        };
+        assert!(on_frames(), "no step has taken the built map yet");
+        rec.progress().unwrap();
+        assert!(!on_frames(), "the built event took the built map");
         assert_eq!(rec.actor().unwrap().read(ROOT, "a").unwrap(), b"bytes");
     }
 }

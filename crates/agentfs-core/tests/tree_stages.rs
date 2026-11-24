@@ -475,9 +475,7 @@ fn a_gate_wait_is_recorded_by_its_cause() {
 /// Calls are appended with no fsync, and a FLUSH makes all of an open's
 /// records durable with one: close_4k's path (open, truncate, write, FLUSH,
 /// RELEASE) does one journal fsync on the call path where it did four. The
-/// builder's batch makes the close's record durable with one more, and the
-/// batch of the switch record the volume appends at the close's built event
-/// (`settle` waits for the volume at rest) one more.
+/// builder's batch makes the close's record durable with one more.
 #[test]
 fn a_call_is_not_fsynced_and_flush_fsyncs_once() {
     let _one = ONE_AT_A_TIME.lock().unwrap_or_else(PoisonError::into_inner);
@@ -512,10 +510,10 @@ fn a_call_is_not_fsynced_and_flush_fsyncs_once() {
     rec.actor().unwrap().close(h).unwrap();
     rec.settle().unwrap();
     let after = Stages::current();
-    assert_eq!(after.journal_fsync.count - before.journal_fsync.count, 3);
-    // The truncate, eight writes, the close's record, its layout chunk, its
-    // step and the switch record at its built event.
-    assert_eq!(after.journal_append.count - before.journal_append.count, 13);
+    assert_eq!(after.journal_fsync.count - before.journal_fsync.count, 2);
+    // The truncate, eight writes, the close's record, its layout chunk and
+    // its step.
+    assert_eq!(after.journal_append.count - before.journal_append.count, 12);
 }
 
 /// The distinct objects the store holds, by id. The history's repack runs in

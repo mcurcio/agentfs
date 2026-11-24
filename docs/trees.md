@@ -532,8 +532,7 @@ when it ends. `Recording::settle` waits until no close begun before it is
 still deciding or landing its save; a close begun after it, of any file, does
 not hold it, and neither does a failed close, which stays pending until its
 tree's next step. It then waits
-until the volume is at rest: every record built and applied by the actor, with
-the switch record a built event appends built too. When the actor
+until every record appended by then is built. When the actor
 stops (a failed journal fsync, a failed record) a close queued behind a save of
 its file and `Recording::settle` wake and answer `Stopped`.
 
@@ -1017,18 +1016,12 @@ the private checkouts copied, the checked-out files' maps rebased onto them
   memory: a save of a million pieces is one entry, and its map's memory is not
   held back by this limit. The actor reports every tree's overlay as it releases its lock, so the
   gate sees it grow at each step and shrink at each rebuild, without a timer.
-  The rebuild at a built event is the volume's own work: its built-event
-  follower (a thread of the core, `tree-built`) waits for a built point the
-  actor has not moved onto, then moves it there under its lock, so a call held
-  here is admitted on the built event alone, whatever the host's threads are
-  doing (a view's take worker deep in a take, or no take worker at all). A
-  panic or failure in the follower stops the volume (`tree Stopped` on
-  stderr, [runbook](runbooks/recording-failures.md#10-the-built-event-follower-stopped)):
-  a call already held at the gate answers `Stopped` on the stop, and so does
-  every later call. Its cost: one catch-up at each built event, under the
-  volume's lock, whose time grows with the tree, and every view's calls wait
-  behind it; a step's own catch-up can cover several built events at once,
-  the follower's covers what has been built when it takes the lock.
+  A known open item: the actor's rebuild at a built event runs only when a
+  host's take worker calls in (`Recording::progress`) or at the volume's next
+  step. While a tree's calls wait here there may be no step, so a take worker
+  busy in a long take keeps them waiting after history has caught up: one
+  `create` run with a fork view held a call 310 s. The waiting-primitive work
+  fixes it.
   Over `agentfs.overlayLimit` (32 MiB unless set,
   [configuration](configuration.md#tree-volumes-the-operator-settings-file)),
   the tree's calls that start new work wait as over the lag limit, until the

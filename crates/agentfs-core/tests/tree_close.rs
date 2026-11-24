@@ -2,8 +2,8 @@
 //! open whose saved map did not move and whose length changed closes in one
 //! hold, comparing no byte, however many calls it made; any other close
 //! decides with the lock released and holds it twice, briefly. The holds
-//! are the calling thread's (the volume's built-event follower holds the
-//! lock at built events of its own); the bytes compared are read through the
+//! are the calling thread's (other threads of the volume hold the lock at
+//! events of their own); the bytes compared are read through the
 //! process-wide stage counters, so one test runs at a time.
 use std::sync::{Arc, Mutex, PoisonError};
 

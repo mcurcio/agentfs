@@ -160,10 +160,6 @@ type BatchRead = Box<dyn FnMut(Option<RecordNo>) + Send>;
 struct State {
     /// The built point.
     built: RecordNo,
-    /// The built point the actor's saved trees were last moved onto
-    /// ([`History::rebuilt`]): a built point past it is a built event the
-    /// actor has not applied ([`History::wait_unapplied`]).
-    rebuilt: RecordNo,
     /// Every pointer as built.
     pointers: Arc<Pointers>,
     /// Each direct save's commit, by its step: what a sync asks of a save.
@@ -347,7 +343,6 @@ impl History {
                 repo,
                 state: Mutex::new(State {
                     built,
-                    rebuilt: built,
                     pointers: Arc::new(pointers),
                     owners,
                     objects,
@@ -726,31 +721,6 @@ impl History {
         self.notify();
     }
 
-    /// The actor moved its saved trees onto the built point `through`
-    /// (`TreeActor::rebuild`), under its lock. Lock order: the actor, then
-    /// History.
-    pub(in crate::tree_actor) fn rebuilt(&self, through: RecordNo) {
-        let mut state = self.state();
-        state.rebuilt = state.rebuilt.max(through);
-    }
-
-    /// Returns `true` once the built point is past the one the actor last
-    /// rebuilt onto, a built event it has not applied, and `false` once
-    /// the volume is stopping: what the volume's built-event follower waits
-    /// on (`Recording::serve`). Woken by the built event itself; no timer.
-    pub(in crate::tree_actor) fn wait_unapplied(&self) -> bool {
-        let mut state = self.state();
-        loop {
-            if state.stopping || state.stopped {
-                return false;
-            }
-            if state.built > state.rebuilt {
-                return true;
-            }
-            state = self.wait(state);
-        }
-    }
-
     /// The builder's maps of files it built or rebased, for the actor.
     pub(in crate::tree_actor) fn publish_maps(&self, maps: Vec<(TreeId, u64, FileMap)>) {
         if !maps.is_empty() {
@@ -840,16 +810,6 @@ impl History {
         while !state.stopped {
             state = self.wait(state);
         }
-    }
-
-    /// The volume stopped under History (its built-event follower failed):
-    /// History is stopping, so every waiter hears it at once (a call held
-    /// at the gate answers [`WaitError::Stopped`], the follower and the
-    /// repack task end), and the builder builds what is wanted, then exits.
-    /// Unlike [`History::stop`], returns at once.
-    pub(in crate::tree_actor) fn stop_now(&self) {
-        self.state().stopping = true;
-        self.notify();
     }
 
     /// The builder exited without a stop asked (it could not start).

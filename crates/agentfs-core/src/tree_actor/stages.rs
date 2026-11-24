@@ -597,8 +597,8 @@ thread_local! {
 }
 
 /// How many holds of the actor's lock the calling thread has begun, from
-/// the same [`Held`] as `actor_lock`'s count. A volume's own threads (the
-/// built-event follower, the gate thread) hold the lock at events of their
+/// the same [`Held`] as `actor_lock`'s count. Other threads (the gate
+/// thread's answers, a host's workers) hold the lock at events of their
 /// own, so a test counting one call's holds counts its own thread's.
 pub fn holds_on_this_thread() -> u64 {
     HOLDS_HERE.with(std::cell::Cell::get)

@@ -688,15 +688,6 @@ while the tree's lag and overlay are under their limits or the builder has
 failed, else at the built event that brings them under
 ([trees](../trees.md#history-trails-the-files)). Each release of the actor's
 lock (`ActorGuard`'s drop) reports every tree's overlay to the gate.
-`Recording::serve` starts the volume's two threads, both joined when the last
-`Recording` drops: the gate thread, which answers every gated call that waits,
-and the built-event follower, which applies each built event to the actor
-under its lock (its saved trees moved onto the built point, then the overlay
-report), so the gate
-opens with no host thread calling in. A panic or failure in the follower stops
-the actor and History at once (`History::stop_now`), so a call already held at
-the gate answers `Stopped`, as every later call does. `progress` still applies a built event
-before its takes, but a host need not call it for the gate to open.
 `Recording::set_overlay_limit(bytes)` sets the overlay limit (the launcher
 passes `OperatorSettings::overlay_limit()`); `History::overlay_bytes(tree)`
 gives a tree's overlay as last reported, in estimated bytes (0 before any
@@ -1028,9 +1019,7 @@ tree). Once the actor stops, a `finish` queued behind another save of its file
 and a `settle` wake and answer `Error::Stopped`. `Recording::settle` waits until
 no save begun before it is pending (a close whose close record is below the
 journal's next record when it starts; one begun after it, of any file, does not
-hold it), then until the volume is at rest: every record appended is built and the
-actor has moved onto that built point (`settle` applies it under the lock, as the
-built-event follower does), with any switch record that appends built too; it is never called from a
+hold it), then until history is built through every record by then; it is never called from a
 thread that finishes saves. `TreeActor::metrics()` counts them in
 `pending_saves`, `oldest_pending_save_ns` and `failed_saves`
 ([telemetry](../telemetry.md#pending-saves)).
