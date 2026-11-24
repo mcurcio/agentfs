@@ -84,6 +84,50 @@ their own allocator, `docs_reference`, `crash_points`, `crash_daemon`,
 test that runs another test of its program in a child process names it with
 `test_name!`, which adds the module path that `--exact` needs.
 
+### Build settings
+
+The workspace's `Cargo.toml` sets the development and test profile:
+
+- **Line tables only** (`debug = "line-tables-only"`) for the workspace's
+  crates, so a panic's backtrace still names file and line, and **no debug
+  info** for dependencies. A debugger shows no local variables in such a
+  build. Release builds are unchanged.
+- **Dependencies stay unoptimised.** `opt-level = 1` for dependencies was
+  measured and not taken: the cold build took 400 s instead of 232 s, and
+  `agentfs-core`'s tests ran in 216 s instead of 217 s.
+
+The first `cargo test -p <crate>` after a `cargo build --workspace` compiles
+some dependencies again (88 s for `agentfs-core` below): a package alone
+turns on fewer features of tokio and others than the workspace does. Both
+builds stay in the target directory, so this is paid once.
+
+Each worktree has its own target directory. Don't share one build
+directory (`CARGO_BUILD_BUILD_DIR`) between worktrees of this repository:
+the hash cargo files a workspace crate's build under does not include the
+checkout's path, so two worktrees build into the same place. One worktree's test then
+runs the other's code, and `CARGO_BIN_EXE_agentfs` names the other
+worktree's binary.
+
+Measured on 2026-11-24 in a container with 4 shared CPUs and 16 GB, at
+`-j 2`, one build at a time, each column from an empty target directory:
+
+| Step | Before | Line tables only | And merged test programs |
+|---|---|---|---|
+| `cargo build --workspace --all-targets`, cold | 296 s | 232 s | 217 s |
+| Then `cargo test -p agentfs-core --no-run` | 154 s | 97 s | 88 s |
+| Target directory after these | 26 GB | 9.3 GB | 6.6 GB |
+| Test programs in the workspace | 70 | 70 | 34 |
+| `cargo test -p agentfs-core`, run only | 233 s | 217 s | 218 s |
+| One edit in `tree_actor/recording/`, then `cargo test -p agentfs-core --no-run` | 27 s | 16 s | 9 s |
+| One edit in `volume.rs`, the same | 29 s | 15 s | 9 s |
+| `cargo test -p agentfs`, its build and run | 143 s | 101 s | 85 s |
+| Of which the run | 32 s | 25 s | 16 s |
+| Target directory at the end | 33 GB | 12 GB | 8.0 GB |
+
+`agentfs-core`'s test run is mostly three programs, one after another:
+`tree_batch_alloc` (71 s, one test), `tree_stages` (about 60 s) and the
+unit tests (about 50 s).
+
 ## CI
 
 Every push runs [`.github/workflows/ci.yml`](../.github/workflows/ci.yml):
