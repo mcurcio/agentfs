@@ -8,7 +8,7 @@ usual cause is a state area that is full or cannot be written.
 
 Sections 1 to 4 are the recording engine's, on recording state areas, which no launcher runs any more ([moving.md](moving.md) moves the CSI volumes
 an older driver made); their `kubectl` lines apply to no volume today.
-Sections 5 to 9 are the tree views', which the sidecar, the Docker
+Sections 5 to 10 are the tree views', which the sidecar, the Docker
 examples, `agentfs mount` and the CSI driver run ([trees](../trees.md)); there `$STATE` is the volume's state area (the
 sidecar's and Docker's `/data/state`).
 
@@ -36,6 +36,7 @@ kubectl -n agentfs-csi exec "$NODE_POD" -c agentfs-csi -- agentfs --state "$STAT
 | `agentfs mount` exits 75 or 1 at start, or does not exit after SIGTERM | the mount's stderr | [7](#7-a-tree-mount-that-will-not-start-or-stop) |
 | `tree HistoryUnverified: step=<n> ...`, `tree HistoryEvidenceNotWritten`, `tree HistoryNotesUnreadable` or `tree HistoryVerifyFailed`; gauge `agentfs.history.unverified` above 0; alert `AgentfsHistoryUnverified` | a tree actor's stderr; telemetry | [8](#8-a-save-history-could-not-check) |
 | `tree SaveFailed: tree=<t> ... it stays pending`, or a tree view's metrics with `failed_saves` rising or `pending_saves` above 0 and `oldest_pending_save_ns` growing | a tree actor's stderr; `--metrics-output` | [9](#9-a-tree-views-save-has-not-landed) |
+| `tree Stopped: the built-event follower failed: <error>; the volume stops` or `... panicked; the volume stops`, then every call of the tree views failing with `EIO` | a tree actor's stderr; the workload's errors | [10](#10-the-built-event-follower-stopped) |
 
 The `<error>` says what failed: `No space left on device` (`ENOSPC`),
 `Disk quota exceeded`, `Read-only file system` (`EROFS`), `Permission
@@ -416,6 +417,25 @@ print(m["pending_saves"], m["oldest_pending_save_ns"] / 1e9, m["failed_saves"])'
   open and its writes are in the journal, and the next mount's recovery
   closes every open it finds there, a pending save's included. `ci/e2e-tree-pending-saves.sh` checks a failed, a
   panicked and a killed decision on a failpoints build.
+
+## 10. The built-event follower stopped
+
+The volume's built-event follower, the thread `tree-built`, moves the actor
+onto each built point history reaches, which lets go of the overlay that holds
+calls at the overlay limit ([trees](../trees.md#history-trails-the-files)).
+When it fails or panics, nothing would open that gate again, so the volume
+stops: stderr has `tree Stopped: the built-event follower failed: <error>; the
+volume stops` or `tree Stopped: the built-event follower panicked; the volume
+stops`, every call the tree views get from then on fails with `EIO`, and a call
+already held at the gate fails the same way. Every record appended before the
+stop is in the journal: nothing the workload was answered for is lost.
+
+- Keep stderr and the state area (`cp -a "$STATE" "$STATE.saved"`) for a
+  report: a panic is a bug, and a failure's `<error>` says what failed. A full
+  or failing state area is [1](#1-the-state-area-is-full-or-unwritable).
+- Restart the mount once the cause is fixed. Its recovery closes every open
+  the journal holds and builds every record
+  ([7](#7-a-tree-mount-that-will-not-start-or-stop)).
 
 ## Verify
 

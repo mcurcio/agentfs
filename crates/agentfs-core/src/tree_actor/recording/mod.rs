@@ -283,15 +283,26 @@ impl Handle {
 }
 
 /// The one order a file's saves land in, live and at restart: opens with a
-/// close record in its order, then those without in open order. A close
-/// without one began after every close with one: its append failed, and
-/// the next record appended would have given it one first
-/// ([`TreeActor::record_close_begun`]); at restart, an open whose close
-/// never began closes last, as its client's end. Sorts recovery's closes, a step's
-/// pending closes, and the saves an open of its own client reads
-/// ([`TreeActor::open_content`], [`PendingFold`]).
-pub(in crate::tree_actor) fn close_rank(handle: u64, h: &Handle) -> (bool, Option<RecordNo>, u64) {
-    (h.close_order.is_none(), h.close_order, handle)
+/// close record in its order, then those without in the order they joined
+/// `pending` (the actor's pending closes: the order their appends failed,
+/// a client's end's opens in open order), then the rest in open order. A
+/// close without a record began after every close with one: its append
+/// failed, and the next record appended gives it one first, in this same
+/// order ([`TreeActor::record_close_begun`]); at restart, with nothing
+/// pending, an open whose close never began closes last, as its client's
+/// end. Sorts recovery's closes, a step's pending closes, and the saves an
+/// open of its own client reads ([`TreeActor::open_content`],
+/// [`PendingFold`]).
+pub(in crate::tree_actor) fn close_rank(
+    handle: u64,
+    h: &Handle,
+    pending: &[u64],
+) -> (bool, Option<RecordNo>, usize, u64) {
+    let joined = pending
+        .iter()
+        .position(|p| *p == handle)
+        .unwrap_or(usize::MAX);
+    (h.close_order.is_none(), h.close_order, joined, handle)
 }
 
 /// What a close took under the lock: the saved map and the open's view as
@@ -739,7 +750,7 @@ impl TreeActor {
             })
             .map(|(handle, h)| (*handle, h))
             .collect();
-        mine.sort_by_key(|(handle, h)| close_rank(*handle, h));
+        mine.sort_by_key(|(handle, h)| close_rank(*handle, h, &self.pending_closes));
         let [(_, only), ..] = mine.as_slice() else {
             return Ok(None);
         };
@@ -1624,10 +1635,13 @@ impl TreeActor {
     /// before any save), by recovery through [`TreeActor::close`], and by
     /// the one writer of a save for a close that has none yet.
     ///
-    /// Record first: each pending close begun earlier whose own append
-    /// failed gets its record before this one, in the order they failed, so
-    /// a failed append never moves a close behind one its client began
-    /// later, live or at restart.
+    /// Record first: each pending close ahead of this one (all of them when
+    /// this one is not pending) with no record, its own append failed, gets
+    /// its record before this one, in the order they joined the pending
+    /// closes, the order [`close_rank`] gives them. So a failed append never
+    /// moves a close behind one its client began later, and a client's end,
+    /// whose opens are pending in open order before any is given its
+    /// record, keeps open order, live and at restart.
     ///
     /// # Errors
     ///
@@ -1642,7 +1656,7 @@ impl TreeActor {
             .pending_closes
             .iter()
             .copied()
-            .filter(|p| *p != handle)
+            .take_while(|p| *p != handle)
             .filter(|p| self.handles.get(p).is_some_and(|o| o.close_order.is_none()))
             .collect();
         for p in earlier {
@@ -1887,7 +1901,11 @@ impl TreeActor {
                 })
             })
             .collect();
-        due.sort_by_key(|handle| self.handles.get(handle).map(|h| close_rank(*handle, h)));
+        due.sort_by_key(|handle| {
+            self.handles
+                .get(handle)
+                .map(|h| close_rank(*handle, h, &self.pending_closes))
+        });
         let mut saved = Vec::with_capacity(due.len());
         for handle in due {
             let _kind = section(Hold::Close);

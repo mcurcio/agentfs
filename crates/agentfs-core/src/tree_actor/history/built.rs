@@ -842,6 +842,16 @@ impl History {
         }
     }
 
+    /// The volume stopped under History (its built-event follower failed):
+    /// History is stopping, so every waiter hears it at once (a call held
+    /// at the gate answers [`WaitError::Stopped`], the follower and the
+    /// repack task end), and the builder builds what is wanted, then exits.
+    /// Unlike [`History::stop`], returns at once.
+    pub(in crate::tree_actor) fn stop_now(&self) {
+        self.state().stopping = true;
+        self.notify();
+    }
+
     /// The builder exited without a stop asked (it could not start).
     pub(in crate::tree_actor) fn builder_gone(&self) {
         let mut state = self.state();

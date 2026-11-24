@@ -1168,10 +1168,10 @@ impl TreeActor {
         let mut abandoned: Vec<_> = volume
             .handles
             .iter()
-            .map(|(handle, h)| recording::close_rank(*handle, h))
+            .map(|(handle, h)| recording::close_rank(*handle, h, &volume.pending_closes))
             .collect();
         abandoned.sort_unstable();
-        for (_, _, handle) in abandoned {
+        for (_, _, _, handle) in abandoned {
             volume.close(handle)?;
         }
         // Tracked paths the rules now never record leave history.
@@ -1885,6 +1885,10 @@ impl TreeActor {
     /// leaves history built through the last record. Once only; what a drop
     /// runs.
     pub(in crate::tree_actor) fn shut_down(&mut self) {
+        // Stopped first: a built event the volume's follower took before
+        // the shutdown finds the actor stopped once it has the lock, and
+        // applies nothing after the builder has gone.
+        self.stopped = true;
         let appended = self.journal.durability().appended();
         self.history.stop(appended);
         // History is stopping: the compactor ends after any compaction in flight.
@@ -2621,10 +2625,12 @@ mod tests {
         assert_eq!(v.read(ROOT, "big").unwrap().len(), 66 << 20);
     }
 
-    /// The built event wakes the actor: once a close's save is built, the
-    /// volume's built-event follower takes the builder's map read from the
-    /// checkout, with no further step and no host's `progress`, and the
-    /// saved map lets go of its journal frames.
+    /// A built event applied takes the builder's map read from the
+    /// checkout, with no further step and no host's `progress`: once the
+    /// volume is at rest (`Recording::settle`, every built event applied),
+    /// the saved map has let go of its journal frames. That the follower
+    /// applies a built event with no caller at all is
+    /// `a_call_held_at_the_overlay_limit_is_admitted_with_no_take_worker`'s.
     #[test]
     fn a_built_event_lets_the_saved_map_go_of_its_frames_without_a_step() {
         let tmp = tempfile::tempdir().unwrap();
@@ -2641,19 +2647,13 @@ mod tests {
         rec.actor().unwrap().write(h, 0, b"bytes", false).unwrap();
         rec.actor().unwrap().close(h).unwrap();
         rec.settle().unwrap();
-        let on_frames = || {
+        {
             let actor = rec.actor().unwrap();
             let object = actor.object_at(ROOT, "a").unwrap();
-            actor.trees[&ROOT].bytes[&object].on_frames()
-        };
-        // A bound on a hang: the follower applies the built event on its own.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        while on_frames() {
             assert!(
-                std::time::Instant::now() < deadline,
+                !actor.trees[&ROOT].bytes[&object].on_frames(),
                 "the built event took the built map"
             );
-            std::thread::yield_now();
         }
         assert_eq!(rec.actor().unwrap().read(ROOT, "a").unwrap(), b"bytes");
     }

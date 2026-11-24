@@ -391,9 +391,13 @@ fn report_overlays(actor: &TreeActor) {
 /// at the overlay limit is admitted on the built event alone, whatever a
 /// host's threads are doing (a take worker deep in a take, or no take
 /// worker at all). Event-driven, never a timer. Ends with the volume: once
-/// History is stopping, or the actor has stopped. A panic or a failure in
-/// it stops the actor, said on stderr: the actor would otherwise serve a
-/// gate no built event opens. Every close queued behind a save, and
+/// History is stopping, or the actor has stopped (checked under the lock,
+/// so a built event that raced the volume's shutdown is never applied
+/// after it). A panic or a failure in it, or a lock a panic poisoned,
+/// stops the volume, said on stderr: the actor answers `Stopped`, and
+/// History stops at once ([`History::stop_now`]), so every waiter hears it:
+/// a call already held at the gate, which no built event would open again,
+/// answers `Stopped` too. Every close queued behind a save, and
 /// `Recording::settle`, waits on a save in flight, which ends on the stop
 /// and wakes them.
 fn follow_built(actor: &Mutex<TreeActor>, history: &History) {
@@ -401,7 +405,7 @@ fn follow_built(actor: &Mutex<TreeActor>, history: &History) {
         let applied = catch_unwind(AssertUnwindSafe(|| -> Result<bool, Error> {
             let waiting = std::time::Instant::now();
             let Ok(mut locked) = actor.lock() else {
-                return Ok(false);
+                return Err(Error::Stopped);
             };
             stages::waited(waiting);
             let held = Held::start();
@@ -424,6 +428,7 @@ fn follow_built(actor: &Mutex<TreeActor>, history: &History) {
         };
         eprintln!("tree Stopped: {why}; the volume stops");
         actor.lock().unwrap_or_else(PoisonError::into_inner).stopped = true;
+        history.stop_now();
         return;
     }
 }
@@ -2135,8 +2140,24 @@ mod tests {
     fn a_call_held_at_the_overlay_limit_is_admitted_with_no_take_worker() {
         let tmp = tempfile::tempdir().unwrap();
         let rec = Recording::serve(new_actor(tmp.path())).unwrap();
+        let (resume, admission) = held_at_the_overlay_gate(&rec);
+        let over = rec.history().overlay_bytes(TreeId::Root);
+        assert!(
+            over > 2_000,
+            "the creates' overlay, {over} bytes, is over the limit"
+        );
+        // The builder goes on and builds the creates: its built event is
+        // all that happens.
+        drop(resume);
+        assert_eq!(admission.recv_timeout(HANG), Ok(true), "admitted");
+        assert!(rec.history().overlay_bytes(TreeId::Root) <= 2_000);
+    }
+
+    /// A call held at the overlay limit by a volume of 2,000 bytes' limit,
+    /// with every builder batch held until the sender returned is dropped:
+    /// the receiver hears the call's answer, `true` when admitted.
+    fn held_at_the_overlay_gate(rec: &Arc<Recording>) -> (mpsc::Sender<()>, mpsc::Receiver<bool>) {
         rec.settle().unwrap();
-        // Every batch from here waits at its start until `resume` is dropped.
         let (resume, held) = mpsc::channel::<()>();
         let held = Mutex::new(held);
         rec.history().on_batch_read(move |_| {
@@ -2151,11 +2172,6 @@ mod tests {
                 .unwrap();
             actor.close(h).unwrap();
         }
-        let over = rec.history().overlay_bytes(TreeId::Root);
-        assert!(
-            over > 2_000,
-            "the creates' overlay, {over} bytes, is over the limit"
-        );
         let (admitted, admission) = mpsc::channel();
         rec.admit_then(
             TreeId::Root,
@@ -2164,38 +2180,27 @@ mod tests {
             }),
         );
         assert!(admission.try_recv().is_err(), "held by the overlay gate");
-        // The builder goes on and builds the creates: its built event is
-        // all that happens.
-        drop(resume);
-        assert_eq!(admission.recv_timeout(HANG), Ok(true), "admitted");
-        assert!(rec.history().overlay_bytes(TreeId::Root) <= 2_000);
+        (resume, admission)
     }
 
-    /// A panic in the built-event follower stops the volume: every later
-    /// call answers `Stopped`, and the volume still drops.
+    /// A panic or a failure in the built-event follower stops the volume:
+    /// a call already held at the gate answers `Stopped` on the stop, as
+    /// does every later call, and the volume still drops.
     #[cfg(feature = "failpoints")]
     #[test]
-    fn a_panic_in_the_built_event_follower_stops_the_volume() {
-        let tmp = tempfile::tempdir().unwrap();
-        let rec = Recording::serve(new_actor(tmp.path())).unwrap();
-        rec.settle().unwrap();
-        let _panic = crate::failpoints::configure("tree.follow_built=panic").unwrap();
-        {
-            let mut actor = rec.actor().unwrap();
-            let h = actor
-                .write_open(TreeId::Root, "a", &writer("w"), Some(ATTRS))
-                .unwrap();
-            actor.close(h).unwrap();
-        }
-        // A bound on a hang: the create's built event reaches the follower.
-        let deadline = std::time::Instant::now() + HANG;
-        while rec.actor().is_ok() {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "the volume never stopped"
+    fn a_follower_stop_answers_a_call_held_at_the_gate() {
+        for how in ["panic", "error"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let rec = Recording::serve(new_actor(tmp.path())).unwrap();
+            let (resume, admission) = held_at_the_overlay_gate(&rec);
+            let _fail = crate::failpoints::configure(&format!("tree.follow_built={how}")).unwrap();
+            drop(resume);
+            assert_eq!(
+                admission.recv_timeout(HANG),
+                Ok(false),
+                "{how}: answered Stopped"
             );
-            std::thread::yield_now();
+            assert!(matches!(rec.actor(), Err(Error::Stopped)), "{how}");
         }
-        assert!(matches!(rec.actor(), Err(Error::Stopped)));
     }
 }

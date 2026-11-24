@@ -1395,7 +1395,9 @@ impl View {
                     return Err(Errno::EEXIST);
                 }
                 // The content it moves is the file's once every pending save
-                // of it, any client's, has landed.
+                // of it, any client's, has landed: a retry waits for a save
+                // begun after its first refusal too, or that save would land
+                // on the tree's file after its name is gone.
                 if let Some(pending) = v.pending_save(&from) {
                     return Ok(Moved::Again(pending));
                 }
@@ -1413,14 +1415,13 @@ impl View {
                     .place(&writing, &to, &mut map.reader(), map.len(), meta)?;
                 // The actor's lock is never taken under the area's hold. A
                 // save of the file begun while the copy was made refuses the
-                // unlink: the copy is stale, and the whole move is retried.
+                // unlink, a retry's too (no retry bound): the copy is stale,
+                // and the whole move is retried.
                 drop(writing);
-                Ok(
-                    match self.actor_retrying(refused)?.unlink(&from).map_err(errno)? {
-                        PathStep::Done(()) => Moved::Done,
-                        PathStep::WaitFor(pending) => Moved::Replaced(pending),
-                    },
-                )
+                Ok(match self.actor()?.unlink(&from).map_err(errno)? {
+                    PathStep::Done(()) => Moved::Done,
+                    PathStep::WaitFor(pending) => Moved::Replaced(pending),
+                })
             }
             Move::Import => {
                 if let Ok(node) = v.node(&to) {
@@ -2841,12 +2842,12 @@ mod tests {
         ));
     }
 
-    /// A refused move out waits only for the saves begun before the
-    /// refusal: its retry, given that refusal, moves the content those
-    /// saves leave while a save the other client began later is still
-    /// pending, which then lands on the moved-out file.
+    /// A refused move out waits for every save of the file, a save begun
+    /// after its refusal too: the moved-out file carries the other
+    /// client's later close, which is never left to land on a tree file
+    /// with no name.
     #[test]
-    fn a_retried_move_out_waits_for_no_save_begun_after_its_refusal() {
+    fn a_retried_move_out_waits_for_a_save_begun_after_its_refusal() {
         let tmp = tempfile::tempdir().unwrap();
         drop(new_actor(tmp.path()));
         let info = tmp.path().join("history.git/info");
@@ -2883,15 +2884,22 @@ mod tests {
             ),
             "a first try waits for the later save"
         );
+        assert!(
+            matches!(
+                view.run_move(root, from, root, to, RenameMode::Replace, Some(refused)),
+                Ok(Moved::Again(_))
+            ),
+            "a retry waits for the later save too"
+        );
+        later.finish().unwrap();
         assert_eq!(
             view.run_move(root, from, root, to, RenameMode::Replace, Some(refused)),
             Ok(Moved::Done)
         );
         assert_eq!(
             std::fs::read(area.path().join("kept.log")).unwrap(),
-            b"new\n"
+            b"two\n"
         );
-        later.finish().unwrap();
         assert!(matches!(
             view.actor().unwrap().node("notes.md"),
             Err(Error::NotFound)

@@ -723,7 +723,7 @@ mod close_records {
                 .into_iter()
                 .find(|(h, _)| *h == handle)
                 .unwrap();
-            close_rank(handle, &Handle::recovered(open.1))
+            close_rank(handle, &Handle::recovered(open.1), &[])
         };
         for cut in [&frames[..=first], &frames[..]] {
             let (one, two) = (rank(cut, h1), rank(cut, h2));
@@ -905,5 +905,63 @@ mod tests {
         drop(v);
         let restarted = reopen(tmp.path()).read(TreeId::Root, "f").unwrap();
         assert_eq!((live, restarted), (b"BBBB".to_vec(), b"BBBB".to_vec()));
+    }
+
+    /// The handles of the journal's close records, in record order.
+    fn close_records(path: &Path) -> Vec<u64> {
+        Journal::open(&path.join(JOURNAL), RecordNo::ZERO)
+            .unwrap()
+            .1
+            .iter()
+            .filter_map(|(record, _)| match record.entry {
+                Entry::CloseBegun { handle } => Some(handle),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A client's end with two opens of one file and no close begun gives
+    /// them their close records in open order, so the later open's `BBBB`
+    /// lands last, live as at a restart after a kill before the end.
+    #[test]
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "a client's end, below the sessions that make one"
+    )]
+    fn a_client_end_of_two_opens_of_one_file_keeps_open_order() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut v = new_actor(tmp.path());
+        let (h1, h2) = two_opens(&mut v);
+        v.close_writer(TreeId::Root, &writer("w").writer).unwrap();
+        let records = close_records(tmp.path());
+        assert_eq!(records[records.len() - 2..], [h1, h2]);
+        let live = v.read(TreeId::Root, "f").unwrap();
+        drop(v);
+        let restarted = reopen(tmp.path()).read(TreeId::Root, "f").unwrap();
+        assert_eq!((live, restarted), (b"BBBB".to_vec(), b"BBBB".to_vec()));
+    }
+
+    /// Two closes whose close records both failed land in the order they
+    /// failed, the order their records are then appended in: `BBBB`'s
+    /// close failed first and `AAAA`'s second, so the file ends `AAAA`,
+    /// live and after a restart.
+    #[test]
+    fn failed_close_records_land_in_the_order_they_failed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut v = new_actor(tmp.path());
+        let (h1, h2) = two_opens(&mut v);
+        {
+            let _append = crate::failpoints::configure("tree.wal_before_header=error@*").unwrap();
+            assert!(v.close_begin(h2).is_err());
+            assert!(v.close_begin(h1).is_err());
+        }
+        assert_eq!(v.metrics().pending_saves, 2);
+        v.mkdir(TreeId::Root, "d", ATTRS, &writer("w")).unwrap();
+        let records = close_records(tmp.path());
+        assert_eq!(records[records.len() - 2..], [h2, h1]);
+        let live = v.read(TreeId::Root, "f").unwrap();
+        drop(v);
+        let restarted = reopen(tmp.path()).read(TreeId::Root, "f").unwrap();
+        assert_eq!((live, restarted), (b"AAAA".to_vec(), b"AAAA".to_vec()));
     }
 }

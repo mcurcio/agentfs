@@ -693,7 +693,9 @@ lock (`ActorGuard`'s drop) reports every tree's overlay to the gate.
 and the built-event follower, which applies each built event to the actor
 under its lock (its saved trees moved onto the built point, then the overlay
 report), so the gate
-opens with no host thread calling in. `progress` still applies a built event
+opens with no host thread calling in. A panic or failure in the follower stops
+the actor and History at once (`History::stop_now`), so a call already held at
+the gate answers `Stopped`, as every later call does. `progress` still applies a built event
 before its takes, but a host need not call it for the gate to open.
 `Recording::set_overlay_limit(bytes)` sets the overlay limit (the launcher
 passes `OperatorSettings::overlay_limit()`); `History::overlay_bytes(tree)`

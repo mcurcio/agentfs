@@ -380,12 +380,14 @@ impl SessionGuard<'_> {
             .map(PathStep::Done)
     }
 
-    /// The pending save of the file at `path`, if it has one in flight
-    /// (for a retry, one begun before its first refusal): what a call that
-    /// reads the file's content for another place (a move out of the tree)
-    /// waits for first.
+    /// The pending save of the file at `path`, if it has one in flight:
+    /// what a call that reads the file's content for another place (a move
+    /// out of the tree) waits for first. Any such save, a retry's too: the
+    /// copy must carry every save answered before it, and a save begun
+    /// after the first refusal that landed on the tree's file once its
+    /// name was gone would be lost.
     pub fn pending_save(&self, path: &str) -> Option<SavePending> {
-        self.actor.pending_save(self.tree, path, self.retrying)
+        self.actor.pending_save(self.tree, path, None)
     }
 
     pub fn object_at(&self, path: &str) -> Result<u64> {

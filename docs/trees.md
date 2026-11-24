@@ -523,13 +523,15 @@ releases began, in the order they began. While a save is pending:
 | an open by another client of the tree | no | the saved content |
 | a second close of the file | no | begun and answered at once; its save lands after the earlier one, so a file's saves land in the order its closes began. A client's end saves its open of the file after every save of it begun before the end |
 | a rename of the file | no | the file keeps its object, and the save lands at the new name |
-| an unlink of it, a rename onto it, a move from the untracked area onto it, a move of it out of the tree, a path `truncate(2)` of it, a time set (`utimensat(2)`) of it | **yes** | the call is retried from the save worker once every save of the file begun before the call has landed or failed. History holds those saves, then the delete. A save of the file begun after the call does not hold it: it lands after the call, so a client that keeps closing the file never keeps the call waiting. A move out of the tree copies the landed content into the area; a time set is made after the landing, which moves the modification time, so the time set stays |
+| an unlink of it, a rename onto it, a move from the untracked area onto it, a move of it out of the tree, a path `truncate(2)` of it, a time set (`utimensat(2)`) of it | **yes** | the call is retried from the save worker once every save of the file begun before the call has landed or failed. History holds those saves, then the delete. For every call but a move out, a save of the file begun after the call does not hold its retry: it lands after the call, so a client that keeps closing the file never keeps the call waiting. A time set is made after the landing of the saves it waited for; a save begun after it lands later and moves the modification time again. A move out of the tree waits for every save of the file, one begun after its refusal too, and copies the landed content into the area: the moved-out file carries every close answered before the move, and no save lands on the tree's file after its name is gone. A client that keeps closing the file keeps a move out of it waiting |
 
 Takes, syncs and landings treat a pending save as an open file: one that touches
 it waits for the save's built event, and one that does not lands meanwhile.
 History and other trees see only landed saves. A view drains its save worker
-when it ends. `Recording::settle` waits until no save begun before it is
-pending; a close begun after it, of any file, does not hold it. It then waits
+when it ends. `Recording::settle` waits until no close begun before it is
+still deciding or landing its save; a close begun after it, of any file, does
+not hold it, and neither does a failed close, which stays pending until its
+tree's next step. It then waits
 until the volume is at rest: every record built and applied by the actor, with
 the switch record a built event appends built too. When the actor
 stops (a failed journal fsync, a failed record) a close queued behind a save of
@@ -556,12 +558,12 @@ closes in close order, not in the order they failed. A close whose close record
 cannot be appended (a full state area) is a failed close the same way, and it
 keeps its client's order: the next close record appended, by its retry or by
 any later close, comes after one appended for it, and failed closes get theirs
-in the order they failed. It lands before every save of its file its client
-closed later: where two such saves overlap, the file holds the later close's
+in the order they failed, the order a step lands them in and its client
+reads them in. It lands before every save of its file its client closed later: where two such saves overlap, the file holds the later close's
 bytes, live and after a restart. Until a tree's failed closes are saved,
 every release of that tree is saved on the view's request thread under the
 actor's lock together with them, in close order (a failed close with no record
-after every close with one), so the view and every call of the volume wait for
+after every close with one, in the order they failed), so the view and every call of the volume wait for
 all of them. No timer
 turns a slow save into a failure: `oldest_pending_save_ns` says how long the
 oldest has waited.
@@ -1021,7 +1023,12 @@ the private checkouts copied, the checked-out files' maps rebased onto them
   here is admitted on the built event alone, whatever the host's threads are
   doing (a view's take worker deep in a take, or no take worker at all). A
   panic or failure in the follower stops the volume (`tree Stopped` on
-  stderr): every later call answers `Stopped`.
+  stderr, [runbook](runbooks/recording-failures.md#10-the-built-event-follower-stopped)):
+  a call already held at the gate answers `Stopped` on the stop, and so does
+  every later call. Its cost: one catch-up at each built event, under the
+  volume's lock, whose time grows with the tree, and every view's calls wait
+  behind it; a step's own catch-up can cover several built events at once,
+  the follower's covers what has been built when it takes the lock.
   Over `agentfs.overlayLimit` (32 MiB unless set,
   [configuration](configuration.md#tree-volumes-the-operator-settings-file)),
   the tree's calls that start new work wait as over the lag limit, until the
