@@ -83,13 +83,16 @@ test that runs past a minute, every minute, and stop it at 15 minutes.
 with `NEXTEST_PROFILE: ci`, also runs on after the first failure and prints
 each failure when it happens and again at the end.
 
-Three slow tree tests build smaller volumes locally than in CI:
-`tree_batch_alloc` compares 1,000 and 10,000 files (2,000 and 20,000 in
-CI), and two `tree_stages` layout tests fill 1,000 files (10,000 in CI).
-`AGENTFS_TEST_VOLUMES` picks the sizes: unset or `small` for the local
-ones, `full` for CI's, which the workflows set beside `NEXTEST_PROFILE`;
-any other value fails the test. Each test's comment says what the local
-sizes do not catch. To run CI's sizes locally:
+Three slow tree tests, `tree_batch_alloc` and two `tree_stages` layout
+tests, build smaller volumes locally than in CI; each test's comment gives
+its sizes and says what the local ones do not catch.
+`AGENTFS_TEST_VOLUMES` picks the sizes: `small` or `full`. Unset, it is
+`small` locally and `full` on GitHub Actions (`GITHUB_ACTIONS=true`), so
+no workflow has to set it, and on Actions `small` fails the test: CI
+always runs the full sizes. Any other value fails the test too. At the
+full sizes `tree_batch_alloc` took 128 s to 160 s on the runners, the
+slowest test of ci.yml's test job, and the two `tree_stages` tests 42 s to
+78 s. To run CI's sizes locally:
 
 ```sh
 AGENTFS_TEST_VOLUMES=full cargo nextest run -p agentfs-core --test tree_batch_alloc --test tree_stages
@@ -190,8 +193,9 @@ differ by noise only. nextest alone, on the "Before" tests, ran
 10,000-file `tree_stages` tests 42 s, beside the other tests. Smaller
 volumes took the run to 75 s. Under nextest a package's run lasts about as
 long as its slowest test. For `agentfs-core` that is `tree_batch_alloc`
-(about 30 s), which builds a 10,000-file volume and must have its process
-to itself. `agentfs`'s run gains nothing: most of its tests are in one program
+(about 30 s locally), which builds a 10,000-file volume and must have its
+process to itself; CI runs it at full size (above), and its run lasts
+about as long. `agentfs`'s run gains nothing: most of its tests are in one program
 (`tests/cli/`), which already ran them several at a time (14 s), and its
 slowest test takes about 5 s.
 

@@ -6,7 +6,7 @@
 //! the test thread only waits in `settle` while the builder works.
 //!
 //! The volumes are [`small`] files and ten times it: 1,000 locally, 2,000
-//! in CI, which sets `AGENTFS_TEST_VOLUMES=full` (docs/development.md,
+//! on GitHub Actions or with `AGENTFS_TEST_VOLUMES=full` (docs/development.md,
 //! "Running tests"). What the test shows is the ratio between a tenfold
 //! volume's batches, not either size, and nearly all of its time is building
 //! the volumes (2,000 and 20,000 took 71 s, most of it the larger volume's

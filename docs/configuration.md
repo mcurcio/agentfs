@@ -1146,8 +1146,8 @@ five gaps until a test answers `go` or `fail`; an empty line ends the gate
 (`agentfs_core::failpoints::FifoGate`, [trees](trees.md#recording-and-durability)).
 
 **Tests only.** `AGENTFS_TEST_VOLUMES` is read by the test programs, never
-by a binary: `full` gives the slow tree tests CI's volume sizes, unset or
-`small` the local ones ([development](development.md#running-tests)).
+by a binary: it picks the slow tree tests' volume sizes
+([development](development.md#running-tests)).
 
 **Telemetry** (see [telemetry](telemetry.md)). Every command with pod flags but `status` (`restore` and `revert` only
 without a mount) exports OpenTelemetry metrics, traces

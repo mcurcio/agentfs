@@ -22,12 +22,15 @@ pub const ATTRS: Attrs = Attrs {
     },
 };
 
-/// The variable that picks the slow tree tests' volume sizes: `small` (the
-/// default, unset) or `full`, which CI sets (docs/development.md, "Running
-/// tests").
+/// The variable that picks the slow tree tests' volume sizes: `small` or
+/// `full` (docs/development.md, "Running tests").
 pub const VOLUMES_VAR: &str = "AGENTFS_TEST_VOLUMES";
 
-/// The volume sizes a slow tree test builds: `Small` locally, `Full` in CI.
+/// The variable every GitHub Actions runner sets to `true`.
+pub const ACTIONS_VAR: &str = "GITHUB_ACTIONS";
+
+/// The volume sizes a slow tree test builds: `Small` locally, `Full` on
+/// GitHub Actions.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Volumes {
     Small,
@@ -35,15 +38,31 @@ pub enum Volumes {
 }
 
 impl Volumes {
-    /// The sizes [`VOLUMES_VAR`] names; `Small` when it is unset. Any other
-    /// value, empty included, panics: a typo never quietly runs the small
-    /// sizes.
+    /// The sizes this run builds, from [`VOLUMES_VAR`] and [`ACTIONS_VAR`];
+    /// panics on a value [`Volumes::parse`] refuses.
     pub fn from_env() -> Volumes {
-        match std::env::var(VOLUMES_VAR) {
-            Err(std::env::VarError::NotPresent) => Volumes::Small,
-            Ok(v) if v == "small" => Volumes::Small,
-            Ok(v) if v == "full" => Volumes::Full,
-            other => panic!("{VOLUMES_VAR} is `small` or `full`, not {other:?}"),
+        let on_actions = std::env::var_os(ACTIONS_VAR).is_some_and(|v| v == "true");
+        Volumes::parse(std::env::var(VOLUMES_VAR), on_actions).unwrap_or_else(|e| panic!("{e}"))
+    }
+
+    /// The sizes `var`, [`VOLUMES_VAR`]'s value, names. Unset is `Small`
+    /// locally and `Full` on GitHub Actions, so no workflow, job or script has
+    /// to remember to set it. Any value but `small` or `full`, empty included,
+    /// is refused, and so is `small` on Actions: CI never quietly runs the
+    /// small sizes.
+    pub fn parse(
+        var: Result<String, std::env::VarError>,
+        on_actions: bool,
+    ) -> Result<Volumes, String> {
+        match var {
+            Err(std::env::VarError::NotPresent) if on_actions => Ok(Volumes::Full),
+            Err(std::env::VarError::NotPresent) => Ok(Volumes::Small),
+            Ok(v) if v == "full" => Ok(Volumes::Full),
+            Ok(v) if v == "small" && on_actions => Err(format!(
+                "{VOLUMES_VAR}=small on GitHub Actions: CI runs the full sizes"
+            )),
+            Ok(v) if v == "small" => Ok(Volumes::Small),
+            other => Err(format!("{VOLUMES_VAR} is `small` or `full`, not {other:?}")),
         }
     }
 

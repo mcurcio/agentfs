@@ -541,13 +541,32 @@ fn stored(state: &Path) -> BTreeSet<String> {
         .collect()
 }
 
-/// The larger tree of the layout tests: 1,000 files locally, 10,000 in CI,
-/// which sets `AGENTFS_TEST_VOLUMES=full` (docs/development.md, "Running
-/// tests").
+/// The larger tree of the layout tests: 1,000 files locally, 10,000 on
+/// GitHub Actions or with `AGENTFS_TEST_VOLUMES=full` (docs/development.md,
+/// "Running tests").
 fn many() -> usize {
-    let files = Volumes::from_env().files(1_000, 10_000);
-    eprintln!("the larger tree: {files} files");
-    files
+    Volumes::from_env().files(1_000, 10_000)
+}
+
+/// Every value of `AGENTFS_TEST_VOLUMES`, on GitHub Actions and off it: unset
+/// is the small sizes locally and the full ones in CI, and CI refuses the
+/// small sizes, so no workflow can quietly run them.
+#[test]
+fn the_volume_sizes_are_full_on_actions_and_refused_small_there() {
+    use std::env::VarError::{NotPresent, NotUnicode};
+    let set = |v: &str| Ok(v.to_owned());
+    assert_eq!(Volumes::parse(Err(NotPresent), false), Ok(Volumes::Small));
+    assert_eq!(Volumes::parse(Err(NotPresent), true), Ok(Volumes::Full));
+    assert_eq!(Volumes::parse(set("small"), false), Ok(Volumes::Small));
+    assert!(Volumes::parse(set("small"), true).is_err());
+    for on_actions in [false, true] {
+        assert_eq!(Volumes::parse(set("full"), on_actions), Ok(Volumes::Full));
+        for bad in ["", "Full", "bogus"] {
+            assert!(Volumes::parse(set(bad), on_actions).is_err(), "{bad:?}");
+        }
+        let not_unicode = Err(NotUnicode(std::ffi::OsString::from("full")));
+        assert!(Volumes::parse(not_unicode, on_actions).is_err());
+    }
 }
 
 /// A volume whose root holds `files` files, `f0` to `f<files - 1>`, then `a`,
