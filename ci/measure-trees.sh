@@ -6,6 +6,7 @@
 # The report is <result>, with samples in <result>.samples.jsonl, from the start.
 # Set MEASURE_TREES_TMPDIR to a directory on the filesystem under test.
 set -euo pipefail
+. "$(dirname "$0")/lib.sh"
 cd "$(dirname "$0")/.."
 mode=${1:?a mode is required}
 out=${2:?output JSON path required}
@@ -23,7 +24,7 @@ cleanup() {
     if [ "$status" != 0 ]; then cat "$work"/*.log "${mount_log:-/dev/null}" 2>/dev/null || true; fi
     rm -rf "$work"
 }
-trap cleanup EXIT
+on_exit cleanup
 mkdir "$work/main" "$work/sandbox" "$work/plain" "$work/backing"
 harness_mode=$mode
 [ "$mode" = smoke-kill ] && harness_mode=pilot

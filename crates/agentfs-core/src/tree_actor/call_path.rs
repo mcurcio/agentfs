@@ -13,10 +13,16 @@
 //! counter bumped at every landing or failure of a pending save. Lock order:
 //! the actor, then the waiters of [`Recording::when_saved_then`], then the
 //! epoch (docs/trees.md, "Recording and durability").
+//!
+//! Two threads of the volume run here, not in a host: the gate thread, which
+//! answers gated calls, and the built-event follower, which applies each
+//! built event to the actor under its lock, so the gate's overlay term falls
+//! on the built event alone (docs/trees.md, "The overlay limit").
 
 use std::collections::BTreeMap;
 use std::ops::{Deref, DerefMut};
 use std::path::Path;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 
 use agentfs_contracts::clients::FileOwner;
@@ -68,12 +74,7 @@ impl<'a> ActorGuard<'a> {
     /// History), then the lock is released, then the hold's measure ends.
     fn release(&mut self) {
         if let Some(guard) = self.guard.take() {
-            guard.history().overlays(
-                guard
-                    .trees
-                    .iter()
-                    .map(|(tree, saved)| (*tree, saved.overlay_bytes())),
-            );
+            report_overlays(&guard);
             drop(guard);
         }
         drop(self.held.take());
@@ -347,12 +348,70 @@ pub enum Progress {
     Empty,
 }
 
+/// Each tree's overlay as `actor` leaves it, reported to the lag gate before
+/// the actor's lock is released: the gate's memory term (lock order: the
+/// actor, then History).
+fn report_overlays(actor: &TreeActor) {
+    actor.history().overlays(
+        actor
+            .trees
+            .iter()
+            .map(|(tree, saved)| (*tree, saved.overlay_bytes())),
+    );
+}
+
+/// The built-event follower, the volume's `tree-built` thread: at each
+/// built event the actor has not applied ([`History::wait_unapplied`]), the
+/// actor's [`TreeActor::on_built`] under its lock, then each tree's overlay
+/// reported to the gate, as every hold's release reports it. So a call held
+/// at the overlay limit is admitted on the built event alone, whatever a
+/// host's threads are doing (a take worker deep in a take, or no take
+/// worker at all). Event-driven, never a timer. Ends with the volume: once
+/// History is stopping, or the actor has stopped. A panic or a failure in
+/// it stops the actor, said on stderr: the actor would otherwise serve a
+/// gate no built event opens. Every close queued behind a save, and
+/// `Recording::settle`, waits on a save in flight, which ends on the stop
+/// and wakes them.
+fn follow_built(actor: &Mutex<TreeActor>, history: &History) {
+    while history.wait_unapplied() {
+        let applied = catch_unwind(AssertUnwindSafe(|| -> Result<bool, Error> {
+            let waiting = std::time::Instant::now();
+            let Ok(mut locked) = actor.lock() else {
+                return Ok(false);
+            };
+            stages::waited(waiting);
+            let held = Held::start();
+            if locked.is_stopped() {
+                return Ok(false);
+            }
+            crate::failpoints::hit("tree.follow_built")?;
+            locked.on_built();
+            report_overlays(&locked);
+            drop(locked);
+            drop(held);
+            Ok(true)
+        }));
+        let why = match applied {
+            Ok(Ok(true)) => continue,
+            // The actor stopped: nothing is left to apply.
+            Ok(Ok(false)) => return,
+            Ok(Err(e)) => format!("the built-event follower failed: {e}"),
+            Err(_) => "the built-event follower panicked".to_owned(),
+        };
+        eprintln!("tree Stopped: {why}; the volume stops");
+        actor.lock().unwrap_or_else(PoisonError::into_inner).stopped = true;
+        return;
+    }
+}
+
 /// One tree volume, served: the actor, its journal's durability, and
 /// History with the builder behind it. Shared as `Arc<Recording>`. Dropping
 /// the last one makes every record durable and builds every step appended,
 /// so a clean shutdown leaves history built through its last record.
 pub struct Recording {
-    actor: Mutex<TreeActor>,
+    /// Shared with the built-event follower alone, which holds no handle on
+    /// the volume, so the last [`Recording`] dropped is always a caller's.
+    actor: Arc<Mutex<TreeActor>>,
     /// The actor's journal's group commit, reached without its lock.
     durability: Arc<Durability>,
     /// The one owner of the Git store, reached without the actor's lock.
@@ -362,6 +421,9 @@ pub struct Recording {
     /// The gate thread, joined at drop: it holds the store (and the state
     /// area's lease) until the builder has stopped.
     gate: Option<std::thread::JoinHandle<()>>,
+    /// The built-event follower ([`follow_built`]), joined at drop: it
+    /// ends once History is stopping.
+    follower: Option<std::thread::JoinHandle<()>>,
     /// Tests: runs where a close's decision runs, with the lock released.
     #[cfg(test)]
     in_decide: Mutex<Option<Box<dyn Fn() + Send>>>,
@@ -385,18 +447,22 @@ impl Drop for Recording {
     fn drop(&mut self) {
         // A failure is logged where the fsync failed; the next open recovers.
         let _ = self.durability.make_all_durable();
-        // Build every record appended, then stop the builder and the gate
-        // thread, so the lease is free once the drop returns. A drop on the
-        // gate thread itself (its last reply held the last handle) leaves it
-        // to end on its own.
+        // Build every record appended, then stop the builder, the gate
+        // thread and the follower, so the lease is free once the drop
+        // returns: the follower's share of the actor goes with its thread. A
+        // drop on the gate thread itself (its last reply held the last
+        // handle) leaves it to end on its own.
         self.actor
-            .get_mut()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
             .shut_down();
         if let Some(gate) = self.gate.take()
             && gate.thread().id() != std::thread::current().id()
         {
             let _ = gate.join();
+        }
+        if let Some(follower) = self.follower.take() {
+            let _ = follower.join();
         }
     }
 }
@@ -409,9 +475,10 @@ impl Lands for &Recording {
 }
 
 impl Recording {
-    /// Serves `actor`, with the volume's gate thread: one thread answers
-    /// every gated call that waits ([`Recording::admit_then`]) and ends once
-    /// the builder has stopped.
+    /// Serves `actor`, with the volume's two threads: the gate thread, which
+    /// answers every gated call that waits ([`Recording::admit_then`]) and
+    /// ends once the builder has stopped, and the built-event follower
+    /// ([`follow_built`]).
     fn serve(actor: TreeActor) -> Result<Arc<Self>, Error> {
         let durability = Arc::clone(actor.durability());
         let history = actor.history().clone();
@@ -424,12 +491,22 @@ impl Recording {
                 crate::failpoints::adopt(owner);
                 gate.serve_gate();
             })?;
+        let actor = Arc::new(Mutex::new(actor));
+        let (follows, built) = (Arc::clone(&actor), history.clone());
+        let owner = crate::failpoints::owner();
+        let follower = std::thread::Builder::new()
+            .name("tree-built".into())
+            .spawn(move || {
+                crate::failpoints::adopt(owner);
+                follow_built(&follows, &built);
+            })?;
         Ok(Arc::new(Self {
-            actor: Mutex::new(actor),
+            actor,
             durability,
             history,
             rules,
             gate: Some(gate),
+            follower: Some(follower),
             #[cfg(test)]
             in_decide: Mutex::new(None),
             #[cfg(test)]
@@ -933,9 +1010,10 @@ mod tests {
             .unwrap()
             .write_open(TreeId::Root, "a", &writer("w"), Some(ATTRS))
             .unwrap();
-        // The create is a step: once it is built, the builder has made its
-        // fsync and waits for the next step, so the flush leads the one held.
-        rec.settle().unwrap();
+        // The create is a step: once it is built and applied, the builder
+        // has made its fsync and waits for the next step, so the flush
+        // leads the one held.
+        quiet(&rec);
         rec.actor().unwrap().write(h, 0, b"x", false).unwrap();
         let (entered, inside) = sync_channel::<()>(0);
         let (release, released) = mpsc::channel::<()>();
@@ -984,6 +1062,21 @@ mod tests {
     /// A bound on a hang, never a coordination: each answer comes on an event.
     const HANG: std::time::Duration = std::time::Duration::from_secs(10);
 
+    /// Every record built and every built event applied, here rather than
+    /// by the follower: the builder waits for a step, and no rebuild left
+    /// to come asks it to build a record appended after this.
+    fn quiet(rec: &Recording) {
+        loop {
+            let built = rec.settle().unwrap();
+            let mut actor = rec.actor().unwrap();
+            // Its switch record, if it appends one, is built next round.
+            actor.on_built();
+            if rec.durability.appended() <= built {
+                return;
+            }
+        }
+    }
+
     /// The fsync's leader held in its fsync: `inside` says it is there, and
     /// it goes on at `release`. Later fsyncs find both ends gone and pass.
     fn hold_fsync(rec: &Recording) -> (mpsc::Receiver<()>, mpsc::Sender<()>) {
@@ -1005,9 +1098,10 @@ mod tests {
             .unwrap()
             .write_open(TreeId::Root, "a", &writer("w"), Some(ATTRS))
             .unwrap();
-        // The create is a step: once it is built, the builder has made its
-        // fsync and waits for the next step, so the next fsync is the test's.
-        rec.settle().unwrap();
+        // The create is a step: once it is built and applied, the builder
+        // has made its fsync and waits for the next step, so the next fsync
+        // is the test's.
+        quiet(&rec);
         rec.actor().unwrap().write(h, 0, b"x", false).unwrap();
         (rec, h)
     }
@@ -1217,8 +1311,12 @@ mod tests {
             b"saved"
         );
         drop(failing);
-        let built = rec.settle().unwrap();
-        assert_eq!(built, rec.durability.appended(), "a retry built it all");
+        quiet(&rec);
+        assert_eq!(
+            rec.history.built_through(),
+            rec.durability.appended(),
+            "a retry built it all"
+        );
     }
 
     /// A saved file `a` of ten bytes, and an open of it whose close keeps the
@@ -1652,8 +1750,8 @@ mod tests {
         }
         // No caller asked for durability: whatever is built, the builder made
         // durable first.
-        let built = rec.settle().unwrap();
-        assert_eq!(built, rec.durability.appended());
+        quiet(&rec);
+        assert_eq!(rec.history().built_through(), rec.durability.appended());
         assert!(rec.durability.mark() >= rec.history().built_through());
     }
 
@@ -1671,7 +1769,7 @@ mod tests {
             rec.actor().unwrap().close(h).unwrap();
         }
         // Calls after the last step: no step asks the builder for them.
-        rec.settle().unwrap();
+        quiet(&rec);
         let h = rec
             .actor()
             .unwrap()
@@ -1918,5 +2016,71 @@ mod tests {
             rec.actor().unwrap().read(TreeId::Root, "f").unwrap(),
             b"AA00BB"
         );
+    }
+
+    /// The overlay gate opens on the built event alone, with no take
+    /// worker or any other host thread calling in and no step after the
+    /// creates: the volume's own follower applies the built event to the
+    /// actor, whose rebuild brings the overlay under the limit.
+    #[test]
+    fn a_call_held_at_the_overlay_limit_is_admitted_with_no_take_worker() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rec = Recording::serve(new_actor(tmp.path())).unwrap();
+        rec.settle().unwrap();
+        // Every batch from here waits at its start until `resume` is dropped.
+        let (resume, held) = mpsc::channel::<()>();
+        let held = Mutex::new(held);
+        rec.history().on_batch_read(move |_| {
+            let _ = held.lock().map(|h| h.recv());
+        });
+        rec.set_overlay_limit(2_000);
+        let w = writer("w");
+        for n in 0..4 {
+            let mut actor = rec.actor().unwrap();
+            let h = actor
+                .write_open(TreeId::Root, &format!("c{n}"), &w, Some(ATTRS))
+                .unwrap();
+            actor.close(h).unwrap();
+        }
+        let over = rec.history().overlay_bytes(TreeId::Root);
+        assert!(over > 2_000, "the creates' overlay, {over} bytes, is over the limit");
+        let (admitted, admission) = mpsc::channel();
+        rec.admit_then(
+            TreeId::Root,
+            Box::new(move |r| {
+                let _ = admitted.send(r.is_ok());
+            }),
+        );
+        assert!(admission.try_recv().is_err(), "held by the overlay gate");
+        // The builder goes on and builds the creates: its built event is
+        // all that happens.
+        drop(resume);
+        assert_eq!(admission.recv_timeout(HANG), Ok(true), "admitted");
+        assert!(rec.history().overlay_bytes(TreeId::Root) <= 2_000);
+    }
+
+    /// A panic in the built-event follower stops the volume: every later
+    /// call answers `Stopped`, and the volume still drops.
+    #[cfg(feature = "failpoints")]
+    #[test]
+    fn a_panic_in_the_built_event_follower_stops_the_volume() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rec = Recording::serve(new_actor(tmp.path())).unwrap();
+        rec.settle().unwrap();
+        let _panic = crate::failpoints::configure("tree.follow_built=panic").unwrap();
+        {
+            let mut actor = rec.actor().unwrap();
+            let h = actor
+                .write_open(TreeId::Root, "a", &writer("w"), Some(ATTRS))
+                .unwrap();
+            actor.close(h).unwrap();
+        }
+        // A bound on a hang: the create's built event reaches the follower.
+        let deadline = std::time::Instant::now() + HANG;
+        while rec.actor().is_ok() {
+            assert!(std::time::Instant::now() < deadline, "the volume never stopped");
+            std::thread::yield_now();
+        }
+        assert!(matches!(rec.actor(), Err(Error::Stopped)));
     }
 }

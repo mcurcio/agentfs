@@ -8,6 +8,7 @@ case "$mode" in fua|flush) ;; *) exit 2 ;; esac
 # The oracle refuses planted images before it judges a real one.
 "$(dirname "$0")/power-loss-trees-check.sh" self-test
 : "${REPLAY_LOG:?}" "${AGENTFS_BIN:?}"
+. "$(dirname "$0")/lib.sh"
 base=${POWER_LOSS_DIR:-${TMPDIR:-/tmp}}
 mkdir -p "$base"
 work=$(mktemp -d "$base/agentfs-tree-power-loss.XXXXXX")
@@ -49,7 +50,7 @@ cleanup() {
   done
   chmod 644 "$results" 2>/dev/null || true
 }
-trap cleanup EXIT
+on_exit cleanup
 loop() { truncate -s "$2" "$1" || notrun "cannot create backing image"; dev=$(losetup -f --show "$1") || notrun "loop device unavailable"; devices+=("$dev"); }
 loop "$work/data.img" 512M; data=$dev
 loop "$work/log.img" 4G; log=$dev

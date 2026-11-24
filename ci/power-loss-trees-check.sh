@@ -221,7 +221,7 @@ else
 fi
 fail() { printf 'FAIL\t%s\t%s\t%s\n' "$FS" "$point" "$*" >> "$RESULTS"; echo "tree replay checkpoint $point: $*" >&2; exit 1; }
 cleanup() { mountpoint -q "$CHECK_MNT" && umount "$CHECK_MNT" || true; dmsetup remove "$CHECK_DM" 2>/dev/null || true; }
-trap cleanup EXIT
+on_exit cleanup
 dmsetup create "$CHECK_DM" --table "0 $(blockdev --getsz "$REPLAY_DEV") snapshot $REPLAY_DEV $COW_DEV N 8" || fail 'snapshot creation'
 mount "/dev/mapper/$CHECK_DM" "$CHECK_MNT" || fail 'filesystem mount'
 m=$CHECK_MNT

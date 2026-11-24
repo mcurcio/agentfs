@@ -50,7 +50,7 @@ cleanup() {
   sudo sh -c "grep '$W' /proc/self/mountinfo | cut -d' ' -f5 | sort -r | xargs -r -n1 umount -l" || true
   sudo rm -rf "$W"
 }
-trap cleanup EXIT
+on_exit cleanup
 
 step "start agentfs-csi"
 sudo "$AGENTFS_CSI_BIN" \

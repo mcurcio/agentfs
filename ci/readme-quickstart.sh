@@ -66,7 +66,7 @@ if [ "$MODE" = docker ]; then
     sudo rm -rf "$MNT" "$W"
     exit $status
   }
-  trap cleanup EXIT
+  on_exit cleanup
 
   step "the quick start ($heading)"
   printf '%s\n' "$block"
@@ -102,7 +102,7 @@ cleanup() {
   rm -rf "$W"
   exit $status
 }
-trap cleanup EXIT
+on_exit cleanup
 
 # cargo as the calling user, with the calling user's PATH.
 mkdir -p "$W/shim"

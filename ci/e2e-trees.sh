@@ -20,7 +20,7 @@ cleanup() {
     if [ "$status" != 0 ]; then cat "$work"/*.log 2>/dev/null || true; fi
     rm -rf "$work"
 }
-trap cleanup EXIT
+on_exit cleanup
 as_root=()
 [ "$(id -u)" = 0 ] || as_root=(sudo)
 mkdir "$work/main" "$work/fork"
@@ -176,7 +176,7 @@ for _ in $(seq 1 200); do
 done
 grep -q writing "$work/writer.log"
 kill -KILL "$pid"
-tree_wait_exit "$pid" 2>/dev/null || true
+tree_wait_exit "$pid" || true
 pid=
 kill "$client"
 wait "$client" 2>/dev/null || true
@@ -198,7 +198,7 @@ start
 # the next init's build, the head has not moved, and the times survive.
 "${as_root[@]}" python3 ci/trees-posix.py touch "$work/main"
 kill -KILL "$pid"
-tree_wait_exit "$pid" 2>/dev/null || true
+tree_wait_exit "$pid" || true
 pid=
 fusermount3 -uz "$work/main"
 fusermount3 -uz "$work/fork"

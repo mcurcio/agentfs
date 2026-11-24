@@ -14,7 +14,7 @@ cleanup() {
   [ "$status" = 0 ] || cat "$work/mount.log" >&2 || true
   rm -rf "$work"
 }
-trap cleanup EXIT
+on_exit cleanup
 wait_mounted() {
   for _ in $(seq 1 200); do
     if mountpoint -q "$1"; then return; fi
