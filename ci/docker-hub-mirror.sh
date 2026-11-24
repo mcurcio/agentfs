@@ -64,10 +64,10 @@ EOF
   ;;
 kind)
   cluster=${2:?kind cluster name}
-  # kind's node images since v0.27 run containerd 2, whose CRI reads
-  # registry hosts from /etc/containerd/certs.d (its default config_path,
-  # one of a colon-separated list) on each pull, so no restart is needed
-  # (kind's "Local Registry" guide). Docker Hub stays the fallback.
+  # ci/kind-cluster.sh points each node's containerd at
+  # /etc/containerd/certs.d (config_path), which it reads on each pull, so
+  # no restart is needed (kind's "Local Registry" guide). Docker Hub stays
+  # the fallback. config_path may be a colon-separated list.
   dir=/etc/containerd/certs.d/docker.io
   hosts=$(printf 'server = "https://registry-1.docker.io"\n\n[host."%s"]\n  capabilities = ["pull", "resolve"]\n' "$MIRROR")
   nodes=$(kind get nodes --name "$cluster")
