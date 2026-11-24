@@ -7,6 +7,15 @@ and with the open in another, told by a pipe after the close returned. RELEASE
 is a background request; the view asks the kernel to keep it ahead of an OPEN.
 Barriers and pipes order everything. No step waits on a timer.
 
+Then pending saves: after a slow close (a 64 MiB file overwritten in place) a
+stat and a read from this process and another give the new size and bytes;
+after write tmp, close, rename over the real file, the real file reads the new
+bytes; a rename onto a file, a path truncate, a time set and a move out of
+the tree (to a name info/exclude places in the untracked area) each wait for
+the file's pending save and then act on its new content; a close and an
+unlink at once leave history with the save before the delete, which
+ci/e2e-tree-pagecache.sh checks after the clean unmount.
+
 The mappings live in processes of their own: CPython holds its lock through
 mmap.flush, and one msync behind a busy view would pace every close to one per
 save, so no queue would form and the test could not see the race.
@@ -175,12 +184,132 @@ def run_round(root, round_name, other_process):
     return len(errors)
 
 
+def write_file(path, data, flags=os.O_CREAT | os.O_WRONLY | os.O_TRUNC):
+    fd = os.open(path, flags, 0o600)
+    try:
+        view = memoryview(data)
+        while view:
+            view = view[os.write(fd, view[:1 << 20]):]
+    finally:
+        os.close(fd)
+
+
+def check(errors, what, path, data):
+    """`path`'s size and bytes are `data`'s, else an error noted."""
+    size = os.stat(path).st_size
+    if size != len(data):
+        errors.append(f"{what}: size {size}, not {len(data)}")
+    if read_all(path) != data:
+        errors.append(f"{what}: not the bytes just written")
+
+
+def pending_saves(root):
+    """A slow close's save is pending: the file's own client (this process
+    and another, both behind this mount's one client) reads its new size
+    and bytes at once; a rename over a file goes first; and a delete waits
+    for the save, so history has the save before the delete (checked by
+    ci/e2e-tree-pagecache.sh after the unmount)."""
+    errors = []
+    slow = root / "slow-close"
+    old = b"o" * SLOW
+    write_file(slow, old)
+    # Overwritten in place, the length kept and only its last byte changed:
+    # its close compares every byte to find it, a decision that takes a
+    # while with the view's request thread free, so a later stat and open
+    # meet the pending save.
+    new = old[:-1] + b"n"
+    write_file(slow, new, os.O_WRONLY)
+    signal_read, signal_write = os.pipe()
+    child = os.fork()
+    if child == 0:
+        status = 1
+        try:
+            os.close(signal_write)
+            assert os.read(signal_read, 1) == b"x"
+            seen = []
+            check(seen, "slow close, another process", slow, new)
+            for error in seen:
+                print(error, flush=True)
+            status = int(bool(seen))
+        finally:
+            os._exit(status)
+    os.close(signal_read)
+    check(errors, "slow close, this process", slow, new)
+    os.write(signal_write, b"x")
+    os.close(signal_write)
+    _, status = os.waitpid(child, 0)
+    if os.waitstatus_to_exitcode(status) != 0:
+        errors.append("slow close: another process read stale content")
+
+    # The temporary file's save is pending when the rename goes first.
+    real, tmp = root / "renamed-over", root / "renamed-over.tmp"
+    write_file(real, b"r" * SLOW)
+    write_file(tmp, old)
+    write_file(tmp, new, os.O_WRONLY)
+    os.rename(tmp, real)
+    check(errors, "rename over", real, new)
+
+    # A rename onto a file whose save is pending waits for it, then replaces it.
+    onto, small = root / "renamed-onto", root / "renamed-onto.small"
+    write_file(onto, old)
+    write_file(small, b"small")
+    write_file(onto, new, os.O_WRONLY)
+    os.rename(small, onto)
+    check(errors, "rename onto", onto, b"small")
+
+    # A path truncate waits for the save, then cuts its content.
+    cut = root / "truncated"
+    write_file(cut, old)
+    write_file(cut, new, os.O_WRONLY)
+    os.truncate(cut, 10)
+    check(errors, "path truncate", cut, new[:10])
+
+    # A time set waits for the save, whose landing moves the modification
+    # time, so the time set is what stays.
+    timed = root / "timed"
+    write_file(timed, old)
+    write_file(timed, new, os.O_WRONLY)
+    os.utime(timed, ns=(1_000_000_000_000_000_005, 2_000_000_000_000_000_007))
+    check(errors, "time set", timed, new)
+    if os.stat(timed).st_mtime_ns != 2_000_000_000_000_000_007:
+        errors.append(f"time set: mtime {os.stat(timed).st_mtime_ns}")
+
+    # A move out of the tree waits for the save, then moves its content.
+    out = root / "moved-out"
+    write_file(out, old)
+    write_file(out, new, os.O_WRONLY)
+    os.rename(out, root / MOVED_OUT)
+    check(errors, "move out", root / MOVED_OUT, new)
+    if out.exists():
+        errors.append("move out: the tracked name is still there")
+
+    gone = root / UNLINKED
+    write_file(gone, old)
+    write_file(gone, new, os.O_WRONLY)
+    os.unlink(gone)
+    if gone.exists():
+        errors.append("close then unlink: the file is still there")
+    for error in errors:
+        print(f"pending saves: {error}", flush=True)
+    print(f"pending saves: {len(errors)} wrong", flush=True)
+    return len(errors)
+
+
+# A close whose decision takes a while: a same-length overwrite of this many
+# bytes compares them all. ci/e2e-tree-pagecache.sh names the same size.
+SLOW = 64 << 20
+UNLINKED = "unlinked-at-once"
+# ci/e2e-tree-pagecache.sh writes *.out to the volume's info/exclude.
+MOVED_OUT = "moved-out.out"
+
+
 def main():
     if len(sys.argv) != 2:
         raise SystemExit(__doc__)
     root = Path(sys.argv[1])
     wrong = sum(run_round(root, name, other) for name, other in (
         ("same", False), ("other", True)))
+    wrong += pending_saves(root)
     return int(bool(wrong))
 
 

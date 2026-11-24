@@ -8,7 +8,7 @@ usual cause is a state area that is full or cannot be written.
 
 Sections 1 to 4 are the recording engine's, on recording state areas, which no launcher runs any more ([moving.md](moving.md) moves the CSI volumes
 an older driver made); their `kubectl` lines apply to no volume today.
-Sections 5 to 8 are the tree views', which the sidecar, the Docker
+Sections 5 to 9 are the tree views', which the sidecar, the Docker
 examples, `agentfs mount` and the CSI driver run ([trees](../trees.md)); there `$STATE` is the volume's state area (the
 sidecar's and Docker's `/data/state`).
 
@@ -35,6 +35,7 @@ kubectl -n agentfs-csi exec "$NODE_POD" -c agentfs-csi -- agentfs --state "$STAT
 | `tree HistoryBuildFailed: <error>`, or a tree view's metrics with `history.health` `failed` or an `oldest_unbuilt_ns` that keeps growing | a tree actor's stderr; `--metrics-output` | [6](#6-a-tree-volumes-history-is-not-built) |
 | `agentfs mount` exits 75 or 1 at start, or does not exit after SIGTERM | the mount's stderr | [7](#7-a-tree-mount-that-will-not-start-or-stop) |
 | `tree HistoryUnverified: step=<n> ...`, `tree HistoryEvidenceNotWritten`, `tree HistoryNotesUnreadable` or `tree HistoryVerifyFailed`; gauge `agentfs.history.unverified` above 0; alert `AgentfsHistoryUnverified` | a tree actor's stderr; telemetry | [8](#8-a-save-history-could-not-check) |
+| `tree SaveFailed: tree=<t> ... it stays pending`, or a tree view's metrics with `failed_saves` rising or `pending_saves` above 0 and `oldest_pending_save_ns` growing | a tree actor's stderr; `--metrics-output` | [9](#9-a-tree-views-save-has-not-landed) |
 
 The `<error>` says what failed: `No space left on device` (`ENOSPC`),
 `Disk quota exceeded`, `Read-only file system` (`EROFS`), `Permission
@@ -299,6 +300,10 @@ volume is released. It waits while:
   ([6](#6-a-tree-volumes-history-is-not-built)). Fix the cause, or let the
   grace period end the process: nothing recorded is lost, and the next mount
   builds it.
+- **a save is pending.** A view lands the saves its save worker holds before
+  its client's end is recorded, so a hung save worker holds the stop
+  ([9](#9-a-tree-views-save-has-not-landed)). Let the grace period end the
+  process: the next mount saves it.
 
 An exit of 1 after a recording failure means the tree actor stopped
 ([5](#5-a-tree-state-area-that-refuses-to-open)): restart once the disk is fixed.
@@ -367,9 +372,56 @@ git --git-dir="$STATE/history.git" -c user.name=<you> -c user.email=<you@example
 The counts are read from history at the next start. Never rewrite the flagged
 commit: the flag is history, and both notes refs only gain commits.
 
+## 9. A tree view's save has not landed
+
+A tree view answers a release (the kernel's request after a file's last
+`close(2)`) once the close is begun; the view's save worker, the thread
+`tree-saves`, decides and lands the save after it
+([trees](../trees.md#pending-saves)). Until it lands it is a **pending save**:
+the program that closed the file reads its new content, a delete, a rename onto
+it, a replace or a path `truncate(2)` of it waits, and a sync or landing that
+touches the file waits. History and other trees see the file as it was. The
+workload is never told: its `close(2)` returned before the decision.
+
+The view's `--metrics-output` file says how many there are
+([telemetry](../telemetry.md#pending-saves)):
+
+```sh
+python3 -c 'import json, sys; m = json.load(open(sys.argv[1]))
+print(m["pending_saves"], m["oldest_pending_save_ns"] / 1e9, m["failed_saves"])' "$METRICS"
+```
+
+- **A failed or panicked decision.** stderr has `tree SaveFailed: tree=<t>
+  open=<n>: <error>; it stays pending`, `tree SaveFailed: tree=<t>: a save
+  panicked; it stays pending` or `... dropped unfinished, it stays pending`,
+  and `failed_saves` rises. The save stays pending and holds its file. The
+  tree's next step saves it again under the volume's lock: any call that
+  records a step in that tree (a close, a `mkdir`, a rename, a sync into a
+  fork), and a restart. Read the error: a full or failing state area is
+  [1](#1-the-state-area-is-full-or-unwritable); a panic is a bug, so keep
+  stderr and the state area (`cp -a "$STATE" "$STATE.saved"`) and report it.
+  Once the cause is fixed, `pending_saves` returns to 0 at the tree's next
+  step; with an idle tree, restart the mount.
+- **A save worker that hangs.** No timer turns a slow save into a failure:
+  `pending_saves` stays above 0 and `oldest_pending_save_ns` keeps growing.
+  The view's later saves queue behind it, so their files stay held too, and a
+  delete of one of them waits. A large save takes about a second to land
+  ([performance](../performance.md#pending-saves-off-the-views-thread)); one
+  that grows for minutes is stuck. Take the threads' stacks for a report
+  (`gdb -p <pid> -batch -ex 'thread apply all bt'`, thread `tree-saves`),
+  then restart the mount. Its stop waits for the save worker
+  ([7](#7-a-tree-mount-that-will-not-start-or-stop)), so let the grace period
+  end it: the next mount saves every pending save it finds in the journal.
+- **agentfs killed with saves pending.** Nothing is lost. A pending save's
+  open and its writes are in the journal, and the next mount's recovery
+  closes every open it finds there, a pending save's included. `ci/e2e-tree-pending-saves.sh` checks a failed, a
+  panicked and a killed decision on a failpoints build.
+
 ## Verify
 
 - `RecordFailed`, `CommitFailed` and `RepackFailed` alarms have stopped,
   and the alerts resolved.
 - `agentfs status` shows the backlog draining, and `head:` moves.
 - `git log` shows the paths named by the alarms.
+- A tree view's metrics show `pending_saves` 0, and history has the file
+  each `tree SaveFailed` named.

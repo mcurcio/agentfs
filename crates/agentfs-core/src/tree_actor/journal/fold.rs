@@ -34,6 +34,10 @@ pub(in crate::tree_actor) struct LiveOpen {
     pub(in crate::tree_actor) anonymous: bool,
     /// An anonymous open's metadata.
     pub(in crate::tree_actor) meta: Option<Meta>,
+    /// Its close's [`Entry::CloseBegun`] record, once its close has begun:
+    /// recovery saves abandoned opens with one in this order, before those
+    /// without one.
+    pub(in crate::tree_actor) close_begun: Option<RecordNo>,
 }
 
 impl LiveOpen {
@@ -45,6 +49,7 @@ impl LiveOpen {
             object: record.object,
             anonymous: record.anonymous,
             meta: record.meta,
+            close_begun: record.close_begun,
         })
     }
 }
@@ -106,7 +111,7 @@ impl Folded {
     }
 
     /// One step's part of the fold: its pointers, the open a create makes, the
-    /// fork it makes, the open a close ends.
+    /// fork it makes, the open a close ends (which has its close record).
     pub(in crate::tree_actor) fn add_step(
         &mut self,
         seq: u64,
@@ -121,6 +126,7 @@ impl Folded {
                 object: seq,
                 anonymous: false,
                 meta: None,
+                close_begun: None,
             }),
             Change::Link { object, .. } => self
                 .opens
@@ -130,8 +136,13 @@ impl Folded {
                     o.open.anonymous = false;
                     o.open.meta = None;
                 }),
+            // Every save follows its open's close record: one without is
+            // no journal this format writes.
             Change::Save { handle, .. } => {
                 let open = self.opens.remove(handle).ok_or(Error::Format)?.open;
+                if open.close_begun.is_none() {
+                    return Err(Error::Format);
+                }
                 self.saved_through.insert((open.tree, open.object), seq);
             }
             Change::Fork { upstream } => {
@@ -252,6 +263,8 @@ impl Replay {
                     tail.pos.clone(),
                 ));
             }
+            // No tree changes: the order is the fold's.
+            Entry::CloseBegun { .. } => {}
             Entry::PageWrite { tree, object, runs } => self
                 .pages
                 .entry((tree.parse::<TreeId>()?, *object))
@@ -531,6 +544,7 @@ pub(in crate::tree_actor) fn fold(frames: &[Frame]) -> Result<Folded> {
                 object: *object,
                 anonymous: false,
                 meta: None,
+                close_begun: None,
             }),
             Entry::AnonymousOpen { tree, by, meta } => folded.add_open(LiveOpen {
                 handle: seq,
@@ -539,6 +553,7 @@ pub(in crate::tree_actor) fn fold(frames: &[Frame]) -> Result<Folded> {
                 object: seq,
                 anonymous: true,
                 meta: Some(*meta),
+                close_begun: None,
             }),
             Entry::Call { handle, call } => {
                 call.check_tail(tail.len)?;
@@ -548,6 +563,14 @@ pub(in crate::tree_actor) fn fold(frames: &[Frame]) -> Result<Folded> {
                     .ok_or(Error::Format)?
                     .calls
                     .push((seq, call.clone(), tail.pos.clone()));
+            }
+            // A close's start, on its live open: at most one per open.
+            Entry::CloseBegun { handle } => {
+                let open = &mut folded.opens.get_mut(handle).ok_or(Error::Format)?.open;
+                if open.close_begun.is_some() {
+                    return Err(Error::Format);
+                }
+                open.close_begun = Some(record.seq);
             }
             Entry::PageWrite { tree, object, runs } => folded
                 .page_writes
@@ -597,15 +620,133 @@ pub(in crate::tree_actor) fn fold(frames: &[Frame]) -> Result<Folded> {
     Ok(folded)
 }
 
+/// The close record in the fold (docs/trees.md, "The journal"): on its live
+/// open, at most one, before the open's save, and the order recovery closes
+/// in.
+#[cfg(test)]
+mod close_records {
+    use std::path::Path;
+
+    use super::super::durable::RecordNo;
+    use super::super::{Change, Entry, Frame, Journal};
+    use super::fold;
+    use crate::tree_actor::recording::{Handle, close_rank};
+    use crate::tree_actor::test_support::{ATTRS, never_due, new_actor_with, writer};
+    use crate::tree_actor::{Error, JOURNAL, TreeActor, TreeId};
+
+    const ROOT: TreeId = TreeId::Root;
+
+    /// The frames of the volume in `dir`, once `v` has shut down.
+    fn frames(v: TreeActor, dir: &Path) -> Vec<Frame> {
+        drop(v);
+        Journal::open(&dir.join(JOURNAL), RecordNo::ZERO).unwrap().1
+    }
+
+    /// `f` saved as `SEED`, then an open of it with `bytes` written at 0:
+    /// a close of it is decided, not saved at its start.
+    fn written(v: &mut TreeActor, bytes: &[u8]) -> u64 {
+        let w = writer("w");
+        if v.read(ROOT, "f").is_err() {
+            let h = v.write_open(ROOT, "f", &w, Some(ATTRS)).unwrap();
+            v.write(h, 0, b"SEED", false).unwrap();
+            v.close(h).unwrap();
+        }
+        let h = v.write_open(ROOT, "f", &w, None).unwrap();
+        v.write(h, 0, bytes, false).unwrap();
+        h
+    }
+
+    fn is_close_record(frame: &Frame) -> bool {
+        matches!(frame.0.entry, Entry::CloseBegun { .. })
+    }
+
+    #[test]
+    fn a_close_record_naming_no_live_open_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut v = new_actor_with(tmp.path(), never_due());
+        let h = written(&mut v, b"AAAA");
+        v.journal_record(Entry::CloseBegun { handle: h + 1000 }, &[])
+            .unwrap();
+        assert!(matches!(fold(&frames(v, tmp.path())), Err(Error::Format)));
+        // A second record for one open.
+        let tmp = tempfile::tempdir().unwrap();
+        let mut v = new_actor_with(tmp.path(), never_due());
+        let h = written(&mut v, b"AAAA");
+        drop(v.close_begin(h).unwrap());
+        let mut frames = frames(v, tmp.path());
+        let folded = fold(&frames).unwrap();
+        assert!(folded.opens[&h].open.close_begun.is_some());
+        let second = frames.iter().rfind(|f| is_close_record(f)).unwrap().clone();
+        frames.push(second);
+        assert!(matches!(fold(&frames), Err(Error::Format)));
+    }
+
+    #[test]
+    fn a_save_with_no_close_record_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut v = new_actor_with(tmp.path(), never_due());
+        let h = written(&mut v, b"AAAA");
+        v.close(h).unwrap();
+        let frames = frames(v, tmp.path());
+        fold(&frames).unwrap();
+        let saved = |frame: &Frame| matches!(&frame.0.entry, Entry::Step { change: Change::Save { handle, .. }, .. } if *handle == h);
+        assert!(frames.iter().any(saved));
+        let without: Vec<Frame> = frames
+            .iter()
+            .filter(|f| !matches!(f.0.entry, Entry::CloseBegun { handle } if handle == h))
+            .cloned()
+            .collect();
+        assert_eq!(without.len() + 1, frames.len());
+        assert!(matches!(fold(&without), Err(Error::Format)));
+    }
+
+    /// A power cut keeps a prefix of the journal: cut after the first of
+    /// two close records, the fold gives the close begun first its record
+    /// and the other none, and recovery's order is still the closes'.
+    #[test]
+    fn a_cut_after_the_first_close_record_keeps_close_order() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut v = new_actor_with(tmp.path(), never_due());
+        let h1 = written(&mut v, b"AAAA");
+        let h2 = written(&mut v, b"BBBB");
+        drop(v.close_begin(h2).unwrap());
+        drop(v.close_begin(h1).unwrap());
+        let frames = frames(v, tmp.path());
+        let first = frames
+            .iter()
+            .position(|f| matches!(f.0.entry, Entry::CloseBegun { handle } if handle == h2))
+            .unwrap();
+        let rank = |frames: &[Frame], handle: u64| {
+            let folded = fold(frames).unwrap();
+            let open = folded
+                .opens
+                .into_iter()
+                .find(|(h, _)| *h == handle)
+                .unwrap();
+            close_rank(handle, &Handle::recovered(open.1), &[])
+        };
+        for cut in [&frames[..=first], &frames[..]] {
+            let (one, two) = (rank(cut, h1), rank(cut, h2));
+            assert!(two < one, "{two:?} then {one:?}");
+        }
+        assert!(rank(&frames[..=first], h1).1.is_none());
+    }
+}
+
 #[cfg(all(test, feature = "failpoints"))]
 mod tests {
     use std::fs::{self, OpenOptions};
     use std::os::unix::fs::FileExt;
     use std::path::Path;
 
-    use super::super::{HEADER, crc_body, header_bytes, read_frame, segment, u32_at};
-    use crate::tree_actor::TreeId;
+    use agentfs_contracts::pod::PodContext;
+
+    use super::super::durable::RecordNo;
+    use super::super::{
+        Entry, HEADER, Journal, crc_body, header_bytes, read_frame, segment, u32_at,
+    };
     use crate::tree_actor::test_support::{ATTRS, new_actor, reopen, writer};
+    use crate::tree_actor::{JOURNAL, TreeActor, TreeId};
 
     /// Rewrites the tail of the first chunk record ([`super::Entry::Bytes`])
     /// in the journal's one segment with `tail` (the same length), and fixes
@@ -664,5 +805,163 @@ mod tests {
         rewrite_chunk(tmp.path(), &zeros);
         let v = reopen(tmp.path());
         assert_eq!(v.read(TreeId::Root, "a").unwrap(), vec![0; 5]);
+    }
+
+    /// `f` saved as `SEED`, then two opens of it, `AAAA` written through
+    /// the first and `BBBB` through the second: their handles.
+    fn two_opens(v: &mut TreeActor) -> (u64, u64) {
+        let w = writer("w");
+        let h = v.write_open(TreeId::Root, "f", &w, Some(ATTRS)).unwrap();
+        v.write(h, 0, b"SEED", false).unwrap();
+        v.close(h).unwrap();
+        let h1 = v.write_open(TreeId::Root, "f", &w, None).unwrap();
+        v.write(h1, 0, b"AAAA", false).unwrap();
+        let h2 = v.write_open(TreeId::Root, "f", &w, None).unwrap();
+        v.write(h2, 0, b"BBBB", false).unwrap();
+        (h1, h2)
+    }
+
+    /// Recovery stopped after it appended its own close record for an
+    /// abandoned open (here: that open's save fails): the next restart
+    /// keeps the record, appends no second one, and lands in its order.
+    #[test]
+    fn a_recovery_stopped_after_its_close_record_keeps_that_order() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut v = new_actor(tmp.path());
+        let (h1, h2) = two_opens(&mut v);
+        // h2's close begun, h1's never: recovery saves h2, then h1.
+        drop(v.close_begin(h2).unwrap());
+        drop(v);
+        {
+            let _second_save = crate::failpoints::configure("tree.before_step=error@2").unwrap();
+            assert!(TreeActor::open(tmp.path(), &PodContext::default()).is_err());
+        }
+        let frames = Journal::open(&tmp.path().join(JOURNAL), RecordNo::ZERO)
+            .unwrap()
+            .1;
+        let records: Vec<u64> = frames
+            .iter()
+            .filter_map(|(record, _)| match record.entry {
+                Entry::CloseBegun { handle } => Some(handle),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(records[records.len() - 2..], [h2, h1]);
+        let v = reopen(tmp.path());
+        assert_eq!(v.read(TreeId::Root, "f").unwrap(), b"AAAA");
+    }
+
+    /// A close whose close record cannot be appended is a failed save, at
+    /// RELEASE and at a client's end alike: pending and counted, never an
+    /// open no path closes, and saved at the tree's next step with its
+    /// record appended first.
+    #[test]
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "a client's end, below the sessions that make one"
+    )]
+    fn a_failed_close_record_is_a_failed_save_saved_at_the_next_step() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut v = new_actor(tmp.path());
+        let (h1, _) = two_opens(&mut v);
+        let w = writer("w");
+        {
+            let _append = crate::failpoints::configure("tree.wal_before_header=error").unwrap();
+            assert!(v.close_begin(h1).is_err());
+        }
+        let metrics = v.metrics();
+        assert_eq!((metrics.failed_saves, metrics.pending_saves), (1, 1));
+        v.mkdir(TreeId::Root, "d", ATTRS, &w).unwrap();
+        assert_eq!(v.read(TreeId::Root, "f").unwrap(), b"AAAA");
+        {
+            let _append = crate::failpoints::configure("tree.wal_before_header=error").unwrap();
+            assert!(v.close_writer(TreeId::Root, &w.writer).is_err());
+        }
+        let metrics = v.metrics();
+        assert_eq!((metrics.failed_saves, metrics.pending_saves), (2, 1));
+        assert_eq!(v.read(TreeId::Root, "f").unwrap(), b"AAAA");
+        v.mkdir(TreeId::Root, "e", ATTRS, &w).unwrap();
+        assert_eq!(v.read(TreeId::Root, "f").unwrap(), b"BBBB");
+        assert_eq!(v.metrics().pending_saves, 0);
+        drop(v);
+        assert_eq!(reopen(tmp.path()).read(TreeId::Root, "f").unwrap(), b"BBBB");
+    }
+
+    /// A close whose close record could not be appended keeps its client's
+    /// order: the next close record appended, here the later close's, comes
+    /// after one for it. Its client closed `AAAA` first and `BBBB` second,
+    /// so the file ends `BBBB`, live and after a restart.
+    #[test]
+    fn a_failed_close_record_keeps_its_clients_close_order() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut v = new_actor(tmp.path());
+        let (h1, h2) = two_opens(&mut v);
+        {
+            let _append = crate::failpoints::configure("tree.wal_before_header=error").unwrap();
+            assert!(v.close_begin(h1).is_err());
+        }
+        v.close(h2).unwrap();
+        let live = v.read(TreeId::Root, "f").unwrap();
+        drop(v);
+        let restarted = reopen(tmp.path()).read(TreeId::Root, "f").unwrap();
+        assert_eq!((live, restarted), (b"BBBB".to_vec(), b"BBBB".to_vec()));
+    }
+
+    /// The handles of the journal's close records, in record order.
+    fn close_records(path: &Path) -> Vec<u64> {
+        Journal::open(&path.join(JOURNAL), RecordNo::ZERO)
+            .unwrap()
+            .1
+            .iter()
+            .filter_map(|(record, _)| match record.entry {
+                Entry::CloseBegun { handle } => Some(handle),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A client's end with two opens of one file and no close begun gives
+    /// them their close records in open order, so the later open's `BBBB`
+    /// lands last, live as at a restart after a kill before the end.
+    #[test]
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "a client's end, below the sessions that make one"
+    )]
+    fn a_client_end_of_two_opens_of_one_file_keeps_open_order() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut v = new_actor(tmp.path());
+        let (h1, h2) = two_opens(&mut v);
+        v.close_writer(TreeId::Root, &writer("w").writer).unwrap();
+        let records = close_records(tmp.path());
+        assert_eq!(records[records.len() - 2..], [h1, h2]);
+        let live = v.read(TreeId::Root, "f").unwrap();
+        drop(v);
+        let restarted = reopen(tmp.path()).read(TreeId::Root, "f").unwrap();
+        assert_eq!((live, restarted), (b"BBBB".to_vec(), b"BBBB".to_vec()));
+    }
+
+    /// Two closes whose close records both failed land in the order they
+    /// failed, the order their records are then appended in: `BBBB`'s
+    /// close failed first and `AAAA`'s second, so the file ends `AAAA`,
+    /// live and after a restart.
+    #[test]
+    fn failed_close_records_land_in_the_order_they_failed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut v = new_actor(tmp.path());
+        let (h1, h2) = two_opens(&mut v);
+        {
+            let _append = crate::failpoints::configure("tree.wal_before_header=error@*").unwrap();
+            assert!(v.close_begin(h2).is_err());
+            assert!(v.close_begin(h1).is_err());
+        }
+        assert_eq!(v.metrics().pending_saves, 2);
+        v.mkdir(TreeId::Root, "d", ATTRS, &writer("w")).unwrap();
+        let records = close_records(tmp.path());
+        assert_eq!(records[records.len() - 2..], [h2, h1]);
+        let live = v.read(TreeId::Root, "f").unwrap();
+        drop(v);
+        let restarted = reopen(tmp.path()).read(TreeId::Root, "f").unwrap();
+        assert_eq!((live, restarted), (b"AAAA".to_vec(), b"AAAA".to_vec()));
     }
 }

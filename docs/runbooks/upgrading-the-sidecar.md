@@ -60,7 +60,7 @@ builds what was left unbuilt.
 ### When the state format changes
 
 A tree volume carries its state format in `/data/state/format`
-(`agentfs-trees-14` today; [trees.md](../trees.md#the-journal)). An image
+(`agentfs-trees-15` today; [trees.md](../trees.md#the-journal)). An image
 whose format differs refuses the volume with nothing written: `init` exits 1
 naming another format, and the pod does not become Ready. Formats are never
 converted, and [CHANGELOG.md](../../CHANGELOG.md) says which release changes
@@ -70,7 +70,7 @@ the format. To move a volume across such a release:
    [Before](#before)) and copy out what the workload needs to carry over,
    through its view.
 2. Scale the workload to 0 and move the old state area aside on the claim
-   (`mv /data/state /data/state.agentfs-trees-13`). Never delete it: its
+   (`mv /data/state /data/state.agentfs-trees-14`). Never delete it: its
    `history.git` keeps every change made on the volume, readable with plain
    `git`.
 3. Deploy the new image. Its `init` creates a new volume in `/data/state`;

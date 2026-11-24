@@ -275,7 +275,11 @@ survives a crash of agentfs. A `close(2)` promises that and no more: it returns
 once the file's calls are in the journal and does not wait for the disk. A call
 survives a power cut once an `fsync(2)` of the file or of the view's directory, or
 a write on an `O_SYNC` or `O_DSYNC` descriptor, has returned after it
-([trees.md](trees.md#recording-and-durability)).
+([trees.md](trees.md#recording-and-durability)). A file's save, the step its last
+close makes of those calls, may land after the close is answered; until then its
+own client reads it and nothing can delete it, and a restart makes it from the
+journal, a file's saves in the order their closes began
+([pending saves](trees.md#pending-saves)).
 
 What a power cut can lose in a tree view:
 
@@ -299,6 +303,7 @@ What a power cut can lose in a tree view:
   and did not sync.
 
 Its git history is built
-behind the calls: a save is visible to the views at its release, and in Git's refs
+behind the calls: a save is visible to its own client at its release, to the views once
+it lands, and in Git's refs
 and commits once the builder reaches it; nothing in Git names an object that is not
 durable ([trees.md](trees.md#history-trails-the-files)).

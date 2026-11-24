@@ -449,7 +449,8 @@ row and counts as released.
   saves can align repeated lines differently. Stored bytes and identities do not
   change.
 
-`fsync` makes the file's calls durable; the final release publishes the file.
+`fsync` makes the file's calls durable; the final release begins the file's save,
+which lands on the view's save worker ([pending saves](#pending-saves)).
 
 ## Recording and durability
 
@@ -474,9 +475,12 @@ actor: its waiters get its error and every later call `EIO` (see
 **`close(2)` does not wait for the disk.** A close (FUSE `FLUSH`) returns once
 the descriptor's calls are in the journal, which they were when each returned.
 It makes no fsync and never returns a journal fsync's error; it answers `EIO`
-only once a failed fsync has stopped the actor. A client's end closes its open
-files as saves the same way, with no wait. A clean unmount makes every record
-durable before the state area's lease is released.
+only once a failed fsync has stopped the actor. The release that follows
+appends the open's close record (see [the journal](#the-journal)) as a call is
+appended: one `write(2)`, no fsync, durable with the next `fsync`, FSYNCDIR,
+`O_SYNC` write or builder batch. A client's end closes its open files as saves
+the same way, with no wait. A clean unmount makes every record durable before
+the state area's lease is released.
 
 **What a power cut loses.** It loses a suffix of the journal: no record
 survives without every record before it. The volume then opens as an
@@ -502,6 +506,66 @@ durable before that unlink, on its own thread and outside the actor's lock: byte
 a program fsynced in the area are in the area or in the tree after any power
 cut. A file moved out of the tree is fsynced in the area, with its directory
 entry, before its unlink from the tree is recorded.
+
+### Pending saves
+
+A view answers a release (FUSE `RELEASE`, sent after the last `close(2)` of an
+open) once the close is begun under the actor's lock, not once its save is
+recorded. Until the save lands it is a **pending save**: the file's newest
+content for its own client, and an open file for everyone else. Each view has
+one save worker thread (`tree-saves`) that decides and lands the saves its
+releases began, in the order they began. While a save is pending:
+
+| A call on the file | Waits? | What it sees |
+|---|---|---|
+| a stat, a lookup, a page fill | no | the size the view gives while the file has a write-open; the modification time moves when the save lands |
+| an open by the file's own client, read-only or for writing | no | the file as that client's pending saves leave it: each save's own calls and the page-write pieces it takes, replayed on the saved bytes in close order. Another open's unsaved calls are not in it. A write-open's own save replays its calls on the saved head. One pending save whose base did not move and with no page write is its open's view, at no cost. Two or more, a moved base or page writes are folded at each such open: the actor's lock is held only to take a snapshot (the saved map, the saves' call counts, the file's page writes, a reader of the journal), and the saves' calls are read back and replayed with the lock released, so other views and the volume's other calls do not wait. The opening view does: it has one request thread, so its other requests wait for the fold, about a second for a million appends. A read-only open reads the file as of its snapshot; a write-open is recorded in the snapshot's hold and gets its view in a second hold, with any page write of the file made meanwhile on it |
+| an open by another client of the tree | no | the saved content |
+| a second close of the file | no | begun and answered at once; its save lands after the earlier one, so a file's saves land in the order its closes began. A client's end saves its open of the file after every save of it begun before the end |
+| a rename of the file | no | the file keeps its object, and the save lands at the new name |
+| an unlink of it, a rename onto it, a move from the untracked area onto it, a move of it out of the tree, a path `truncate(2)` of it, a time set (`utimensat(2)`) of it | **yes** | the call is retried from the save worker once every save of the file begun before the call has landed or failed. History holds those saves, then the delete. For every call but a move out, a save of the file begun after the call does not hold its retry: it lands after the call, so a client that keeps closing the file never keeps the call waiting. A time set is made after the landing of the saves it waited for; a save begun after it lands later and moves the modification time again. A move out of the tree waits for every save of the file, one begun after its refusal too, and copies the landed content into the area: the moved-out file carries every close answered before the move, and no save lands on the tree's file after its name is gone. A client that keeps closing the file keeps a move out of it waiting |
+
+Takes, syncs and landings treat a pending save as an open file: one that touches
+it waits for the save's built event, and one that does not lands meanwhile.
+History and other trees see only landed saves. A view drains its save worker
+when it ends. `Recording::settle` waits until no close begun before it is
+still deciding or landing its save; a close begun after it, of any file, does
+not hold it, and neither does a failed close, which stays pending until its
+tree's next step. It then waits
+until every record appended by then is built. When the actor
+stops (a failed journal fsync, a failed record) a close queued behind a save of
+its file and `Recording::settle` wake and answer `Stopped`.
+
+**A restart keeps close order.** Each close's start is a record in the
+journal, its close record, and its number is the close's order: the order a
+file's saves land in, live and at restart. A release appends it before
+anything else it does; a client's end appends one for each open it closes, in
+open order, before any save. Recovery saves a crash's abandoned opens in the
+order of their close records, then those with none in open order, appending
+their records as it goes, which is the order a client's end gives them. Two
+pending saves of one file closed in the other order than they were opened
+land after a kill as they would have live: where they overlap, the file holds
+the later-closed open's bytes, as its client read them. After a power cut the
+close records that survive are a prefix of those appended, so the order holds
+for every close an `fsync`, FSYNCDIR or `O_SYNC` write that returned covered.
+
+A decision that fails, or a save worker that panics in one, leaves the save
+pending as a failed close: `tree SaveFailed` on stderr, the `failed_saves`
+counter and the `pending_saves` gauge in the metrics file, and the save made
+again at the tree's next step or at restart. A step saves its tree's failed
+closes in close order, not in the order they failed. A close whose close record
+cannot be appended (a full state area) is a failed close the same way, and it
+keeps its client's order: the next close record appended, by its retry or by
+any later close, comes after one appended for it, and failed closes get theirs
+in the order they failed, the order a step lands them in and its client
+reads them in. It lands before every save of its file its client closed later: where two such saves overlap, the file holds the later close's
+bytes, live and after a restart. Until a tree's failed closes are saved,
+every release of that tree is saved on the view's request thread under the
+actor's lock together with them, in close order (a failed close with no record
+after every close with one, in the order they failed), so the view and every call of the volume wait for
+all of them. No timer
+turns a slow save into a failure: `oldest_pending_save_ns` says how long the
+oldest has waited.
 
 ## File maps
 
@@ -535,12 +599,12 @@ A close does bounded work under the actor's lock:
   left out of the save.
 
 Releasing the lock lets other views and claims of the volume go on while a
-close is decided. Within one view a slow close still holds its other
-requests, since one thread answers them in order (below): a sidecar's single
-root view gains only the shorter close.
+close is decided. A view begins each close under the lock and answers the
+release at once; the decision and the landing run on the view's save worker
+([pending saves](#pending-saves)), so a slow close holds none of the view's
+other requests.
 
-Either way the step is recorded before the release is answered. A view reads
-a map with the actor unlocked: the lock is held only to clone it.
+A view reads a map with the actor unlocked: the lock is held only to clone it.
 
 - After a batch is built and checked out, the builder reads each changed file
   from its checkout instead of the frames, through a hard link in the state
@@ -681,6 +745,18 @@ appends it and applies it to the saved state the views serve; it runs no git.
   carry files, `carry-<built point>`. A frame never spans two segments, and a
   frame over 64 MiB has a segment of its own. A new segment's directory entry is
   fsynced before the durable mark covers any record in it.
+- **The close record.** A close's start is a record of its own, `CloseBegun`,
+  naming the open: about 100 bytes and one `write(2)` under the actor's lock,
+  no fsync, so it is in the kernel when the release is answered and durable
+  with the next `fsync`, FSYNCDIR, `O_SYNC` write or builder batch, as a call
+  is. Its number is the close's order ([pending saves](#pending-saves)). An open
+  has at most one, and every save follows its open's. It is no step: it has
+  no writer, builds no commit, adds to no tree's lag and moves no pointer; the
+  builder skips it. Recovery folds it onto its open, and refuses (`Format`) a
+  close record that names no live open, a second one for an open, and a save
+  of an open with none. Compaction folds it into the open's record in the
+  checkpoint while the open lives, so it goes into no carry file: it leaves
+  with its segment, and a fold from the checkpoint restores it.
 - A failed step keeps serving and saves at the next step in its tree. Only a failed
   journal `fsync` (a leader's, or the fsync of the directory a checkpoint is
   renamed in) or rollback stops the actor; a
@@ -689,7 +765,8 @@ appends it and applies it to the saved state the views serve; it runs no git.
 - Recovery reads the journal and serves from it without waiting for history: the
   saved state is the trees as built (read from Git and the private checkouts)
   with every later record replayed on them by the transitions the actor ran at
-  the call. It then closes abandoned opens through the ordinary step; the builder
+  the call. It then closes abandoned opens through the ordinary step, in close
+  order ([pending saves](#pending-saves)); the builder
   catches up behind, as at any time (see
   [History trails the files](#history-trails-the-files)), and a failed build
   raises its alarm without refusing the open. The recovered records are made
@@ -820,7 +897,7 @@ appends it and applies it to the saved state the views serve; it runs no git.
   `bases/`, `actor.lock`, `format` and rebuilt private checkout caches, which the workload
   never sees. A create writes an `initializing` marker first and removes it last;
   the next `init` starts a cut-short create over. The state format is
-  `agentfs-trees-14`. **Earlier state formats (13 included) do not open**, and
+  `agentfs-trees-15`. **Earlier state formats (14 included) do not open**, and
   are never converted ([upgrading](runbooks/upgrading-the-sidecar.md)).
 
 ## History trails the files
@@ -836,7 +913,8 @@ fsynced. That entry moves the built point. Only then are Git's refs, `config` an
 the private checkouts copied, the checked-out files' maps rebased onto them
 ([File maps](#file-maps)), and waiters woken.
 
-- A save is visible to every view at its release, before it is built. Git's refs,
+- A save is visible to every view once it lands, before it is built, and to its
+  own client from its release ([pending saves](#pending-saves)). Git's refs,
   commits and checkouts show only what is built.
 - Takes are decided on built history, off the actor's lock (below, "Takes").
 - A commit is dated by its step's record, in `+0000`. A replay after a crash may
@@ -938,6 +1016,12 @@ the private checkouts copied, the checked-out files' maps rebased onto them
   memory: a save of a million pieces is one entry, and its map's memory is not
   held back by this limit. The actor reports every tree's overlay as it releases its lock, so the
   gate sees it grow at each step and shrink at each rebuild, without a timer.
+  A known open item: the actor's rebuild at a built event runs only when a
+  host's take worker calls in (`Recording::progress`) or at the volume's next
+  step. While a tree's calls wait here there may be no step, so a take worker
+  busy in a long take keeps them waiting after history has caught up: one
+  `create` run with a fork view held a call 310 s. The waiting-primitive work
+  fixes it.
   Over `agentfs.overlayLimit` (32 MiB unless set,
   [configuration](configuration.md#tree-volumes-the-operator-settings-file)),
   the tree's calls that start new work wait as over the lag limit, until the
@@ -1098,8 +1182,10 @@ either. The FUSE adapter uses zero entry and attribute TTLs and
 direct I/O, and negotiates neither passthrough nor the writeback cache. A read with
 no lock owner is a page fill and a write with `FUSE_WRITE_CACHE` is a page write.
 `max_background` is as high as the kernel allows, to keep a release ahead of a later
-open. One thread answers requests in order; a `FLUSH` is answered at once, and an `FSYNC`, FSYNCDIR or `O_SYNC`
-write from the journal's waiter thread once its records are durable. The queue worker takes one entry at a time, releasing the actor between takes,
+open. One thread answers requests in order; a `FLUSH` is answered at once, a `RELEASE` once its close is begun
+(its save lands on the view's save worker, [pending saves](#pending-saves)), and an `FSYNC`, FSYNCDIR or `O_SYNC`
+write from the journal's waiter thread once its records are durable. An `UNLINK`, a rename onto a file or a path
+truncate of a file with a pending save is answered from the save worker once the saves of it begun before the call have landed. The queue worker takes one entry at a time, releasing the actor between takes,
 and drops the kernel's pages of files a take changed. A file open for writing
 holds back that fork's syncs from its upstream until it closes; no alarm is raised
 for a waiting open. See [library/filesystem.md](library/filesystem.md).
@@ -1285,8 +1371,8 @@ What the tree views do not support:
   tracked file past an anonymous file's first answer `EPERM`; devices answer
   `EPERM`; FIFOs and sockets are untracked; extended attributes and ACLs are
   not supported.
-- **Times.** A file's mtime moves at its last close, not at each write
-  (close-to-open). Reads are not tracked: atime is the last time set, else
+- **Times.** A file's mtime moves when its last close's save lands, not at each
+  write (close-to-open). Reads are not tracked: atime is the last time set, else
   the time the entry was made. A checkout of history shows checkout times, as git does.
 - **A file no name reaches has no metadata steps.** `fchmod`, `fchown` and
   `futimens` of an `O_TMPFILE` file, or of a file unlinked while open, answer
@@ -1335,6 +1421,10 @@ What the tree views do not support:
   are not merged into one piece, so an open of a million small appends holds a
   million pieces (peaks of 774 and 885 MiB in two local runs;
   [performance](performance.md#tree-views-release-build)).
+- **The model replay makes no call over a pending save.** The library
+  replay saves each close before it returns and settles after every call,
+  because its invariants read git after each one; `tree_pending_saves.rs` and
+  `e2e-tree-pending-saves.sh` cover pending saves instead.
 - **A restart copies every checkout.** Each start writes the private checkouts
   of the built point whole, so its time grows with the tree (38 to 39 s for
   100,000 files in one local run).
@@ -1386,6 +1476,14 @@ jobs in [development.md](development.md); the method is in
   reopened.
 - `e2e-tree-restart.sh`, `e2e-tree-recording-faults.sh`, `e2e-tree-enospc.sh`:
   view-host death, kills at each failpoint, state exhaustion.
+- `e2e-tree-pending-saves.sh` (`trees-pending-saves.py`): a save worker's
+  decision that fails, panics or kills agentfs (failpoint `tree.close_decide`)
+  loses nothing, and two saves of one file closed in the other order than
+  they were opened land in close order after a `kill -9` (cases `order` and
+  `order-restarted`); `e2e-tree-pagecache.sh` also checks that a stat, an open and a
+  rename after a slow close see its save, and that a delete right after a close
+  leaves history with the save, then the delete. `tree_pending_saves.rs` holds
+  the library's cases.
 - `power-loss-trees.sh`: `dm-log-writes` replay on ext4 and XFS, on the upstream and
   a fork. At each checkpoint the volume opens, recovery saves what survived, the
   recovered files are a prefix of the calls made that holds every call before the

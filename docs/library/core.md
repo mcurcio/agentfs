@@ -973,10 +973,64 @@ writer's. `admit_then`, `durable_then` and `durable_all_then` run unlocked.
 once a journal fsync has failed, never that fsync's own error. `durable_all`
 blocks the caller until every record so far is durable: what a view waits for
 before a change outside the journal destroys bytes a record carries.
+
+A RELEASE goes in two halves ([pending saves](../trees.md#pending-saves)).
+`TreeSession::start_close(handle)` begins the close under the lock and gives a
+`tree_actor::Closing`: `Saved(saved)` when it saved at once, or
+`Decide(SaveToDecide)`, a pending save. `SaveToDecide::finish()` decides it with
+the lock released and lands it under the lock, after any earlier-begun save of
+the same file; dropped unfinished, a panic included, it stays pending as a failed
+close (counted in `failed_saves`). `close(handle)` and `Recording::close_with` are
+both halves on the caller's thread, for the CLI, tests and recovery;
+`Recording::start_close_with(handle, check)` is the first half with a check run
+under the same hold, which `TreeSession::start_close` uses.
+`SessionGuard::open_map(path)` is what an open reads: the file as this client's
+pending saves leave it (their own calls and the page-write pieces their saves
+take, replayed on the saved map in close order), else the saved map; never
+another open's unsaved calls, and it never waits for a save. **`open_map` and
+`write_open` may release the guard's lock inside them and take it again**: when
+the client's pending saves need a fold, the guard's hold takes a snapshot and
+the fold runs with the lock released, so other views go on meanwhile. Anything
+read through the guard before the call may have moved when it returns: read
+what a reply names from the open (`open_object`), not the path again. The
+content a read-only open gets is as of its snapshot; a write-open is recorded in
+the snapshot's hold and gets its view in a second hold, with the file's page
+writes made meanwhile on it. A failed fold closes a write-open, as a client's
+end closes an open (saved after the pending saves it would have folded, not a
+failed save), and is its answer; `Error::NotFound` when the client ended
+meanwhile; `Error::Stopped` when
+the actor stopped. `TreeActor::write_open`, the library's one-hold call for the
+CLI and tests, folds under the lock. `unlink`, `rename` (onto `to`),
+`replace_file`, `truncate_path` and `set_times` answer `tree_actor::PathStep`: `Done(value)`,
+or `WaitFor(SavePending)` with nothing done while the file they would delete or
+replace has a pending save. `SavePending` is made only by the core and must be
+used: hand it and a retry of the whole call to `when_saved_then(pending, then)`,
+which runs `then` once no save of that file begun before the refusal is pending
+(at once when none is, else on the thread that lands the last of them, with the
+lock released; `Error::Stopped` when the actor stops first);
+`Recording::when_saved_then` is the same without a session. `SavePending::before()`
+is the journal's next record at the refusal. The retry takes its guard with
+`TreeSession::lock_retrying(Some(pending))`, which refuses it again only for a save
+begun before that refusal, so a save begun later lands after the call and a client
+that keeps closing the file never keeps it waiting. A rename of the pending
+file itself goes first. `pending_save(path)` names the file's pending save, if
+any, for a caller that reads the file to put it elsewhere (a move out of the
+tree). Once the actor stops, a `finish` queued behind another save of its file
+and a `settle` wake and answer `Error::Stopped`. `Recording::settle` waits until
+no save begun before it is pending (a close whose close record is below the
+journal's next record when it starts; one begun after it, of any file, does not
+hold it), then until history is built through every record by then; it is never called from a
+thread that finishes saves. `TreeActor::metrics()` counts them in
+`pending_saves`, `oldest_pending_save_ns` and `failed_saves`
+([telemetry](../telemetry.md#pending-saves)).
+
 `unbind` removes the binding and, under the same lock,
 `TreeActor::close_writer` closes every open of the client's writer as a save,
-in handle order, with no wait for the disk. A failure is logged and an
-unsaved close stays pending. Lock order: the actor, then the bindings.
+in handle order, with no wait for the disk: each gets its close record first,
+all before any save, so the end's order survives a restart; an open of a file
+with a save in flight begun before the end is saved when that save lands, after
+it. A failure (of an append or a save) is logged and an unsaved close stays
+pending, saved at its tree's next step. Lock order: the actor, then the bindings.
 
 ### Rows and domain events
 

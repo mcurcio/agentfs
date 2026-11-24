@@ -51,6 +51,8 @@ pub const POINTS: &[&str] = &[
     "tree.wal_after_fsync",
     "tree.before_step",
     "tree.replace_before_step",
+    "tree.close_decide",
+    "tree.pending_fold",
     "tree.untrack_after_place",
     "tree.fork_copy_file",
     "tree.fork_after_copy",

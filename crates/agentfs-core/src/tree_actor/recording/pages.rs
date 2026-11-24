@@ -73,7 +73,7 @@ impl<L: Located> Run<L> {
     }
 
     /// The run as the write it is.
-    fn call(&self) -> (Call, L) {
+    pub(super) fn call(&self) -> (Call, L) {
         self.clone().into_call()
     }
 

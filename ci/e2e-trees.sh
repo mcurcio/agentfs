@@ -6,6 +6,8 @@ set -euo pipefail
 . "$(dirname "$0")/tree-git-test-lib.sh"
 bin=${AGENTFS_BIN:-$PWD/target/debug/agentfs}
 work=$(mktemp -d)
+# Canonical: tree_unmount_dead finds a dead mount by its path.
+work=$(realpath "$work")
 pid=
 client=
 writer=
@@ -20,7 +22,7 @@ cleanup() {
     if [ "$status" != 0 ]; then cat "$work"/*.log 2>/dev/null || true; fi
     rm -rf "$work"
 }
-trap cleanup EXIT
+on_exit cleanup
 as_root=()
 [ "$(id -u)" = 0 ] || as_root=(sudo)
 mkdir "$work/main" "$work/fork"
@@ -175,8 +177,7 @@ for _ in $(seq 1 200); do
     sleep 0.1
 done
 grep -q writing "$work/writer.log"
-kill -KILL "$pid"
-tree_wait_exit "$pid" 2>/dev/null || true
+tree_kill_mount "$pid" "$work/mount.log" "$work/main" "$work/fork"
 pid=
 kill "$client"
 wait "$client" 2>/dev/null || true
@@ -184,8 +185,6 @@ client=
 kill -KILL "$writer"
 wait "$writer" 2>/dev/null || true
 writer=
-fusermount3 -uz "$work/main"
-fusermount3 -uz "$work/fork"
 "$bin" --state "$work/state" init --volume t
 head=$(git --git-dir="$work/state/history.git" rev-parse root)
 test "$(tree_git_file "$work/state/history.git" root crash)" = acknowledged-before-kill
@@ -197,11 +196,8 @@ start
 # touch and touch -d set a file's times and build no commit: after a kill and
 # the next init's build, the head has not moved, and the times survive.
 "${as_root[@]}" python3 ci/trees-posix.py touch "$work/main"
-kill -KILL "$pid"
-tree_wait_exit "$pid" 2>/dev/null || true
+tree_kill_mount "$pid" "$work/mount.log" "$work/main" "$work/fork"
 pid=
-fusermount3 -uz "$work/main"
-fusermount3 -uz "$work/fork"
 "$bin" --state "$work/state" init --volume t
 test "$(git --git-dir="$work/state/history.git" rev-parse root)" = "$head"
 start

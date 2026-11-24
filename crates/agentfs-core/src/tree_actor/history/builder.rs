@@ -547,6 +547,8 @@ impl BuildState {
                     .calls
                     .push_back((seq, call.clone(), tail.pos.clone()));
             }
+            // A close's start builds nothing: its save step does.
+            Entry::CloseBegun { .. } => {}
             Entry::PageWrite { tree, object, runs } => self
                 .pages
                 .entry((tree.parse::<TreeId>()?, *object))

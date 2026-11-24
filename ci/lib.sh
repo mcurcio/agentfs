@@ -18,6 +18,20 @@ fail() {
 
 pass() { printf '\033[32mok\033[0m   %s\n' "$*"; }
 
+# on_exit COMMAND: runs COMMAND when this shell exits, and in no other. Under
+# bash 5.2 a forked child (a `( ... ) &` subshell, or `cmd &` before it execs)
+# that gets a fatal signal before it resets its traps runs the EXIT trap it
+# inherited: a script's cleanup then runs twice
+# at once, and the copy in the child unmounts or kills what the script still
+# uses. The trap compares the exiting shell's $BASHPID with the one that
+# registered it ($$ is the parent's inside a subshell), so a subshell may
+# register its own. `case` keeps $?, so COMMAND still reads the exit status.
+# Every ci/ script registers its EXIT cleanup here: docs_reference.rs
+# (`ci_exit_traps_run_in_their_own_shell`) refuses a bare `trap ... EXIT`.
+on_exit() { # command
+  trap "case \$BASHPID in $BASHPID) $1 ;; esac" EXIT
+}
+
 # Operator runbooks run as written: the fenced block after
 # `<!-- ci: <name> -->` in docs/runbooks/<runbook>.
 RUNBOOKS=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/docs/runbooks

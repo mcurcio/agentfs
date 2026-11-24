@@ -403,6 +403,20 @@ must exit 1, and the tracer runs it before the figures.
   mount). `probe` gives p50, p99 and the longest of each call in each
   view. A stall in the workload's view alone is that view's one request
   thread; one in both views is the volume's lock.
+- **Probe legs time what a pending save leaves waiting** (`--probe` only,
+  each alone with `--only NAME`, no bar). `creates_during_close` creates
+  4 KiB files beside `close_frag`'s close until its save lands;
+  `rename_save` writes a 64 MiB temporary file, closes it and renames it
+  over a 64 MiB file, with creates beside it, and checks the real file's
+  bytes; `many_closes` overwrites and closes 64 files of 4 MiB twice each
+  while `close_frag`'s save is decided, and checks each holds its second
+  round; `other_view_close` closes `close_frag`'s file in the workload's
+  view and the same file in `--probe-view` at once, probing the other
+  view; `pending_open` makes one million 64-byte appends and closes them,
+  makes one more append and closes it, then opens the file read-only, an
+  open that folds both pending saves, and times that open with the probe
+  in both views. Each gives p50, p99 and the longest of its calls, and the
+  lock, gate and request figures of its window.
 - The report is the job's artifact `trees-figures-<fs>`.
 
 Figures from two runs on GitHub `ubuntu-24.04` runners, each one
@@ -687,11 +701,12 @@ The same pair of runs, for what a save costs:
   after. `close_1g`, `close_64m` and `close_4k` therefore time no disk
   wait, and their bars, the recording engine's fsynced closes, are marks
   for regressions only.
-- **The view's one thread stalls its own files as long as a close's
-  decision takes.** The close of `close_frag` held its view's thread
+- **The view's one thread stalled its own files as long as a close's
+  decision took.** The close of `close_frag` held its view's thread
   382 ms (its `release`) and `write_1m`'s 870 ms, so a stat of another
   file in that view waited as long, while another view waited at most 124
-  and 87 ms. Nothing here changed that.
+  and 87 ms. A view's save worker now decides the save
+  ([pending saves](#pending-saves-off-the-views-thread)).
 - **What holds the lock longest now** is a take of a large save (91 to
   145 ms), the catch-up onto a built point in a tree of 50,000 files
   (178 ms), and the land of a close with a large map (55 to 71 ms). The
@@ -727,6 +742,106 @@ each):
   by `create`'s first 2,000 creates, which fell from 0.406 to 0.099 ms once
   a close stopped waiting for the disk, so the ratio no longer says
   whether a long history slows a create.
+
+### Pending saves, off the view's thread
+
+A view answers a release once the close is begun and its save worker
+decides and lands the save ([trees](trees.md#pending-saves)). Each leg and
+`close_frag` run alone on a fresh volume with a fork's view
+(`trees-figures.py --only W --metrics --probe --probe-view FORK`, release
+build, one 4-CPU container shared with other work, Intel Xeon at
+2.10 GHz, ext4; local observations, not CI). "Before" is commit 41653b5,
+which decided the save on the view's request thread; "after" is commit
+cffc114. Two cells for one figure are two runs. All times in ms.
+
+| Figure | Before | After |
+|---|---|---|
+| `close_frag`: same view, longest probe call | 545 | 121 |
+| `close_frag`: other view, longest probe call | 117 | 123 |
+| `close_frag`: longest `release` on the view's thread | 552 | 0.4 |
+| `creates_during_close`: longest create | 506, 507 | 121, 337 |
+| `creates_during_close`: longest `close(2)` of a create | 0.5, 0.4 | 0.1, 0.4 |
+| `rename_save`: longest create, and the rename | 2,597 and 2,594 | 2,051 and 2,051 |
+| `other_view_close`: other view, longest call | 1,289, 1,225 | 832, 206 |
+
+- **No request waits for another file's decision on the view's thread.**
+  A release now holds that thread under a millisecond, so `close_frag`'s
+  probe in the same view no longer waits the close's 0.5 s.
+- **What a create beside a large save still waits for is the volume's
+  lock.** The longest create, 121 and 337 ms, matched the longest wait for
+  the lock in its run (106 and 335 ms), held by the actor's walk after a
+  compaction (97 ms), a take into the fork (87 to 104 ms) and the save's
+  land (91 and 337 ms). Before, a create waited for the whole decision on
+  the view's thread, about 0.5 s. A first run of the leg, on a volume where
+  the fork was still taking earlier legs' 64 MiB files, waited 971 ms.
+- **The rename waits at the lag gate, not for the save.** `rename_save`'s
+  rename and the creates beside it waited 2.0 to 2.6 s, before and after,
+  all of it at the lag gate (2,048 and 2,593 ms) while history built the
+  128 MiB just written. The real file held the renamed file's bytes in
+  every run.
+- **`many_closes` does not time the stall.** Its `close(2)` is a FLUSH,
+  answered before the kernel sends the RELEASE that held the view's thread,
+  so its longest `close(2)` (3.6 ms before, 0.1 after, one run each) is
+  noise either way; the stall showed as the next open's wait, which the leg
+  does not time.
+- **A file's saves land in close order under load.** In every run each of
+  `many_closes`' 64 files held its second round's bytes once its saves
+  landed. One view's save worker lands its saves in the order they began,
+  so this leg checks that order on one view; the core's wait between two
+  saves of one file decided on different threads is checked by
+  `a_queued_close_waits_for_the_earlier_landing`
+  (`crates/agentfs-core/src/tree_actor/call_path.rs`).
+- **A client's open of a file with several pending saves folds them off
+  the volume's lock, on its own view.** Such an open reads every call of
+  those saves back from the journal and replays them, at each open; the
+  lock is held only for the snapshot ([trees](trees.md#pending-saves)).
+  The `pending_open` leg, run alone on a fresh volume with a fork's view
+  (`trees-figures.py --only pending_open --metrics --probe --probe-view
+  FORK`, release build, the container above, ext4, two runs each; local
+  observations, not CI). "Before" is commit ae45af8, which folded under
+  the lock; "after" is the commit that moved the fold off it. All in ms.
+
+  | Figure | Before | After |
+  |---|---|---|
+  | the open(2) that folds | 1,792, 1,443 | 836, 948 |
+  | longest probe call in the fork's view | 1,811, 1,462 | 51, 31 |
+  | longest probe call in the opening view | 1,811, 1,462 | 879, 939 |
+  | longest `page_image` hold of the lock | 1,792, 1,443 | none |
+  | longest wait for the lock | 1,782, 1,434 | 53, 31 |
+
+  The folding open(2) itself is not faster: the fold does the same work,
+  only off the lock. The first row's drop is run-to-run spread: a later
+  A/B on the same host, alternating runs, gave 1,002 and 1,491 ms at
+  commit 773efe0 (under the lock) and 912 and 1,647 ms at c26cb70 (off
+  it). The fork's view no longer waits for the fold: its longest call is back
+  near the 45 ms it waited before pending saves. The opening view still
+  does, because one thread answers its requests in order: a stat of
+  another file in that view waits as long as the open. An open of a file
+  with one pending save on an unmoved base is its open's view, about
+  0.4 ms, with no fold.
+- **A close record costs `create` nothing measurable.** Each close's start
+  is one more journal append, about 100 bytes and one `write(2)` under the
+  lock ([trees](trees.md#the-journal)). The many-file `create` in the
+  `image` workflow's tree views tracer (`ci/e2e-trees-tracer.sh --figures`),
+  50,000 files, total seconds, two runs each on GitHub `ubuntu-24.04`
+  runners: before, commit 4e16030 (`image` runs 45216940719 and
+  45216954610), ext4 23.3 and 23.6, XFS 13.4 and 12.9; after, commit
+  ae45af8 (runs 45230149331 and 45230161224), ext4 33.3 and 13.8, XFS 36.4
+  and 13.9. One run after was faster than both before and one slower, on
+  both filesystems, so the spread is the runners', not the record's; every
+  run met the bar.
+- **Another view still waits for the volume's lock.** When both views close
+  a fragmented file at once, the other view's slowest call (a stat) waited
+  206 to 832 ms, against 1.2 to 1.3 s before; the lock was held longest by
+  the walk after a compaction (114 to 446 ms) and the two saves' lands (145
+  to 208 ms). The prediction of at most 124 ms, `close_frag`'s other view
+  alone, does not hold with two large saves at once.
+- **A pending save's own time** shows as the leg's `landed_s`: 0.1 to
+  1.6 s after the last close, against 0.1 to 0.2 s before, when the close
+  had been saved before the view answered the stat that starts the wait.
+- **The `close` lock kind's longest share rose in one run.** It read 59 to
+  337 ms after, against 33 to 196 ms before; one run each does not say
+  whether a land under the lock grew or a run met more contention.
 
 ## Performance budget
 

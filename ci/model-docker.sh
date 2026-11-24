@@ -18,6 +18,7 @@
 # MODEL_WORK_VOLUME, MODEL_CARGO_VOLUME (agentfs-model-target, -work, -cargo) override the
 # image, the docker program and the volumes.
 set -euo pipefail
+. "$(dirname "$0")/lib.sh"
 root=$(cd "$(dirname "$0")/.." && pwd)
 budget=$root/crates/agentfs-model/planted/budget.json
 docker=${MODEL_DOCKER:-docker}
@@ -70,7 +71,7 @@ esac
 
 name=agentfs-model-$$-$RANDOM
 state=$(mktemp -d)
-trap 'rm -rf "$state"' EXIT
+on_exit 'rm -rf "$state"'
 # The time of the last progress, replaced whole so the alarm never reads it half written.
 stamp() { date +%s > "$state/last.new" && mv "$state/last.new" "$state/last"; }
 stamp

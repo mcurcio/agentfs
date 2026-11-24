@@ -45,7 +45,8 @@ use serde::Serialize;
 use crate::file_lock::{FileLock, Mode};
 use crate::fsutil::sync_dir;
 pub use agentfs_contracts::{NotATree, TreeId};
-pub use call_path::{Progress, Recording, Then};
+pub(crate) use call_path::ActorGuard;
+pub use call_path::{Closing, PathStep, Progress, Recording, SavePending, SaveToDecide, Then};
 use history::builder::{BuildState, Builder, JournalReader, copy_all};
 pub use history::built::{
     BuildError, BuiltSnapshot, Checkpointed, Health, History, Lag, TreeLag, WaitError,
@@ -75,13 +76,14 @@ pub use recording::file_map::FileMapReader;
 pub use recording::layout::Fingerprint;
 pub use recording::{DirEntry, FileMap, Node, RenameMode};
 use recording::{Handle, pages};
+pub(crate) use recording::{OpenContent, WriteOpenStart};
 use rows::SavedRows;
 pub use rows::{Chain, RowDomain, RowEvent, RowWrite};
 use stages::Stages;
 use tree::{EventNumber, SavedTree};
 pub use untracked::{AreaWrite, UntrackedArea};
 
-const FORMAT: &str = "agentfs-trees-14\n";
+const FORMAT: &str = "agentfs-trees-15\n";
 
 /// How one open volume keeps its journal (docs/library/core.md, "Git-backed
 /// tree views"). Fixed for the life of the open; nothing of it is stored in
@@ -358,6 +360,14 @@ pub struct Metrics {
     pub journal_carried_bytes: u64,
     /// History as built behind the call path.
     pub history: HistoryMetrics,
+    /// Saves begun and not landed: being decided, queued, or failed and
+    /// awaiting a retry (docs/trees.md, "Pending saves").
+    pub pending_saves: u64,
+    /// The age of the oldest of them, in nanoseconds; 0 with none.
+    pub oldest_pending_save_ns: u64,
+    /// Saves whose decision or land failed, or that were dropped
+    /// unfinished, since open.
+    pub failed_saves: u64,
 }
 
 /// A single synchronous actor. Sharing requires a mutex; a second process
@@ -401,8 +411,9 @@ pub struct TreeActor {
     /// The tree each queue entry came from: the step's tree that queued it.
     sources: BTreeMap<String, TreeId>,
     handles: BTreeMap<u64, Handle>,
-    /// Closes that could not save, in arrival order. Their handles count as
-    /// open until a later step in their tree saves them, or a restart does.
+    /// Closes that could not save, in arrival order; a step saves them in
+    /// close order (`recording::close_rank`). Their handles count as open
+    /// until a later step in their tree saves them, or a restart does.
     pending_closes: Vec<u64>,
     next: u64,
     /// The last record's time: what a step just recorded applies its times at.
@@ -761,7 +772,9 @@ impl TreeActor {
     /// write. Recovery serves the trees as built with every later record
     /// replayed on them, never waiting for history (the builder catches up
     /// behind); then closes every abandoned write-open exactly once, as its
-    /// own writer with its journaled pod context, and makes every record
+    /// own writer with its journaled pod context, in close order (those
+    /// whose close began in the order of their close records, then the rest
+    /// in open order), and makes every record
     /// durable. `service` is carried by the Sync commits this run writes. It
     /// takes no queue entries: the view's worker or a caller runs
     /// [`TreeActor::progress`].
@@ -1149,8 +1162,16 @@ impl TreeActor {
             let saved_through = saved.get(&key).copied().unwrap_or(0);
             volume.pages_restore(key.0, key.1, writes, saved_through);
         }
-        let abandoned: Vec<_> = volume.handles.keys().copied().collect();
-        for handle in abandoned {
+        // In close order: the closes a client began, in their close
+        // records' order, then the rest in open order, each given its close
+        // record by its recovery close, as a client's end gives them.
+        let mut abandoned: Vec<_> = volume
+            .handles
+            .iter()
+            .map(|(handle, h)| recording::close_rank(*handle, h, &volume.pending_closes))
+            .collect();
+        abandoned.sort_unstable();
+        for (_, _, _, handle) in abandoned {
             volume.close(handle)?;
         }
         // Tracked paths the rules now never record leave history.
@@ -1229,6 +1250,23 @@ impl TreeActor {
             pointers_at_steps: self.at_steps.len() as u64,
             compactor_through: self.history.compactor_through().get(),
         };
+        let pending: Vec<_> = self
+            .handles
+            .iter()
+            .filter(|(handle, h)| h.closing || self.pending_closes.contains(handle))
+            .map(|(_, h)| h.pending_since)
+            .collect();
+        metrics.pending_saves = pending.len() as u64;
+        metrics.oldest_pending_save_ns = pending
+            .iter()
+            .flatten()
+            .map(|since| {
+                u64::try_from(since.elapsed().as_nanos())
+                    .unwrap_or(u64::MAX)
+                    .max(1)
+            })
+            .max()
+            .unwrap_or(0);
         metrics
     }
 
@@ -1844,6 +1882,9 @@ impl TreeActor {
     /// leaves history built through the last record. Once only; what a drop
     /// runs.
     pub(in crate::tree_actor) fn shut_down(&mut self) {
+        // Stopped first: from here the actor answers `Stopped`, so nothing
+        // is applied to it after its builder has gone.
+        self.stopped = true;
         let appended = self.journal.durability().appended();
         self.history.stop(appended);
         // History is stopping: the compactor ends after any compaction in flight.
@@ -2228,6 +2269,7 @@ mod tests {
             "agentfs-trees-11\n",
             "agentfs-trees-12\n",
             "agentfs-trees-13\n",
+            "agentfs-trees-14\n",
         ] {
             let tmp = tempfile::tempdir().unwrap();
             drop(new_actor(tmp.path()));

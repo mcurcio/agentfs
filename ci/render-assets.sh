@@ -11,6 +11,7 @@
 # resvg must be on PATH, or named by RESVG.
 
 set -euo pipefail
+. "$(dirname "$0")/lib.sh"
 
 cd "$(dirname "$0")/.."
 RESVG=${RESVG:-resvg}
@@ -33,7 +34,7 @@ ASSETS=(
 )
 
 out=$(mktemp -d)
-trap 'rm -rf "$out"' EXIT
+on_exit 'rm -rf "$out"'
 failed=0
 for entry in "${ASSETS[@]}"; do
   read -r svg size_opt size <<<"$entry"

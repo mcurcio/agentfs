@@ -9,7 +9,6 @@
 //! Lock order: the tree actor's lock, then the bindings'.
 
 use std::collections::BTreeMap;
-use std::ops::DerefMut;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
@@ -18,8 +17,9 @@ use agentfs_contracts::pod::WriterAt;
 use agentfs_contracts::ports::{SessionAuthority, SessionBinder};
 
 use crate::tree_actor::{
-    Attrs, DirEntry, Error, FileMap, Node, Recording, RenameMode, Saved, SetTime, Then, TreeActor,
-    TreeId, UntrackedArea,
+    ActorGuard, Attrs, Closing, DirEntry, Error, FileMap, Node, OpenContent, PathStep, RecordNo,
+    Recording, RenameMode, SavePending, Saved, SetTime, Then, TreeActor, TreeId, UntrackedArea,
+    WriteOpenStart,
 };
 
 type Result<T> = std::result::Result<T, Error>;
@@ -124,12 +124,26 @@ impl TreeSession {
     ///
     /// [`Error::Stopped`] when the actor stopped.
     pub fn lock(&self) -> Result<SessionGuard<'_>> {
+        self.lock_retrying(None)
+    }
+
+    /// [`TreeSession::lock`] for the retry of a call `refused` was given
+    /// ([`SessionGuard::unlink`] and the other refused calls): the guard
+    /// refuses a call again only for a save begun before that first
+    /// refusal, so a save begun after it never keeps the call waiting.
+    /// None is a first call's guard, [`TreeSession::lock`].
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Stopped`] when the actor stopped.
+    pub fn lock_retrying(&self, refused: Option<SavePending>) -> Result<SessionGuard<'_>> {
         let actor = self.sessions.recording.actor()?;
         let writes_as = self.writes_as();
         Ok(SessionGuard {
-            actor: Box::new(actor),
+            actor,
             tree: self.tree,
             writes_as,
+            retrying: refused.map(|r| r.before()),
         })
     }
 
@@ -155,6 +169,29 @@ impl TreeSession {
         self.sessions.recording.close_with(handle, |actor| {
             own(actor, self.tree, self.writes_as().as_ref(), handle)
         })
+    }
+
+    /// RELEASE's first half for this session's open `handle`
+    /// ([`Recording::start_close_with`]): checked as the session's own under
+    /// the lock; a [`Closing::Decide`] goes to the view's save worker. The
+    /// view answers the kernel on return.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NotFound`] for an open that is not this session's; as
+    /// [`Recording::start_close_with`].
+    pub fn start_close(&self, handle: u64) -> Result<Closing> {
+        self.sessions.recording.start_close_with(handle, |actor| {
+            own(actor, self.tree, self.writes_as().as_ref(), handle)
+        })
+    }
+
+    /// Runs `then`, the retry of a refused path call, once every save of
+    /// `pending`'s file begun before the refusal has landed or failed
+    /// ([`Recording::when_saved_then`]); the retry takes its guard with
+    /// [`TreeSession::lock_retrying`].
+    pub fn when_saved_then(&self, pending: SavePending, then: Then) {
+        self.sessions.recording.when_saved_then(pending, then);
     }
 
     /// The operator's rules ([`Recording::rules`]).
@@ -221,12 +258,17 @@ fn own(actor: &TreeActor, tree: TreeId, writes_as: Option<&WriterAt>, handle: u6
 
 /// The actor locked for one session: [`TreeActor`]'s calls of the same name,
 /// with the session's tree and writer. The lock is [`Recording::actor`]'s
-/// guard, measured as every hold is; it is held boxed because the guard's
-/// type is not named outside the tree actor.
+/// guard, measured as every hold is. Two calls may release it inside them
+/// and take it again, to fold the client's pending saves:
+/// [`SessionGuard::open_map`] and [`SessionGuard::write_open`].
 pub struct SessionGuard<'a> {
-    actor: Box<dyn DerefMut<Target = TreeActor> + 'a>,
+    actor: ActorGuard<'a>,
     tree: TreeId,
     writes_as: Option<WriterAt>,
+    /// A retried call's first refusal's record
+    /// ([`TreeSession::lock_retrying`]): only a save begun before it
+    /// refuses the call again.
+    retrying: Option<RecordNo>,
 }
 
 impl SessionGuard<'_> {
@@ -246,6 +288,33 @@ impl SessionGuard<'_> {
 
     pub fn file_map(&self, path: &str) -> Result<FileMap> {
         self.actor.file_map(self.tree, path)
+    }
+
+    /// What an open of `path` by this session's client reads: the file as
+    /// its client's pending saves leave it, else its saved map. Another
+    /// client's pending save is not shown (close-to-open, ledger R1.1, for
+    /// the file's own client). O(1) when one pending save whose base did
+    /// not move and no page write is the file's; else the fold of its
+    /// client's pending saves on the saved map, in close order
+    /// (`TreeActor::open_content`).
+    ///
+    /// **The lock may be released inside.** A fold runs with the actor's
+    /// lock released (`ActorGuard::unlocked`): the content is as of the
+    /// hold that took its snapshot, and whatever the caller read through
+    /// the guard before may have moved by the time this returns.
+    ///
+    /// # Errors
+    ///
+    /// As [`TreeActor::file_map`]; a failed fold; [`Error::Stopped`] when
+    /// the actor stopped while the fold ran.
+    pub fn open_map(&mut self, path: &str) -> Result<FileMap> {
+        let Some(by) = &self.writes_as else {
+            return self.actor.file_map(self.tree, path);
+        };
+        match self.actor.open_content(self.tree, path, by)? {
+            OpenContent::Ready(map) => Ok(map),
+            OpenContent::Fold(fold) => self.actor.unlocked(|| fold.fold())?,
+        }
     }
 
     pub fn file_len(&self, path: &str) -> Result<u64> {
@@ -292,14 +361,33 @@ impl SessionGuard<'_> {
         self.actor.set_meta(self.tree, path, attrs, by)
     }
 
+    /// `utimensat(2)` ([`TreeActor::set_times`]): refused with nothing done
+    /// while the file at `path` has a pending save, whose landing sets the
+    /// modification time; so a time set after a close is not undone by
+    /// that close's later landing.
     pub fn set_times(
         &mut self,
         path: &str,
         atime: Option<SetTime>,
         mtime: Option<SetTime>,
-    ) -> Result<()> {
+    ) -> Result<PathStep<()>> {
         let by = self.writes_as.as_ref().ok_or(Error::ReadOnly)?;
-        self.actor.set_times(self.tree, path, atime, mtime, by)
+        if let Some(pending) = self.actor.pending_save(self.tree, path, self.retrying) {
+            return Ok(PathStep::WaitFor(pending));
+        }
+        self.actor
+            .set_times(self.tree, path, atime, mtime, by)
+            .map(PathStep::Done)
+    }
+
+    /// The pending save of the file at `path`, if it has one in flight:
+    /// what a call that reads the file's content for another place (a move
+    /// out of the tree) waits for first. Any such save, a retry's too: the
+    /// copy must carry every save answered before it, and a save begun
+    /// after the first refusal that landed on the tree's file once its
+    /// name was gone would be lost.
+    pub fn pending_save(&self, path: &str) -> Option<SavePending> {
+        self.actor.pending_save(self.tree, path, None)
     }
 
     pub fn object_at(&self, path: &str) -> Result<u64> {
@@ -322,9 +410,30 @@ impl SessionGuard<'_> {
         self.actor.page_fill(self.tree, object, offset, size)
     }
 
+    /// A write-open of `path` ([`TreeActor::write_open`]): its view starts
+    /// from the file as this client's pending saves leave it.
+    ///
+    /// **The lock may be released inside.** When those saves need a fold,
+    /// the open is recorded in one hold, the fold runs with the actor's lock
+    /// released (`ActorGuard::unlocked`), and the view is set in a second
+    /// hold, with every page write of the file made meanwhile on it
+    /// (`TreeActor::write_open_view`). Whatever the caller read through the
+    /// guard before may have moved by the time this returns.
+    ///
+    /// # Errors
+    ///
+    /// As [`TreeActor::write_open`]; a failed fold closes the open and is
+    /// the answer; [`Error::NotFound`] when the client ended while the fold
+    /// ran; [`Error::Stopped`].
     pub fn write_open(&mut self, path: &str, create: Option<Attrs>) -> Result<u64> {
         let by = self.writes_as.as_ref().ok_or(Error::ReadOnly)?;
-        self.actor.write_open(self.tree, path, by, create)
+        match self.actor.write_open_begin(self.tree, path, by, create)? {
+            WriteOpenStart::Ready(handle) => Ok(handle),
+            WriteOpenStart::Fold { handle, fold } => {
+                let folded = self.actor.unlocked(|| fold.fold())?;
+                self.actor.write_open_folded(handle, folded)
+            }
+        }
     }
 
     pub fn write_open_truncating(&mut self, path: &str, create: Option<Attrs>) -> Result<u64> {
@@ -343,28 +452,70 @@ impl SessionGuard<'_> {
         self.actor.first_link(self.tree, object, path, by)
     }
 
-    pub fn rename(&mut self, from: &str, to: &str, mode: RenameMode) -> Result<()> {
+    /// `rename(2)` ([`TreeActor::rename`]): refused with nothing done while
+    /// `to` names a file with a pending save (the rename would replace
+    /// it); a pending save of `from` follows its file to `to`.
+    pub fn rename(&mut self, from: &str, to: &str, mode: RenameMode) -> Result<PathStep<()>> {
         let by = self.writes_as.as_ref().ok_or(Error::ReadOnly)?;
-        self.actor.rename(self.tree, from, to, mode, by)
+        if let Some(pending) = self.actor.pending_save(self.tree, to, self.retrying) {
+            return Ok(PathStep::WaitFor(pending));
+        }
+        self.actor
+            .rename(self.tree, from, to, mode, by)
+            .map(PathStep::Done)
     }
 
     /// A whole-file replace of `path` with the `len` bytes of `src`
-    /// ([`TreeActor::replace_file`]).
+    /// ([`TreeActor::replace_file`]): refused with nothing done, `src`
+    /// unread, while `path` names a file with a pending save.
     pub fn replace_file(
         &mut self,
         path: &str,
         attrs: Attrs,
         src: &mut dyn std::io::Read,
         len: u64,
-    ) -> Result<Saved> {
+    ) -> Result<PathStep<Saved>> {
         let by = self.writes_as.as_ref().ok_or(Error::ReadOnly)?;
+        if let Some(pending) = self.actor.pending_save(self.tree, path, self.retrying) {
+            return Ok(PathStep::WaitFor(pending));
+        }
         self.actor
             .replace_file(self.tree, path, attrs, src, len, by)
+            .map(PathStep::Done)
     }
 
-    pub fn unlink(&mut self, path: &str) -> Result<()> {
+    /// A path `truncate(2)` of `path` to `size`: an open, its truncate and
+    /// its close in this one hold ([`TreeActor::write_open_to_truncate`],
+    /// [`TreeActor::truncate`], [`TreeActor::close`]), refused with nothing
+    /// done while the file has a pending save. No fold of the client's
+    /// pending saves is read: the close replays the truncate on the saved
+    /// head, after them.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::ReadOnly`]; as the three calls it makes.
+    pub fn truncate_path(&mut self, path: &str, size: u64) -> Result<PathStep<()>> {
         let by = self.writes_as.as_ref().ok_or(Error::ReadOnly)?;
-        self.actor.unlink(self.tree, path, by)
+        if let Some(pending) = self.actor.pending_save(self.tree, path, self.retrying) {
+            return Ok(PathStep::WaitFor(pending));
+        }
+        let handle = self
+            .actor
+            .write_open_to_truncate(self.tree, path, by, None)?;
+        let truncated = self.actor.truncate(handle, size);
+        self.actor.close(handle)?;
+        truncated.map(PathStep::Done)
+    }
+
+    /// `unlink(2)` ([`TreeActor::unlink`]): refused with nothing done while
+    /// the file at `path` has a pending save, so history keeps the save,
+    /// then the delete (the owner, 2026-11-23: the delete waits).
+    pub fn unlink(&mut self, path: &str) -> Result<PathStep<()>> {
+        let by = self.writes_as.as_ref().ok_or(Error::ReadOnly)?;
+        if let Some(pending) = self.actor.pending_save(self.tree, path, self.retrying) {
+            return Ok(PathStep::WaitFor(pending));
+        }
+        self.actor.unlink(self.tree, path, by).map(PathStep::Done)
     }
 
     pub fn open_object(&self, handle: u64) -> Result<u64> {

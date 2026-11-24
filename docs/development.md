@@ -292,10 +292,14 @@ evidence. CI scripts judge the build:
   `crates/agentfs-conformance/tests/regressions`
   ([VERIFYING.md](../crates/agentfs-model/VERIFYING.md)).
 - `e2e-tree-pagecache.sh`: shared mappings in 21 cases, `trees-mmap`, 64
-  closes reopened.
+  closes reopened, and pending saves (`trees-close-open.py`): a stat, an open
+  and a rename after a slow close, and history's save then delete.
 - `e2e-tree-restart.sh`, `e2e-tree-recording-faults.sh` and
   `e2e-tree-enospc.sh`: view-host death, kills at each failpoint, state
   exhaustion.
+- `e2e-tree-pending-saves.sh` (job `recording-faults`): a save worker's
+  decision failing, panicking or killing agentfs at failpoint
+  `tree.close_decide`, on a failpoints build ([trees](trees.md#pending-saves)).
 - `power-loss-trees.sh`: dm-log-writes replay on ext4 and XFS, on the
   upstream and a fork, each checkpoint also rebuilding the refs from the
   journal alone.
@@ -329,3 +333,18 @@ evidence. CI scripts judge the build:
   to refs under `refs/agentfs/`. The one way a branch is replaced is
   `agentfs push --force-with-lease`, by an operator
   ([history-rewrite](runbooks/history-rewrite.md)).
+- **A script's cleanup runs only in its own shell.** Every shell script
+  under `ci/` registers its EXIT cleanup with `on_exit` from `ci/lib.sh`
+  (`ci/tree-git-test-lib.sh` sources it), never a bare `trap ... EXIT`.
+  Under bash 5.2 a forked child (a `( ... ) &` subshell, or `cmd &` before
+  it execs) that gets a fatal signal before it resets its traps runs the
+  EXIT trap it inherited, so a script's cleanup could run in that child and
+  unmount or kill what the script still used. `on_exit` compares the exiting
+  shell's `$BASHPID` with the one that registered it (`$$` is the parent's
+  inside a subshell), so the cleanup runs once, in its own shell, and a
+  subshell may register its own. A test
+  (`ci_exit_traps_run_in_their_own_shell`) refuses a bare EXIT trap under
+  `ci/`. A killed mount is killed with `tree_kill_mount`, which fails loudly
+  when the daemon ended before the kill, exits other than by the kill, or
+  left no mount entry, and `tree_wait_exit`'s message and status are never
+  hidden.

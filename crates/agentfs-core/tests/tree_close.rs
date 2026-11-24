@@ -1,12 +1,14 @@
 //! A close's work under the actor's lock (docs/trees.md, "File maps"): an
 //! open whose saved map did not move and whose length changed closes in one
 //! hold, comparing no byte, however many calls it made; any other close
-//! decides with the lock released and holds it twice, briefly. Read through
-//! the process-wide stage counters, so one test runs at a time.
-use std::sync::{Arc, Mutex};
+//! decides with the lock released and holds it twice, briefly. The holds
+//! are the calling thread's (other threads of the volume hold the lock at
+//! events of their own); the bytes compared are read through the
+//! process-wide stage counters, so one test runs at a time.
+use std::sync::{Arc, Mutex, PoisonError};
 
 use agentfs_contracts::pod::PodContext;
-use agentfs_core::tree_actor::stages::Stages;
+use agentfs_core::tree_actor::stages::{Stages, holds_on_this_thread};
 use agentfs_core::tree_actor::{Recording, Saved, TreeId};
 use trees::{ATTRS, identity, writer};
 
@@ -39,16 +41,15 @@ fn with_a(dir: &std::path::Path) -> Arc<Recording> {
     rec
 }
 
-/// The lock holds and bytes compared by one `close_with`.
-fn close_costs(rec: &Recording, handle: u64) -> (Saved, u64, u64) {
+/// The lock holds and bytes compared by one `close_with`, which runs on
+/// this thread.
+fn close_costs(rec: &Arc<Recording>, handle: u64) -> (Saved, u64, u64) {
     let before = Stages::current();
+    let held = holds_on_this_thread();
     let saved = rec.close_with(handle, |_| Ok(())).unwrap();
+    let holds = holds_on_this_thread() - held;
     let after = Stages::current();
-    (
-        saved,
-        after.actor_lock.count - before.actor_lock.count,
-        after.bytes_compared - before.bytes_compared,
-    )
+    (saved, holds, after.bytes_compared - before.bytes_compared)
 }
 
 /// A4: a write that changes the length, its base not moved: one hold of
@@ -56,7 +57,7 @@ fn close_costs(rec: &Recording, handle: u64) -> (Saved, u64, u64) {
 /// holds, and its own bytes compared.
 #[test]
 fn a_close_whose_base_did_not_move_is_one_hold() {
-    let _one = ONE_AT_A_TIME.lock().unwrap();
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(PoisonError::into_inner);
     let tmp = tempfile::tempdir().unwrap();
     let rec = with_a(tmp.path());
     let w = writer("w");
@@ -89,7 +90,7 @@ fn a_close_whose_base_did_not_move_is_one_hold() {
 /// a few pieces, is the save.
 #[test]
 fn a_hundred_thousand_calls_close_in_one_hold() {
-    let _one = ONE_AT_A_TIME.lock().unwrap();
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(PoisonError::into_inner);
     let tmp = tempfile::tempdir().unwrap();
     let rec = with_a(tmp.path());
     let w = writer("w");

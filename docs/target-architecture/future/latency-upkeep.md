@@ -79,7 +79,6 @@ One local run of `create` (50,000 one-line files in one directory, with a fork's
 
 Found while the built slices were measured. None has a slice.
 
-- **The view's one request thread.** A view answers its requests on one thread, so a large close's own decision stalls the view's other files: 382 ms in `close_frag` and 870 ms in `write_1m`. A close that runs off that thread needs every request type to respect a save ordering; missing one breaks close-to-open. It is the riskiest change considered here.
 - **The walk onto carried frames.** It held the lock 114 ms in `close_frag`, whose open has 200,000 pieces. No figures workload holds a file open across a compaction to measure it on purpose.
 - **The page image.** A page fill or writeback builds a file's image under the lock from every live open's calls. No workload measured it.
 - **The lag gate's waits for other files of a busy tree.** A write to another file of a tree whose history trails waits at the gate. The probe never writes, so no figure shows it.

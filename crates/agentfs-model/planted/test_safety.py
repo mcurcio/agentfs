@@ -135,7 +135,9 @@ class Compare(unittest.TestCase):
         self.root = pathlib.Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, self.root)
         (self.root / "ci").mkdir()
-        shutil.copy(ROOT / "ci/model-digest.sh", self.root / "ci")
+        # The script sources ci/lib.sh beside it.
+        for script in ("model-digest.sh", "lib.sh"):
+            shutil.copy(ROOT / "ci" / script, self.root / "ci")
         (self.root / "ci/git-release").write_text("2.47.3\n")
         base = self.root / "crates/agentfs-model/baseline"
         base.mkdir(parents=True)

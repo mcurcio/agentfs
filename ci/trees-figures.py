@@ -47,11 +47,15 @@ restarted view as soon as `docker run -d` returns and the container's pid is
 read, so the view's first milliseconds are unsampled, and touches the stop
 file once the view is mounted: that output is --restart-peak.
 
-Every timed save ends with a stat(2) of the file. The view saves a file when
-the kernel releases it, which reaches agentfs just after close(2) returns,
-and the view answers requests one at a time and in order, so the stat
-returns only once the save is committed. Each figure therefore includes the
-commit, not only the close.
+Every timed save ends with a stat(2) of the file. The view begins a file's
+close when the kernel releases it, which reaches agentfs just after close(2)
+returns, and the view answers requests one at a time and in order, so the
+stat returns only once the close is begun. A close saved under the lock (an
+open of a few pieces whose length changed: every `create` and `close_4k`)
+is committed by then; any other is a pending save, decided and landed on
+the view's save worker after the stat (docs/trees.md, "Pending saves"), so
+`close_s` of `close_64m`, `close_1g`, `close_frag` and `write_1m` is the
+close begun, and the save's own time is in `drain_s`.
 
     close_4k   a 4 KiB file rewritten and closed `count` times: p50 and p99 of
                one open, write, close and stat, in ms
@@ -137,6 +141,42 @@ alone is the view's one thread; in both, the lock. The probe never writes,
 so the lag gate, which holds only new work, never holds it. It adds requests
 beside the workload, so the tracer does not pass it: it is read locally.
 
+With --probe, five probe legs run after the workloads, each alone with
+`--only NAME`, against a deadline of their own (LEG_DEADLINE_S) and with no
+bar: they are read, never gated (owner, 2026-11-20). Each needs --metrics,
+waits for its saves to land (`landed_s`: until a metrics file written after
+the last close shows `pending_saves` 0) and reports `spread` figures
+(`count`, `p50_ms`, `p99_ms`, `max_ms`) under its name, with `lock`,
+`gate_wait` and `requests` as a workload's, from its start until its saves
+landed:
+
+    creates_during_close  close_frag's close, with a 4 KiB file created,
+               written and closed in its directory every 10 ms on another
+               thread until the close's save lands: `create` (open and
+               write) and `close`, and `frag_close_ms`, the close(2) itself
+    rename_save  a 64 MiB file written as `fig-leg-tmp`, closed and renamed
+               over an existing 64 MiB `fig-leg-real`, with creates in the
+               directory meanwhile: `create` and `close`, `rename_ms`, the
+               rename's own time, and `bytes_ok`, the real file's sha256
+               once the save landed against the bytes written
+    many_closes  64 files of 4 MiB, each overwritten in place and closed
+               twice while close_frag's save is decided: `close`, each
+               close(2), and `wrong_bytes`, the files not holding their
+               second round's bytes once every save landed (a file's saves
+               land in close order)
+    other_view_close  (needs --probe-view) close_frag's close in the view
+               and the same close in --probe-view at once, with the probe
+               in the other view: `other`, its calls, and `longest_ms`, the
+               longest of them
+    pending_open  1,000,000 64-byte appends in one open and its close, one
+               more append-open, append and close, then a read-only open of
+               the file, which folds the view's two pending saves of it:
+               `open_ms`, that open(2); `bytes_ok`, its last line read back;
+               `probe`, the probe's calls from the second open to the
+               landing in this view (`same`) and in --probe-view (`other`),
+               with `same_longest_ms` and `other_longest_ms`; the fold's
+               lock share is `lock`'s `page_image`
+
 Each workload runs on a worker thread. One the deadline catches inside a
 save gets `grace_s` more to come back; one still blocked then is stuck in
 the view, so the FUSE connection is aborted (/sys/fs/fuse/connections, as
@@ -144,6 +184,7 @@ root) to free it, and the workloads after it are reported as not run.
 """
 
 import argparse
+import hashlib
 import json
 import math
 import os
@@ -163,8 +204,9 @@ FRAG_WRITES = 200_000
 SMALL_WRITE = 64
 APPENDS = 1_000_000
 HISTORY_CREATES = 2_000
-GUARANTEE = ("saved before the view answers any later request; "
-             "history built later (drain_s: from the workload's end to the built point reaching it)")
+GUARANTEE = ("begun before the view answers any later request, a large save landed on the view's "
+             "save worker; history built later (drain_s: from the workload's end to the built point "
+             "reaching it)")
 FUSECTL = "/sys/fs/fuse/connections"
 
 
@@ -340,35 +382,48 @@ def write_all(fd, data):
         chunk = chunk[os.write(fd, chunk):]
 
 
-def close_frag(view, run, _target):
-    """A 64 MiB file fragmented by 200,000 random small writes in one open,
-    then closed: the close that held every view of the volume for 99 s."""
-    path = os.path.join(view, "fig-frag")
+def fragmented(path, run):
+    """`path` written as 64 MiB in 1 MiB blocks and closed, then opened again
+    for FRAG_WRITES 64-byte writes at random offsets (the same offsets and
+    bytes in every run), counted in run.extra["writes"]: the open descriptor,
+    whose close is close_frag's; None, closed, once the deadline passed."""
     block = bytearray(os.urandom(MIB))
-    run.extra.update(writes=0)
+    run.extra.setdefault("writes", 0)
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
     try:
         for n in range(BIG_BYTES // MIB):
             if not run.open():
-                return
+                return None
             block[:8] = n.to_bytes(8, "little")
             write_all(fd, block)
     finally:
         os.close(fd)
     os.stat(path)
-    # The same offsets and bytes in every run.
     rng = random.Random(1)
-    closing = None
     fd = os.open(path, os.O_WRONLY)
     try:
         for n in range(FRAG_WRITES):
             if n % 1000 == 0 and not run.open():
-                return
+                os.close(fd)
+                return None
             os.pwrite(fd, rng.randbytes(SMALL_WRITE), rng.randrange(BIG_BYTES - SMALL_WRITE))
             run.extra["writes"] += 1
-        closing = time.monotonic()
-    finally:
+    except BaseException:
         os.close(fd)
+        raise
+    return fd
+
+
+def close_frag(view, run, _target):
+    """A 64 MiB file fragmented by 200,000 random small writes in one open,
+    then closed: the close that held every view of the volume for 99 s."""
+    path = os.path.join(view, "fig-frag")
+    run.extra.update(writes=0)
+    fd = fragmented(path, run)
+    if fd is None:
+        return
+    closing = time.monotonic()
+    os.close(fd)
     os.stat(path)
     end = time.monotonic()
     if end > run.deadline:
@@ -924,6 +979,325 @@ def lock_hold_ms(metrics):
         return None
 
 
+def landed(metrics, cap):
+    """Seconds from now until a metrics file written after now shows no
+    pending save; None past `cap`. Called once a stat of the view has
+    answered after the close, so the release was begun (the view answers in
+    order): its save is pending or landed by then."""
+    start = time.monotonic()
+    until = start + cap
+    renames = Renames(metrics)
+    try:
+        floor = (metrics_of(metrics) or {}).get("seq", 0) + 2
+        while True:
+            now = metrics_of(metrics)
+            if now and now.get("seq", 0) >= floor and now.get("pending_saves", 0) == 0:
+                return round(time.monotonic() - start, 3)
+            if not renames.wait(until):
+                return None
+    finally:
+        renames.close()
+
+
+class Creator:
+    """New files in a directory while a save is pending: on a daemon thread,
+    every `interval_s`, a 4 KiB file created and written (`create`, from the
+    open to the write's return) and closed (`close`). Measurement only."""
+
+    def __init__(self, directory, prefix, interval_s=0.01):
+        self.directory, self.prefix, self.interval_s = directory, prefix, interval_s
+        self.samples = {"create": [], "close": []}
+        self.error = None
+        self._stopped = threading.Event()
+        self._thread = threading.Thread(target=self._run, name=f"creator-{prefix}", daemon=True)
+
+    def _run(self):
+        n = 0
+        while not self._stopped.wait(self.interval_s):
+            n += 1
+            path = os.path.join(self.directory, f"{self.prefix}-{n}")
+            try:
+                start = time.monotonic()
+                fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+                try:
+                    write_all(fd, page(n))
+                finally:
+                    closing = time.monotonic()
+                    os.close(fd)
+                end = time.monotonic()
+            except OSError as error:
+                self.error = str(error)
+                return
+            self.samples["create"].append(closing - start)
+            self.samples["close"].append(end - closing)
+
+    def start(self):
+        self._thread.start()
+
+    def stop(self, grace):
+        """`spread`'s figures per call, with `error` if a call failed and
+        `stuck` if one was still running `grace` s later."""
+        self._stopped.set()
+        self._thread.join(grace)
+        found = {call: spread(list(samples)) for call, samples in self.samples.items()}
+        if self.error:
+            found["error"] = self.error
+        if self._thread.is_alive():
+            found["stuck"] = True
+        return found
+
+
+def write_big(path, salt, run):
+    """A 64 MiB file of random 1 MiB blocks, each headed by `salt` and its
+    number, written and left open: the descriptor and the bytes' sha256,
+    or None, closed, once the deadline passed."""
+    block = bytearray(os.urandom(MIB))
+    digest = hashlib.sha256()
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+    for n in range(BIG_BYTES // MIB):
+        if not run.open():
+            os.close(fd)
+            return None
+        block[:16] = salt.to_bytes(8, "little") + n.to_bytes(8, "little")
+        write_all(fd, block)
+        digest.update(block)
+    return fd, digest.hexdigest()
+
+
+def sha256_of(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as file:
+        while chunk := file.read(MIB):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def many_bytes(index, round_no):
+    """MANY_BYTES of one file's content in one round: every round's differ."""
+    head = f"{index} {round_no}\n".encode()
+    return (head * (MANY_BYTES // len(head) + 1))[:MANY_BYTES]
+
+
+def creates_during_close(args, run, grace):
+    """close_frag's close, with 4 KiB files created, written and closed in its
+    directory every 10 ms until its save lands."""
+    path = os.path.join(args.view, "fig-leg-frag")
+    fd = fragmented(path, run)
+    if fd is None:
+        return
+    creator = Creator(args.view, "fig-leg-create")
+    creator.start()
+    start = time.monotonic()
+    os.close(fd)
+    run.extra["frag_close_ms"] = ms(time.monotonic() - start)
+    os.stat(args.view)
+    run.extra["landed_s"] = landed(args.metrics, args.drain_cap)
+    run.extra.update(creator.stop(grace))
+    run.finished = run.extra["landed_s"] is not None and "error" not in run.extra
+
+
+def rename_save(args, run, grace):
+    """A 64 MiB file written as tmp, closed and renamed over an existing
+    64 MiB file, with files created in the directory meanwhile; the real
+    file's bytes checked once the save landed."""
+    real = os.path.join(args.view, "fig-leg-real")
+    tmp = os.path.join(args.view, "fig-leg-tmp")
+    opened = write_big(real, 0, run)
+    if opened is None:
+        return
+    os.close(opened[0])
+    os.stat(args.view)
+    if landed(args.metrics, args.drain_cap) is None:
+        return
+    creator = Creator(args.view, "fig-leg-rename")
+    creator.start()
+    opened = write_big(tmp, 1, run)
+    if opened is None:
+        creator.stop(grace)
+        return
+    fd, want = opened
+    start = time.monotonic()
+    os.close(fd)
+    run.extra["tmp_close_ms"] = ms(time.monotonic() - start)
+    start = time.monotonic()
+    os.rename(tmp, real)
+    run.extra["rename_ms"] = ms(time.monotonic() - start)
+    os.stat(args.view)
+    run.extra["landed_s"] = landed(args.metrics, args.drain_cap)
+    run.extra.update(creator.stop(grace))
+    run.extra["bytes_ok"] = sha256_of(real) == want
+    run.finished = (run.extra["landed_s"] is not None and run.extra["bytes_ok"]
+                    and "error" not in run.extra)
+
+
+def many_closes(args, run, _grace):
+    """64 files of 4 MiB, each overwritten in place and closed twice while
+    close_frag's save is decided; each file's bytes checked once every save
+    landed (the second round's: a file's saves land in close order)."""
+    names = [os.path.join(args.view, f"fig-leg-many-{i}") for i in range(MANY_FILES)]
+    for i, name in enumerate(names):
+        if not run.open():
+            return
+        write_file(name, many_bytes(i, 0))
+    os.stat(args.view)
+    if landed(args.metrics, args.drain_cap) is None:
+        return
+    fd = fragmented(os.path.join(args.view, "fig-leg-frag"), run)
+    if fd is None:
+        return
+    os.close(fd)
+    closes = []
+    for round_no in (1, 2):
+        for i, name in enumerate(names):
+            out = os.open(name, os.O_WRONLY)
+            try:
+                os.pwrite(out, many_bytes(i, round_no), 0)
+            finally:
+                start = time.monotonic()
+                os.close(out)
+                closes.append(time.monotonic() - start)
+    os.stat(args.view)
+    run.extra["landed_s"] = landed(args.metrics, args.drain_cap)
+    run.extra["close"] = spread(closes)
+    wrong = []
+    for i, name in enumerate(names):
+        with open(name, "rb") as file:
+            if file.read() != many_bytes(i, 2):
+                wrong.append(os.path.basename(name))
+    run.extra["wrong_bytes"] = wrong
+    run.finished = run.extra["landed_s"] is not None and not wrong
+
+
+def other_view_close(args, run, grace):
+    """close_frag's close in this view and the same close in --probe-view at
+    once, with the probe reading the other view: its longest call."""
+    if not args.probe_view:
+        run.error = "needs --probe-view"
+        return
+    same = fragmented(os.path.join(args.view, "fig-leg-frag"), run)
+    if same is None:
+        return
+    other = fragmented(os.path.join(args.probe_view, "fig-leg-frag-other"), run)
+    if other is None:
+        os.close(same)
+        return
+    probe = Probe({"other": args.probe_view})
+    probe.start()
+    both = threading.Barrier(2)
+    closed = {}
+
+    def close(label, fd):
+        both.wait()
+        start = time.monotonic()
+        os.close(fd)
+        closed[label] = ms(time.monotonic() - start)
+
+    threads = [threading.Thread(target=close, args=pair, daemon=True)
+               for pair in (("same", same), ("other", other))]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    os.stat(args.view)
+    os.stat(args.probe_view)
+    run.extra["landed_s"] = landed(args.metrics, args.drain_cap)
+    calls = probe.stop(grace)["other"]
+    longest = [v["max_ms"] for k, v in calls.items() if k in ("stat", "open", "read") and v]
+    run.extra.update(frag_close_ms=closed, other=calls,
+                     longest_ms=max(longest) if longest else None)
+    run.finished = (run.extra["landed_s"] is not None and bool(longest)
+                    and "error" not in calls and "stuck" not in calls)
+
+
+def pending_open(args, run, grace):
+    """1,000,000 appends and their close, one more append and its close,
+    then a read-only open that folds both pending saves: its time, and the
+    probe's longest call in this view and in --probe-view meanwhile."""
+    path = os.path.join(args.view, "fig-leg-pending")
+    line = b"x" * (SMALL_WRITE - 1) + b"\n"
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_APPEND, 0o644)
+    try:
+        for n in range(APPENDS):
+            if n % 1000 == 0 and not run.open():
+                return
+            write_all(fd, line)
+    finally:
+        os.close(fd)
+    views = {"same": args.view}
+    if args.probe_view:
+        views["other"] = args.probe_view
+    probe = Probe(views)
+    probe.start()
+    fd = os.open(path, os.O_WRONLY | os.O_APPEND)
+    try:
+        write_all(fd, line)
+    finally:
+        os.close(fd)
+    start = time.monotonic()
+    fd = os.open(path, os.O_RDONLY)
+    run.extra["open_ms"] = ms(time.monotonic() - start)
+    try:
+        run.extra["bytes_ok"] = os.pread(fd, SMALL_WRITE, APPENDS * SMALL_WRITE) == line
+    finally:
+        os.close(fd)
+    os.stat(args.view)
+    run.extra["landed_s"] = landed(args.metrics, args.drain_cap)
+    calls = probe.stop(grace)
+    run.extra["probe"] = calls
+    for label, found in calls.items():
+        longest = [v["max_ms"] for k, v in found.items() if k in ("stat", "open", "read") and v]
+        run.extra[f"{label}_longest_ms"] = max(longest) if longest else None
+    run.finished = (run.extra["landed_s"] is not None and run.extra["bytes_ok"]
+                    and not any("error" in c or "stuck" in c for c in calls.values()))
+
+
+# Probe legs (--probe only): what a pending save leaves waiting. Each reports
+# `spread` figures under its name; none has a bar (owner, 2026-11-20).
+LEGS = [("creates_during_close", creates_during_close), ("rename_save", rename_save),
+        ("many_closes", many_closes), ("other_view_close", other_view_close),
+        ("pending_open", pending_open)]
+LEG_DEADLINE_S = 600
+MANY_FILES = 64
+MANY_BYTES = 4 * MIB
+
+
+def run_leg(name, leg, args, grace, dev):
+    """One probe leg on a worker thread against LEG_DEADLINE_S: its report
+    entry, and whether it was stuck in the view (the connection then
+    aborted)."""
+    entry = {"name": name, "leg": True, "deadline_s": LEG_DEADLINE_S}
+    if not args.metrics:
+        return {**entry, "finished": False, "error": "needs --metrics"}, False
+    run = Run(time.monotonic() + LEG_DEADLINE_S)
+    stages_before = stages_of(args.metrics)
+
+    def worker():
+        try:
+            leg(args, run, grace)
+        except OSError as error:
+            run.error = str(error)
+
+    thread = threading.Thread(target=worker, name=name, daemon=True)
+    thread.start()
+    thread.join(LEG_DEADLINE_S + grace)
+    stuck = thread.is_alive()
+    if stuck:
+        abort_connection(dev)
+        thread.join(grace)
+        entry["stuck"] = f"still running {grace} s after the deadline"
+    with run.lock:
+        entry.update(finished=run.finished and not stuck, **run.extra)
+        if run.error:
+            entry["error"] = run.error
+    if not stuck:
+        # What held the leg's calls: read once its saves landed.
+        stages_after = stages_of(args.metrics)
+        entry.update(lock=lock_figures(stages_before, stages_after),
+                     gate_wait=gate_figures(stages_before, stages_after),
+                     requests=request_figures(stages_before, stages_after))
+    return entry, stuck
+
+
 def restarted(args, baseline):
     """The `restart` figure: the tracer's time to mount and the new view's
     sampled RssAnon peak through its mount (--restart-peak), on the state the
@@ -966,8 +1340,8 @@ def main():
                         help="time another file's stat, open and read beside " + ", ".join(PROBED))
     parser.add_argument("--probe-view",
                         help="with --probe: another view of the volume (a fork's mount) to probe too")
-    parser.add_argument("--only", action="append", choices=[n for n, _ in WORKLOADS],
-                        help="run only this workload (repeatable; a probe's shortcut)")
+    parser.add_argument("--only", action="append", choices=[n for n, _ in WORKLOADS + LEGS],
+                        help="run only this workload or probe leg (repeatable; a probe's shortcut)")
     parser.add_argument("--baseline",
                         help="the first run's report: the view was restarted on its state, so "
                              "report restart and run long_history, adding both to that report")
@@ -996,6 +1370,9 @@ def main():
     for needed in ("view", "filesystem", "image", "output"):
         if getattr(args, needed) is None:
             parser.error(f"--{needed} is required")
+    legs = [n for n, _ in LEGS if n in (args.only or ())]
+    if legs and not args.probe:
+        parser.error(f"--only {legs[0]}: a probe leg runs only with --probe")
     baseline_report = None
     if args.baseline:
         with open(args.baseline) as file:
@@ -1126,6 +1503,17 @@ def main():
             print(f"{shown} on {args.filesystem}: {json.dumps(value)}", flush=True)
             if warn:
                 report_miss(shown, held, value, args.filesystem)
+    for name, leg in LEGS if args.probe and baseline_report is None else ():
+        if args.only and name not in args.only:
+            continue
+        if stopped:
+            workloads.append({"name": name, "leg": True, "finished": False,
+                              "not_run": "an earlier workload was stuck in the view"})
+            continue
+        entry, stuck = run_leg(name, leg, args, grace, dev)
+        stopped, aborted = stopped or stuck, aborted or stuck
+        workloads.append(entry)
+        print(f"{name} on {args.filesystem}: {json.dumps(entry)}", flush=True)
 
     report = {"build": args.build, "filesystem": args.filesystem, "image": args.image,
               "host": host(), "connection_aborted": aborted, "workloads": workloads}

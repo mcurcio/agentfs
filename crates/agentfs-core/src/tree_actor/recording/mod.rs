@@ -35,7 +35,7 @@ use super::meta::{Attrs, Kind, Meta, Perm, SetTime, Times};
 use super::queue::Key;
 use super::stages::{Hold, section};
 use super::tree::{DirState, EventNumber, SavedTree};
-use super::{Error, Result, Saved, TreeActor, TreeId};
+use super::{Error, Result, SavePending, Saved, TreeActor, TreeId};
 use crate::paths::RepoPath;
 pub use file_map::FileMap;
 use layout::{Layout, Positions};
@@ -224,9 +224,19 @@ pub(in crate::tree_actor) struct Handle {
     /// The saved map's step when the view was taken (open, or rebase_built
     /// moving a call-less view).
     pub(in crate::tree_actor) base_step: Option<RecordNo>,
-    /// Its close is being decided with the lock released: only that close's
-    /// finish saves it; close_writer and save_pending leave it.
+    /// Its close is being decided with the lock released, or waits its turn
+    /// behind an earlier-begun save of its file: a pending save that only
+    /// that close's finish saves; close_writer and save_pending leave it.
     pub(in crate::tree_actor) closing: bool,
+    /// Its close record ([`Entry::CloseBegun`]), once its close has
+    /// begun: the record's number is the close's order, the one a file's
+    /// saves land in, live and at restart ([`close_rank`]). None only
+    /// before a close begins, or for a failed close whose record could not
+    /// be appended: the next close record appended, its retry's or a later
+    /// close's, appends it first ([`TreeActor::record_close_begun`]).
+    pub(in crate::tree_actor) close_order: Option<RecordNo>,
+    /// When its save became pending: the age the metrics give.
+    pub(in crate::tree_actor) pending_since: Option<std::time::Instant>,
 }
 
 impl Handle {
@@ -248,12 +258,15 @@ impl Handle {
             call_count: 0,
             base_step,
             closing: false,
+            close_order: None,
+            pending_since: None,
         }
     }
 
     /// An open recovery found live, before any call is served: a recovery
     /// close saves it at once, replaying its calls read back from the
-    /// journal. Its view is never read, so it has no base.
+    /// journal, in the order of its close record when it has one. Its view
+    /// is never read, so it has no base.
     pub(in crate::tree_actor) fn recovered(folded: FoldedOpen) -> Self {
         let FoldedOpen { open, calls } = folded;
         let lengths = calls
@@ -263,9 +276,33 @@ impl Handle {
         Self {
             lengths,
             call_count: calls.len() as u64,
+            close_order: open.close_begun,
             ..Self::new(open.tree, &open.by, open.object, FileMap::empty(), None)
         }
     }
+}
+
+/// The one order a file's saves land in, live and at restart: opens with a
+/// close record in its order, then those without in the order they joined
+/// `pending` (the actor's pending closes: the order their appends failed,
+/// a client's end's opens in open order), then the rest in open order. A
+/// close without a record began after every close with one: its append
+/// failed, and the next record appended gives it one first, in this same
+/// order ([`TreeActor::record_close_begun`]); at restart, with nothing
+/// pending, an open whose close never began closes last, as its client's
+/// end. Sorts recovery's closes, a step's pending closes, and the saves an
+/// open of its own client reads ([`TreeActor::open_content`],
+/// [`PendingFold`]).
+pub(in crate::tree_actor) fn close_rank(
+    handle: u64,
+    h: &Handle,
+    pending: &[u64],
+) -> (bool, Option<RecordNo>, usize, u64) {
+    let joined = pending
+        .iter()
+        .position(|p| *p == handle)
+        .unwrap_or(usize::MAX);
+    (h.close_order.is_none(), h.close_order, joined, handle)
 }
 
 /// What a close took under the lock: the saved map and the open's view as
@@ -298,11 +335,94 @@ pub(in crate::tree_actor) struct CloseDecision {
     pieces: Vec<(u64, pages::Run)>,
 }
 
+/// What an open by a client with pending saves of a file reads, taken
+/// under the actor's lock and folded with it released
+/// ([`PendingFold::fold`]), as a close's decision is: the saved map (a
+/// clone, O(1)), the client's pending saves in close order with how many
+/// calls each made, the file's page writes and `saved_through`, and a
+/// reader of the journal as it stood. Every input is a snapshot: a pending
+/// save takes no more calls, so the fold gives the content as of the hold
+/// that took it, whatever lands meanwhile (docs/trees.md, "Pending saves").
+#[must_use = "a pending fold must be folded, with the actor's lock released"]
+pub(crate) struct PendingFold {
+    saved: FileMap,
+    /// Each pending save's open and its call count, in close order.
+    closes: Vec<(u64, u64)>,
+    /// The file's page writes and `saved_through`, when it has any.
+    pages: Option<(Vec<(u64, pages::Run)>, u64)>,
+    reader: CallReader,
+}
+
+impl PendingFold {
+    /// The fold, from the snapshots alone, reading no actor state: each
+    /// pending save's own calls read back from the journal and replayed on
+    /// the saved map in close order, each with the page-write pieces its
+    /// save takes ([`pages::calls_for_close`]), as the saves will land.
+    /// Never called with the actor locked, but by
+    /// [`TreeActor::write_open`]'s one hold (`Hold::PageImage`).
+    ///
+    /// # Errors
+    ///
+    /// A failed read of the journal; a call that does not apply.
+    pub(crate) fn fold(self) -> Result<FileMap> {
+        let Self {
+            mut saved,
+            closes,
+            pages,
+            reader,
+        } = self;
+        crate::failpoints::hit("tree.pending_fold")?;
+        let (writes, mut through) = pages.unwrap_or_default();
+        for (handle, call_count) in closes {
+            let own = if call_count > 0 {
+                reader.calls(handle)?
+            } else {
+                Vec::new()
+            };
+            for call in pages::calls_for_close(saved.len(), &own, &writes, through) {
+                saved.apply(call.call(), call.at())?;
+            }
+            // Each later save lands after a step past every page write so
+            // far: it takes only the pieces over its own calls' bytes.
+            through = u64::MAX;
+        }
+        Ok(saved)
+    }
+}
+
+/// What an open by a file's own client reads, decided under the lock
+/// ([`TreeActor::open_content`]).
+#[must_use = "a pending fold must be folded, with the actor's lock released"]
+pub(crate) enum OpenContent {
+    /// The saved map, or the one pending save's view whose base did not
+    /// move with no page write: a clone, O(1).
+    Ready(FileMap),
+    /// Two or more pending saves, a moved base or page writes: folded with
+    /// the lock released.
+    Fold(PendingFold),
+}
+
+/// How a write-open goes on after [`TreeActor::write_open_begin`]: its
+/// view is set, or its open is on record and its view waits for the fold
+/// of its client's pending saves ([`TreeActor::write_open_view`]).
+#[must_use = "a write-open's view must be set from its fold"]
+pub(crate) enum WriteOpenStart {
+    /// The open, its view set: it may be given to its client.
+    Ready(u64),
+    /// The open, live with a placeholder view (the saved map, no base), and
+    /// the fold its view is set from: not to be given to its client before
+    /// [`TreeActor::write_open_view`].
+    Fold { handle: u64, fold: PendingFold },
+}
+
 /// How a close goes on after [`TreeActor::close_begin`]: saved under the
-/// lock already, or to be decided with it released.
+/// lock already, to be decided with it released, or queued behind an
+/// earlier-begun save of its file, its snapshot taken at its turn
+/// ([`TreeActor::close_resume`]).
 pub(in crate::tree_actor) enum CloseStart {
     Done(Saved),
     Decide(CloseWork),
+    Queued,
 }
 
 impl CloseWork {
@@ -421,6 +541,267 @@ impl TreeActor {
         let tree = self.tree(tree)?;
         let object = tree.names.get(path).ok_or(Error::NotFound)?;
         Ok(tree.bytes.get(object).ok_or(Error::NotFound)?.clone())
+    }
+
+    /// A file at `path` whose save is being decided, or queued behind an
+    /// earlier save of it: the session's refusal of a call that would
+    /// delete or replace it (an unlink, a rename onto it, a whole-file
+    /// replace, a path truncate, a time set, a move out). A failed save is
+    /// no refusal: its retry saves first at the call's own step. A first
+    /// call (`retrying` None) is refused for any save in flight, and the
+    /// refusal carries the journal's next record; a retry of a refused
+    /// call (`retrying` its first refusal's record) only for a save whose
+    /// close record is below that, and its refusal carries the same record,
+    /// so a save begun after the first refusal never holds the call.
+    pub(crate) fn pending_save(
+        &self,
+        tree: TreeId,
+        path: &str,
+        retrying: Option<RecordNo>,
+    ) -> Option<SavePending> {
+        let t = self.tree(tree).ok()?;
+        let object = *t.names.get(path)?;
+        // Every save in flight has its close record, below the next one.
+        let before = retrying.unwrap_or_else(|| self.durability().appended().next());
+        self.save_in_flight(tree, object, Some(before))
+            .then(|| SavePending::new(tree, object, before))
+    }
+
+    /// Whether a close of `object` in `tree` is in flight (being decided or
+    /// queued), its close record below `before` when given.
+    pub(in crate::tree_actor) fn save_in_flight(
+        &self,
+        tree: TreeId,
+        object: u64,
+        before: Option<RecordNo>,
+    ) -> bool {
+        self.handles.values().any(|h| {
+            h.closing
+                && h.tree == tree
+                && h.object == object
+                && before.is_none_or(|b| h.close_order.is_some_and(|o| o < b))
+        })
+    }
+
+    /// Whether a close of the volume is in flight (being decided or queued)
+    /// whose close record is below `before`: what `Recording::settle` waits
+    /// out, for the closes begun before it.
+    pub(in crate::tree_actor) fn saves_in_flight(&self, before: RecordNo) -> bool {
+        self.handles
+            .values()
+            .any(|h| h.closing && h.close_order.is_some_and(|o| o < before))
+    }
+
+    /// What an open of `path` by `by` reads, under the lock in O(segments +
+    /// the file's page writes): the saved map when `by` has no pending save
+    /// of it; one pending save's view whose base did not move, with no page
+    /// write, as a clone; else a [`PendingFold`] of `by`'s pending saves in
+    /// close order, for the caller to fold with the lock released
+    /// (close-to-open, ledger R1.1: another client's pending save is not
+    /// shown, nor any open's unsaved calls). Never reads the journal and
+    /// never waits.
+    ///
+    /// # Errors
+    ///
+    /// As [`TreeActor::file_map`].
+    pub(crate) fn open_content(
+        &self,
+        tree: TreeId,
+        path: &str,
+        by: &WriterAt,
+    ) -> Result<OpenContent> {
+        let object = *self.tree(tree)?.names.get(path).ok_or(Error::NotFound)?;
+        match self.pending_content(tree, object, by)? {
+            Some(content) => Ok(content),
+            None => self.file_map(tree, path).map(OpenContent::Ready),
+        }
+    }
+
+    /// A write-open's first half, under the lock: as
+    /// [`TreeActor::write_open`] up to its view. With pending saves of the
+    /// file by `by` that need a fold, the open is on record (its `Open`
+    /// record appended, its handle live, its view the saved map with no
+    /// base until set) and its fold is handed back; the handle is never
+    /// given to a client before [`TreeActor::write_open_view`] sets its
+    /// view. Never reads the journal.
+    ///
+    /// # Errors
+    ///
+    /// As [`TreeActor::write_open`].
+    pub(crate) fn write_open_begin(
+        &mut self,
+        tree: TreeId,
+        path: &str,
+        by: &WriterAt,
+        create: Option<Attrs>,
+    ) -> Result<WriteOpenStart> {
+        name(path)?;
+        if create.is_some() && self.tree(tree)?.kind_at(path).is_none() {
+            self.recorded_name(path, Kind::File)?;
+        }
+        let t = self.tree(tree)?;
+        match t.kind_at(path) {
+            Some(Kind::Dir) => return Err(Error::IsADirectory),
+            Some(Kind::Symlink) => return Err(Error::Invalid),
+            Some(Kind::File) | None => {}
+        }
+        let Some(object) = t.names.get(path).copied() else {
+            let Some(attrs) = create else {
+                return Err(Error::NotFound);
+            };
+            return self
+                .create_step(tree, path, by, attrs)
+                .map(WriteOpenStart::Ready);
+        };
+        // The writer's own pending saves are its view's start, taken in the
+        // hold that records the open: such a view has no base, so its close
+        // replays its calls on the saved head and never saves the view.
+        let pending = self.pending_content(tree, object, by)?;
+        let (handle, _) = self.journal_record(
+            Entry::Open {
+                tree: tree.to_string(),
+                path: path.to_owned(),
+                by: by.clone(),
+                object,
+            },
+            &[],
+        )?;
+        let saved = self
+            .tree(tree)?
+            .bytes
+            .get(&object)
+            .cloned()
+            .unwrap_or_default();
+        match pending {
+            Some(OpenContent::Ready(bytes)) => {
+                self.handles
+                    .insert(handle, Handle::new(tree, by, object, bytes, None));
+                Ok(WriteOpenStart::Ready(handle))
+            }
+            Some(OpenContent::Fold(fold)) => {
+                self.handles
+                    .insert(handle, Handle::new(tree, by, object, saved, None));
+                Ok(WriteOpenStart::Fold { handle, fold })
+            }
+            None => {
+                let base = saved.step();
+                self.handles
+                    .insert(handle, Handle::new(tree, by, object, saved, base));
+                self.pages_opened(tree, object);
+                Ok(WriteOpenStart::Ready(handle))
+            }
+        }
+    }
+
+    /// A write-open's second half, under the lock: its view is `folded`,
+    /// the fold its [`WriteOpenStart::Fold`] gave, with every page-write run
+    /// of the file recorded after its `Open` record applied in record order,
+    /// as each was applied to every open view of the file at its call. O(those
+    /// runs); no journal read.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NotFound`] for an open that is gone or whose close has begun
+    /// (its client ended while the fold ran); [`Error::Stopped`].
+    pub(crate) fn write_open_view(&mut self, handle: u64, mut folded: FileMap) -> Result<()> {
+        if self.is_stopped() {
+            return Err(Error::Stopped);
+        }
+        let h = self
+            .handles
+            .get(&handle)
+            .filter(|h| {
+                h.close_order.is_none() && !h.closing && !self.pending_closes.contains(&handle)
+            })
+            .ok_or(Error::NotFound)?;
+        if let Some(state) = self.pages.get(&(h.tree, h.object)) {
+            for (_, run) in state.writes.iter().filter(|(seq, _)| *seq > handle) {
+                // Each run was checked against `i64` at its page write.
+                let (call, pos) = run.call();
+                let _ = folded.apply(&call, &pos);
+            }
+        }
+        if let Some(h) = self.handles.get_mut(&handle) {
+            h.bytes = folded;
+        }
+        Ok(())
+    }
+
+    /// What an open of `object` by `by` reads when `by` has pending saves
+    /// of it, or None when it has none (see [`TreeActor::open_content`]):
+    /// one pending save whose base did not move, with no page write of the
+    /// file, gives its open's view, a clone; more, a moved base or page
+    /// writes give a [`PendingFold`] of them in close order
+    /// ([`close_rank`]).
+    fn pending_content(
+        &self,
+        tree: TreeId,
+        object: u64,
+        by: &WriterAt,
+    ) -> Result<Option<OpenContent>> {
+        let mut mine: Vec<(u64, &Handle)> = self
+            .handles
+            .iter()
+            .filter(|(handle, h)| {
+                h.tree == tree
+                    && h.object == object
+                    && h.by.writer == by.writer
+                    && (h.closing || self.pending_closes.contains(handle))
+            })
+            .map(|(handle, h)| (*handle, h))
+            .collect();
+        mine.sort_by_key(|(handle, h)| close_rank(*handle, h, &self.pending_closes));
+        let [(_, only), ..] = mine.as_slice() else {
+            return Ok(None);
+        };
+        let saved_step = self
+            .tree(tree)?
+            .bytes
+            .get(&object)
+            .ok_or(Error::NotFound)?
+            .step();
+        if mine.len() == 1
+            && only.base_step.is_some()
+            && only.base_step == saved_step
+            && self.pages_written(tree, object).is_none()
+        {
+            return Ok(Some(OpenContent::Ready(only.bytes.clone())));
+        }
+        let closes: Vec<u64> = mine.iter().map(|(handle, _)| *handle).collect();
+        self.pending_fold(tree, object, &closes)
+            .map(|fold| Some(OpenContent::Fold(fold)))
+    }
+
+    /// The snapshot a fold of `closes`, pending saves of `object` in
+    /// `tree` in close order, reads: the saved map, each one's call count,
+    /// the file's page writes and `saved_through`, and a reader of the
+    /// journal as it stands. O(segments + the file's page writes); reads no
+    /// journal.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NotFound`] when `tree` holds no such object or an open of
+    /// `closes` is gone.
+    fn pending_fold(&self, tree: TreeId, object: u64, closes: &[u64]) -> Result<PendingFold> {
+        let saved = self
+            .tree(tree)?
+            .bytes
+            .get(&object)
+            .ok_or(Error::NotFound)?
+            .clone();
+        let closes = closes
+            .iter()
+            .map(|handle| {
+                let h = self.handles.get(handle).ok_or(Error::NotFound)?;
+                Ok((*handle, h.call_count))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(PendingFold {
+            saved,
+            closes,
+            pages: self.pages_writes(tree, object),
+            reader: self.journal.call_reader(),
+        })
     }
 
     /// The saved length of `path`.
@@ -704,7 +1085,7 @@ impl TreeActor {
         by: &WriterAt,
         create: Option<Attrs>,
     ) -> Result<u64> {
-        let handle = self.write_open(tree, path, by, create)?;
+        let handle = self.write_open_to_truncate(tree, path, by, create)?;
         if let Err(error) = self.truncate(handle, 0) {
             if let Err(close) = self.close(handle) {
                 eprintln!("tree close after a failed truncate: {close}");
@@ -714,16 +1095,46 @@ impl TreeActor {
         Ok(handle)
     }
 
+    /// A write-open whose first call is a truncate, as `open(O_TRUNC)` and
+    /// a path `truncate(2)` make: no fold of `by`'s pending saves is read,
+    /// under the lock or off it. Its view (the saved map) feeds only the
+    /// truncate's length check, and its close replays its calls on the
+    /// saved head (it has no base), after those saves.
+    ///
+    /// # Errors
+    ///
+    /// As [`TreeActor::write_open`], but never a failed fold.
+    pub(crate) fn write_open_to_truncate(
+        &mut self,
+        tree: TreeId,
+        path: &str,
+        by: &WriterAt,
+        create: Option<Attrs>,
+    ) -> Result<u64> {
+        Ok(match self.write_open_begin(tree, path, by, create)? {
+            WriteOpenStart::Ready(handle) => handle,
+            WriteOpenStart::Fold { handle, fold } => {
+                drop(fold);
+                handle
+            }
+        })
+    }
+
     /// Open a private write buffer. With `create`, a missing file is made
     /// with those attributes (in a set-group-ID directory, its group): a
     /// recorded step. The returned number is persisted before it can be used
-    /// and never repeats.
+    /// and never repeats. The view starts from the file as `by`'s pending
+    /// saves leave it; their fold, when one is needed, runs here under the
+    /// lock in one hold (`Hold::PageImage`): the CLI's and tests' way. A
+    /// session's write-open folds with the lock released
+    /// ([`crate::session::SessionGuard::write_open`]).
     ///
     /// # Errors
     ///
     /// [`Error::IsADirectory`] for a directory, [`Error::Invalid`] for a
     /// link, [`Error::NotFound`] for a missing file without `create`, and as
-    /// [`TreeActor::mkdir`] for a create.
+    /// [`TreeActor::mkdir`] for a create; a failed fold, which closes the
+    /// open.
     pub fn write_open(
         &mut self,
         tree: TreeId,
@@ -731,42 +1142,46 @@ impl TreeActor {
         by: &WriterAt,
         create: Option<Attrs>,
     ) -> Result<u64> {
-        name(path)?;
-        if create.is_some() && self.tree(tree)?.kind_at(path).is_none() {
-            self.recorded_name(path, Kind::File)?;
+        match self.write_open_begin(tree, path, by, create)? {
+            WriteOpenStart::Ready(handle) => Ok(handle),
+            WriteOpenStart::Fold { handle, fold } => {
+                let folded = {
+                    let _kind = section(Hold::PageImage);
+                    fold.fold()
+                };
+                self.write_open_folded(handle, folded)
+            }
         }
-        let t = self.tree(tree)?;
-        match t.kind_at(path) {
-            Some(Kind::Dir) => return Err(Error::IsADirectory),
-            Some(Kind::Symlink) => return Err(Error::Invalid),
-            Some(Kind::File) | None => {}
+    }
+
+    /// A write-open's view set from its fold's outcome
+    /// ([`TreeActor::write_open_view`]); a failed fold closes the open, with
+    /// no calls, as a client's end closes an open (saved after the pending
+    /// saves of its file, not a failed save), and is the answer.
+    ///
+    /// # Errors
+    ///
+    /// The fold's error; as [`TreeActor::write_open_view`].
+    pub(crate) fn write_open_folded(
+        &mut self,
+        handle: u64,
+        folded: Result<FileMap>,
+    ) -> Result<u64> {
+        match folded {
+            Ok(map) => self.write_open_view(handle, map).map(|()| handle),
+            Err(error) => {
+                // The open has no call: it closes as a client's end closes
+                // it, after the pending saves it would have folded, never
+                // as a failed save of its own.
+                let tree = self.handles.get(&handle).map(|h| h.tree);
+                if let Some(tree) = tree
+                    && let Err(close) = self.close_held(tree, &[handle])
+                {
+                    eprintln!("tree close after a failed fold: {close}");
+                }
+                Err(error)
+            }
         }
-        let Some(object) = t.names.get(path).copied() else {
-            let Some(attrs) = create else {
-                return Err(Error::NotFound);
-            };
-            return self.create_step(tree, path, by, attrs);
-        };
-        let (handle, _) = self.journal_record(
-            Entry::Open {
-                tree: tree.to_string(),
-                path: path.to_owned(),
-                by: by.clone(),
-                object,
-            },
-            &[],
-        )?;
-        let bytes = self
-            .tree(tree)?
-            .bytes
-            .get(&object)
-            .cloned()
-            .unwrap_or_default();
-        let base = bytes.step();
-        self.handles
-            .insert(handle, Handle::new(tree, by, object, bytes, base));
-        self.pages_opened(tree, object);
-        Ok(handle)
     }
 
     /// Create an unnamed open object (`O_TMPFILE`) with these attributes.
@@ -836,14 +1251,20 @@ impl TreeActor {
 
     /// Every open and pending close of `writer` in `tree` closes as a save,
     /// in handle order, after the tree's closes already pending (git-model
-    /// §6): what an ended client's opens become. Answers each of its saves,
-    /// in that order. A failed save stops here: it and the rest stay pending,
-    /// saved at the tree's next step or at restart. The session's alone
-    /// (clippy.toml).
+    /// §6): what an ended client's opens become. Each open is pending
+    /// first, then each gets its close record in handle order, all before
+    /// any save, so the end's order survives a restart. Answers each of its
+    /// saves, in that order. An open of a file with a save in flight begun
+    /// before the end (another client's close, or its own) is saved when
+    /// that save lands, not ahead of it, and is not answered here. A failed
+    /// append or save stops here: it and the rest stay pending, counted in
+    /// `failed_saves`, and saved (an open with no close record appending
+    /// its record first) at the tree's next step or at restart. The
+    /// session's alone (clippy.toml).
     ///
     /// # Errors
     ///
-    /// A failed save, as [`TreeActor::close`].
+    /// A failed close-record append or save, as [`TreeActor::close`].
     pub fn close_writer(&mut self, tree: TreeId, writer: &WriterLabel) -> Result<Vec<Saved>> {
         if self.is_stopped() {
             return Err(Error::Stopped);
@@ -854,9 +1275,28 @@ impl TreeActor {
             .filter(|(_, h)| h.tree == tree && h.by.writer == *writer && !h.closing)
             .map(|(handle, _)| *handle)
             .collect();
-        for handle in &mine {
+        self.close_held(tree, &mine)
+    }
+
+    /// The opens `mine` of `tree`, in handle order, close as a client's
+    /// end closes them ([`TreeActor::close_writer`]): each pending, then
+    /// each given its close record, then the tree's pending closes saved
+    /// in close order, a close held back behind an earlier-begun save of
+    /// its file saved when that save lands. Answers each of `mine` saved
+    /// here. Not a failed save, unless an append or a save fails.
+    fn close_held(&mut self, tree: TreeId, mine: &[u64]) -> Result<Vec<Saved>> {
+        let now = std::time::Instant::now();
+        for handle in mine {
+            if let Some(h) = self.handles.get_mut(handle) {
+                h.pending_since.get_or_insert(now);
+            }
             if !self.pending_closes.contains(handle) {
                 self.pending_closes.push(*handle);
+            }
+        }
+        for handle in mine {
+            if let Err(e) = self.record_close_begun(*handle) {
+                return Err(self.close_failed(*handle, e));
             }
         }
         let saved = self.save_pending(tree)?;
@@ -975,6 +1415,9 @@ impl TreeActor {
     /// next step in its tree and at restart. [`TreeActor::close_begin`],
     /// [`CloseWork::decide`] and [`TreeActor::close_finish`] in one hold of
     /// the lock: `Recording::close_with` releases it for the decision.
+    /// A close of a file whose earlier-begun save is in flight cannot wait
+    /// in one hold: it answers [`Error::Busy`] and stays pending, saved
+    /// after that save. A session reaches this only for a file with none.
     pub fn close(&mut self, handle: u64) -> Result<Saved> {
         let _kind = section(Hold::Close);
         match self.close_begin(handle)? {
@@ -983,21 +1426,28 @@ impl TreeActor {
                 Ok(decision) => self.close_finish(decision),
                 Err(e) => Err(self.close_failed(handle, e)),
             },
+            CloseStart::Queued => Err(self.close_failed(handle, Error::Busy)),
         }
     }
 
     /// A close's first half, under the lock, O(1) plus the file's page
-    /// writes. Saved here: an anonymous or orphaned file's, any close in a
+    /// writes. First its close record ([`TreeActor::record_close_begun`]):
+    /// a failed append is a failed close, pending and counted, its record
+    /// appended first by the next close record appended, so it keeps its
+    /// client's order. Saved here: an anonymous or orphaned file's, any close in a
     /// tree with failed closes pending (after them, in order), an open with
     /// no call and no page write (unchanged), and an open whose saved map
     /// has not moved, whose file has no page writes and whose length changed,
     /// with few pieces: its view is the save. Else the snapshots for
-    /// [`CloseWork::decide`], the handle marked closing.
+    /// [`CloseWork::decide`], the handle marked closing. First of all, a
+    /// close of a file with an earlier-begun save in flight is marked
+    /// closing with no snapshot ([`CloseStart::Queued`]): it is never saved
+    /// ahead of that save.
     ///
     /// # Errors
     ///
     /// [`Error::Stopped`], [`Error::NotFound`] (no such open, or one being
-    /// closed); a failed save, which stays pending.
+    /// closed); a failed close-record append or save, which stays pending.
     pub(in crate::tree_actor) fn close_begin(&mut self, handle: u64) -> Result<CloseStart> {
         let _kind = section(Hold::Close);
         if self.is_stopped() {
@@ -1007,6 +1457,51 @@ impl TreeActor {
         if h.closing {
             return Err(Error::NotFound);
         }
+        let (tree, object) = (h.tree, h.object);
+        if let Err(e) = self.record_close_begun(handle) {
+            return Err(self.close_failed(handle, e));
+        }
+        let queued = self.save_in_flight(tree, object, None);
+        if let Some(h) = self.handles.get_mut(&handle) {
+            h.pending_since.get_or_insert_with(std::time::Instant::now);
+            if queued {
+                h.closing = true;
+                return Ok(CloseStart::Queued);
+            }
+        }
+        self.close_start(handle)
+    }
+
+    /// A queued close's turn, under the lock: still [`CloseStart::Queued`]
+    /// while an earlier-begun save of its file is in flight, else its close
+    /// as [`TreeActor::close_begin`] goes on past that check.
+    ///
+    /// # Errors
+    ///
+    /// As [`TreeActor::close_begin`]; [`Error::NotFound`] for an open not
+    /// queued.
+    pub(in crate::tree_actor) fn close_resume(&mut self, handle: u64) -> Result<CloseStart> {
+        let _kind = section(Hold::Close);
+        if self.is_stopped() {
+            return Err(Error::Stopped);
+        }
+        let h = self
+            .handles
+            .get(&handle)
+            .filter(|h| h.closing)
+            .ok_or(Error::NotFound)?;
+        if self.save_in_flight(h.tree, h.object, h.close_order) {
+            return Ok(CloseStart::Queued);
+        }
+        if let Some(h) = self.handles.get_mut(&handle) {
+            h.closing = false;
+        }
+        self.close_start(handle)
+    }
+
+    /// [`TreeActor::close_begin`] past its same-file check.
+    fn close_start(&mut self, handle: u64) -> Result<CloseStart> {
+        let h = self.handles.get(&handle).ok_or(Error::NotFound)?;
         let (tree, object) = (h.tree, h.object);
         let t = self.tree(tree)?;
         let pending = self
@@ -1106,19 +1601,76 @@ impl TreeActor {
             }
             self.run_pending_closes(work.tree, Some(handle))
         };
-        saved.map_err(|e| self.close_failed(handle, e))
+        let saved = saved.map_err(|e| self.close_failed(handle, e))?;
+        // The landing is the tree's step: the closes it held back (an ended
+        // client's open of the file) are saved after it.
+        if let Err(e) = self.save_pending(work.tree) {
+            eprintln!("tree SaveFailed: tree={}: {e}; it stays pending", work.tree);
+        }
+        Ok(saved)
     }
 
     /// A close that could not save: it stays pending, its handle still
     /// counting as open, and saves at its tree's next step or at restart.
+    /// Counted in `failed_saves`.
     pub(in crate::tree_actor) fn close_failed(&mut self, handle: u64, error: Error) -> Error {
         if let Some(h) = self.handles.get_mut(&handle) {
             h.closing = false;
+            h.pending_since.get_or_insert_with(std::time::Instant::now);
             if !self.pending_closes.contains(&handle) {
                 self.pending_closes.push(handle);
             }
+            self.metrics.failed_saves = self.metrics.failed_saves.saturating_add(1);
         }
         error
+    }
+
+    /// The open's close record: [`Entry::CloseBegun`] appended, with no
+    /// fsync, unless the open has one, and its number set as the open's
+    /// `close_order`. One `write(2)` of about 100 bytes: in the kernel when
+    /// the close is answered, so it survives a kill, and durable at the
+    /// next fsync, FSYNCDIR, `O_SYNC` write or builder batch. Called by
+    /// [`TreeActor::close_begin`] before anything else it does, by
+    /// [`TreeActor::close_writer`] for each open it closes (all appended
+    /// before any save), by recovery through [`TreeActor::close`], and by
+    /// the one writer of a save for a close that has none yet.
+    ///
+    /// Record first: each pending close ahead of this one (all of them when
+    /// this one is not pending) with no record, its own append failed, gets
+    /// its record before this one, in the order they joined the pending
+    /// closes, the order [`close_rank`] gives them. So a failed append never
+    /// moves a close behind one its client began later, and a client's end,
+    /// whose opens are pending in open order before any is given its
+    /// record, keeps open order, live and at restart.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NotFound`] for no such open; a failed append, with the
+    /// open unchanged (an earlier close given its record keeps it).
+    fn record_close_begun(&mut self, handle: u64) -> Result<RecordNo> {
+        let h = self.handles.get(&handle).ok_or(Error::NotFound)?;
+        if let Some(order) = h.close_order {
+            return Ok(order);
+        }
+        let earlier: Vec<u64> = self
+            .pending_closes
+            .iter()
+            .copied()
+            .take_while(|p| *p != handle)
+            .filter(|p| self.handles.get(p).is_some_and(|o| o.close_order.is_none()))
+            .collect();
+        for p in earlier {
+            let (seq, _) = self.journal_record(Entry::CloseBegun { handle: p }, &[])?;
+            if let Some(o) = self.handles.get_mut(&p) {
+                o.close_order = Some(RecordNo::new(seq));
+            }
+        }
+        let (seq, _) = self.journal_record(Entry::CloseBegun { handle }, &[])?;
+        let order = RecordNo::new(seq);
+        if let Some(h) = self.handles.get_mut(&handle) {
+            h.close_order = Some(order);
+        }
+        Ok(order)
     }
 
     /// `rename(2)`: a step. A directory moves with every entry under it,
@@ -1320,7 +1872,7 @@ impl TreeActor {
         }
     }
 
-    /// Saves this tree's pending closes in arrival order, answering for `wanted`.
+    /// Saves this tree's pending closes in close order, answering for `wanted`.
     pub(in crate::tree_actor) fn run_pending_closes(
         &mut self,
         tree: TreeId,
@@ -1333,14 +1885,27 @@ impl TreeActor {
             .map_or(Saved::Unchanged, |(_, saved)| saved))
     }
 
-    /// Saves this tree's pending closes in arrival order; answers each.
+    /// Saves this tree's pending closes in close order ([`close_rank`]),
+    /// not the order they failed in; answers each. A pending close of a
+    /// file with a save in flight that began before it (any such save, for
+    /// an open with no close record) stays pending until that save lands:
+    /// a file's saves land in the order their closes began.
     fn save_pending(&mut self, tree: TreeId) -> Result<Vec<(u64, Saved)>> {
-        let due: Vec<u64> = self
+        let mut due: Vec<u64> = self
             .pending_closes
             .iter()
             .copied()
-            .filter(|handle| self.handles.get(handle).is_some_and(|h| h.tree == tree))
+            .filter(|handle| {
+                self.handles.get(handle).is_some_and(|h| {
+                    h.tree == tree && !self.save_in_flight(tree, h.object, h.close_order)
+                })
+            })
             .collect();
+        due.sort_by_key(|handle| {
+            self.handles
+                .get(handle)
+                .map(|h| close_rank(*handle, h, &self.pending_closes))
+        });
         let mut saved = Vec::with_capacity(due.len());
         for handle in due {
             let _kind = section(Hold::Close);
@@ -1506,7 +2071,10 @@ impl TreeActor {
     /// its layout in chunk records just before the step, and the page-write
     /// `pieces` it applied; the saved map is then the layout laid on the
     /// saved map ([`decided`]): what a replay of the records lays. The one
-    /// writer of a Saved close. The open's keys go and its handle with them.
+    /// writer of a Saved close, so the one place that makes sure the open
+    /// has its close record before its save (a restart refuses a save with
+    /// none): a failed close whose record could not be appended at its
+    /// start appends it here. The open's keys go and its handle with them.
     fn save_close(
         &mut self,
         handle: u64,
@@ -1514,6 +2082,7 @@ impl TreeActor {
         saved_bytes: Option<Decided>,
         pieces: Vec<(u64, pages::Run)>,
     ) -> Result<Saved> {
+        self.record_close_begun(handle)?;
         let h = self.handles.get(&handle).ok_or(Error::NotFound)?;
         let (tree, object, by) = (h.tree, h.object, h.by.clone());
         let (chunks, saved_bytes) = match saved_bytes {

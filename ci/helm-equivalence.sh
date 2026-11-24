@@ -10,10 +10,11 @@
 #   ci/helm-equivalence.sh
 
 set -euo pipefail
+. "$(dirname "$0")/lib.sh"
 cd "$(dirname "$0")/.."
 
 out=$(mktemp -d)
-trap 'rm -rf "$out"' EXIT
+on_exit 'rm -rf "$out"'
 
 echo "== charts/agentfs-csi = deploy/csi + deploy/csi/example StorageClasses"
 {
