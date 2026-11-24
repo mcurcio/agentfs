@@ -14,6 +14,8 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  # cargo-nextest's ci profile (.config/nextest.toml): every failure, no retries.
+  NEXTEST_PROFILE: ci
 
 jobs:
   lint:
@@ -47,14 +49,17 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           key: docs
+      - uses: taiki-e/install-action@fe3acb53a98b62c772db35de75ce0e4595e7ca8c # v2.90.8
+        with:
+          tool: cargo-nextest@0.9.152
       - name: config keys read = config::KEYS
-        run: cargo test --locked -p agentfs-core --lib config::tests::every_config_read_is_registered
+        run: cargo nextest run --locked -p agentfs-core --lib config::tests::every_config_read_is_registered
       - name: configuration.md and architecture.md against the code, and links
-        run: cargo test --locked -p agentfs-core --test docs_reference
+        run: cargo nextest run --locked -p agentfs-core --test docs_reference
       - name: agentfs flags and environment variables
-        run: cargo test --locked -p agentfs --bin agentfs -- reference_tests doc_tables plan_reads_only_env_vars
+        run: cargo nextest run --locked -p agentfs --bin agentfs reference_tests doc_tables plan_reads_only_env_vars
       - name: agentfs-csi flags and environment variables
-        run: cargo test --locked -p agentfs-csi --bin agentfs-csi reference_tests
+        run: cargo nextest run --locked -p agentfs-csi --bin agentfs-csi reference_tests
 
   test:
     name: test (${{ matrix.features }})
@@ -74,7 +79,12 @@ jobs:
       # The model and the library align lines with the image's release of git.
       - uses: ./.github/actions/pinned-git
       - run: git lfs version
-      - run: cargo test --workspace --locked ${{ matrix.features == 'all' && '--all-features' || '' }}
+      - uses: taiki-e/install-action@fe3acb53a98b62c772db35de75ce0e4595e7ca8c # v2.90.8
+        with:
+          tool: cargo-nextest@0.9.152
+      - run: cargo nextest run --workspace --locked ${{ matrix.features == 'all' && '--all-features' || '' }}
+      # nextest does not run doctests.
+      - run: cargo test --doc --workspace --locked ${{ matrix.features == 'all' && '--all-features' || '' }}
 
   e2e-telemetry:
     name: e2e (OpenTelemetry collector)
@@ -149,6 +159,9 @@ jobs:
         with:
           key: crash
       - run: sudo apt-get update && sudo apt-get install -y fuse3 jq
+      - uses: taiki-e/install-action@fe3acb53a98b62c772db35de75ce0e4595e7ca8c # v2.90.8
+        with:
+          tool: cargo-nextest@0.9.152
       - run: ci/crash-tests.sh
 
   trees:

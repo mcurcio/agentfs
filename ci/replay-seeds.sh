@@ -12,6 +12,7 @@ last=${3:?the last seed}
 traces=${4:?a directory of traces}
 cargo build --locked -p agentfs-conformance --bin phase1-replay
 # The test binary's path as cargo reports it, so nothing depends on cargo's directory layout.
+# cargo test, not nextest: it only builds; each seed below runs the program itself.
 bin=$(cargo test --locked -p agentfs-model --test interleavings --no-run --message-format=json |
     jq -r 'select(.executable != null and .target.name == "interleavings") | .executable' | tail -n 1)
 [ -x "$bin" ] || { echo "could not find the interleavings test binary" >&2; exit 1; }

@@ -8,6 +8,7 @@ on:
       - 'ci/**'
       - 'vendor/**'
       - 'Cargo.*'
+      - '.config/nextest.toml'
       - '.github/workflows/phase-1.yml'
       - '.github/actions/**'
   pull_request:
@@ -23,6 +24,8 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  # cargo-nextest's ci profile (.config/nextest.toml): every failure, no retries.
+  NEXTEST_PROFILE: ci
 
 jobs:
   conformance:
@@ -45,7 +48,13 @@ jobs:
       # The tree views mount with FUSE allow_other by default.
       - run: echo user_allow_other | sudo tee -a /etc/fuse.conf
       - uses: ./.github/actions/pinned-git
-      - run: cargo test --manifest-path vendor/fuser/Cargo.toml --lib raw_tmpfile_request_dispatches_and_returns_create_reply
+      - uses: taiki-e/install-action@fe3acb53a98b62c772db35de75ce0e4595e7ca8c # v2.90.8
+        with:
+          tool: cargo-nextest@0.9.152
+      # vendor/fuser is a workspace of its own, without the ci profile.
+      - run: cargo nextest run --manifest-path vendor/fuser/Cargo.toml --lib raw_tmpfile_request_dispatches_and_returns_create_reply
+        env:
+          NEXTEST_PROFILE: default
       - run: cargo build --locked -p agentfs -p agentfs-model --bin agentfs --bin phase1-oracle
       - run: |
           set -o pipefail
@@ -59,7 +68,7 @@ jobs:
       # A floor is the count on landing: a trace that leaves the scope fails here.
       - name: record the model's calls
         if: success() || failure()
-        run: cargo test --locked -p agentfs-model --test scenarios --test interleavings
+        run: cargo nextest run --locked -p agentfs-model --test scenarios --test interleavings
         env:
           AGENTFS_MODEL_TRACE_DIR: ${{ runner.temp }}/traces
           AGENTFS_MODEL_SWEEP: ${{ env.SWEEP }}
@@ -250,7 +259,10 @@ jobs:
       # The tree views mount with FUSE allow_other by default.
       - run: echo user_allow_other | sudo tee -a /etc/fuse.conf
       - uses: ./.github/actions/pinned-git
-      - run: cargo test --locked -p agentfs-core --test tree_stages
+      - uses: taiki-e/install-action@fe3acb53a98b62c772db35de75ce0e4595e7ca8c # v2.90.8
+        with:
+          tool: cargo-nextest@0.9.152
+      - run: cargo nextest run --locked -p agentfs-core --test tree_stages
       - run: cargo build --locked -p agentfs
       - run: ci/measure-trees.sh smoke-kill "$RUNNER_TEMP/smoke-kill.json"
         env:

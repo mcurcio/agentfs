@@ -9,15 +9,15 @@
 #   root).
 #
 # A tree view killed mid-stream is ci/e2e-tree-restart.sh's and the tracer's.
-# Needs git. Reproducible on any such host:
+# Needs git and cargo-nextest. Reproducible on any such host:
 #
 #   ci/crash-tests.sh
 
 . "$(dirname "$0")/lib.sh"
 
 step "engine crash matrix"
-cargo test --locked -p agentfs-core --features failpoints --test crash_points -- --nocapture
+cargo nextest run --locked -p agentfs-core --features failpoints --test crash_points --no-capture
 
 step "process crash tests"
-cargo test --locked -p agentfs --features failpoints --test crash_daemon
+cargo nextest run --locked -p agentfs --features failpoints --test crash_daemon
 

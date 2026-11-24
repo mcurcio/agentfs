@@ -21,18 +21,21 @@ command -v jq >/dev/null || fail "jq is needed to find the test binary"
 
 step "build"
 cargo build --locked -p agentfs
-bin=$(cargo test --locked -p agentfs --test launcher_mount --no-run --message-format=json 2>/dev/null |
-  jq -r 'select(.executable != null and .target.name == "launcher_mount") | .executable' | tail -n 1)
-[ -x "$bin" ] || fail "could not find the launcher_mount test binary"
-host_bin=$(cargo test --locked -p agentfs --test launcher_host --no-run --message-format=json 2>/dev/null |
-  jq -r 'select(.executable != null and .target.name == "launcher_host") | .executable' | tail -n 1)
-[ -x "$host_bin" ] || fail "could not find the launcher_host test binary"
-csi_bin=$(cargo test --locked -p agentfs --test csi_trees --no-run --message-format=json 2>/dev/null |
-  jq -r 'select(.executable != null and .target.name == "csi_trees") | .executable' | tail -n 1)
-[ -x "$csi_bin" ] || fail "could not find the csi_trees test binary"
-unit=$(cargo test --locked -p agentfs-fuse --lib --no-run --message-format=json 2>/dev/null |
-  jq -r 'select(.executable != null and .target.name == "agentfs_fuse") | .executable' | tail -n 1)
-[ -x "$unit" ] || fail "could not find the agentfs-fuse unit test binary"
+# test_binary PACKAGE TARGET-NAME CARGO-TARGET-ARGS...: the path of a test program cargo
+# builds. cargo test, not nextest: it only builds, and the tests below run the program
+# itself under sudo with libtest's own flags.
+test_binary() {
+  local package=$1 name=$2 path
+  shift 2
+  path=$(cargo test --locked -p "$package" "$@" --no-run --message-format=json 2>/dev/null |
+    jq -r --arg name "$name" 'select(.executable != null and .target.name == $name) | .executable' | tail -n 1)
+  [ -x "$path" ] || fail "could not find the $name test binary"
+  echo "$path"
+}
+bin=$(test_binary agentfs launcher_mount --test launcher_mount)
+host_bin=$(test_binary agentfs launcher_host --test launcher_host)
+csi_bin=$(test_binary agentfs csi_trees --test csi_trees)
+unit=$(test_binary agentfs-fuse agentfs_fuse --lib)
 
 step "creating as the caller, as root (crates/agentfs-fuse/src/creds.rs)"
 OUT=$(sudo "$unit" creds:: --nocapture 2>&1) || { echo "$OUT"; fail "creds tests failed"; }
