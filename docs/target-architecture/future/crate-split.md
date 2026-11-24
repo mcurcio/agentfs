@@ -1,7 +1,7 @@
 # agentfs-core along domain lines: the crates, and in what order
 
 **Design, not built. The owner answered its questions on 2026-11-24 ([OWNER-GUIDANCE.md](../../../OWNER-GUIDANCE.md),
-"Performance"); one follow-up is open (Q1 below).** Layer: module (crate boundaries inside system.md's "git model").
+"Performance"); the front's FUSE question too (Q1: B).** Layer: module (crate boundaries inside system.md's "git model").
 Counts read at main 7efd868 (after PR #43's build settings and merged test programs); nothing built or run.
 **[read]**: counted in code (`use` lines and paths outside test modules). **[measured]**: `docs/development.md`,
 "Build settings".
@@ -190,7 +190,7 @@ PR 1 speed (#43, merged) -> PR 2 the front, the CLI rename, base, tree-engine, g
 - **The mark before the journal.** `Then` ties durability to the call path; the journal cannot be cut until the mark
   replaces it. PR 4 and PR 5: one `phase-1.yml` dispatch each.
 
-## 5. Open question
+## 5. The front and the filesystem layer (answered: B)
 
 **Q1 (general guidance): does `agentfs` also front the filesystem layer?** The owner, 2026-10-29 (AGENTS.md principle
 10): "There is “the library” of agentfs, and “the filesystem” agentfs, and the kubernetes adapter layer".
@@ -198,7 +198,7 @@ PR 1 speed (#43, merged) -> PR 2 the front, the CLI rename, base, tree-engine, g
 | Option | Gives | Costs |
 |---|---|---|
 | A. `agentfs::fuse` behind a `fuse` feature now | one name for both layers a consumer links; the default build has no FUSE | agentfs-fuse links and exposes the recording engine (`boundary.rs:42-43`), so with the feature on the front re-exports `record` and `volume` types and links agentfs-core, until M9 |
-| B. The library only until M9, then the `fuse` feature (recommended) | the front never carries the engine M9 deletes | a consumer that mounts names agentfs-fuse until M9 |
+| B. The library only until M9, then the `fuse` feature (chosen) | the front never carries the engine M9 deletes | a consumer that mounts names agentfs-fuse until M9 |
 | C. As A, after splitting agentfs-fuse's recording-engine front out first | A without the recording engine | moves in agentfs-fuse for code M9 deletes |
 
 The CSI driver stays its own crate either way: it is deployed, not linked. The answer sets the front's features.
