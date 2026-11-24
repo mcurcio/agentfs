@@ -64,16 +64,18 @@ EOF
   ;;
 kind)
   cluster=${2:?kind cluster name}
-  # kind's node images since v0.27 read registry hosts from
-  # /etc/containerd/certs.d, per pull, so no restart is needed (kind's
-  # "Local Registry" guide). The node's own server stays the fallback.
+  # kind's node images since v0.27 run containerd 2, whose CRI reads
+  # registry hosts from /etc/containerd/certs.d (its default config_path,
+  # one of a colon-separated list) on each pull, so no restart is needed
+  # (kind's "Local Registry" guide). Docker Hub stays the fallback.
   dir=/etc/containerd/certs.d/docker.io
   hosts=$(printf 'server = "https://registry-1.docker.io"\n\n[host."%s"]\n  capabilities = ["pull", "resolve"]\n' "$MIRROR")
   nodes=$(kind get nodes --name "$cluster")
   [ -n "$nodes" ] || fail "kind cluster $cluster has no nodes"
   for node in $nodes; do
-    config=$(docker exec "$node" containerd config dump)
-    grep -E "config_path = [\"']/etc/containerd/certs.d[\"']" >/dev/null <<<"$config" ||
+    paths=$(docker exec "$node" containerd config dump 2>/dev/null | grep -E '^ *config_path *=' || true)
+    echo "$node's containerd: $paths"
+    grep -E "config_path *= *[\"']([^\"']*:)?/etc/containerd/certs\.d(:[^\"']*)?[\"']" >/dev/null <<<"$paths" ||
       fail "$node's containerd does not read registry hosts from /etc/containerd/certs.d"
     docker exec "$node" mkdir -p "$dir"
     printf '%s\n' "$hosts" | docker exec -i "$node" cp /dev/stdin "$dir/hosts.toml"
