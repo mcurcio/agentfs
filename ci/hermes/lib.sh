@@ -165,8 +165,12 @@ tool_container() { # note
 }
 
 # Pulls the tool image ahead, so the terminal tool's first call does not
-# wait on it.
+# wait on it, through the mirror CI's daemon settings name
+# (ci/docker/daemon.json, mounted into docker-in-docker).
 pull_tool_image() {
+  assert_contains "$(dind_exec docker info --format '{{json .RegistryConfig.Mirrors}}')" \
+    "$(jq -er '."registry-mirrors"[0]' "$HERMES_LIB/../docker/daemon.json")" \
+    "docker-in-docker pulls Docker Hub through the mirror"
   dind_exec docker pull -q "$(sed -n 's/^ *docker_image: *//p' "$HERMES_CONFIG")"
 }
 

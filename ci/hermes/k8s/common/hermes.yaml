@@ -45,6 +45,9 @@ spec:
             failureThreshold: 150
           volumeMounts:
             - { name: dind-storage, mountPath: /var/lib/docker }
+            # CI's daemon settings: Docker Hub through mirror.gcr.io
+            # (ci/docker-hub-mirror.sh).
+            - { name: dind-daemon, mountPath: /etc/docker/daemon.json, subPath: daemon.json, readOnly: true }
       containers:
         - name: hermes
           image: hermes-agent
@@ -65,3 +68,5 @@ spec:
           configMap: { name: hermes-config }
         - name: dind-storage
           emptyDir: {}
+        - name: dind-daemon
+          configMap: { name: dind-daemon }

@@ -36,7 +36,9 @@ jobs:
           kubectl kustomize ci/k8s-csi/negative >/dev/null
           kubectl kustomize ci/k8s-csi/forks/driver >/dev/null
           kubectl kustomize ci/k8s-csi/forks/apps >/dev/null
-      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - uses: ./.github/actions/docker-hub-mirror
+        with:
+          buildx: true
       - id: meta
         uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
         with:
@@ -81,6 +83,7 @@ jobs:
     timeout-minutes: 35
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: ./.github/actions/docker-hub-mirror
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: agentfs-image
@@ -97,9 +100,7 @@ jobs:
           echo "$RUNNER_TEMP/kind/bin" >>"$GITHUB_PATH"
       - name: create the cluster
         run: |
-          kind version
-          kind create cluster --name agentfs-e2e --config ci/kind/cluster.yaml \
-            --image "$KIND_NODE_IMAGE" --wait 120s
+          ci/kind-cluster.sh agentfs-e2e ci/kind/cluster.yaml 120s
           kind load image-archive "$RUNNER_TEMP/agentfs-image.tar" --name agentfs-e2e
           kubectl get nodes -o wide
       - name: start git server
@@ -123,6 +124,7 @@ jobs:
     timeout-minutes: 40
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: ./.github/actions/docker-hub-mirror
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: agentfs-image
@@ -139,9 +141,7 @@ jobs:
           echo "$RUNNER_TEMP/kind/bin" >>"$GITHUB_PATH"
       - name: create the cluster
         run: |
-          kind version
-          kind create cluster --name agentfs-csi --config ci/kind/cluster.yaml \
-            --image "$KIND_NODE_IMAGE" --wait 120s
+          ci/kind-cluster.sh agentfs-csi ci/kind/cluster.yaml 120s
           kind load image-archive "$RUNNER_TEMP/agentfs-image.tar" --name agentfs-csi
           kubectl get nodes -o wide
       - name: start git server
@@ -208,6 +208,7 @@ jobs:
     timeout-minutes: 40
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: ./.github/actions/docker-hub-mirror
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: agentfs-image
@@ -224,8 +225,7 @@ jobs:
       - name: create the cluster
         run: |
           docker load -i "$RUNNER_TEMP/agentfs-image.tar"
-          kind create cluster --name agentfs-forks --config ci/kind/cluster.yaml \
-            --image "$KIND_NODE_IMAGE" --wait 120s
+          ci/kind-cluster.sh agentfs-forks ci/kind/cluster.yaml 120s
           kind load image-archive "$RUNNER_TEMP/agentfs-image.tar" --name agentfs-forks
           kubectl get nodes -o wide
       - name: start git server
@@ -252,6 +252,7 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: ./.github/actions/docker-hub-mirror
       - name: build
         run: |
           docker build -t agentfs-git-server:ci \

@@ -93,6 +93,7 @@ wait_healthy() { # service seconds
 
 step "start agentfs, the model server, docker-in-docker and Hermes"
 docker version --format 'docker {{.Server.Version}}'
+require_docker_hub_mirror
 docker compose version
 # Hermes and dind bind the mount point itself, which Docker requires to
 # exist when it creates them; the FUSE mount covers it before they start.

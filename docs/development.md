@@ -385,6 +385,21 @@ evidence. CI scripts judge the build:
   `ubuntu-24.04`, never `ubuntu-latest`, so the kernel, FUSE, kind and nginx
   the tests rely on change only when the pin does.
   `crates/agentfs-core/tests/docs_reference.rs` fails on any other runner.
+- **CI pulls Docker Hub through mirror.gcr.io**, Google's pull-through
+  cache, because anonymous pulls from shared runners hit Docker Hub's rate
+  limit. The mirror's one home is
+  [`ci/docker/daemon.json`](../ci/docker/daemon.json).
+  [`ci/docker-hub-mirror.sh`](../ci/docker-hub-mirror.sh) applies it to each
+  daemon that pulls: the runner's dockerd and the buildx builder's BuildKit
+  through the [`docker-hub-mirror`](../.github/actions/docker-hub-mirror/action.yml)
+  action, every kind node's containerd through
+  [`ci/kind-cluster.sh`](../ci/kind-cluster.sh), and the docker-in-docker
+  daemons of `ci/hermes` by mounting the file. Images stay pinned by digest,
+  and each daemon falls back to Docker Hub when the mirror fails. A test
+  (`workflows_pull_docker_hub_through_the_mirror`) refuses a workflow that
+  sets up buildx or creates a kind cluster around these helpers, or a job
+  that pulls without the action. The examples and charts users run keep
+  Docker Hub as their default.
 - **The image is published after the kind jobs pass.** The `image`
   workflow publishes to `ghcr.io/mcurcio/agentfs` as the commit sha and
   `latest`, only from main and only after both kind end-to-end jobs
