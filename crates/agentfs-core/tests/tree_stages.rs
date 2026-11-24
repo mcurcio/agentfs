@@ -554,11 +554,15 @@ fn filled(state: &Path, files: usize) -> TreeActor {
 }
 
 /// A save's cost grows with its change, not the tree (Q1-A, hashed
-/// sub-folders): one changed file in a tree of 100 files and in one of
-/// 10,000 stores the same objects, feeds the builder the same, and starts the
-/// same Git children.
+/// sub-folders; docs/trees.md, "What a commit holds"): one changed file in a
+/// tree of 100 files and in one of 1,000 stores the same objects, feeds the
+/// builder the same, and starts the same Git children. The counts are exact,
+/// so any cost that grows with the tree shows at either size. 1,000 names are
+/// more than one level of 256 folders holds, so a fan-out that grew a level
+/// with the tree would have grown; 10,000 cost 50 s of creates and showed
+/// nothing more.
 #[test]
-fn a_save_stores_the_same_objects_at_100_and_10000_files() {
+fn a_save_stores_the_same_objects_at_100_and_1000_files() {
     let _one = ONE_AT_A_TIME.lock().unwrap_or_else(PoisonError::into_inner);
     let cost = |files: usize| {
         let tmp = tempfile::tempdir().unwrap();
@@ -576,7 +580,7 @@ fn a_save_stores_the_same_objects_at_100_and_10000_files() {
     };
     let expect = (STORED_PER_SAVE, OBJECTS_PER_SAVE, CHILDREN_PER_SAVE);
     assert_eq!(cost(100), expect, "at 100 files");
-    assert_eq!(cost(10_000), expect, "at 10,000 files");
+    assert_eq!(cost(1_000), expect, "at 1,000 files");
 }
 
 /// A file's first bytes are all new lines: the builder takes them as the
@@ -706,7 +710,10 @@ fn fanout_matches_git_hash_object() {
 }
 
 /// A file's path depends on its name alone: the same at 10 files and at
-/// 10,000 (two fixed levels of 256, never a fan-out that grows).
+/// 1,000 (two fixed levels of 256, never a fan-out that grows; docs/trees.md,
+/// "What a commit holds"). 1,000 names are more than one level of 256
+/// folders holds, so a fan-out that grew a level with the tree would have
+/// grown by then.
 #[test]
 fn a_files_path_never_changes_when_siblings_are_added() {
     let _one = ONE_AT_A_TIME.lock().unwrap_or_else(PoisonError::into_inner);
@@ -722,7 +729,7 @@ fn a_files_path_never_changes_when_siblings_are_added() {
     let hex = hash_object("a");
     let expect = format!("files/{}/{}/a", &hex[..2], &hex[2..4]);
     assert_eq!(path(10), expect);
-    assert_eq!(path(10_000), expect);
+    assert_eq!(path(1_000), expect);
 }
 
 /// A save on the root and the sync that carries it to a sandbox must cost the same
