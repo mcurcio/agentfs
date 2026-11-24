@@ -217,6 +217,58 @@ fn an_unlink_of_a_pending_file_waits_for_its_save() {
     assert!(subjects[1].starts_with("Direct by "), "{subjects:?}");
 }
 
+/// A refused unlink waits only for the saves of its file begun before the
+/// refusal: another client that keeps closing the file does not keep it
+/// waiting. Its retry, through `lock_retrying`, is refused again only for
+/// those saves, so it runs while the later saves are still pending, and
+/// history holds the earlier save, then the delete.
+#[test]
+fn a_refused_unlink_waits_only_for_saves_begun_before_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (rec, mut sessions) = serve(tmp.path());
+    let a = client(&mut sessions, "a");
+    let b = client(&mut sessions, "b");
+    save(&a, "f", b"old!");
+    let first = pending(&b, "f", 0, b"one!");
+    let step = a.lock().unwrap().unlink("f").unwrap();
+    let PathStep::WaitFor(waiting) = step else {
+        panic!("the unlink ran: {step:?}");
+    };
+    let (then, heard) = noted();
+    a.when_saved_then(waiting, then);
+    // `b` keeps closing the file: a save begun after the refusal, queued
+    // behind the first, and still pending when the first lands.
+    let later = pending(&b, "f", 0, b"two!");
+    assert!(
+        heard.try_recv().is_err(),
+        "the callback ran before the save"
+    );
+    commit(first.finish().unwrap());
+    assert_eq!(
+        heard.try_recv(),
+        Ok(true),
+        "the earlier save's landing ran the callback, the later one pending"
+    );
+    let again = a.lock().unwrap().unlink("f").unwrap();
+    assert!(
+        matches!(again, PathStep::WaitFor(_)),
+        "a first call waits for the later save: {again:?}"
+    );
+    let retried = a.lock_retrying(Some(waiting)).unwrap().unlink("f").unwrap();
+    assert_eq!(
+        retried,
+        PathStep::Done(()),
+        "the retry waits for no later save"
+    );
+    // The later save lands on the unlinked file, after the delete.
+    later.finish().unwrap();
+    rec.settle().unwrap();
+    let subjects = root_subjects(tmp.path());
+    assert!(subjects[0].starts_with("Unlink by "), "{subjects:?}");
+    assert!(subjects[1].starts_with("Direct by "), "{subjects:?}");
+    assert!(rec.actor().unwrap().read(ROOT, "f").is_err(), "f is gone");
+}
+
 /// A rename of the pending file goes first and its save lands at the new
 /// name; a rename onto a pending file waits.
 #[test]

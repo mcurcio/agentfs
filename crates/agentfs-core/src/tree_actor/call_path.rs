@@ -156,6 +156,10 @@ impl DerefMut for ActorGuard<'_> {
 /// the gate's, never with the actor locked.
 pub type Then = Box<dyn FnOnce(Result<(), Error>) + Send + 'static>;
 
+/// A refused call's retry ([`Recording::when_saved_then`]), with the record
+/// its refusal waits below.
+type Refused = (RecordNo, Then);
+
 /// How a RELEASE goes on after its first half
 /// ([`Recording::start_close_with`]): saved already, under the one hold, or
 /// a pending save for the view's save worker to decide and land
@@ -298,20 +302,40 @@ impl Drop for SaveToDecide {
 
 /// A path call refused, nothing done, because a file it would delete or
 /// replace has a pending save: an `unlink(2)`, a `rename(2)` onto it, a
-/// whole-file replace of it, a path `truncate(2)`. Made only by the core;
-/// handed to [`Recording::when_saved_then`] to retry the call once that
-/// save has landed or failed (the owner, 2026-11-23: the delete waits).
+/// whole-file replace of it, a path `truncate(2)`, a time set, a move out
+/// of the tree. Made only by the core; handed to
+/// [`Recording::when_saved_then`] to retry the call once the saves it
+/// waits for have landed or failed (the owner, 2026-11-23: the delete
+/// waits). It carries the journal's next record at the refusal: it waits
+/// only for the file's saves whose close record is below it, the saves
+/// begun before it, and its retry, made through a guard taken with
+/// [`crate::session::TreeSession::lock_retrying`], is refused only for
+/// those. A save begun later lands after the retried call, so a client
+/// that keeps closing the file never keeps the call waiting.
 #[must_use = "the refused call must be retried once the save lands"]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SavePending {
     tree: TreeId,
     object: u64,
+    before: RecordNo,
 }
 
 impl SavePending {
-    /// The refusal for `object` in `tree`: the core's alone.
-    pub(in crate::tree_actor) fn new(tree: TreeId, object: u64) -> Self {
-        Self { tree, object }
+    /// The refusal for `object` in `tree`, waiting for its saves begun
+    /// before record `before`: the core's alone.
+    pub(in crate::tree_actor) fn new(tree: TreeId, object: u64, before: RecordNo) -> Self {
+        Self {
+            tree,
+            object,
+            before,
+        }
+    }
+
+    /// The journal's next record when the call was first refused: the
+    /// file's saves whose close record is below it are the ones it waits
+    /// for.
+    pub fn before(&self) -> RecordNo {
+        self.before
     }
 
     /// The tree whose file has the pending save.
@@ -434,9 +458,10 @@ pub struct Recording {
     /// Tests: runs inside every [`ActorGuard::unlocked`], lock released.
     #[cfg(test)]
     in_unlocked: Mutex<Option<Box<dyn Fn() + Send>>>,
-    /// Each file's [`Recording::when_saved_then`] callbacks, run once no
-    /// save of it is in flight. Locked only under the actor's lock.
-    waiters: Mutex<BTreeMap<(TreeId, u64), Vec<Then>>>,
+    /// Each file's [`Recording::when_saved_then`] callbacks, each with the
+    /// record its refusal waits below, run once no save of the file begun
+    /// before that record is in flight. Locked only under the actor's lock.
+    waiters: Mutex<BTreeMap<(TreeId, u64), Vec<Refused>>>,
     /// The close epoch: bumped at every landing or failure of a pending
     /// save; read under the actor's lock with the state a waiter checks.
     epoch: Mutex<u64>,
@@ -660,27 +685,29 @@ impl Recording {
         }))
     }
 
-    /// Runs `then` once no save of `pending`'s file is pending: at once on
-    /// this thread when its save has already landed or failed, else on the
-    /// thread that lands or fails the last of them (a view's save worker,
-    /// or a [`Recording::close_with`] caller), with the actor unlocked. The
-    /// check and the registration are under the actor's lock, so no landing
-    /// is missed. `then` gets [`Error::Stopped`] when the actor stops first;
-    /// it retries the refused call, which may be refused again for a save
-    /// begun meanwhile.
+    /// Runs `then` once no save of `pending`'s file begun before the
+    /// refusal is in flight: at once on this thread when they have already
+    /// landed or failed, else on the thread that lands or fails the last of
+    /// them (a view's save worker, or a [`Recording::close_with`] caller),
+    /// with the actor unlocked. A save of the file begun after the refusal
+    /// does not hold it. The check and the registration are under the
+    /// actor's lock, so no landing is missed. `then` gets [`Error::Stopped`]
+    /// when the actor stops first; it retries the refused call through
+    /// [`crate::session::TreeSession::lock_retrying`], which refuses it
+    /// again only for a save begun before the first refusal.
     pub fn when_saved_then(&self, pending: SavePending, then: Then) {
         let file = (pending.tree, pending.object);
         let actor = match self.actor() {
             Ok(actor) => actor,
             Err(e) => return then(Err(e)),
         };
-        if actor.save_in_flight(file.0, file.1, None) {
+        if actor.save_in_flight(file.0, file.1, Some(pending.before)) {
             self.waiters
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
                 .entry(file)
                 .or_default()
-                .push(then);
+                .push((pending.before, then));
             return;
         }
         drop(actor);
@@ -688,15 +715,23 @@ impl Recording {
     }
 
     /// In a landing's or failure's hold of `actor`: the close epoch bumped,
-    /// and `file`'s waiters taken once no save of it is in flight.
+    /// and each of `file`'s waiters taken once no save of the file begun
+    /// before its refusal is in flight.
     fn settled(&self, actor: &TreeActor, file: (TreeId, u64)) -> Vec<Then> {
-        let waiters = if actor.save_in_flight(file.0, file.1, None) {
-            Vec::new()
-        } else {
-            self.take_waiters(file)
-        };
+        let mut waiters = self.waiters.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut due = Vec::new();
+        if let Some(all) = waiters.remove(&file) {
+            let (held, ready): (Vec<_>, Vec<_>) = all
+                .into_iter()
+                .partition(|(before, _)| actor.save_in_flight(file.0, file.1, Some(*before)));
+            due = ready.into_iter().map(|(_, then)| then).collect();
+            if !held.is_empty() {
+                waiters.insert(file, held);
+            }
+        }
+        drop(waiters);
         self.bump_epoch();
-        waiters
+        due
     }
 
     /// A save ended with the actor stopped or its lock poisoned: `file`'s
@@ -716,6 +751,9 @@ impl Recording {
             .unwrap_or_else(PoisonError::into_inner)
             .remove(&file)
             .unwrap_or_default()
+            .into_iter()
+            .map(|(_, then)| then)
+            .collect()
     }
 
     /// Runs `waiters` with the actor unlocked: each retries its refused

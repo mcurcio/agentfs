@@ -17,8 +17,8 @@ use agentfs_contracts::pod::WriterAt;
 use agentfs_contracts::ports::{SessionAuthority, SessionBinder};
 
 use crate::tree_actor::{
-    ActorGuard, Attrs, Closing, DirEntry, Error, FileMap, Node, OpenContent, PathStep, Recording,
-    RenameMode, SavePending, Saved, SetTime, Then, TreeActor, TreeId, UntrackedArea,
+    ActorGuard, Attrs, Closing, DirEntry, Error, FileMap, Node, OpenContent, PathStep, RecordNo,
+    Recording, RenameMode, SavePending, Saved, SetTime, Then, TreeActor, TreeId, UntrackedArea,
     WriteOpenStart,
 };
 
@@ -124,12 +124,26 @@ impl TreeSession {
     ///
     /// [`Error::Stopped`] when the actor stopped.
     pub fn lock(&self) -> Result<SessionGuard<'_>> {
+        self.lock_retrying(None)
+    }
+
+    /// [`TreeSession::lock`] for the retry of a call `refused` was given
+    /// ([`SessionGuard::unlink`] and the other refused calls): the guard
+    /// refuses a call again only for a save begun before that first
+    /// refusal, so a save begun after it never keeps the call waiting.
+    /// None is a first call's guard, [`TreeSession::lock`].
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Stopped`] when the actor stopped.
+    pub fn lock_retrying(&self, refused: Option<SavePending>) -> Result<SessionGuard<'_>> {
         let actor = self.sessions.recording.actor()?;
         let writes_as = self.writes_as();
         Ok(SessionGuard {
             actor,
             tree: self.tree,
             writes_as,
+            retrying: refused.map(|r| r.before()),
         })
     }
 
@@ -172,8 +186,10 @@ impl TreeSession {
         })
     }
 
-    /// Retries a refused path call once `pending`'s save has landed or
-    /// failed ([`Recording::when_saved_then`]).
+    /// Runs `then`, the retry of a refused path call, once every save of
+    /// `pending`'s file begun before the refusal has landed or failed
+    /// ([`Recording::when_saved_then`]); the retry takes its guard with
+    /// [`TreeSession::lock_retrying`].
     pub fn when_saved_then(&self, pending: SavePending, then: Then) {
         self.sessions.recording.when_saved_then(pending, then);
     }
@@ -249,6 +265,10 @@ pub struct SessionGuard<'a> {
     actor: ActorGuard<'a>,
     tree: TreeId,
     writes_as: Option<WriterAt>,
+    /// A retried call's first refusal's record
+    /// ([`TreeSession::lock_retrying`]): only a save begun before it
+    /// refuses the call again.
+    retrying: Option<RecordNo>,
 }
 
 impl SessionGuard<'_> {
@@ -352,7 +372,7 @@ impl SessionGuard<'_> {
         mtime: Option<SetTime>,
     ) -> Result<PathStep<()>> {
         let by = self.writes_as.as_ref().ok_or(Error::ReadOnly)?;
-        if let Some(pending) = self.actor.pending_save(self.tree, path) {
+        if let Some(pending) = self.actor.pending_save(self.tree, path, self.retrying) {
             return Ok(PathStep::WaitFor(pending));
         }
         self.actor
@@ -360,11 +380,12 @@ impl SessionGuard<'_> {
             .map(PathStep::Done)
     }
 
-    /// The pending save of the file at `path`, if it has one in flight:
-    /// what a call that reads the file's content for another place (a move
-    /// out of the tree) waits for first.
+    /// The pending save of the file at `path`, if it has one in flight
+    /// (for a retry, one begun before its first refusal): what a call that
+    /// reads the file's content for another place (a move out of the tree)
+    /// waits for first.
     pub fn pending_save(&self, path: &str) -> Option<SavePending> {
-        self.actor.pending_save(self.tree, path)
+        self.actor.pending_save(self.tree, path, self.retrying)
     }
 
     pub fn object_at(&self, path: &str) -> Result<u64> {
@@ -434,7 +455,7 @@ impl SessionGuard<'_> {
     /// it); a pending save of `from` follows its file to `to`.
     pub fn rename(&mut self, from: &str, to: &str, mode: RenameMode) -> Result<PathStep<()>> {
         let by = self.writes_as.as_ref().ok_or(Error::ReadOnly)?;
-        if let Some(pending) = self.actor.pending_save(self.tree, to) {
+        if let Some(pending) = self.actor.pending_save(self.tree, to, self.retrying) {
             return Ok(PathStep::WaitFor(pending));
         }
         self.actor
@@ -453,7 +474,7 @@ impl SessionGuard<'_> {
         len: u64,
     ) -> Result<PathStep<Saved>> {
         let by = self.writes_as.as_ref().ok_or(Error::ReadOnly)?;
-        if let Some(pending) = self.actor.pending_save(self.tree, path) {
+        if let Some(pending) = self.actor.pending_save(self.tree, path, self.retrying) {
             return Ok(PathStep::WaitFor(pending));
         }
         self.actor
@@ -473,7 +494,7 @@ impl SessionGuard<'_> {
     /// [`Error::ReadOnly`]; as the three calls it makes.
     pub fn truncate_path(&mut self, path: &str, size: u64) -> Result<PathStep<()>> {
         let by = self.writes_as.as_ref().ok_or(Error::ReadOnly)?;
-        if let Some(pending) = self.actor.pending_save(self.tree, path) {
+        if let Some(pending) = self.actor.pending_save(self.tree, path, self.retrying) {
             return Ok(PathStep::WaitFor(pending));
         }
         let handle = self
@@ -489,7 +510,7 @@ impl SessionGuard<'_> {
     /// then the delete (the owner, 2026-11-23: the delete waits).
     pub fn unlink(&mut self, path: &str) -> Result<PathStep<()>> {
         let by = self.writes_as.as_ref().ok_or(Error::ReadOnly)?;
-        if let Some(pending) = self.actor.pending_save(self.tree, path) {
+        if let Some(pending) = self.actor.pending_save(self.tree, path, self.retrying) {
             return Ok(PathStep::WaitFor(pending));
         }
         self.actor.unlink(self.tree, path, by).map(PathStep::Done)

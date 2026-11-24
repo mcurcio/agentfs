@@ -857,7 +857,8 @@ open handles is locked only after the open, never across the release. A call ref
 a setattr's path truncate or time set) and a move out of the tree of a file
 with a pending save (`SessionGuard::pending_save`) drop the guard and hand a
 retry of the whole request to `TreeSession::when_saved_then`, replying only from
-the retry; a setattr retries only what it has not done, so its metadata step is
+the retry, which locks with `TreeSession::lock_retrying` and the first refusal, so
+it waits only for the saves begun before that refusal; a setattr retries only what it has not done, so its metadata step is
 not made twice. A move out whose unlink is refused after it placed its copy is
 retried whole, replacing that copy.
 A thread joins each view's session, drains its save worker, then sends

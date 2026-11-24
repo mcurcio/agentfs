@@ -1012,10 +1012,14 @@ CLI and tests, folds under the lock. `unlink`, `rename` (onto `to`),
 or `WaitFor(SavePending)` with nothing done while the file they would delete or
 replace has a pending save. `SavePending` is made only by the core and must be
 used: hand it and a retry of the whole call to `when_saved_then(pending, then)`,
-which runs `then` once no save of that file is pending (at once when none is, else
-on the thread that lands it, with the lock released; `Error::Stopped` when the
-actor stops first); `Recording::when_saved_then` is the same without a session.
-The retry may be refused again for a save begun meanwhile. A rename of the pending
+which runs `then` once no save of that file begun before the refusal is pending
+(at once when none is, else on the thread that lands the last of them, with the
+lock released; `Error::Stopped` when the actor stops first);
+`Recording::when_saved_then` is the same without a session. `SavePending::before()`
+is the journal's next record at the refusal. The retry takes its guard with
+`TreeSession::lock_retrying(Some(pending))`, which refuses it again only for a save
+begun before that refusal, so a save begun later lands after the call and a client
+that keeps closing the file never keeps it waiting. A rename of the pending
 file itself goes first. `pending_save(path)` names the file's pending save, if
 any, for a caller that reads the file to put it elsewhere (a move out of the
 tree). Once the actor stops, a `finish` queued behind another save of its file

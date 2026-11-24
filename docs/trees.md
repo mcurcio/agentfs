@@ -523,7 +523,7 @@ releases began, in the order they began. While a save is pending:
 | an open by another client of the tree | no | the saved content |
 | a second close of the file | no | begun and answered at once; its save lands after the earlier one, so a file's saves land in the order its closes began. A client's end saves its open of the file after every save of it begun before the end |
 | a rename of the file | no | the file keeps its object, and the save lands at the new name |
-| an unlink of it, a rename onto it, a move from the untracked area onto it, a move of it out of the tree, a path `truncate(2)` of it, a time set (`utimensat(2)`) of it | **yes** | the call is retried from the save worker once the save has landed or failed. History holds the save, then the delete. A move out of the tree copies the landed content into the area; a time set is made after the landing, which moves the modification time, so the time set stays |
+| an unlink of it, a rename onto it, a move from the untracked area onto it, a move of it out of the tree, a path `truncate(2)` of it, a time set (`utimensat(2)`) of it | **yes** | the call is retried from the save worker once every save of the file begun before the call has landed or failed. History holds those saves, then the delete. A save of the file begun after the call does not hold it: it lands after the call, so a client that keeps closing the file never keeps the call waiting. A move out of the tree copies the landed content into the area; a time set is made after the landing, which moves the modification time, so the time set stays |
 
 Takes, syncs and landings treat a pending save as an open file: one that touches
 it waits for the save's built event, and one that does not lands meanwhile.
@@ -1185,7 +1185,7 @@ no lock owner is a page fill and a write with `FUSE_WRITE_CACHE` is a page write
 open. One thread answers requests in order; a `FLUSH` is answered at once, a `RELEASE` once its close is begun
 (its save lands on the view's save worker, [pending saves](#pending-saves)), and an `FSYNC`, FSYNCDIR or `O_SYNC`
 write from the journal's waiter thread once its records are durable. An `UNLINK`, a rename onto a file or a path
-truncate of a file with a pending save is answered from the save worker once the save has landed. The queue worker takes one entry at a time, releasing the actor between takes,
+truncate of a file with a pending save is answered from the save worker once the saves of it begun before the call have landed. The queue worker takes one entry at a time, releasing the actor between takes,
 and drops the kernel's pages of files a take changed. A file open for writing
 holds back that fork's syncs from its upstream until it closes; no alarm is raised
 for a waiting open. See [library/filesystem.md](library/filesystem.md).
@@ -1421,11 +1421,6 @@ What the tree views do not support:
   are not merged into one piece, so an open of a million small appends holds a
   million pieces (peaks of 774 and 885 MiB in two local runs;
   [performance](performance.md#tree-views-release-build)).
-- **A refused call waits for every save of its file.** An unlink, a rename
-  onto the file, a path truncate, a time set or a move out of the tree waits
-  until no save of the file is in flight, not only the saves begun before it,
-  so a client that keeps closing the file keeps the call waiting
-  ([pending saves](#pending-saves)).
 - **The model replay makes no call over a pending save.** The library
   replay saves each close before it returns and settles after every call,
   because its invariants read git after each one; `tree_pending_saves.rs` and

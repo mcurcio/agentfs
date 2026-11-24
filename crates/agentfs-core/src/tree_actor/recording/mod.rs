@@ -535,13 +535,25 @@ impl TreeActor {
     /// A file at `path` whose save is being decided, or queued behind an
     /// earlier save of it: the session's refusal of a call that would
     /// delete or replace it (an unlink, a rename onto it, a whole-file
-    /// replace, a path truncate). A failed save is no refusal: its retry
-    /// saves first at the call's own step.
-    pub(crate) fn pending_save(&self, tree: TreeId, path: &str) -> Option<SavePending> {
+    /// replace, a path truncate, a time set, a move out). A failed save is
+    /// no refusal: its retry saves first at the call's own step. A first
+    /// call (`retrying` None) is refused for any save in flight, and the
+    /// refusal carries the journal's next record; a retry of a refused
+    /// call (`retrying` its first refusal's record) only for a save whose
+    /// close record is below that, and its refusal carries the same record,
+    /// so a save begun after the first refusal never holds the call.
+    pub(crate) fn pending_save(
+        &self,
+        tree: TreeId,
+        path: &str,
+        retrying: Option<RecordNo>,
+    ) -> Option<SavePending> {
         let t = self.tree(tree).ok()?;
         let object = *t.names.get(path)?;
-        self.save_in_flight(tree, object, None)
-            .then(|| SavePending::new(tree, object))
+        // Every save in flight has its close record, below the next one.
+        let before = retrying.unwrap_or_else(|| self.durability().appended().next());
+        self.save_in_flight(tree, object, Some(before))
+            .then(|| SavePending::new(tree, object, before))
     }
 
     /// Whether a close of `object` in `tree` is in flight (being decided or
