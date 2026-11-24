@@ -95,3 +95,4 @@
   - [Checkpoints and patch notices](target-architecture/future/integrator-hooks.md)
   - [Recording without a mount](target-architecture/future/recording-without-a-mount.md)
   - [State on NFS](target-architecture/future/state-on-nfs.md)
+  - [Crate split](target-architecture/future/crate-split.md)
