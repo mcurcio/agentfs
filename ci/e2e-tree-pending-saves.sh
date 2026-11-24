@@ -18,7 +18,7 @@ cleanup() {
   [ -z "$pid" ] || tree_stop "$pid"
   for m in "$work/main" "$work/fork"; do fusermount3 -uz "$m" 2>/dev/null || true; done
 }
-trap cleanup EXIT
+on_exit cleanup
 
 # `start SPEC LOG [fork]` mounts the root, with the fork's view too when asked,
 # its failpoints set to SPEC, and waits until every view is mounted.

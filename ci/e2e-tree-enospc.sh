@@ -15,7 +15,7 @@ cleanup() {
   for m in "$work/main" "$work/fork"; do fusermount3 -uz "$m" 2>/dev/null || true; done
   mountpoint -q "$work/volume" && sudo umount "$work/volume" || true
 }
-trap cleanup EXIT
+on_exit cleanup
 expect_stopped() {
   local log=$1 status=0
   tree_wait_exit "$pid" || status=$?

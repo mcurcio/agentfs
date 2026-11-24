@@ -8,6 +8,7 @@
 #   sudo env AGENTFS_BIN=/path/to/agentfs ci/trees-object-dir-syncs.sh
 set -euo pipefail
 : "${AGENTFS_BIN:?}"
+. "$(dirname "$0")/lib.sh"
 work=$(mktemp -d "${TMPDIR:-/tmp}/agentfs-object-dir-syncs.XXXXXX")
 work=$(realpath "$work")
 mkdir -p "$work/main" "$work/sandbox"
@@ -17,7 +18,7 @@ cleanup() {
   for m in "$work/main" "$work/sandbox"; do fusermount3 -uz "$m" 2>/dev/null || true; done
   rm -rf "$work"
 }
-trap cleanup EXIT
+on_exit cleanup
 "$AGENTFS_BIN" --state "$work/state" init --volume t
 strace -f -y -qq -e trace=fsync,fdatasync,pwrite64 -o "$work/trace" \
   "$AGENTFS_BIN" --state "$work/state" mount "$work/main" --fork-mount "$work/sandbox" >"$work/mount.log" 2>&1 & pid=$!

@@ -5,12 +5,13 @@
 # finding 42), so an upgrade is a known change in how later saves align repeated lines.
 #   ci/install-git.sh PREFIX
 set -euo pipefail
+. "$(dirname "$0")/lib.sh"
 prefix=${1:?a prefix}
 pin=$(dirname "$0")/git-release
 release=$(sed -n 1p "$pin")
 sum=$(sed -n 2p "$pin")
 build=$(mktemp -d)
-trap 'rm -rf "$build"' EXIT
+on_exit 'rm -rf "$build"'
 sudo apt-get update
 sudo apt-get install -y gcc make zlib1g-dev libcurl4-openssl-dev libexpat1-dev
 curl -fsSL -o "$build/git.tar.xz" "https://www.kernel.org/pub/software/scm/git/git-$release.tar.xz"

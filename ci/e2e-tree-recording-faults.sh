@@ -14,7 +14,7 @@ cleanup() {
   [ -z "$pid" ] || tree_stop "$pid"
   for m in "$work/main" "$work/fork"; do fusermount3 -uz "$m" 2>/dev/null || true; done
 }
-trap cleanup EXIT
+on_exit cleanup
 # `start SPEC` mounts the root and the keyed fork's view (made at the first
 # mount), whose writer it attaches; `start SPEC root` the root alone. The fork's
 # one writer is spent at a clean unmount, so a remount after one leaves the
@@ -142,7 +142,8 @@ PY
   # Wait for the requested failpoint, and require evidence that it fired.
   for _ in $(seq 1 300); do kill -0 "$pid" 2>/dev/null || break; sleep .1; done
   if kill -0 "$pid" 2>/dev/null; then echo "$point did not fire" >&2; exit 1; fi
-  tree_wait_exit "$pid" 2>/dev/null || true; pid=
+  status=0; tree_wait_exit "$pid" 60 || status=$?; pid=
+  [ "$status" = 137 ] || { echo "agentfs exited with status $status, not the failpoint's SIGKILL" >&2; cat "$work/mount.log" >&2; exit 1; }
   wait "$client" 2>/dev/null || true
   grep -F "agentfs failpoint $point triggered (kill)" "$work/mount.log" >/dev/null || { cat "$work/mount.log" >&2; exit 1; }
   # The kill met the call its count names: the receipt holds every call that
@@ -157,7 +158,7 @@ PY
   got=$(tr '\n' ' ' < "$work/receipt" | sed 's/ $//')
   [ "$meets" != close ] || got=${got% close}
   [ "$got" = "$want" ] || { echo "$spec met the wrong call: receipt '$got', expected '$want'" >&2; cat "$work/mount.log" >&2; exit 1; }
-  fusermount3 -uz "$work/main"
+  tree_unmount_dead "$work/main"
   "$bin" --state "$work/state" init --volume t
   gitdir=$work/state/history.git
   [ "$(tree_git_file "$gitdir" root baseline)" = baseline ]

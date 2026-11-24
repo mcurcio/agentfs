@@ -88,7 +88,7 @@ cleanup() {
     docker volume rm "$DATA" >/dev/null 2>&1 || true
   fi
 }
-trap cleanup EXIT
+on_exit cleanup
 cleanup
 mkdir -p "$VIEW" "$RECEIPTS"
 rm -f "$RECEIPTS"/*

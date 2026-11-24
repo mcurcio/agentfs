@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # A view-host restart with handles open (git-model §18), on Linux CI only.
 set -euo pipefail
+. "$(dirname "$0")/lib.sh"
 bin=${AGENTFS_BIN:-$PWD/target/debug/agentfs}
 work=$(mktemp -d)
 cleanup() {
@@ -9,7 +10,7 @@ cleanup() {
   [ "$status" = 0 ] || cat "$work/mount.log" >&2 || true
   rm -rf "$work"
 }
-trap cleanup EXIT
+on_exit cleanup
 mkdir "$work/main"
 "$bin" --state "$work/state" init --volume t
 python3 ci/trees-restart.py "$bin" "$work/state" "$work/main"

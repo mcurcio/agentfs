@@ -30,6 +30,7 @@
 # fails the run. A check slower than 1.5 times its budgeted seconds fails. Each unit (the
 # scenarios, a seed) prints `unit-start:` and `unit-done:` lines for the wrapper's alarm.
 set -euo pipefail
+. "$(dirname "$0")/lib.sh"
 cmd=${1:?record, check, collect, accept or compare}
 root=$(cd "$(dirname "$0")/.." && pwd)
 golden=$root/crates/agentfs-model/baseline/digests.txt
@@ -249,7 +250,7 @@ slowest() {
 case $cmd in
     record)
         dir=$(mktemp -d)
-        trap 'rm -rf "$dir"' EXIT
+        on_exit 'rm -rf "$dir"'
         start=$SECONDS
         collect "$dir"
         [ "$tests_failed" = 0 ] || exit 1
@@ -269,7 +270,7 @@ PY
         ;;
     check)
         dir=$(mktemp -d)
-        trap 'rm -rf "$dir"' EXIT
+        on_exit 'rm -rf "$dir"'
         start=$SECONDS
         if [ "${2:-}" = --all ]; then
             collect "$dir"

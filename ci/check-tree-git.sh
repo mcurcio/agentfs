@@ -2,8 +2,9 @@
 # Check the Git operations phase 1's copy of the refs and its recovery rest on.
 # Reftable is not used: `git` needs only the files format (git-model §12).
 set -euo pipefail
+. "$(dirname "$0")/lib.sh"
 probe=$(mktemp -d)
-trap 'rm -rf "$probe"' EXIT
+on_exit 'rm -rf "$probe"'
 # Which release answers matters: line identity depends on it (MODEL.md, finding 42).
 # The model and the library both look it up in agentfs_align::GIT_PATH, CI's jobs and
 # the image are pinned to one release (ci/git-release), and each fails if it has another.
