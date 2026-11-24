@@ -529,7 +529,9 @@ Takes, syncs and landings treat a pending save as an open file: one that touches
 it waits for the save's built event, and one that does not lands meanwhile.
 History and other trees see only landed saves. A view drains its save worker
 when it ends. `Recording::settle` waits until no save begun before it is
-pending; a close begun after it, of any file, does not hold it. When the actor
+pending; a close begun after it, of any file, does not hold it. It then waits
+until the volume is at rest: every record built and applied by the actor, with
+the switch record a built event appends built too. When the actor
 stops (a failed journal fsync, a failed record) a close queued behind a save of
 its file and `Recording::settle` wake and answer `Stopped`.
 
@@ -1013,6 +1015,13 @@ the private checkouts copied, the checked-out files' maps rebased onto them
   memory: a save of a million pieces is one entry, and its map's memory is not
   held back by this limit. The actor reports every tree's overlay as it releases its lock, so the
   gate sees it grow at each step and shrink at each rebuild, without a timer.
+  The rebuild at a built event is the volume's own work: its built-event
+  follower (a thread of the core, `tree-built`) waits for a built point the
+  actor has not moved onto, then moves it there under its lock, so a call held
+  here is admitted on the built event alone, whatever the host's threads are
+  doing (a view's take worker deep in a take, or no take worker at all). A
+  panic or failure in the follower stops the volume (`tree Stopped` on
+  stderr): every later call answers `Stopped`.
   Over `agentfs.overlayLimit` (32 MiB unless set,
   [configuration](configuration.md#tree-volumes-the-operator-settings-file)),
   the tree's calls that start new work wait as over the lag limit, until the
