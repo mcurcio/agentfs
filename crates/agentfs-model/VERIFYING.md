@@ -108,7 +108,7 @@ cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo test --locked -p agentfs-core --test docs_reference
 ```
 
-Run the model's tests locally, not `cargo test --workspace`: the FUSE crates' tests belong to CI (see
+Run the model's tests locally, not the whole workspace's: the FUSE crates' tests belong to CI (see
 "Safety"), and in this container one of them, `agentfs-fuse`'s
 `creds::tests::as_root_the_caller_owns_what_it_creates`, fails because the container runs without the
 capabilities and the FUSE device a mount needs. CI runs the whole workspace on every push.
@@ -156,7 +156,7 @@ with squashing; finding 28's are `r10_two_deletes_of_one_line_agree_over_an_unse
 `r10_a_later_delete_agrees_with_the_winning_delete`). Finding 3's two tests went with the per-file setting when the owner chose whole changes (rule 3e); finding
 24's test passes since the owner deleted P3 (2026-11-04), as `r9_cooperating_programs_never_deadlock`.
 
-CI runs `cargo test --workspace` (so the scenarios and the regression seeds), fmt, clippy with `-D warnings`, and the
+CI runs `cargo nextest run --workspace` and `cargo test --doc --workspace` (so the scenarios and the regression seeds), fmt, clippy with `-D warnings`, and the
 mdBook build. It does not run 500 seeds, the ignored tests or planted bugs: those stay local, and a design pull
 request says in its body that they were run and what they showed.
 

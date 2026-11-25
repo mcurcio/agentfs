@@ -115,10 +115,17 @@ Run fmt, then clippy and the tests of the packages the change touches; CI is the
 . ~/.devenv   # if the container uses the no-root toolchain (see below)
 cargo fmt --all --check
 cargo clippy -p <crate> -p <crate> --all-targets -- -D warnings
-cargo test -p <crate> -p <crate>   # add --features failpoints where the change touches failpoints
+cargo nextest run -p <crate> -p <crate>   # add --features failpoints where the change touches failpoints
+cargo test --doc -p <crate>               # only for a crate with doctests: nextest does not run them
 ```
 
-A doc change also runs `cargo test -p agentfs-core --test docs_reference`. Run one module of a merged test program with `--test it tree_actor::` ([development](docs/development.md#test-programs)). `--all-features` needs OpenSSL and libssh2. CI builds it; a minimal container may not be able to.
+Tests run with [cargo-nextest](https://nexte.st), each in its own process, all programs at once; `.config/nextest.toml` sets its profiles, and the workflows select the `ci` profile with `NEXTEST_PROFILE: ci`, and on GitHub Actions the slow tree tests build their full sizes ([development](docs/development.md#running-tests)). Where it is missing, install the release CI pins (the archive's SHA-256 is in `ci/dev-image.sh`):
+
+```sh
+curl -LsSf https://get.nexte.st/0.9.152/linux | tar zxf - -C ~/.cargo/bin
+```
+
+A doc change also runs `cargo nextest run -p agentfs-core --test docs_reference`. Run one module of a merged test program with `cargo nextest run -p agentfs-core --test it tree_actor::` ([development](docs/development.md#test-programs)); `-E 'test(/^tree_actor::/)'` is nextest's exact form. `--all-features` needs OpenSSL and libssh2. CI builds it; a minimal container may not be able to.
 
 ## What only CI can test
 
@@ -132,7 +139,7 @@ GitHub Actions runners can, so put such tests in a script under `ci/` and a job 
 
 | Workflow | Runs on | Typical duration | Covers |
 |---|---|---|---|
-| `ci.yml` | every push and PR | ~5 min | lint, docs checks, unit/integration tests, FUSE mounts, crash injection, telemetry (the tree mount's `agentfs.not_built` at a real collector), phase 1 tree views, csi-sanity against `agentfs-csi` with real `agentfs init` and `agentfs host` children and FUSE views |
+| `ci.yml` | every push and PR | ~7 min | lint, docs checks, unit/integration tests, FUSE mounts, crash injection, telemetry (the tree mount's `agentfs.not_built` at a real collector), phase 1 tree views, csi-sanity against `agentfs-csi` with real `agentfs init` and `agentfs host` children and FUSE views |
 | `image.yml` | every push and PR | ~10–12 min | container image, kind sidecar e2e, the CSI driver on one kind node (`ci/e2e-csi.sh`: a volume's `agentfs host`, refusals, crash recovery, kept volumes; `ci/e2e-csi-forks.sh`: a fork claim landing in its source), the tree views' tracer and release figures on ext4 and XFS (the many-file `create` fails the job when it misses its bar, any other miss is a warning; about fifteen minutes); publishes to GHCR on main |
 | `alerts.yml` | pushes and PRs touching `deploy/alerts`, its `ci/` scripts or the telemetry code | ~4 min | promtool checks and unit tests of the example alert rules, the generated `PrometheusRule`, the rules against the binary's metrics in a real Prometheus |
 | `docker.yml` | pushes and PRs touching the image, `examples/docker`, `ci/hermes` or `deploy/examples/hermes` | ~5–8 min | the Docker examples (`docker run`, compose, compose with a git server remote) via `ci/e2e-docker.sh`, one job each; upstream Hermes' published image on the compose example, with its tool containers on docker-in-docker and a scripted model server, via `ci/e2e-hermes.sh` (a ~2.5 min job; deployment.md §10) |
@@ -146,7 +153,7 @@ Rules:
 - Pin third-party actions by full commit SHA (`gh api repos/OWNER/REPO/commits/TAG --jq .sha`).
 - Pin runners to `ubuntu-24.04`, never the floating `-latest` label. A test (`workflows_pin_runners`) enforces this.
 - A change is done when the **ci** and **image** runs for your final pushed SHA are green. Wait for both: `gh run list -R mcurcio/agentfs --commit <sha>`, then `gh run watch <id> -R mcurcio/agentfs --exit-status`. Don't report success while either is still in progress.
-- Run the regression tier, never the full sweep, for a push or a slice: `cargo test` runs it, and so does `phase-1.yml` on a pull request. The full sweep (`AGENTFS_MODEL_SWEEP=1`, `ci/model-digest.sh check --all`, a manual `phase-1.yml`) is for a change to the model's rules or generator, run once at the end. The owner, 2026-11-13: "a test suite should run in seconds to minutes, not hours".
+- Run the regression tier, never the full sweep, for a push or a slice: `cargo nextest run` runs it, and so does `phase-1.yml` on a pull request. The full sweep (`AGENTFS_MODEL_SWEEP=1`, `ci/model-digest.sh check --all`, a manual `phase-1.yml`) is for a change to the model's rules or generator, run once at the end. The owner, 2026-11-13: "a test suite should run in seconds to minutes, not hours".
 - A release figure that misses a bar other than `create`'s is a warning, a follow-up to fix and report, not a reason to hold the change.
 - Read failures with `gh run view <id> --log-failed`. A test that fails only sometimes is a broken test: find the mechanism, then fix the test or the product bug it exposes. Never rerun it as the fix, and never keep a list of tolerated flakes. The owner, 2026-10-18: "“Known flake” is not an acceptable category. Broken tests must be fixed".
 

@@ -6,9 +6,14 @@ end-to-end tests yourself.
 ## Building
 
 ```sh
-cargo test --workspace
+cargo nextest run --workspace
+cargo test --doc --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 ```
+
+Tests run under [cargo-nextest](https://nexte.st), one process per test
+and as many at once as there are CPUs; [Running tests](#running-tests)
+says how.
 
 ### The Rust toolchain
 
@@ -52,7 +57,7 @@ The FUSE layer uses fuser's pure-Rust mount code, so building needs no
 libfuse or pkg-config; running a mount needs `/dev/fuse` (and `fusermount3`
 from the `fuse3` package for a non-root daemon).
 
-Tests only: `cargo test --workspace --features agentfs/failpoints` adds
+Tests only: `cargo nextest run --workspace --features agentfs/failpoints` adds
 the crash-injection failpoints (`AGENTFS_FAILPOINTS`
 in the [configuration reference](configuration.md)). Never ship such a
 build: its `--version` ends in `+failpoints`.
@@ -63,6 +68,41 @@ The container image:
 docker build -t agentfs:dev .                 # https, ssh and otlp-tls features, Debian trixie
 ```
 
+### Running tests
+
+`cargo nextest run` runs every test in a process of its own, several at
+once, so a test never shares globals, an allocator or counters with
+another. nextest does not run doctests: `cargo test --doc` does, for a
+package with a library (`agentfs` is a binary only and has none). AGENTS.md
+gives the pinned nextest release and how to install it.
+
+[`.config/nextest.toml`](../.config/nextest.toml) holds two profiles. Both
+retry nothing, because a failure is a broken test or a bug, and both name a
+test that runs past a minute, every minute, and stop it at 15 minutes.
+`default` is the one a local run uses. `ci`, which the workflows select
+with `NEXTEST_PROFILE: ci`, also runs on after the first failure and prints
+each failure when it happens and again at the end.
+
+Three slow tree tests, `tree_batch_alloc` and two `tree_stages` layout
+tests, build smaller volumes locally than in CI; each test's comment gives
+its sizes and says what the local ones do not catch.
+`AGENTFS_TEST_VOLUMES` picks the sizes: `small` or `full`. Unset, it is
+`small` locally and `full` on GitHub Actions (`GITHUB_ACTIONS=true`), so
+no workflow has to set it, and on Actions `small` fails the test: CI
+always runs the full sizes. Any other value fails the test too. At the
+full sizes `tree_batch_alloc` took 128 s to 160 s on the runners, the
+slowest test of ci.yml's test job, and the two `tree_stages` tests 42 s to
+78 s. To run CI's sizes locally:
+
+```sh
+AGENTFS_TEST_VOLUMES=full cargo nextest run -p agentfs-core --test tree_batch_alloc --test tree_stages
+```
+
+`cargo test --no-run` is still used where a script builds a test program
+and then runs it itself: `ci/fuse-tests.sh` runs it under sudo with
+libtest's flags, and `ci/model-digest.sh` and `ci/replay-seeds.sh` run one
+process per seed. Each says so in a comment.
+
 ### Test programs
 
 Cargo links one program per file in a crate's `tests/`. To link fewer,
@@ -71,8 +111,8 @@ process in one program each, a module per file: `tests/it/` and
 `tests/cli/`. Run one file's tests by its module:
 
 ```sh
-cargo test -p agentfs-core --test it tree_actor::
-cargo test -p agentfs --test cli cli_fork::
+cargo nextest run -p agentfs-core --test it tree_actor::
+cargo nextest run -p agentfs --test cli cli_fork::
 ```
 
 A test file stays a program of its own when it needs the process to
@@ -80,7 +120,8 @@ itself or CI runs it by name: `tree_stages` and `tree_close` read
 process-wide counters, `tree_batch_alloc` and `tree_overlay_alloc` set
 their own allocator, `docs_reference`, `crash_points`, `crash_daemon`,
 `launcher_mount`, `launcher_host` and `csi_trees` are named by CI, and
-`history_service`'s timings are kept apart from the other tests' load. A
+`history_service` keeps its timings in a program of its own. Its 5 s
+deadlines hold with the other tests running beside it. A
 test that runs another test of its program in a child process names it with
 `test_name!`, which adds the module path that `--exact` needs.
 
@@ -96,7 +137,8 @@ The workspace's `Cargo.toml` sets the development and test profile:
   measured and not taken: the cold build took 400 s instead of 232 s, and
   `agentfs-core`'s tests ran in 216 s instead of 217 s.
 
-The first `cargo test -p <crate>` after a `cargo build --workspace` compiles
+The first test build of a package (`cargo nextest run -p <crate>`) after a
+`cargo build --workspace` compiles
 some dependencies again (88 s for `agentfs-core` below): a package alone
 turns on fewer features of tokio and others than the workspace does. Both
 builds stay in the target directory, so this is paid once.
@@ -124,9 +166,38 @@ Measured on 2026-11-24 in a container with 4 shared CPUs and 16 GB, at
 | Of which the run | 32 s | 25 s | 16 s |
 | Target directory at the end | 33 GB | 12 GB | 8.0 GB |
 
-`agentfs-core`'s test run is mostly three programs, one after another:
-`tree_batch_alloc` (71 s, one test), `tree_stages` (about 60 s) and the
-unit tests (about 50 s).
+The table above ran the tests with `cargo test`, one program after
+another. The table below compares that with nextest, measured on
+2026-11-24 in the same kind of container (4 CPUs, 15 GB), at `-j 2`, one
+build at a time. Each column has its own worktree and target directory.
+Its test programs were built first, so only the run is timed. "Before" is
+`cargo test`, with `tree_batch_alloc` on volumes of 2,000 and 20,000
+files and two `tree_stages` tests on 10,000 files. "After" is nextest,
+with those volumes a tenth of the size:
+
+| Step | Before | After |
+|---|---|---|
+| `agentfs-core`'s tests, run only | 196 s | 77 s |
+| Of which: the tests (`cargo test` before, `cargo nextest run` after) | 196 s | 75 s |
+| Of which: the doctests (`cargo test --doc`, none today) | in the above | 2 s |
+| `tree_batch_alloc`, its one test | 65 s | 30 s alone, 32 s in the full run |
+| `tree_stages`, its 15 tests | 57 s | 4.4 s alone |
+| `agentfs-core`'s unit tests | 46 s | beside the rest |
+| `agentfs`'s tests, run only (no doctests: binary only) | 15 s | 17 s |
+| `agentfs-core`'s test programs built from an empty target directory | 128 s | 119 s |
+| `agentfs`'s, the same | 86 s | 88 s |
+
+No profile setting changed between the two columns, so the build times
+differ by noise only. nextest alone, on the "Before" tests, ran
+`agentfs-core` in 128 s: `tree_batch_alloc` took 81 s and each of the two
+10,000-file `tree_stages` tests 42 s, beside the other tests. Smaller
+volumes took the run to 75 s. Under nextest a package's run lasts about as
+long as its slowest test. For `agentfs-core` that is `tree_batch_alloc`
+(about 30 s locally), which builds a 10,000-file volume and must have its
+process to itself; CI runs it at full size (above), and its run lasts
+about as long. `agentfs`'s run gains nothing: most of its tests are in one program
+(`tests/cli/`), which already ran them several at a time (14 s), and its
+slowest test takes about 5 s.
 
 ## CI
 
@@ -135,7 +206,8 @@ Every push runs [`.github/workflows/ci.yml`](../.github/workflows/ci.yml):
 - **lint:** rustfmt, clippy with default and all features, and
   [`ci/check-deps.sh`](../ci/check-deps.sh): what C and crypto each feature
   set links.
-- **test:** the workspace tests, with default and all features. They
+- **test:** the workspace tests under nextest's `ci` profile, then the
+  doctests with `cargo test --doc`, with default and all features. They
   include `restore` and `revert` without a mount
   ([`cli_restore.rs`](../crates/agentfs/tests/cli/cli_restore.rs)), and the
   `.gitmodules` checks against the runner's `git` (the parser against

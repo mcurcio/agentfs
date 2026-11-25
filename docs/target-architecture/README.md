@@ -58,6 +58,7 @@ Smaller slices, one page each:
 | Upkeep still under the volume lock: the catch-up's overlay walk, a dead client's closes, the fork copy (gated on a figure) | [Latency and upkeep](future/latency-upkeep.md) |
 | Landing patches while a workload runs | [Live landing](future/live-landing.md) |
 | Recovery tooling beyond restore and revert | [Recovery tooling](future/recovery-tooling.md) |
+| agentfs-core split into crates along domain lines, under one library name, `agentfs`; faster tests first | [Crate split](future/crate-split.md) |
 | Sandbox overlay: shared locks, inode gaps, hosting on a front | [Overlay gaps](future/sandbox-overlay-gaps.md) |
 | Wider power-loss coverage | [Power-loss coverage](future/power-loss-coverage.md) |
 | Reloading OTLP TLS files | [OTLP TLS reload](future/otlp-tls-reload.md) |

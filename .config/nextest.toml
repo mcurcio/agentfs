@@ -1,0 +1,17 @@
+# cargo-nextest's settings for this workspace (AGENTS.md, "Local gates").
+# Each test runs in its own process, so a test never shares globals, an
+# allocator or counters with another. Doctests do not run under nextest:
+# `cargo test --doc` runs them.
+
+[profile.default]
+# A failure is a broken test or a bug, never retried (AGENTS.md: no flakes).
+retries = 0
+# Name a test that runs past a minute, every minute; stop one at 15.
+slow-timeout = { period = "60s", terminate-after = 15 }
+
+# What GitHub Actions runs: every failure of the run, not only the first.
+[profile.ci]
+retries = 0
+fail-fast = false
+slow-timeout = { period = "60s", terminate-after = 15 }
+failure-output = "immediate-final"

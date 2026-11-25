@@ -679,9 +679,10 @@ dirs/root                   JSON path ("") and meta of the root directory
 path's bytes; `cc` and `dd` the same of the identity in decimal. The folders are
 fixed (256 by 256), so an entry's place never changes when others come or go,
 and a commit that changes one file rewrites only the folders on its three paths:
-the builder's cost per save is the same at 100 files and at 100,000. `git log --
-files/2e/65/a` is the history of a file named `a` (`printf a | git hash-object
---stdin` starts `2e65`). A file's path nests under its folders
+the builder's cost per save does not grow with the tree (`tree_stages.rs`
+counts it exactly at 100 and 1,000 files). `git log -- files/2e/65/a` is the
+history of a file named `a` (`printf a | git hash-object --stdin` starts
+`2e65`). A file's path nests under its folders
 (`files/7f/3c/skills/web/SKILL.md`): a file and a directory never share a path,
 so no blob there is ever a folder too. A directory's record is one leaf named by
 `key`, the whole `git hash-object --stdin` of its path (40 hex digits, of which
@@ -1467,7 +1468,7 @@ jobs in [development.md](development.md); the method is in
   metadata, each collision's lost lines and each loss's cause by rules 13 and 14,
   with invariants read from git (D1 among them: every entry's parent has a `dirs/`
   record). The rules' scenarios for directories, metadata and links are also kept
-  as traces in `crates/agentfs-conformance/tests/rules/`, which `cargo test`
+  as traces in `crates/agentfs-conformance/tests/rules/`, which `cargo nextest run`
   replays on the model and the library. A mount makes only the calls one system
   call can: a chmod and a chown are two changes on Linux, so a trace that changes
   both at once, or makes a directory or link owned by another user, replays on the

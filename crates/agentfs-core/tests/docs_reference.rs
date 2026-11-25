@@ -5,7 +5,8 @@
 //!   key agentfs reads;
 //! - the same for the operator attributes ([`rules::OPERATOR_ATTRIBUTES`]);
 //! - every relative link and `#anchor` in README.md and docs/ resolves;
-//! - every CI job runs on the pinned runner, `ubuntu-24.04`;
+//! - every CI job runs on the pinned runner, `ubuntu-24.04`, and runs its
+//!   tests with cargo-nextest;
 //! - the Dockerfile's dependency-cache stage stubs every workspace member;
 //! - every script under ci/ is executable, and no pipe in one ends in a
 //!   reader that exits early (pipefail turns its SIGPIPE into a failure);
@@ -410,6 +411,111 @@ fn workflows_pin_runners() {
         }
     }
     assert!(problems.is_empty(), "{}", problems.join("\n"));
+}
+
+/// The comment that gives a `cargo test` in CI its reason.
+const NOT_NEXTEST: &str = "cargo test, not nextest:";
+
+/// CI runs the unit and integration tests with cargo-nextest (AGENTS.md,
+/// "Local gates"). A workflow or `ci/` script runs `cargo test` only for
+/// doctests (`--doc`), which nextest does not run, or under a comment
+/// with `cargo test, not nextest:` and the reason, in the same block of
+/// lines.
+#[test]
+fn ci_runs_tests_with_nextest() {
+    let root = workspace();
+    let mut files = Vec::new();
+    files_under(&root.join(".github/workflows"), &mut files);
+    files_under(&root.join("ci"), &mut files);
+    files.retain(|p| {
+        p.extension()
+            .is_some_and(|e| e == "yml" || e == "yaml" || e == "sh")
+    });
+    files.sort();
+    let mut problems = Vec::new();
+    let mut nextest = 0;
+    for path in &files {
+        let text = std::fs::read_to_string(path).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        for (n, line) in lines.iter().enumerate() {
+            let code = line.trim_start();
+            if code.starts_with('#') {
+                continue;
+            }
+            if code.contains("cargo nextest run") {
+                nextest += 1;
+            }
+            let words: Vec<&str> = code.split_whitespace().collect();
+            if !words.windows(2).any(|w| w == ["cargo", "test"]) || words.contains(&"--doc") {
+                continue;
+            }
+            let reasoned = lines[..n]
+                .iter()
+                .rev()
+                .take_while(|l| !l.trim().is_empty())
+                .any(|l| l.trim_start().starts_with('#') && l.contains(NOT_NEXTEST));
+            if !reasoned {
+                problems.push(format!(
+                    "{}:{}: cargo test; run cargo nextest run, or say why above (`# {NOT_NEXTEST} ...`)",
+                    path.strip_prefix(&root).unwrap_or(path).display(),
+                    n + 1
+                ));
+            }
+        }
+    }
+    assert!(
+        nextest > 3,
+        "only {nextest} cargo nextest runs found: is the scan broken?"
+    );
+    assert!(problems.is_empty(), "{}", problems.join("\n"));
+}
+
+/// The workflows, the development image (`ci/dev-image.sh`) and AGENTS.md's
+/// install line name one release of cargo-nextest.
+#[test]
+fn nextest_is_pinned_to_one_release() {
+    let root = workspace();
+    // Each `marker<version>` in `file`, the version ending at the first character
+    // that is not a digit or a dot.
+    let versions = |file: &Path, marker: &str| -> Vec<(String, String)> {
+        let text = std::fs::read_to_string(file).unwrap();
+        let name = file
+            .strip_prefix(&root)
+            .unwrap_or(file)
+            .display()
+            .to_string();
+        text.match_indices(marker)
+            .map(|(at, _)| {
+                let rest = &text[at + marker.len()..];
+                let end = rest
+                    .find(|c: char| !(c.is_ascii_digit() || c == '.'))
+                    .unwrap_or(rest.len());
+                (name.clone(), rest[..end].trim_end_matches('.').to_owned())
+            })
+            .collect()
+    };
+    let mut found = Vec::new();
+    let mut workflows = Vec::new();
+    files_under(&root.join(".github/workflows"), &mut workflows);
+    workflows.sort();
+    for path in &workflows {
+        found.extend(versions(path, "tool: cargo-nextest@"));
+    }
+    let in_workflows = found.len();
+    let image = versions(&root.join("ci/dev-image.sh"), "version=");
+    let agents = versions(&root.join("AGENTS.md"), "get.nexte.st/");
+    assert!(
+        in_workflows > 0 && image.len() == 1 && agents.len() == 1,
+        "expected cargo-nextest pins in the workflows, one in ci/dev-image.sh and one in AGENTS.md: \
+         {found:?} {image:?} {agents:?}"
+    );
+    found.extend(image);
+    found.extend(agents);
+    let releases: BTreeSet<&str> = found.iter().map(|(_, v)| v.as_str()).collect();
+    assert!(
+        releases.len() == 1 && releases.iter().all(|v| v.split('.').count() == 3),
+        "cargo-nextest is pinned to more than one release, or not to a release:\n{found:?}"
+    );
 }
 
 /// CI pulls Docker Hub through mirror.gcr.io (docs/development.md,

@@ -63,6 +63,7 @@ tests_failed=0
 # The path of test target $1 that cargo builds, as cargo prints it.
 test_binary() {
     local path
+    # cargo test, not nextest: it only builds; collect runs each seed's program itself.
     path=$(cargo test --locked -p agentfs-model --test "$1" --no-run 2>&1 |
         sed -n "s|^ *Executable tests/$1\.rs (\(.*\))\$|\1|p")
     if [ -n "$path" ]; then realpath "$path"; fi
