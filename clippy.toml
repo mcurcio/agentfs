@@ -57,6 +57,28 @@ disallowed-methods = [
     # behaviour in libgit2: the one registration runs inside core's init_git.
     { path = "git2::transport::register", reason = "transports are registered by agentfs_core::ssh_transport::register", allow-invalid = true },
 
+    # Every way libgit2 creates a transport: a remote (from which connect,
+    # fetch and push), a clone, a submodule's clone or update. Only the
+    # recording engine opens one, each site after its init_git (which
+    # registers the transports) and marked with an #[expect]; the tree engine
+    # opens none. This is what ssh_transport::register's SAFETY rests on.
+    { path = "git2::Repository::remote", reason = "only the recording engine opens a remote, after init_git", allow-invalid = true },
+    { path = "git2::Repository::remote_anonymous", reason = "only the recording engine opens a remote, after init_git", allow-invalid = true },
+    { path = "git2::Repository::remote_with_fetch", reason = "only the recording engine opens a remote, after init_git", allow-invalid = true },
+    { path = "git2::Repository::find_remote", reason = "only the recording engine opens a remote, after init_git", allow-invalid = true },
+    { path = "git2::Remote::create_detached", reason = "only the recording engine opens a remote, after init_git", allow-invalid = true },
+    { path = "git2::Repository::clone", reason = "only the recording engine opens a remote, after init_git", allow-invalid = true },
+    { path = "git2::Repository::clone_recurse", reason = "only the recording engine opens a remote, after init_git", allow-invalid = true },
+    { path = "git2::build::RepoBuilder::clone", reason = "only the recording engine opens a remote, after init_git", allow-invalid = true },
+    { path = "git2::Submodule::clone", reason = "only the recording engine opens a remote, after init_git", allow-invalid = true },
+    { path = "git2::Submodule::update", reason = "only the recording engine opens a remote, after init_git", allow-invalid = true },
+
+    # Each Git child the tree engine starts is counted (agentfs_git::git_cli::counted):
+    # align's own diff starts its child uncounted, so it is for callers off
+    # that path, each marked with an #[expect]. Pass a spawner to
+    # agentfs_align::histogram_with or agentfs_lines' `_with` calls.
+    { path = "agentfs_align::histogram", reason = "pass the spawner: agentfs_align::histogram_with (the tree engine's is git_cli::counted)", allow-invalid = true },
+
     # A tree volume's Git store is opened only by its History (the tree
     # actor's `history` module): nothing else reads history past what is built.
     { path = "agentfs_core::tree_git::TreeGit::open", reason = "a tree volume's store is History's: read it through tree_actor::History" },

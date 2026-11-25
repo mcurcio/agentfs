@@ -127,10 +127,10 @@ pub(crate) fn register() {
         // this process creates a transport. It runs once, inside
         // `init_git`'s `Once`, which every recording-engine path that opens
         // a remote calls first, so no call returns before the registration
-        // has finished. Nothing else opens a remote: the tree engine is
-        // refused one (agentfs-repo's
-        // `the_tree_engine_names_no_recording_engine_module`), and
-        // agentfs-fuse, agentfs and agentfs-csi name no git2 remote API.
+        // has finished. Nothing else opens a remote: clippy refuses every
+        // git2 call that creates a transport (a remote, a clone, a
+        // submodule's clone or update; `clippy.toml`) but where an
+        // `#[expect]` marks a recording-engine site after `init_git`.
         #[expect(
             clippy::disallowed_methods,
             reason = "the one registration of a transport"

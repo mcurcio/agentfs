@@ -39,7 +39,10 @@ pub enum ConfigError {
     Git(#[from] git2::Error),
     #[error("agentfs.volume is not set")]
     MissingVolume,
-    #[error("{key}: {value:?} is not a duration (use e.g. 200ms, 60s, 5m)")]
+    #[error(
+        "{key}: {value:?} is not a duration (use e.g. {})",
+        agentfs_contracts::units::DURATION_EXAMPLES
+    )]
     BadDuration { key: String, value: String },
     #[error("{key}: {value:?} is not one of {allowed}")]
     BadChoice {

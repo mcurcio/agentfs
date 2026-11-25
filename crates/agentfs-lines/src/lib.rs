@@ -1154,10 +1154,10 @@ pub fn render(sources: &[&dyn Image], pieces: &[Piece]) -> io::Result<Vec<u8>> {
 }
 
 /// Git's text-mode histogram diff of two images in memory, through the one call
-/// the model shares, its `git` child started by `spawn`. Against an empty old
-/// image every new line is an insert, the one hunk `git diff` gives
-/// (`@@ -0,0 +1,n @@`): answered with no child, so a new file's first save
-/// starts no `git diff`.
+/// the model shares, its `git` child started by `spawn`: `agentfs_align`'s
+/// `histogram_with`, but for an empty old image. Against one every new line is
+/// an insert, the one hunk `git diff` gives (`@@ -0,0 +1,n @@`): answered with
+/// no child, so a new file's first save starts no `git diff`.
 ///
 /// # Errors
 ///

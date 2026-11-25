@@ -18,6 +18,8 @@ agentfs-contracts = { version = "0.1.0", path = "../agentfs-contracts" }
 agentfs-failpoints = { version = "0.1.0", path = "../agentfs-failpoints" }
 agentfs-git = { version = "0.1.0", path = "../agentfs-git" }
 agentfs-os = { version = "0.1.0", path = "../agentfs-os" }
+# The git program's isolated environment (tree_git's `git` children).
+agentfs-align = { version = "0.1.0", path = "../agentfs-align" }
 # Line maps: which version wrote each line of a tree's files (tree_actor).
 agentfs-lines = { version = "0.1.0", path = "../agentfs-lines" }
 # The Rules domain: where each new name of a tree lives (tree_actor's untracked areas).

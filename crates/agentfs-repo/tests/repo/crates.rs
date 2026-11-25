@@ -915,17 +915,17 @@ fn production(source: &str) -> &str {
 }
 
 /// The ways a source starts a process: `Command`'s methods take no
-/// argument (a thread scope's `spawn` takes one), the same methods passed
-/// as functions (a spawner handed to `agentfs_lines`' `_with` calls), and
-/// `agentfs_align`'s diff that starts its own `git`.
-const STARTS: [&str; 7] = [
+/// argument (a thread scope's `spawn` takes one), and the same methods
+/// passed as functions (a spawner handed to `agentfs_lines`' `_with`
+/// calls). `agentfs_align::histogram`, which starts its own `git`, is
+/// refused by clippy (`clippy.toml`), which resolves imports and aliases.
+const STARTS: [&str; 6] = [
     ".spawn()",
     ".output()",
     ".status()",
     "Command::spawn",
     "Command::output",
     "Command::status",
-    "agentfs_align::histogram(",
 ];
 
 /// How `source`'s production text starts a process itself.
@@ -936,19 +936,18 @@ fn starts_in(source: &str) -> Vec<&'static str> {
 
 /// The tree engine starts each `git` child through
 /// `agentfs_git::git_cli::counted`, the one site that counts it: none of
-/// its production sources, nor the line maps' (`agentfs-lines`, which take
-/// the spawner from their caller), starts a process itself, but the
-/// history's repack task, whose `git repack` is not on the actor's path and
-/// stays uncounted, so each operation's count of Git children stays exact.
-/// `counted` is git_cli's one `.spawn()`.
+/// its production sources ([`tree_engine_files`]), nor the line maps'
+/// (`agentfs-lines`, which take the spawner from their caller), starts a
+/// process itself, but the history's repack task, whose `git repack` is not
+/// on the actor's path and stays uncounted, so each operation's count of
+/// Git children stays exact. `counted` is git_cli's one `.spawn()`.
 #[test]
 fn the_tree_engine_starts_git_only_through_counted() {
     let workspace = Workspace::load();
     let root = root();
     let dir = |name: &str| root.join(&workspace.member(name).unwrap().dir);
     let src = dir("agentfs-core").join("src");
-    let mut files = vec![src.join("tree_git.rs")];
-    files_under(&src.join("tree_actor"), &mut files);
+    let mut files = tree_engine_files(&src);
     files_under(&dir("agentfs-lines").join("src"), &mut files);
     let repack = src.join("tree_actor/history/repack.rs");
     let mut problems = Vec::new();
@@ -987,11 +986,6 @@ fn a_process_started_outside_counted_is_found() {
         starts_in("histogram_files_with(&a, &b, Command::spawn)"),
         ["Command::spawn"]
     );
-    assert_eq!(
-        starts_in("agentfs_align::histogram(old, new)?"),
-        ["agentfs_align::histogram("]
-    );
-    assert!(starts_in("agentfs_align::histogram_with(old, new, spawn)?").is_empty());
     assert!(starts_in("#[cfg(test)]\nmod tests { fn f() { cmd.status(); } }").is_empty());
     assert!(
         starts_in("#[cfg(all(test, feature = \"x\"))]\n#[allow(x)]\nmod t { s.output() }")
@@ -1014,16 +1008,23 @@ const TREE_ENGINE: [&str; 6] = [
     "operator_settings",
 ];
 
-/// Calls that would reach a remote through libgit2, whose transports the
-/// recording engine's `init_git` registers after `agentfs_git::init`: the
-/// tree engine opens no remote.
-const REMOTE_CALLS: [&str; 5] = [
-    "find_remote",
-    "remote_anonymous",
-    "remote_with_fetch",
-    "git2::Remote",
-    "git2::transport",
-];
+/// The production sources of the tree engine's modules in agentfs-core
+/// (`src`): [`TREE_ENGINE`]'s files and directories.
+fn tree_engine_files(src: &Path) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    for module in TREE_ENGINE {
+        let dir = src.join(module);
+        if dir.is_dir() {
+            files_under(&dir, &mut files);
+        }
+        let file = src.join(format!("{module}.rs"));
+        if file.is_file() {
+            files.push(file);
+        }
+    }
+    files.sort();
+    files
+}
 
 /// The first module of each `crate::` path in `text`, with the line it is
 /// on: `crate::a::b` names `a`, and `crate::{a, b::c}` names `a` and `b`.
@@ -1077,28 +1078,20 @@ fn crate_paths(text: &str) -> Vec<(usize, String)> {
 }
 
 /// Where `source`'s production text reaches past the tree engine: a
-/// `crate::` path to a module not in [`TREE_ENGINE`], or a remote call.
+/// `crate::` path to a module not in [`TREE_ENGINE`].
 fn recording_engine_uses(source: &str) -> Vec<String> {
-    let text = production(source);
-    let mut problems: Vec<String> = crate_paths(text)
+    crate_paths(production(source))
         .into_iter()
         .filter(|(_, module)| !TREE_ENGINE.contains(&module.as_str()))
         .map(|(line, module)| format!("{line}: names `crate::{module}`"))
-        .collect();
-    for call in REMOTE_CALLS {
-        for (at, _) in text.match_indices(call) {
-            let line = text[..at].matches('\n').count() + 1;
-            problems.push(format!("{line}: names `{call}`"));
-        }
-    }
-    problems
+        .collect()
 }
 
 /// The tree engine's modules in agentfs-core name no recording-engine
-/// module and open no remote, so they move to their own crate whole and
-/// the recording engine's transports (registered after libgit2's setup)
-/// are never used by them. `super::` chains that reach the crate root are
-/// not read; there are none. The crate boundary replaces this check.
+/// module, so they move to their own crate whole. `super::` chains that
+/// reach the crate root are not read; there are none. The crate boundary
+/// replaces this check. (That the tree engine opens no remote is clippy's
+/// ban in `clippy.toml`, which outlives the boundary.)
 #[test]
 fn the_tree_engine_names_no_recording_engine_module() {
     let workspace = Workspace::load();
@@ -1106,12 +1099,7 @@ fn the_tree_engine_names_no_recording_engine_module() {
     let src = root
         .join(&workspace.member("agentfs-core").unwrap().dir)
         .join("src");
-    let mut files: Vec<PathBuf> = TREE_ENGINE[1..]
-        .iter()
-        .map(|m| src.join(format!("{m}.rs")))
-        .collect();
-    files_under(&src.join(TREE_ENGINE[0]), &mut files);
-    files.sort();
+    let files = tree_engine_files(&src);
     let mut problems = Vec::new();
     let mut paths = 0;
     for file in &files {
@@ -1156,10 +1144,6 @@ fn a_tree_engine_use_of_the_recording_engine_is_found() {
     assert_eq!(
         recording_engine_uses("use crate::{store, paths::RepoPath};"),
         ["1: names `crate::paths`"]
-    );
-    assert_eq!(
-        recording_engine_uses("let r = repo.find_remote(\"origin\")?;"),
-        ["1: names `find_remote`"]
     );
     assert!(recording_engine_uses("#[cfg(test)]\nmod tests { use crate::config; }").is_empty());
 }

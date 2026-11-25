@@ -15,6 +15,21 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// The `PATH` git is looked up in and runs with.
 pub const GIT_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 
+/// The `git` program `git` in an environment of its own, the one home of it:
+/// none of the caller's variables, `PATH=`[`GIT_PATH`], `LC_ALL=C`, and the
+/// system and global git configuration switched off, so only what the call
+/// sets reaches the program. Callers add their call's own variables.
+pub fn isolated(git: impl AsRef<std::ffi::OsStr>) -> Command {
+    let mut command = Command::new(git);
+    command
+        .env_clear()
+        .env("PATH", GIT_PATH)
+        .env("LC_ALL", "C")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null");
+    command
+}
+
 /// A changed region of the histogram diff, with zero-based ranges. A count of 0
 /// starts after the line the diff named.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -66,13 +81,8 @@ fn temp_dir() -> io::Result<TempDir> {
 /// a broken worktree stops `git diff`, and a diff setting would change which lines
 /// keep their identity.
 pub fn command(dir: &Path, old: &Path, new: &Path) -> Command {
-    let mut command = Command::new("git");
+    let mut command = isolated("git");
     command
-        .env_clear()
-        .env("PATH", GIT_PATH)
-        .env("LC_ALL", "C")
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .current_dir(dir)
         .args([
             "diff",
@@ -227,6 +237,7 @@ mod tests {
     }
 
     #[test]
+    #[expect(clippy::disallowed_methods, reason = "align's own diff, tested")]
     fn a_changed_line_and_an_insert_are_read_from_the_program() {
         assert_eq!(
             histogram(b"a\nb\nc\n", b"a\nB\nc\nd\n").unwrap(),
@@ -248,6 +259,7 @@ mod tests {
     }
 
     #[test]
+    #[expect(clippy::disallowed_methods, reason = "align's own diff, tested")]
     fn text_mode_reads_nul_bytes_as_lines() {
         let hunks = histogram(b"a\0\nb\n", b"a\0\nc\n").unwrap();
         assert_eq!(hunks[0].old_start, 1);
@@ -274,6 +286,7 @@ mod tests {
     }
 
     #[test]
+    #[expect(clippy::disallowed_methods, reason = "align's own diff, tested")]
     fn two_files_are_diffed_as_two_strings_are() {
         let dir = temp_dir().unwrap();
         let (a, b) = (dir.0.join("a"), dir.0.join("b"));

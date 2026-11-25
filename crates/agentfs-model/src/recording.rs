@@ -921,6 +921,10 @@ impl Recording {
     /// against the new (as text, whatever bytes they hold), through the call the
     /// library shares (finding 41), as (old start, old count, new start, new count)
     /// per changed region, 0-based.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the model is off the tree engine's counted path"
+    )]
     fn hunks(old: &[String], new: &[String]) -> Vec<(usize, usize, usize, usize)> {
         agentfs_align::histogram(old.concat().as_bytes(), new.concat().as_bytes())
             .expect("the alignment's diff runs")

@@ -127,6 +127,10 @@ fn fetch_now(
     let auth = RemoteAuth::new(remote);
     let state = AuthState::new();
     let _scope = auth.ssh_scope(&state);
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the recording engine opens a remote, after init_git"
+    )]
     let mut git_remote = match repo.remote_anonymous(url) {
         Ok(r) => r,
         Err(e) => return FetchOutcome::failed(name, PushFailureKind::Local, e.to_string()),

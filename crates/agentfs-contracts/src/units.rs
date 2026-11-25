@@ -38,9 +38,13 @@ pub fn parse_size(value: &str) -> Option<u64> {
     (n > 0).then_some(n)
 }
 
+/// How a duration is written, for a refusal's text: what
+/// [`parse_duration`] reads.
+pub const DURATION_EXAMPLES: &str = "500ms, 5s, 30m, 24h";
+
 /// A flag's value that is not a duration ([`parse_duration`]).
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[error("{0:?} is not a duration (use e.g. 500ms, 5s, 30m, 24h)")]
+#[error("{0:?} is not a duration (use e.g. {DURATION_EXAMPLES})")]
 pub struct NotADuration(pub String);
 
 /// [`parse_duration`] as a command-line value parser (clap's

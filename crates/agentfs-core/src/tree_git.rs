@@ -447,18 +447,12 @@ impl TreeGit {
     }
 
     fn command(&self, bare: bool) -> Command {
-        let mut cmd = Command::new("git");
+        let mut cmd = agentfs_align::isolated("git");
         cmd.arg("-c").arg("core.hooksPath=/dev/null");
         if let Some(lease) = &self.lease {
             attach_lease(&mut cmd, lease);
         }
-        cmd.env_clear()
-            .env("PATH", agentfs_git::git_cli::GIT_PATH)
-            .env("LC_ALL", "C")
-            .env("GIT_CONFIG_NOSYSTEM", "1")
-            .env("GIT_CONFIG_GLOBAL", "/dev/null")
-            .env("GIT_TERMINAL_PROMPT", "0")
-            .current_dir(&self.path);
+        cmd.env("GIT_TERMINAL_PROMPT", "0").current_dir(&self.path);
         if bare {
             cmd.env("GIT_DIR", &self.path);
         }
@@ -1193,13 +1187,8 @@ mod tests {
         let lease = FileLock::try_take(&root.join("actor.lock"), Mode::Exclusive)
             .unwrap()
             .unwrap();
-        let mut command = Command::new("git");
+        let mut command = agentfs_align::isolated("git");
         command
-            .env_clear()
-            .env("PATH", agentfs_git::git_cli::GIT_PATH)
-            .env("LC_ALL", "C")
-            .env("GIT_CONFIG_NOSYSTEM", "1")
-            .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .env("GIT_TERMINAL_PROMPT", "0")
             .args(["upload-pack", "--stateless-rpc"])
             .arg(root.join("repo.git"))

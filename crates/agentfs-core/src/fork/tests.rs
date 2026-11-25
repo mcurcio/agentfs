@@ -787,6 +787,7 @@ fn publish_waits_for_an_unreachable_remote() {
 fn push_source_branch(source: &Vol) {
     let repo = source.repo();
     let head = source.head().unwrap();
+    #[expect(clippy::disallowed_methods, reason = "a test's remote")]
     let mut push = repo
         .remote_anonymous(&source.remote.display().to_string())
         .unwrap();

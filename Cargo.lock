@@ -124,6 +124,7 @@ dependencies = [
 name = "agentfs-core"
 version = "0.1.0"
 dependencies = [
+ "agentfs-align",
  "agentfs-clients",
  "agentfs-contracts",
  "agentfs-failpoints",

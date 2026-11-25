@@ -38,10 +38,10 @@ pub const PACK_CONFIG: [&str; 12] = [
     "core.packedGitLimit=128m",
 ];
 
-/// Starts a Git child on the tree actor's path, and counts it. The one spawn
-/// site there: children clear their `PATH`, so no wrapper could count them, and
-/// a source test (agentfs-repo's `the_tree_engine_starts_git_only_through_counted`)
-/// fails when another site appears.
+/// Starts a Git child and counts it, for a caller whose count of children must
+/// be exact: its one spawn site, since children clear their `PATH` and no
+/// wrapper could count them. A caller's source test keeps every other site out
+/// (docs/architecture.md names the one there is).
 pub fn counted(cmd: &mut Command) -> io::Result<Child> {
     let child = cmd.spawn()?;
     CHILDREN.fetch_add(1, Ordering::Relaxed);
@@ -59,14 +59,9 @@ pub fn children() -> u64 {
 /// directory `git_dir`, stdin null. Stdout and stderr are left to the
 /// caller.
 pub fn command(git: &Path, git_dir: &Path) -> Command {
-    let mut cmd = Command::new(git);
-    cmd.env_clear()
-        .env("PATH", GIT_PATH)
-        .env("LC_ALL", "C")
-        .env("HOME", git_dir)
+    let mut cmd = agentfs_align::isolated(git);
+    cmd.env("HOME", git_dir)
         .env("GIT_DIR", git_dir)
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_TERMINAL_PROMPT", "0")
         .current_dir(git_dir)
         .stdin(Stdio::null());

@@ -312,3 +312,30 @@ steps: "a docs-only change builds in seconds" → A (for every page but the five
 build core or the model); "makes C and M9 possible" → B1 and B2 (no leaf the recording engine alone uses, no module the
 tree engine alone uses, outside core); "the four edges gone" → B2's standing check. Untested until the slices land:
 every check above; the rank prototype and the `cargo` lexer prototype ran in a scratch script only.
+
+## Errata (2026-11-25, the review fix round; the pages' corrections, the built code is the reference)
+
+1. **B1, the spawn check's production text.** "Up to the first `#[cfg(test)]`" left about 30 tree-engine files mostly
+   unread (`builder.rs` has a test-only item part way through), so probe (1) passed. The check reads up to the first
+   test *module* (`mod` under `#[cfg(test)]` or `#[cfg(all(test, ...))]`), `production` in agentfs-repo's `crates.rs`.
+2. **B1, agentfs-failpoints' manifest.** Deps `libc`, `rustix` (process) and `thiserror`, all optional, with
+   `failpoints = ["dep:libc", "dep:rustix", "dep:thiserror"]`: a release build links none of them.
+3. **B1, agentfs-os' manifest.** Also depends on `thiserror`.
+4. **A, agentfs-repo's dev-dependencies.** `tempfile` beside `agentfs-failpoints`.
+5. **B1, probe (4)'s premise is false.** git2 0.21 and libgit2-sys 0.18.8 have `default = []`, so `git2 = "0.21"`
+   links no OpenSSL and the probe cannot fail. The probe is `features = ["https"]` (or `"ssh"`) on agentfs-git's git2,
+   which `ci/check-deps.sh` refuses ("default build links openssl-sys").
+6. **Files outside the pages' lists.** `docs/target-architecture/future/crate-split.md` (section 2 and the rows; this
+   round marks A and B built and cuts section 2 to what remains), `docs/target-architecture/domains/trees.md`, and
+   `crates/agentfs-conformance/tests/regressions/pieces-shorter-run.patch` (its paths; `git apply --check` exits 0).
+7. **B2, the uncounted diff.** The check refused `agentfs_align::histogram(` only as a written path, so an import or
+   alias passed. Clippy bans `agentfs_align::histogram` (`clippy.toml`), which resolves both; the text check no longer
+   lists it. The spawn check and the recording-module check read one list of tree-engine files (`TREE_ENGINE`).
+8. **B2, the remote half of the recording-module check.** Its five strings missed `Repository::remote`, the clones,
+   `Remote::create_detached` and any braced or aliased import, and C deletes the check while the engine keeps git2.
+   Clippy bans every git2 call that creates a transport (a remote, a clone, a submodule's clone or update), with an
+   `#[expect]` at each recording-engine site after `init_git` and in tests; `ssh_transport::register`'s SAFETY cites
+   that ban. The check reads `crate::` paths only.
+9. **Design page, section 1.** agentfs-csi depends on agentfs-fuse (the stale-mount judge), not on the engine only;
+   the page now says so, with its cost. The `git` program's isolated environment has one home, `agentfs_align::isolated`,
+   which agentfs-git's `command` and the tree store's commands build on.

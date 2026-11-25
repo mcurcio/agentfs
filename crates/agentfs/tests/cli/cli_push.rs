@@ -785,6 +785,7 @@ fn force_with_lease_replaces_only_the_leased_branch() {
     let tree = repo.treebuilder(None).unwrap().write().unwrap();
     let tree = repo.find_tree(tree).unwrap();
     let unrelated = repo.commit(None, &sig, &sig, "x", &tree, &[]).unwrap();
+    #[expect(clippy::disallowed_methods, reason = "a test's remote")]
     repo.remote_anonymous(&remote.display().to_string())
         .unwrap()
         .push(&[format!("+{unrelated}:refs/heads/agentfs/demo")], None)

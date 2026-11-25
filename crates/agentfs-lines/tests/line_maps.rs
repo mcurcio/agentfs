@@ -82,7 +82,7 @@ fn an_empty_old_image_aligns_as_git_does() {
     ];
     for new in inputs {
         let ours = agentfs_lines::histogram_with(b"", new, Command::spawn).unwrap();
-        let git = agentfs_align::histogram(b"", new).unwrap();
+        let git = agentfs_align::histogram_with(b"", new, Command::spawn).unwrap();
         assert_eq!(ours, git, "{new:?}");
         let map = save(&LineMap::default(), b"", new, 1);
         assert_eq!(bytes(&map, new), new);

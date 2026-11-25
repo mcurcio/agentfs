@@ -1651,6 +1651,10 @@ impl RemotePusher {
         let auth = AuthState::new();
         let _scope = self.auth.ssh_scope(&auth);
         let listed = (|| {
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "the recording engine opens a remote, after init_git"
+            )]
             let mut remote = self.repo.remote_anonymous(self.remote.push_url())?;
             let callbacks = self.auth.callbacks(&auth);
             let proxy =
@@ -1746,6 +1750,10 @@ impl RemotePusher {
         let rejected = RefCell::new(Vec::new());
         let judged_claim = Cell::new(None);
         let result = (|| {
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "the recording engine opens a remote, after init_git"
+            )]
             let mut remote = self.repo.remote_anonymous(self.remote.push_url())?;
             // Where libgit2 will push, after any `url.<base>.insteadOf` or
             // `pushInsteadOf` of the volume's own config: a path there is
@@ -3853,6 +3861,7 @@ mod tests {
             saved_head: None,
         });
         state.save(&state_path).unwrap();
+        #[expect(clippy::disallowed_methods, reason = "a test's remote")]
         v.com
             .history()
             .repo()
@@ -4489,6 +4498,7 @@ mod tests {
         // The operator takes g in and accepts it (what `agentfs start
         // accept` writes): no alarm, and the accepted ref is pushed.
         let repo = v2.com.history().repo();
+        #[expect(clippy::disallowed_methods, reason = "a test's remote")]
         repo.remote_anonymous(&url)
             .unwrap()
             .fetch(&["refs/heads/agentfs/v1"], None, None)

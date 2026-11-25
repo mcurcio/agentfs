@@ -230,6 +230,10 @@ pub(crate) fn fetch_branch(
         };
         (kind, message)
     };
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the recording engine opens a remote, after init_git"
+    )]
     let mut git_remote = repo.remote_anonymous(url).map_err(failed)?;
     let fetched = {
         let mut options = FetchOptions::new();
