@@ -49,12 +49,13 @@ COPY crates/agentfs-csi/proto crates/agentfs-csi/proto
 # A workspace member the image does not build still needs its manifest.
 COPY crates/agentfs-model/Cargo.toml crates/agentfs-model/
 COPY crates/agentfs-conformance/Cargo.toml crates/agentfs-conformance/
+COPY crates/agentfs-test-metrics/Cargo.toml crates/agentfs-test-metrics/
 COPY crates/agentfs-repo/Cargo.toml crates/agentfs-repo/
 # Every target a manifest declares must exist, so the record_step bench
 # gets a stub too.
-RUN mkdir -p crates/agentfs-align/src crates/agentfs-lines/src crates/agentfs-failpoints/src crates/agentfs-os/src crates/agentfs-git/src crates/agentfs-rules/src crates/agentfs-contracts/src crates/agentfs-volume/src crates/agentfs-clients/src crates/agentfs-trees/src crates/agentfs-engine/src crates/agentfs-core/src crates/agentfs-core/benches crates/agentfs-fuse/src crates/agentfs/src crates/agentfs-csi/src crates/agentfs-model/src crates/agentfs-conformance/src crates/agentfs-repo/src \
+RUN mkdir -p crates/agentfs-align/src crates/agentfs-lines/src crates/agentfs-failpoints/src crates/agentfs-os/src crates/agentfs-git/src crates/agentfs-rules/src crates/agentfs-contracts/src crates/agentfs-volume/src crates/agentfs-clients/src crates/agentfs-trees/src crates/agentfs-engine/src crates/agentfs-core/src crates/agentfs-core/benches crates/agentfs-fuse/src crates/agentfs/src crates/agentfs-csi/src crates/agentfs-model/src crates/agentfs-conformance/src crates/agentfs-test-metrics/src crates/agentfs-repo/src \
  && echo "fn main() {}" > crates/agentfs-core/benches/record_step.rs \
- && touch crates/agentfs-align/src/lib.rs crates/agentfs-lines/src/lib.rs crates/agentfs-failpoints/src/lib.rs crates/agentfs-os/src/lib.rs crates/agentfs-git/src/lib.rs crates/agentfs-rules/src/lib.rs crates/agentfs-contracts/src/lib.rs crates/agentfs-volume/src/lib.rs crates/agentfs-clients/src/lib.rs crates/agentfs-trees/src/lib.rs crates/agentfs-engine/src/lib.rs crates/agentfs-core/src/lib.rs crates/agentfs-fuse/src/lib.rs crates/agentfs-csi/src/lib.rs crates/agentfs-model/src/lib.rs crates/agentfs-conformance/src/lib.rs crates/agentfs-repo/src/lib.rs \
+ && touch crates/agentfs-align/src/lib.rs crates/agentfs-lines/src/lib.rs crates/agentfs-failpoints/src/lib.rs crates/agentfs-os/src/lib.rs crates/agentfs-git/src/lib.rs crates/agentfs-rules/src/lib.rs crates/agentfs-contracts/src/lib.rs crates/agentfs-volume/src/lib.rs crates/agentfs-clients/src/lib.rs crates/agentfs-trees/src/lib.rs crates/agentfs-engine/src/lib.rs crates/agentfs-core/src/lib.rs crates/agentfs-fuse/src/lib.rs crates/agentfs-csi/src/lib.rs crates/agentfs-model/src/lib.rs crates/agentfs-conformance/src/lib.rs crates/agentfs-test-metrics/src/lib.rs crates/agentfs-repo/src/lib.rs \
  && echo 'fn main() { std::process::exit(1) }' > crates/agentfs/src/main.rs \
  && echo 'fn main() { std::process::exit(1) }' > crates/agentfs-csi/src/main.rs \
  && cargo build --release --locked -p agentfs -p agentfs-csi --features agentfs/https,agentfs/ssh,agentfs/otlp-tls

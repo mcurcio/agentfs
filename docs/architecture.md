@@ -10,7 +10,6 @@ is. The libraries behind it, and why each was chosen, are under
 
 | Crate | Kind | What it is |
 |---|---|---|
-| `agentfs-engine` | library | The tree engine: git-backed tree views whose saves one actor orders, with its journal, history, sessions, operator settings and the store adapters that implement the domains' ports. The recording engine's sibling: neither depends on the other ([trees](trees.md)) |
 | `agentfs-core` | library | The engine: path rules, the journal, frozen copies, commits, pushes, restores, the patch queue, the history service, LFS, telemetry. No FUSE and no CLI |
 | `agentfs-fuse` | library | The FUSE layer: a passthrough filesystem over the backing tree that calls the engine at every change boundary |
 | `agentfs` | binary | The `agentfs` command (every subcommand is listed in [configuration](configuration.md#commands)); OpenTelemetry export |
@@ -157,7 +156,7 @@ row names a module that no longer exists; `tests.rs` files are not listed.
 
 | Module | Role |
 |---|---|
-| `lib.rs` | Crate root: the tree engine's overview |
+| `lib.rs` | Crate root: the tree engine's crate, the recording engine's sibling |
 
 ### `agentfs-core`
 
@@ -398,6 +397,12 @@ row names a module that no longer exists; `tests.rs` files are not listed.
 | `mounted.rs` | `Mounted`: the shared calls as real system calls on a mount of a failpoints build, each take through the take gate |
 | `invariants.rs` | What must hold in the real system, read from `git`, its own reader of line maps and name histories and its own byte oracle, never `tree_actor` |
 | `bin/phase1-replay.rs` | `phase1-replay model\|library\|mount DIR [--record OUT]`: replays the traces, with floors, against `open-findings.txt`; `--record` writes what the system did with each |
+
+### `agentfs-test-metrics`
+
+| Module | Role |
+|---|---|
+| `lib.rs` | Crate root: the in-memory metric reader the engines' tests share |
 
 ### `agentfs-repo`
 

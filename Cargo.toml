@@ -1,9 +1,13 @@
 [workspace]
 resolver = "3"
 exclude = ["vendor/fuser"]
-members = ["crates/agentfs-align", "crates/agentfs-lines", "crates/agentfs-failpoints", "crates/agentfs-os", "crates/agentfs-git", "crates/agentfs-rules", "crates/agentfs-contracts", "crates/agentfs-volume", "crates/agentfs-clients", "crates/agentfs-trees", "crates/agentfs-engine", "crates/agentfs-core", "crates/agentfs-fuse", "crates/agentfs", "crates/agentfs-csi", "crates/agentfs-model", "crates/agentfs-conformance", "crates/agentfs-repo"]
+members = ["crates/agentfs-align", "crates/agentfs-lines", "crates/agentfs-failpoints", "crates/agentfs-os", "crates/agentfs-git", "crates/agentfs-rules", "crates/agentfs-contracts", "crates/agentfs-volume", "crates/agentfs-clients", "crates/agentfs-trees", "crates/agentfs-engine", "crates/agentfs-core", "crates/agentfs-fuse", "crates/agentfs", "crates/agentfs-csi", "crates/agentfs-model", "crates/agentfs-conformance", "crates/agentfs-test-metrics", "crates/agentfs-repo"]
 
 [workspace.package]
+# The product's one version, which every published package takes: it is
+# written into what agentfs records and reports (history's verification
+# notes, the LFS user agent, the telemetry scope, the CSI vendor version).
+version = "0.1.0"
 edition = "2024"
 # File::lock and its family (agentfs_os::file_lock).
 rust-version = "1.89"

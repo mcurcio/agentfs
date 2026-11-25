@@ -298,6 +298,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "agentfs-test-metrics"
+version = "0.0.0"
+
+[[package]]
 name = "agentfs-trees"
 version = "0.1.0"
 dependencies = [

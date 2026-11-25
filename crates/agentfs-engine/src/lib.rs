@@ -1,6 +1,4 @@
-//! The tree engine: a volume of git-backed tree views whose saves one actor
-//! orders (docs/trees.md). Each call and step is in the actor's journal
-//! before it returns, and history is built from the journal; the store
-//! adapters here implement the domains' ports (`agentfs-contracts`) over
-//! that actor. It is the recording engine's sibling (`agentfs-core`):
-//! neither depends on the other. docs/architecture.md maps its modules.
+//! The tree engine's crate, the sibling of the recording engine
+//! (`agentfs-core`): neither depends on the other, and the ranks refuse an
+//! edge between them (docs/architecture.md). It holds no module yet;
+//! docs/target-architecture/future/crate-split.md says what it takes.
