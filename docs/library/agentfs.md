@@ -82,30 +82,25 @@ volume a second way, outside the consumer API.
 
 ### Outside the consumer API
 
-These items are `pub` for the workspace's own crates (the FUSE layer, the
-binary, the conformance replay) and reachable through `agentfs`, but they
-are not for a consumer. Inside this workspace `clippy.toml` bans most of them
-outside their one caller; a consumer's build does not read this workspace's
-`clippy.toml`, so nothing stops a consumer from calling them:
+Two calls are `pub` and reachable through `agentfs` but are not for a
+consumer. Nothing stops one from calling them: a consumer's build does not
+read this workspace's `clippy.toml`.
 
-- The `StateArea` port's `create`, called directly: the service's `init`
-  makes a volume through `VolumeService::ensure`, which calls it after its
-  launch-scope check (VO6) and its judgement of what the state area holds
-  (VO5).
+- The `StateArea` port's `create`, called directly: a trait method the
+  Volume domain calls. Use the service's `init`, which makes a volume
+  through `VolumeService::ensure` after its launch-scope check (VO6) and its
+  judgement of what the state area holds (VO5).
 - The guard's calls that name a tree and a writer (`write_open` and the
-  other file calls `Recording::actor`'s guard takes a `WriterAt` for): a
-  writer no Clients row knows of. A client writes through its session,
-  which Clients binds (C5).
-- `TreeActor::fork_with`, `record_rows` and `drop_fork`: row writes the
-  domains' store makes; call the store.
-- `TreeActor::close_writer`: a client's end, which `Sessions::unbind` makes.
-- `TreeActor::create` and `create_with`: a volume made with a hand-made id;
-  `VolumeService::ensure` makes it through `TreeStateArea`, which gives it
-  one (VO5).
-- `tree_git::TreeGit::open`, `open_with_lease`, `init` and
-  `init_with_lease`: a tree volume's git store is history's.
-- `tree_actor::COMPACT_GATE_VAR`, `ChannelGate`, `CompactGate` and `Gap`:
-  the compaction gate the crash tests drive.
+  other file calls `Recording::actor`'s guard takes a `WriterAt` for): the
+  engine's call surface under sessions, which the replay and its tests use.
+  Their writer is one no Clients row knows of. Write through a client's
+  session (`Domains::sessions`), which Clients binds (C5).
+
+The rest of the engine's test-only surface is not in a consumer's build:
+the items behind `agentfs-engine`'s `test-util` feature, which is off by
+default and which the library never turns on ([test
+builds](engine.md#test-builds)). The rows, a client's end and History's own
+store opening are `pub(crate)` in the engine.
 
 The Rust API is not versioned: its public types may change between
 versions.

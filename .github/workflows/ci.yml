@@ -30,6 +30,12 @@ jobs:
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: clippy (all features)
         run: cargo clippy --workspace --all-targets --locked --all-features -- -D warnings
+      # A workspace-wide build turns the engine's test-util on (through
+      # agentfs-conformance): these two build the library as a consumer does.
+      - name: clippy (the library as a consumer builds it)
+        run: cargo clippy --locked -p agentfs-engine -p agentfs-service -p agentfs --lib -- -D warnings
+      - name: the front's doctest without test-util
+        run: cargo test --doc --locked -p agentfs
       - name: linked C and crypto per feature set
         run: ci/check-deps.sh
       - name: the model's safety net (corpus runner, digest compare, mount refusal, stall alarm)

@@ -129,12 +129,14 @@ impl std::fmt::Debug for Store {
 
 impl TreeGit {
     /// Initialize a bare repository. For an actor, use `init_with_lease`.
+    #[cfg(any(test, feature = "test-util"))]
     pub fn init(path: impl AsRef<Path>) -> Result<Self> {
         Self::init_inner(path.as_ref(), None)
     }
 
     /// Initialize while retaining the actor's exclusive lock across Git children.
-    pub fn init_with_lease(path: impl AsRef<Path>, lease: Arc<FileLock>) -> Result<Self> {
+    #[cfg_attr(feature = "test-util", visibility::make(pub))]
+    pub(crate) fn init_with_lease(path: impl AsRef<Path>, lease: Arc<FileLock>) -> Result<Self> {
         Self::init_inner(path.as_ref(), Some(lease))
     }
 
@@ -151,13 +153,15 @@ impl TreeGit {
     }
 
     /// Open a repository. For an actor, use `open_with_lease`.
+    #[cfg(any(test, feature = "test-util"))]
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         Self::open_inner(path.as_ref(), None)
     }
 
     /// Keeps the path and the actor's lock across Git children. Runs no git and
     /// checks no format: after a crash `write_config` comes first.
-    pub fn open_with_lease(path: impl AsRef<Path>, lease: Arc<FileLock>) -> Result<Self> {
+    #[cfg_attr(feature = "test-util", visibility::make(pub))]
+    pub(crate) fn open_with_lease(path: impl AsRef<Path>, lease: Arc<FileLock>) -> Result<Self> {
         Self::open_inner(path.as_ref(), Some(lease))
     }
 

@@ -40,7 +40,7 @@ use opentelemetry::global::BoxedTracer;
 use opentelemetry::logs::{AnyValue, LogRecord as _, Logger, Severity};
 use opentelemetry::metrics::{Counter, Histogram, Meter};
 use opentelemetry::trace::{SpanKind, Status, TraceContextExt as _, Tracer as _};
-use opentelemetry::{Context, ContextGuard, InstrumentationScope, KeyValue};
+use opentelemetry::{Context, ContextGuard, KeyValue};
 
 use crate::config::Settings;
 use crate::events::{Event, EventSink, Events};
@@ -122,8 +122,6 @@ pub mod names {
     pub const RECONCILE_FAILURES: &str = "agentfs.reconcile.failures";
     pub const NESTED_GITDIR_HEURISTIC: &str = "agentfs.nested.gitdir_heuristic";
     pub const FORK_PUBLISH_DURATION: &str = "agentfs.fork.publish.duration";
-    /// Recorded by the binary, which owns the exporters.
-    pub const TELEMETRY_EXPORT_FAILURES: &str = "agentfs.telemetry.export_failures";
 }
 
 /// Span names.
@@ -153,13 +151,6 @@ const FORK_PUBLISH_BOUNDARIES: [f64; 12] = [
 /// The longest the push gauges reuse one backlog walk (see
 /// [`BacklogSnapshot`]).
 const BACKLOG_SNAPSHOT_TTL: Duration = Duration::from_secs(1);
-
-/// The instrumentation scope of every agentfs meter, tracer and logger.
-pub fn scope() -> InstrumentationScope {
-    InstrumentationScope::builder("agentfs")
-        .with_version(env!("CARGO_PKG_VERSION"))
-        .build()
-}
 
 /// Turns alarm events into log records.
 pub trait AlarmLog: Send + Sync {
@@ -1229,7 +1220,14 @@ pub(crate) mod testing {
     use opentelemetry_sdk::logs::{InMemoryLogExporter, SdkLogRecord, SdkLoggerProvider};
     use opentelemetry_sdk::trace::{InMemorySpanExporter, SdkTracerProvider, SpanData};
 
+    use opentelemetry::InstrumentationScope;
+
     use super::*;
+
+    /// The scope of the instruments under test: any, the reader reads them all.
+    fn scope() -> InstrumentationScope {
+        InstrumentationScope::builder("agentfs").build()
+    }
 
     pub(crate) struct Harness {
         pub(crate) telemetry: Telemetry,

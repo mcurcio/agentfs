@@ -43,7 +43,9 @@ use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::os::unix::fs::{FileExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, PoisonError, mpsc};
+use std::sync::Arc;
+#[cfg(any(test, feature = "test-util"))]
+use std::sync::{Mutex, PoisonError, mpsc};
 
 use serde::{Deserialize, Serialize};
 
@@ -435,6 +437,7 @@ pub enum Gap {
 
 impl Gap {
     /// Every gap, in the order one compaction passes them.
+    #[cfg(any(test, feature = "test-util"))]
     pub const ALL: [Gap; 5] = [
         Gap::Covered,
         Gap::Written,
@@ -445,6 +448,7 @@ impl Gap {
 
     /// Its line on the FIFO gate: `covered`, `written`, `renamed`,
     /// `dir_synced`, `before_unlink`.
+    #[cfg(any(test, feature = "test-util", feature = "failpoints"))]
     pub fn name(self) -> &'static str {
         match self {
             Gap::Covered => "covered",
@@ -471,7 +475,8 @@ impl Gap {
 
 /// Parks a volume's compactor at each gap of every compaction, and may fail
 /// the step after a gap. Called on the compactor thread with no lock held.
-pub trait CompactGate: Send + Sync {
+#[cfg_attr(feature = "test-util", visibility::make(pub))]
+pub(crate) trait CompactGate: Send + Sync {
     /// Returns when the compactor may go on past `gap`; `Err(e)` fails the
     /// compaction there, as [`Gap`]'s fault says.
     ///
@@ -485,11 +490,13 @@ pub trait CompactGate: Send + Sync {
 /// compactor waits for the holder's verdict. A gap nobody receives, or
 /// reached once the verdict sender is dropped, passes at once, so a pair
 /// with both ends dropped is a gate that never parks.
+#[cfg(any(test, feature = "test-util"))]
 pub struct ChannelGate {
     reached: Mutex<mpsc::Sender<Gap>>,
     verdicts: Mutex<mpsc::Receiver<io::Result<()>>>,
 }
 
+#[cfg(any(test, feature = "test-util"))]
 impl ChannelGate {
     /// The gate, the receiver of each gap it reaches, and the sender of
     /// verdicts.
@@ -508,6 +515,7 @@ impl ChannelGate {
     }
 }
 
+#[cfg(any(test, feature = "test-util"))]
 impl CompactGate for ChannelGate {
     fn at(&self, gap: Gap) -> io::Result<()> {
         let sent = self
@@ -530,6 +538,7 @@ impl CompactGate for ChannelGate {
 /// FIFOs of an `agentfs_failpoints::FifoGate`, parked at each gap's
 /// [`Gap::name`]. Read only by the `agentfs` binary, and only in a
 /// `failpoints` build. Release builds ignore it.
+#[cfg(any(test, feature = "test-util"))]
 pub const COMPACT_GATE_VAR: &str = "AGENTFS_COMPACT_GATE";
 
 /// The test script's gate: parks at each gap's name.

@@ -41,7 +41,7 @@ use std::time::{Duration, Instant};
 use opentelemetry::global::{BoxedTracer, ObjectSafeTracerProvider as _};
 use opentelemetry::logs::{LoggerProvider as _, Severity};
 use opentelemetry::metrics::{Counter, Meter, MeterProvider as _};
-use opentelemetry::{Key, KeyValue};
+use opentelemetry::{InstrumentationScope, Key, KeyValue};
 use opentelemetry_otlp::WithExportConfig as _;
 use opentelemetry_sdk::Resource;
 use opentelemetry_sdk::error::OTelSdkResult;
@@ -51,11 +51,49 @@ use opentelemetry_sdk::metrics::exporter::PushMetricExporter;
 use opentelemetry_sdk::metrics::{SdkMeterProvider, Temporality};
 use opentelemetry_sdk::trace::{SdkTracerProvider, SpanData, SpanExporter};
 
-use agentfs_core::identity::Context;
-use agentfs_core::telemetry::{self, OtelAlarmLog, Telemetry, names};
+use agentfs_core::telemetry::{AlarmLog, OtelAlarmLog, Telemetry};
+
+use crate::pod_args::PodArgs;
 
 #[cfg(feature = "otlp-tls")]
 mod tls;
+
+/// The counter of failed exports, by signal. Recorded by the binary, which
+/// owns the exporters.
+const TELEMETRY_EXPORT_FAILURES: &str = "agentfs.telemetry.export_failures";
+
+/// The instrumentation scope of every agentfs meter, tracer and logger.
+fn scope() -> InstrumentationScope {
+    InstrumentationScope::builder("agentfs")
+        .with_version(env!("CARGO_PKG_VERSION"))
+        .build()
+}
+
+/// Who the process is, as every signal's resource names it. An empty field
+/// is left out of the resource.
+#[derive(Clone, Debug, Default)]
+pub struct Identity {
+    pub namespace: String,
+    pub pod: String,
+    pub pod_uid: String,
+    pub node: String,
+    /// `service.instance.id`.
+    pub replica: String,
+}
+
+impl Identity {
+    /// A tree volume's process: its pod flags as given, the replica
+    /// [`PodArgs::replica`].
+    pub fn of_pod(pod: &PodArgs) -> Self {
+        Self {
+            namespace: pod.namespace.clone(),
+            pod: pod.pod.clone(),
+            pod_uid: pod.pod_uid.clone(),
+            node: pod.node.clone(),
+            replica: pod.replica(),
+        }
+    }
+}
 
 /// How long exit waits for telemetry to flush.
 pub const TELEMETRY_SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
@@ -446,7 +484,7 @@ impl ExportHealth {
     pub fn count_with(&self, meter: &Meter) {
         let _ = self.counter.set(
             meter
-                .u64_counter(names::TELEMETRY_EXPORT_FAILURES)
+                .u64_counter(TELEMETRY_EXPORT_FAILURES)
                 .with_description("Telemetry exports that failed, by signal")
                 .build(),
         );
@@ -823,7 +861,7 @@ macro_rules! exporter {
 }
 
 /// Sets up export for `volume` from the process environment.
-pub fn init(volume: &str, ctx: &Context) -> Otel {
+pub fn init(volume: &str, identity: &Identity) -> Otel {
     // With TLS built, reqwest has rustls but no crypto provider of its own,
     // even for plain http: ring is the process's (an error means one is
     // already installed).
@@ -859,7 +897,7 @@ pub fn init(volume: &str, ctx: &Context) -> Otel {
             Err(e) => eprintln!("warning: telemetry: no runtime for gRPC export: {e}"),
         }
     }
-    let resource = resource(volume, ctx);
+    let resource = resource(volume, identity);
     let health = ExportHealth::new();
     // The runtime a signal's exporter runs on: gRPC's only.
     let handle = |transport: &Transport| match (transport.protocol, &runtime) {
@@ -932,11 +970,10 @@ pub fn init(volume: &str, ctx: &Context) -> Otel {
     }
     let tracer_handle = tracer
         .as_ref()
-        .map(|p| BoxedTracer::new(p.boxed_tracer(telemetry::scope())));
-    let alarms = logger.as_ref().map(|p| {
-        Box::new(OtelAlarmLog::new(p.logger_with_scope(telemetry::scope())))
-            as Box<dyn telemetry::AlarmLog>
-    });
+        .map(|p| BoxedTracer::new(p.boxed_tracer(scope())));
+    let alarms = logger
+        .as_ref()
+        .map(|p| Box::new(OtelAlarmLog::new(p.logger_with_scope(scope()))) as Box<dyn AlarmLog>);
     Otel {
         telemetry: Telemetry::new(&meter_handle, tracer_handle, alarms),
         meter: meter_handle,
@@ -949,7 +986,7 @@ pub fn init(volume: &str, ctx: &Context) -> Otel {
     }
 }
 
-/// The process's meter, under [`telemetry::scope`]: `provider`'s, else
+/// The process's meter, under [`scope`]: `provider`'s, else
 /// the API's no-op provider's, which drops every instrument. The one place
 /// the binary makes a meter.
 #[expect(
@@ -958,16 +995,14 @@ pub fn init(volume: &str, ctx: &Context) -> Otel {
 )]
 fn meter_of(provider: Option<&SdkMeterProvider>) -> Meter {
     match provider {
-        Some(provider) => provider.meter_with_scope(telemetry::scope()),
-        None => {
-            opentelemetry::metrics::NoopMeterProvider::new().meter_with_scope(telemetry::scope())
-        }
+        Some(provider) => provider.meter_with_scope(scope()),
+        None => opentelemetry::metrics::NoopMeterProvider::new().meter_with_scope(scope()),
     }
 }
 
 /// The resource every signal carries. `OTEL_SERVICE_NAME` and
 /// `OTEL_RESOURCE_ATTRIBUTES` win over what agentfs sets.
-fn resource(volume: &str, ctx: &Context) -> Resource {
+fn resource(volume: &str, ctx: &Identity) -> Resource {
     let detected = Resource::builder().build();
     let service_name = Key::from_static_str("service.name");
     let named = detected
@@ -1285,12 +1320,11 @@ mod tests {
 
     #[test]
     fn resource_names_the_service_and_volume() {
-        let ctx = Context {
-            volume: "demo".into(),
+        let ctx = Identity {
             replica: "pod-0".into(),
             pod: "pod-0".into(),
             namespace: "ns".into(),
-            ..Context::default()
+            ..Identity::default()
         };
         let r = resource("demo", &ctx);
         let get = |k: &'static str| r.get(&Key::from_static_str(k)).map(|v| v.to_string());

@@ -81,9 +81,10 @@ disallowed-methods = [
 
     # A tree volume's Git store is opened only by its History (the tree
     # actor's `history` module): nothing else reads history past what is built.
-    { path = "agentfs_engine::tree_git::TreeGit::open", reason = "a tree volume's store is History's: read it through tree_actor::History" },
+    # `open` and `init` exist only in the engine's test builds (`test-util`).
+    { path = "agentfs_engine::tree_git::TreeGit::open", reason = "a tree volume's store is History's: read it through tree_actor::History", allow-invalid = true },
     { path = "agentfs_engine::tree_git::TreeGit::open_with_lease", reason = "a tree volume's store is History's: read it through tree_actor::History" },
-    { path = "agentfs_engine::tree_git::TreeGit::init", reason = "a tree volume's store is History's: read it through tree_actor::History" },
+    { path = "agentfs_engine::tree_git::TreeGit::init", reason = "a tree volume's store is History's: read it through tree_actor::History", allow-invalid = true },
     { path = "agentfs_engine::tree_git::TreeGit::init_with_lease", reason = "a tree volume's store is History's: read it through tree_actor::History" },
 
     # A row's step is the store adapter's (agentfs_engine::store): it stamps the

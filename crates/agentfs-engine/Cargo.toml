@@ -42,8 +42,12 @@ sha2 = "0.11"
 thiserror = "2.0.21"
 # A new volume's id (RFC 9562 version 4), made in state_area.rs only.
 uuid = { version = "1", default-features = false, features = ["std", "v4"] }
+# `test-util` only: makes the test-only surface `pub` (`visibility::make`).
+visibility = { version = "0.1.1", optional = true }
 
 [dev-dependencies]
+# Itself with `test-util`: its own tests/ reach the test-only surface.
+agentfs-engine = { path = ".", features = ["test-util"] }
 # The Volume domain over the real state area (tests/it/state_area.rs).
 agentfs-volume = { version = "0.1.0", path = "../agentfs-volume" }
 # The Trees domain over the store adapter (tests/it/tree_store.rs).
@@ -57,3 +61,7 @@ tempfile = "3.27.0"
 [features]
 # Test builds only: failpoints on the durable path (`failpoints`). Never in a release or image.
 failpoints = ["agentfs-failpoints/failpoints"]
+# Test builds only: the items only the workspace's tests and test builds call
+# (docs/library/engine.md, "Test builds"). Off by default; the library never
+# turns it on.
+test-util = ["dep:visibility"]

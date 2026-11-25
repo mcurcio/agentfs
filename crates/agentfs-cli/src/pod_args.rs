@@ -33,6 +33,16 @@ impl PodArgs {
             node: field(&self.node)?,
         })
     }
+
+    /// The replica a process of this pod is: the pod name, else the host
+    /// name. The commands with `--replica` take that flag first.
+    pub fn replica(&self) -> String {
+        if self.pod.is_empty() {
+            crate::hostname()
+        } else {
+            self.pod.clone()
+        }
+    }
 }
 
 #[cfg(test)]

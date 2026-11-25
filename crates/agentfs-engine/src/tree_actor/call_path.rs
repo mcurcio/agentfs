@@ -479,6 +479,7 @@ impl Recording {
     /// # Errors
     ///
     /// As [`TreeActor::create`].
+    #[cfg(any(test, feature = "test-util"))]
     pub fn create(
         root: &Path,
         identity: &VolumeIdentity,
@@ -494,7 +495,8 @@ impl Recording {
     /// # Errors
     ///
     /// As [`TreeActor::create`].
-    pub fn create_with(
+    #[cfg_attr(feature = "test-util", visibility::make(pub))]
+    pub(crate) fn create_with(
         root: &Path,
         identity: &VolumeIdentity,
         root_owner: Option<FileOwner>,

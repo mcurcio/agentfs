@@ -31,7 +31,8 @@ module; [trees](../trees.md) says what a tree view does and promises.
 
 `tree_actor::TreeActor` is a git-backed volume whose saves are ordered by
 one actor. It is not the recording engine
-([`agentfs-core`](core.md)) and does not share its state format. `TreeActor::create(root, identity, root_owner, service)` makes a
+([`agentfs-core`](core.md)) and does not share its state format. `TreeActor::create(root, identity, root_owner, service)`
+(a [test build](#test-builds)'s; a consumer creates through the service's `init`) makes a
 volume with its identity (`agentfs_contracts::volume::VolumeIdentity`: a name
 and an id). Its Root commit records the root directory with mode 0755 and
 `root_owner` (an `agentfs_contracts::clients::FileOwner`, uid and gid, parsed from
@@ -81,16 +82,18 @@ How an open volume keeps its journal is an option of its open, `Upkeep`,
 fixed for the life of the open and stored nowhere:
 `TreeActor::{create_with, open_with}`, `Recording::{create_with, open_with}`
 and `TreeStateArea::with_upkeep` take one, and `create`, `open` and
-`TreeStateArea::at` use `Upkeep::default()`.
+`TreeStateArea::at` use `Upkeep::default()`. The `create` calls are a [test
+build](#test-builds)'s; `TreeStateArea` creates in every build.
 
 | Field | Default | Meaning |
 |---|---|---|
 | `segment_bytes` | 64 MiB | The next frame starts a new segment once the current one has a record and the frame would take it past this |
 | `compact_from` | 64 MiB | The floor of compaction's due length. Unread with a gate |
-| `gate` | none | A `CompactGate`: the compactor then compacts at every built event, and calls `at(gap)` at each of a compaction's five gaps (`Gap`), with no lock held. `Err` fails the compaction there |
+| `gate` | none | Crate-private, set by `Upkeep::gated`. A `CompactGate`: the compactor then compacts at every built event, and calls `at(gap)` at each of a compaction's five gaps (`Gap`), with no lock held. `Err` fails the compaction there |
 
-`Upkeep::gated(gate)` is one frame per segment with that gate, for a test
-that wants every built event to compact a small volume. `ChannelGate::pair()`
+In a [test build](#test-builds), `Upkeep::gated(gate)` is one frame per
+segment with that gate, for a test that wants every built event to compact a
+small volume. `ChannelGate::pair()`
 is a gate in a test's hands: it gives the gate, a receiver of each gap the
 compactor reaches, where it stays parked, and a sender of verdicts. Dropping
 both ends leaves a gate that never parks. The library reads no environment
@@ -440,7 +443,8 @@ context); what a row holds is the store's. `TreeActor::row(chain)` and
 `rows(domain)` read the rows from
 the actor's saved state, never Git, so they answer while history lags or the
 builder fails. `TreeActor::fork_with`, `record_rows` and `drop_fork` run the
-steps; only the store calls them (a clippy rule). `drop_fork(fork, rows)` is one
+steps; they are crate-private (`fork_with` and `drop_fork` `pub` in a [test
+build](#test-builds)), and only the store calls them (a clippy rule). `drop_fork(fork, rows)` is one
 step that deletes the fork's branch and its queue's entries with its rows, and
 forgets the tree at once; it answers `Busy` (the store's `Refused`) while its
 upstream's queue holds an entry it queued, a file is open in it, or a fork names
@@ -483,6 +487,27 @@ Errors are `thiserror` enums, one per area; none is a catch-all.
 | `tree_actor::Error` | Tree views; `Error::errno()` maps each to the errno a file call answers with |
 | `tree_git::Error` | The tree volume's git store |
 | `agentfs_contracts::volume::VolumeError` | `TreeStateArea`'s `StateArea` port |
+
+## Test builds
+
+The items only the workspace's tests and test builds call are behind the
+`test-util` feature, off by default (the pattern of tokio's `test-util`). The
+library crate `agentfs` never turns it on, and `ci/check-deps.sh` fails when
+its build would (`ok   library features`). With it:
+
+- `pub` where the engine also calls them, `pub(crate)` without it:
+  `TreeActor::{create_with, fork_with, drop_fork}`, `Recording::create_with`,
+  `TreeGit::{open_with_lease, init_with_lease}`, and `tree_actor::CompactGate`.
+- Present only with it: `TreeActor::create`, `Recording::create`,
+  `TreeGit::{open, init}`, `Upkeep::gated`, and `tree_actor::COMPACT_GATE_VAR`,
+  `ChannelGate` and `Gap`.
+
+`TreeActor::record_rows` and `close_writer` are crate-private in every build.
+The engine's own tests reach these items through a dev-dependency on itself
+with the feature; the FUSE layer's and the binary's tests, the binary's
+`failpoints` build and `agentfs-conformance` turn it on. A crate that depends
+on the engine by name can still turn it on. `Minter::new` is not behind it: a
+consumer's `main` is its composition root and mints.
 
 ## What this layer does not do
 

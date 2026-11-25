@@ -41,7 +41,6 @@ use agentfs_contracts::views::{MountOptions, ViewError, ViewId};
 use agentfs_contracts::volume::{
     EnsureOutcome, StartPoint, VolumeError, VolumeIdentity, VolumeSpec,
 };
-use agentfs_core::identity::Context as Identity;
 use agentfs_engine::operator_settings::OperatorSettings;
 use agentfs_engine::state_area::TreeStateArea;
 use agentfs_engine::telemetry;
@@ -52,6 +51,7 @@ use opentelemetry::metrics::Meter;
 
 use self::serving::{Serving, Trigger};
 use crate::daemon::Daemon;
+use crate::otel::Identity;
 use crate::pod_args::PodArgs;
 
 /// Exit status when another process holds the state area (`EX_TEMPFAIL`).
@@ -387,7 +387,7 @@ pub fn mount(state: &Path, args: MountArgs, minter: Minter) -> Result<ExitCode> 
         .collect();
     mountpoint::outside_the_state_area(state, &views)?;
     let boot = settings::at_boot(state, &views)?;
-    let otel = crate::otel::init(name.as_str(), &identity(name.as_str(), &args.pod));
+    let otel = crate::otel::init(name.as_str(), &Identity::of_pod(&args.pod));
     telemetry::observe_process(otel.meter(), &boot.not_built);
     let expect: Vec<mountpoint::Expect> = std::iter::once(mountpoint::Expect::Source(
         agentfs_fuse::tree_view::view_source(name.as_str(), TreeId::Root),
@@ -429,24 +429,6 @@ pub fn mount(state: &Path, args: MountArgs, minter: Minter) -> Result<ExitCode> 
     let code = mount.run(state, root, fork, minter);
     drop(otel);
     code
-}
-
-/// The telemetry identity of a mount: its pod flags, the replica the pod
-/// name or else the host name.
-fn identity(volume: &str, pod: &PodArgs) -> Identity {
-    let replica = if pod.pod.is_empty() {
-        crate::hostname()
-    } else {
-        pod.pod.clone()
-    };
-    Identity {
-        volume: volume.to_owned(),
-        namespace: pod.namespace.clone(),
-        pod: pod.pod.clone(),
-        pod_uid: pod.pod_uid.clone(),
-        node: pod.node.clone(),
-        replica,
-    }
 }
 
 /// How every tree volume this binary opens keeps its journal: `mount` and

@@ -364,7 +364,7 @@ row names a module that no longer exists; `tests.rs` files are not listed.
 | `launcher/verify.rs` | `agentfs verify`: every save history flagged unverified whose flag stands checked again by this release, one line per flag, and the one home of its exit status (0 none standing, 2 one standing, 1 an error, 75 the volume in use) |
 | `launcher/command.rs` | `mount -- COMMAND`: the command spawned once every view is up, its exit a trigger of the loop, a stop sent on as SIGTERM through a pidfd |
 | `mountpoint.rs` | Creating and sealing a bare mount point, shared by the launcher and the front |
-| `pod_args.rs` | The pod flags (`--namespace`, `--pod`, `--pod-uid`, `--node`) one clap group shares between the recording engine's commands and `init`, `mount` and `fork end` |
+| `pod_args.rs` | The pod flags (`--namespace`, `--pod`, `--pod-uid`, `--node`) one clap group shares between the recording engine's commands and `init`, `mount` and `fork end`, and the replica a process of the pod is (the pod name, else the host name) |
 | `main.rs` | The CLI (`Cli`), command dispatch, the tree-volume guard of every recording command, `probe`, `status`, `record`, `flush`, `push` (direct) and `run` |
 | `daemon.rs` | Signals and shutdown for `run`, `front` and a held `mount` |
 | `front.rs` | `agentfs front`: a front of a history service, which only the CSI node plugin starts, and `record --history-service` |
@@ -379,7 +379,7 @@ row names a module that no longer exists; `tests.rs` files are not listed.
 | `fork_cmd.rs` | `agentfs fork create`, `finish` (`--retry`), `status`, `abandon`, `list` and `deliver` (`fork end` is the launcher's) |
 | `start_cmd.rs` | `agentfs start accept --tip`: a started volume's answer to the start-branch alarm |
 | `lfs_cmd.rs` | `agentfs lfs`: fetching objects into the local LFS cache, and pruning it |
-| `otel.rs` | Telemetry export: the OpenTelemetry SDK, exporters (http/protobuf, http/json, gRPC on its own runtime) and the environment it reads |
+| `otel.rs` | Telemetry export: the OpenTelemetry SDK, exporters (http/protobuf, http/json, gRPC on its own runtime) and the environment it reads; the resource's identity (`Identity`), the instrumentation scope and the export-failure counter |
 | `otel/tls.rs` | The `otlp-tls` feature: TLS to the collector (CA bundle or system store, client certificate) for the HTTP and gRPC exporters |
 | `reference_tests.rs` | Test only: checks docs/configuration.md against the CLI's flags and variables |
 

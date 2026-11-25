@@ -378,13 +378,16 @@ struct Pod {
 }
 
 impl Pod {
-    fn context(&self, volume: &str) -> Context {
-        let replica = self
-            .replica
+    /// `--replica`, else [`pod_args::PodArgs::replica`].
+    fn replica(&self) -> String {
+        self.replica
             .clone()
             .filter(|r| !r.is_empty())
-            .or_else(|| (!self.args.pod.is_empty()).then(|| self.args.pod.clone()))
-            .unwrap_or_else(hostname);
+            .unwrap_or_else(|| self.args.replica())
+    }
+
+    fn context(&self, volume: &str) -> Context {
+        let replica = self.replica();
         Context {
             volume: volume.to_owned(),
             namespace: self.args.namespace.clone(),
@@ -1295,7 +1298,7 @@ struct Session {
 impl Session {
     fn start(state: &StateDir, pod: &Pod) -> Result<Self> {
         let volume = volume_name(state)?;
-        let otel = otel::init(&volume, &pod.context(&volume));
+        let otel = otel::init(&volume, &telemetry_identity(pod.context(&volume)));
         let events = otel.telemetry().sink(stderr_sink());
         Ok(Self {
             volume,
@@ -1438,6 +1441,18 @@ fn input_for(root: &Path, path: &str) -> Result<Input> {
         backing,
         executable: meta.permissions().mode() & 0o111 != 0,
     })
+}
+
+/// A recording command's telemetry identity: its commit context's pod
+/// fields, `pod_uid` already falling back to the replica.
+fn telemetry_identity(context: Context) -> otel::Identity {
+    otel::Identity {
+        namespace: context.namespace,
+        pod: context.pod,
+        pod_uid: context.pod_uid,
+        node: context.node,
+        replica: context.replica,
+    }
 }
 
 fn hostname() -> String {

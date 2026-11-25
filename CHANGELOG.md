@@ -114,6 +114,11 @@ design was reviewed on 2026-10-12.
   `host` and `fork end` use the same crate, the only one that composes the
   domains (docs/library/service.md). `agentfs init` now prints a failed
   recovery as `error: <reason>`.
+- **`agentfs-engine`'s `test-util` feature.** The engine's items only tests
+  call (creating a volume with a hand-made id, the compaction gate, opening
+  the git store directly) are behind it, off by default, and the library
+  crate `agentfs` never turns it on; the row writes and a client's end are
+  crate-private (docs/library/engine.md, "Test builds").
 - **The library crate `agentfs`.** The one crate a consumer depends on: the
   tree engine, the shared kernel and the Volume, Clients, Trees and Rules
   domains under one name (`agentfs::engine`, `agentfs::contracts`, ...), with

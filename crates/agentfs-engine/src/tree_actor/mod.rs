@@ -63,7 +63,10 @@ pub use history::verify::{
     VerifyReport, release, verify_flagged,
 };
 use history::{check_objects, clean_packs, read_trees, refs, remove_stale_locks, sync_marker};
-pub use journal::compaction::{COMPACT_GATE_VAR, ChannelGate, CompactGate, Gap};
+#[cfg_attr(feature = "test-util", visibility::make(pub))]
+pub(crate) use journal::compaction::CompactGate;
+#[cfg(any(test, feature = "test-util"))]
+pub use journal::compaction::{COMPACT_GATE_VAR, ChannelGate, Gap};
 use journal::compaction::{Checkpoint, JournalCompaction, Published};
 pub use journal::durable::{Durability, DurableError, RecordNo};
 use journal::segment::SEGMENT_BYTES;
@@ -101,7 +104,7 @@ pub struct Upkeep {
     pub compact_from: u64,
     /// Parks the compactor at each gap; with one, the compactor compacts at
     /// every built event. Default none.
-    pub gate: Option<Arc<dyn CompactGate>>,
+    pub(crate) gate: Option<Arc<dyn CompactGate>>,
 }
 
 impl Default for Upkeep {
@@ -128,6 +131,7 @@ impl Upkeep {
     /// One frame per segment (`segment_bytes: 1`), `compact_from` as the
     /// default, and `gate`: a compaction at every built event that covers
     /// every segment but the newest. What `AGENTFS_COMPACT_GATE` sets.
+    #[cfg(any(test, feature = "test-util"))]
     pub fn gated(gate: Arc<dyn CompactGate>) -> Self {
         Self {
             segment_bytes: 1,
@@ -662,6 +666,7 @@ impl TreeActor {
     ///
     /// [`Error::Exists`] for any other directory, [`Error::Busy`] while another
     /// holds the state area, and any failed write.
+    #[cfg(any(test, feature = "test-util"))]
     pub fn create(
         root: &Path,
         identity: &VolumeIdentity,
@@ -676,7 +681,8 @@ impl TreeActor {
     /// # Errors
     ///
     /// As [`TreeActor::create`].
-    pub fn create_with(
+    #[cfg_attr(feature = "test-util", visibility::make(pub))]
+    pub(crate) fn create_with(
         root: &Path,
         identity: &VolumeIdentity,
         root_owner: Option<FileOwner>,
@@ -1335,7 +1341,8 @@ impl TreeActor {
     /// [`Error::NotFound`] for an upstream that is no tree, and for a fork:
     /// forks are made of the root only (recovery refuses a fork of a fork);
     /// `rows`' own error; a failed copy or record, which changes nothing.
-    pub fn fork_with<F>(&mut self, upstream: TreeId, rows: F) -> Result<TreeId>
+    #[cfg_attr(feature = "test-util", visibility::make(pub))]
+    pub(crate) fn fork_with<F>(&mut self, upstream: TreeId, rows: F) -> Result<TreeId>
     where
         F: FnOnce(TreeId, RecordNo) -> Result<Vec<RowWrite>>,
     {
@@ -1397,7 +1404,7 @@ impl TreeActor {
     /// # Errors
     ///
     /// `rows`' own error; a failed record, which changes nothing.
-    pub fn record_rows<F>(&mut self, rows: F) -> Result<RecordNo>
+    pub(crate) fn record_rows<F>(&mut self, rows: F) -> Result<RecordNo>
     where
         F: FnOnce(RecordNo) -> Result<Vec<RowWrite>>,
     {
@@ -1435,7 +1442,8 @@ impl TreeActor {
     /// it, or a fork names it as upstream ([`TreeActor::has_child`]);
     /// [`Error::NotFound`] for the root or no such tree; `rows`' own error; a
     /// failed record, which changes nothing.
-    pub fn drop_fork<F>(&mut self, fork: TreeId, rows: F) -> Result<()>
+    #[cfg_attr(feature = "test-util", visibility::make(pub))]
+    pub(crate) fn drop_fork<F>(&mut self, fork: TreeId, rows: F) -> Result<()>
     where
         F: FnOnce(RecordNo) -> Result<Vec<RowWrite>>,
     {

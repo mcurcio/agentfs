@@ -4,10 +4,11 @@
 # libgit2 (no OpenSSL, no ring, no aws-lc); `otlp-tls` adds ring and rustls
 # only; `ssh` adds russh with ring and never OpenSSL or libssh2; only `https`
 # brings OpenSSL. The library: no recording engine, no FUSE, no
-# OpenTelemetry SDK or exporter, no TLS and no libssh2. The recording engine
-# is refused here, not by the ranks: its rank is the tree engine's
-# (docs/target-architecture/future/crate-split.md, "Traps"). The ranks
-# refuse the FUSE layer.
+# OpenTelemetry SDK or exporter, no TLS and no libssh2, and no crate of the
+# workspace with a test build's feature (test-util, failpoints) turned on.
+# The recording engine is refused here, not by the ranks: its rank is the
+# tree engine's (docs/target-architecture/future/crate-split.md, "Traps").
+# The ranks refuse the FUSE layer.
 set -euo pipefail
 
 packages() { # cargo-tree-args...
@@ -47,3 +48,8 @@ all=$(library)
 found=$(grep -Ex "agentfs-core|fuser|opentelemetry_sdk|opentelemetry-otlp|$NO_TLS|libssh2-sys" <<<"$all" || true)
 [ -z "$found" ] || fail "library links $(echo "$found" | tr '\n' ' ')"
 echo "ok   library"
+
+features=$(cargo tree --locked -p agentfs -e normal,features --prefix none --format '{p}')
+found=$(grep -E '^agentfs-[a-z-]+ feature "(test-util|failpoints)"' <<<"$features" | sort -u || true)
+[ -z "$found" ] || fail "library turns on $(echo "$found" | tr '\n' ' ')"
+echo "ok   library features"

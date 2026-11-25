@@ -65,6 +65,9 @@ tiny_http = "0.12.0"
 git2 = { version = "0.21.0", default-features = false }
 
 [dev-dependencies]
+# The engine's test-only surface: the store read by cli_verify.rs and the
+# compaction gate's variable in reference_tests.rs.
+agentfs-engine = { version = "0.1.0", path = "../agentfs-engine", features = ["test-util"] }
 # The markdown reader of the documentation tests (src/reference_tests.rs).
 agentfs-repo = { version = "0.0.0", path = "../agentfs-repo" }
 # The tree engine's rule set, for the deploy examples' rule files
@@ -98,5 +101,6 @@ ssh = ["agentfs-core/ssh"]
 otlp-tls = ["dep:reqwest", "dep:rustls", "dep:rustls-native-certs", "dep:rustls-pki-types", "dep:tonic", "opentelemetry-otlp/tls-ring"]
 # Test builds only: failpoints on the durable path,
 # set by AGENTFS_FAILPOINTS. `--version` says `+failpoints`. Never in a
-# release or image.
-failpoints = ["agentfs-core/failpoints", "agentfs-engine/failpoints", "agentfs-failpoints/failpoints", "agentfs-fuse/failpoints"]
+# release or image. The engine's test-util is for the compaction gate
+# (`launcher::upkeep`).
+failpoints = ["agentfs-core/failpoints", "agentfs-engine/failpoints", "agentfs-engine/test-util", "agentfs-failpoints/failpoints", "agentfs-fuse/failpoints"]

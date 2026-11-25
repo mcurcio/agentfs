@@ -1265,7 +1265,11 @@ impl TreeActor {
     /// # Errors
     ///
     /// A failed close-record append or save, as [`TreeActor::close`].
-    pub fn close_writer(&mut self, tree: TreeId, writer: &WriterLabel) -> Result<Vec<Saved>> {
+    pub(crate) fn close_writer(
+        &mut self,
+        tree: TreeId,
+        writer: &WriterLabel,
+    ) -> Result<Vec<Saved>> {
         if self.is_stopped() {
             return Err(Error::Stopped);
         }

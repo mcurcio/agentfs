@@ -38,7 +38,8 @@ use agentfs_engine::tree_actor::TreeId;
 use anyhow::{Context as _, Result};
 
 use super::serving::{self, Driver, Serving, Trigger};
-use super::{context, found, guard, identity, settings};
+use super::{context, found, guard, settings};
+use crate::otel::Identity;
 use crate::pod_args::PodArgs;
 
 /// Exit status of a host not run by a launcher, or told a malformed line.
@@ -111,10 +112,7 @@ pub fn host(state: &Path, args: HostArgs, minter: Minter) -> Result<ExitCode> {
     };
     guard(&volume.name, &args.volume)?;
     let boot = settings::at_boot(state, &[])?;
-    let otel = crate::otel::init(
-        volume.name.as_str(),
-        &identity(volume.name.as_str(), &args.pod),
-    );
+    let otel = crate::otel::init(volume.name.as_str(), &Identity::of_pod(&args.pod));
     telemetry::observe_process(otel.meter(), &boot.not_built);
     let cap = LaunchCap::mint(&minter, launcher, LaunchScope::Root);
     let launcher = super::launcher(minter, cap, at);

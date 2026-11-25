@@ -62,6 +62,17 @@ the crash-injection failpoints (`AGENTFS_FAILPOINTS`
 in the [configuration reference](configuration.md)). Never ship such a
 build: its `--version` ends in `+failpoints`.
 
+Beside it, `agentfs-engine`'s `test-util` feature makes the engine's
+test-only surface `pub` ([engine](library/engine.md#test-builds)). It is off
+by default and the library crate `agentfs` never turns it on. The engine's
+own tests get it through a dev-dependency on the engine itself, the FUSE
+layer's and the binary's tests through their dev-dependencies, the binary's
+`failpoints` build through that feature, and `agentfs-conformance` through
+its dependency. A workspace-wide build therefore has it on: build the
+library alone, as a consumer does, with
+`cargo clippy -p agentfs-engine -p agentfs-service -p agentfs --lib` and
+`cargo test --doc -p agentfs`.
+
 The container image:
 
 ```sh
@@ -240,7 +251,10 @@ Every push runs [`.github/workflows/ci.yml`](../.github/workflows/ci.yml):
 - **lint:** rustfmt, clippy with default and all features, and
   [`ci/check-deps.sh`](../ci/check-deps.sh): what C and crypto each feature
   set of the binary links, and that the library crate `agentfs` links no
-  recording engine, FUSE, OpenTelemetry SDK, TLS or SSH.
+  recording engine, FUSE, OpenTelemetry SDK, TLS or SSH and turns on no
+  `test-util` or `failpoints` feature. Then the library as a consumer builds
+  it, without `test-util`: clippy of `agentfs-engine`, `agentfs-service`
+  and `agentfs`'s libraries, and `agentfs`'s doctest.
 - **test:** the workspace tests under nextest's `ci` profile, then the
   doctests with `cargo test --doc`, with default and all features. They
   include `restore` and `revert` without a mount
