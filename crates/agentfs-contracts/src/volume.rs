@@ -156,6 +156,10 @@ pub enum VolumeError {
     Busy,
     #[error("the volume's state could not be made durable: {0:?}")]
     NotDurable(IoKind),
+    /// The state area could not be read: its path and the I/O failure.
+    /// Nothing was written.
+    #[error("the volume's state area could not be read: {0}")]
+    Unreadable(String),
     /// The operator's rules hold one the volume does not build: refused
     /// before anything was written. Carries the refusal, naming the file and
     /// line.
@@ -199,7 +203,8 @@ pub trait Volume {
     ///
     /// # Errors
     ///
-    /// `NotPermitted` for a fork launcher; the refusals above; `NotDurable`.
+    /// `NotPermitted` for a fork launcher; the refusals above; `Unreadable`,
+    /// `NotDurable`.
     fn ensure(
         &mut self,
         spec: VolumeSpec,

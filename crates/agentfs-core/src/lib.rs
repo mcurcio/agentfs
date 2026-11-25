@@ -57,6 +57,7 @@ pub mod telemetry;
 pub mod tracked;
 pub mod tree_actor;
 pub mod tree_git;
+pub mod tree_telemetry;
 pub mod visibility;
 pub mod volume;
 pub(crate) mod watched;

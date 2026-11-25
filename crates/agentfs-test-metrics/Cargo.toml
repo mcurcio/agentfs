@@ -10,3 +10,8 @@ publish = false
 
 [package.metadata.agentfs]
 rank = "tests"
+
+[dependencies]
+opentelemetry = { version = "0.33.1", default-features = false, features = ["metrics"] }
+# The SDK's meter provider and its in-memory exporter.
+opentelemetry_sdk = { version = "0.33.1", default-features = false, features = ["metrics", "testing"] }

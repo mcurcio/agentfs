@@ -25,6 +25,7 @@ is. The libraries behind it, and why each was chosen, are under
 | `agentfs-clients` | library | The Clients domain, pure over its ports: attachments, grants and each fork's one writer |
 | `agentfs-trees` | library | The Trees domain, pure over its ports: each fork's lifecycle |
 | `agentfs-conformance` | library and binary, tests only | The model's recorded calls against the real tree library and real mounts (git-model §18). Depends on `agentfs-core` and `agentfs-model`; nothing depends on it |
+| `agentfs-test-metrics` | library, tests only | The one in-memory reader of OpenTelemetry metrics the engines' tests share: a meter over the SDK's in-memory exporter, and the point of a metric by name and exact attributes. Depends on no other agentfs crate |
 | `agentfs-repo` | library, tests only | Checks over the whole repository, as its tests: the documentation against the code, the workflows and CI scripts, the sources' repository-wide rules, the crates and their ranks. Its library is what the documentation tests share: a reader of the markdown in `docs/` and of the workspace as `cargo metadata` describes it. Its library depends on no other agentfs crate |
 
 Which crate may depend on which is set by the ranks below, and a test
@@ -41,8 +42,9 @@ workspace manifest lists the ranks, each after every rank it uses, with the
 ranks each may use (`[workspace.metadata.agentfs] ranks`). A normal or build
 dependency on another package of the workspace must be in a rank its own
 rank uses, so two packages of one rank never depend on each other unless the
-rank uses itself. A dev-dependency may point anywhere, as a test of the
-binary drives the CSI driver. `crates/agentfs-repo` checks the manifests,
+rank uses itself. A dev-dependency may point anywhere but at a sibling of
+a rank that does not use itself, as a test of the binary drives the CSI
+driver; one engine's tests never build the other. `crates/agentfs-repo` checks the manifests,
 and this table against the workspace manifest.
 
 | Rank | Uses | Layer | What it holds |
@@ -54,7 +56,7 @@ and this table against the workspace manifest.
 | `engine` | `line-identity`, `leaf`, `shared-kernel`, `domain` | the library | What implements the ports and owns the state on disk; no engine depends on another |
 | `filesystem` | `leaf`, `shared-kernel`, `domain`, `engine`, `filesystem` | the filesystem | The FUSE layer and the `agentfs` binary, the composition root |
 | `kubernetes` | `leaf`, `shared-kernel`, `engine`, `filesystem` | the kubernetes adapter | The CSI driver |
-| `tests` | `line-identity`, `leaf`, `shared-kernel`, `domain`, `engine`, `filesystem`, `kubernetes`, `tests` | none | Packages that exist only for tests: the model, the conformance replay, the repository checks. No other rank uses it |
+| `tests` | `line-identity`, `leaf`, `shared-kernel`, `domain`, `engine`, `filesystem`, `kubernetes`, `tests` | none | Packages that exist only for tests: the model, the conformance replay, the metric reader, the repository checks. No other rank uses it |
 
 ## Module map
 
@@ -166,6 +168,7 @@ row names a module that no longer exists; `tests.rs` files are not listed.
 | `volume.rs` | Opens a state area: crash recovery, then the [`Recorder`](#the-synchronous-step) used at every boundary and the `Committer` that turns records into commits |
 | `record.rs` | What the journal stores: one record per change boundary, absolute state, never deltas |
 | `state_area.rs` | The `StateArea` port over the tree actor: inspect without the lock, create a volume with a new id and its root owner, open and keep the recovered volume, served (`Recording`), with the upkeep its caller gave (`with_upkeep`); once open, Volume's `VolumeStore` and `QueueFacts` through the `TreeStore` it makes |
+| `tree_telemetry.rs` | The tree engine's OpenTelemetry instruments, registered on a `Meter` its caller makes (the binary): `observe_process` (`agentfs.not_built`, the volume lock's, the lag gate's and the tree views' requests' latency figures, the journal's checkpoints) and `observe_unverified` (`agentfs.history.unverified`) |
 | `session.rs` | The history service's sessions (`Sessions`, the `SessionBinder` port): each bound to a client's authority; a `TreeSession` locks the actor with its tree and writer (writes `EROFS` without one, handles only its own); a RELEASE in two halves (`start_close`, then `SaveToDecide::finish` elsewhere); opens read the client's pending saves (`open_map`, `write_open`), folding them with the actor's lock released (`ActorGuard::unlocked`) when they need a fold; an unlink, a rename onto a file, a replace or a path truncate of a file with a pending save is refused with `PathStep::WaitFor` and retried by `when_saved_then` through `lock_retrying`, refused again only for a save begun before the first refusal; unbind saves the client's opens and makes them durable |
 | `store.rs` | The domains' store ports over one served volume (`TreeStore`): Trees' `ForkStore` (create, end, drop), Clients' `ClientStore` (attach, rebind, end, release a claim on each tree's Clients chain), Volume's `VolumeStore` (the lifecycle row on `refs/agentfs/volume`) and the `QueueFacts`, each write one journal step (a fork and its row, a drop and its row, or rows alone) made durable before it returns, off the actor's lock; the audit stamps' one home (`created` set once, `changed` each write); the ports' word for each actor failure |
 | `tree_actor/mod.rs` | The tree actor: the actor, recovery and queue orchestration. A step is one unit of work: decided, appended to the journal as the change itself, applied to the saved state, with no git on the call path; creating a volume (its identity file, then `format` last), inspecting and opening a state area, recovery (history built through the journal, then abandoned opens closed); each tree's last head-moving step and the keys steps touched, which a take's land checks |
@@ -261,7 +264,7 @@ row names a module that no longer exists; `tests.rs` files are not listed.
 | `config.rs` | Operator settings from the history repository's own git config, and `config::KEYS` |
 | `operator_settings.rs` | A tree volume's operator settings: `<state>/config`, its `include.path` lines written whole and read with libgit2 following them, `classify`, the one table of keys tree volumes do not build yet (push, patches, LFS, other), `overlay_limit` (`agentfs.overlayLimit`, checked), and `install_rules`, which installs a launcher's operator rule files as `info/exclude` and `info/attributes`, each written whole |
 | `events.rs` | Alarm and event signals, handed to a non-blocking sink |
-| `telemetry.rs` | OpenTelemetry instruments and spans over the API only, the `agentfs.not_built` gauge among them; the binary picks exporters |
+| `telemetry.rs` | The recording engine's OpenTelemetry instruments and spans over the API only; the binary picks exporters |
 | `history_service/mod.rs` | One history service per volume fed by fronts |
 | `history_service/wire.rs` | The gRPC contract `agentfs.history.v2` (generated from `proto/`) and its validated conversions to agentfs types |
 | `history_service/bridge.rs` | Synchronous callers on a tokio runtime (Tokio's bridging pattern): multi-thread, or current-thread driven by its callers; for the client and the server |

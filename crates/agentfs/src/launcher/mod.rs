@@ -47,8 +47,10 @@ use agentfs_core::identity::Context as Identity;
 use agentfs_core::operator_settings;
 use agentfs_core::state_area::TreeStateArea;
 use agentfs_core::tree_actor::{self, Recording, TreeId, Upkeep};
+use agentfs_core::tree_telemetry;
 use agentfs_volume::VolumeService;
 use anyhow::{Context, Result, bail};
+use opentelemetry::metrics::Meter;
 
 use self::domains::{ClientsSlot, Domains};
 use self::serving::{Serving, Trigger};
@@ -66,16 +68,13 @@ const EXIT_NOT_STARTED: u8 = 127;
 const UPGRADE_RUNBOOK: &str = "docs/runbooks/upgrading-the-sidecar.md";
 
 /// The gauge of the volume's flagged saves (`agentfs.history.unverified`),
-/// registered on `telemetry`: it reads the staged volume's counts while the
+/// registered on `meter`: it reads the staged volume's counts while the
 /// returned handle lives, never the actor's lock.
 ///
 /// # Errors
 ///
 /// The actor stopped before the gauge could be registered.
-fn observe_unverified(
-    telemetry: &agentfs_core::telemetry::Telemetry,
-    domains: &Domains,
-) -> Result<UnverifiedGauge> {
+fn observe_unverified(meter: &Meter, domains: &Domains) -> Result<UnverifiedGauge> {
     let verification = domains
         .sessions
         .recording()
@@ -83,7 +82,7 @@ fn observe_unverified(
         .context("reading the volume's flagged saves")?
         .verification();
     let gauge: UnverifiedGauge = std::sync::Arc::new(move || verification.counts());
-    telemetry.observe_unverified(std::sync::Arc::downgrade(&gauge));
+    tree_telemetry::observe_unverified(meter, std::sync::Arc::downgrade(&gauge));
     Ok(gauge)
 }
 
@@ -240,16 +239,14 @@ fn context(pod: &PodArgs) -> Result<PodContext> {
 ///
 /// The state area cannot be read.
 fn found(state: &Path) -> Result<std::result::Result<VolumeIdentity, ExitCode>> {
-    Ok(
-        match tree_actor::inspect(state).context("reading the state area")? {
-            Found::Nothing => {
-                eprintln!("error: no volume here: run `agentfs init --volume NAME` first");
-                Err(ExitCode::FAILURE)
-            }
-            Found::Other => Err(other_format(state)),
-            Found::Volume(identity) => Ok(identity),
-        },
-    )
+    Ok(match TreeStateArea::at(state).inspect()? {
+        Found::Nothing => {
+            eprintln!("error: no volume here: run `agentfs init --volume NAME` first");
+            Err(ExitCode::FAILURE)
+        }
+        Found::Other => Err(other_format(state)),
+        Found::Volume(identity) => Ok(identity),
+    })
 }
 
 /// The `--volume` guard: another name at the state area is refused before
@@ -413,8 +410,7 @@ pub fn mount(state: &Path, args: MountArgs, minter: Minter) -> Result<ExitCode> 
     mountpoint::outside_the_state_area(state, &views)?;
     let boot = settings::at_boot(state, &views)?;
     let otel = crate::otel::init(name.as_str(), &identity(name.as_str(), &args.pod));
-    otel.telemetry().observe_not_built(&boot.not_built);
-    otel.telemetry().observe_latency();
+    tree_telemetry::observe_process(otel.meter(), &boot.not_built);
     let expect: Vec<mountpoint::Expect> = std::iter::once(mountpoint::Expect::Source(
         agentfs_fuse::tree_view::view_source(name.as_str(), TreeId::Root),
     ))
@@ -450,7 +446,7 @@ pub fn mount(state: &Path, args: MountArgs, minter: Minter) -> Result<ExitCode> 
         command: args.command,
         volume: name,
         overlay_limit: boot.overlay_limit,
-        telemetry: otel.telemetry().clone(),
+        meter: otel.meter().clone(),
     };
     let code = mount.run(state, root, fork, minter);
     drop(otel);
@@ -549,8 +545,8 @@ struct Mount {
     volume: VolumeName,
     /// The lag gate's overlay limit, from the operator settings.
     overlay_limit: u64,
-    /// The process's telemetry: the flagged saves' gauge registers on it.
-    telemetry: agentfs_core::telemetry::Telemetry,
+    /// The process's meter: the flagged saves' gauge registers on it.
+    meter: Meter,
 }
 
 /// What a view that could not open says.
@@ -623,7 +619,7 @@ impl Mount {
             Ok(staged) => staged,
             Err(code) => return Ok(code),
         };
-        let _gauge = observe_unverified(&self.telemetry, &staged.domains)?;
+        let _gauge = observe_unverified(&self.meter, &staged.domains)?;
         let domains = &mut staged.domains;
         let mut specs = vec![root];
         if let Some(ForkView { mut spec, key }) = fork {

@@ -133,6 +133,7 @@ dependencies = [
  "agentfs-os",
  "agentfs-repo",
  "agentfs-rules",
+ "agentfs-test-metrics",
  "agentfs-trees",
  "agentfs-volume",
  "base64 0.23.1",
@@ -300,6 +301,10 @@ dependencies = [
 [[package]]
 name = "agentfs-test-metrics"
 version = "0.0.0"
+dependencies = [
+ "opentelemetry",
+ "opentelemetry_sdk",
+]
 
 [[package]]
 name = "agentfs-trees"

@@ -5395,24 +5395,32 @@ mod tests {
             h.telemetry.observe_volume(&v.state, &v.settings);
             v.commit();
             let head = v.commit();
-            assert_eq!(h.gauge_u64(names::PUSH_UNPUSHED_COMMITS, origin()), Some(2));
+            assert_eq!(
+                h.metrics.gauge_u64(names::PUSH_UNPUSHED_COMMITS, origin()),
+                Some(2)
+            );
             let age = h
+                .metrics
                 .gauge_f64(names::PUSH_OLDEST_UNPUSHED_AGE, origin())
                 .unwrap();
             assert!((0.0..60.0).contains(&age), "{age}");
-            assert_eq!(h.gauge_u64(names::PUSH_DIVERGED, origin()), Some(0));
+            assert_eq!(h.metrics.gauge_u64(names::PUSH_DIVERGED, origin()), Some(0));
 
             let mut pusher =
                 v.pusher_with("origin", h.telemetry.sink(Arc::new(NullSink)), &h.telemetry);
             assert!(pusher.push_once().is_success());
-            assert_eq!(h.gauge_u64(names::PUSH_UNPUSHED_COMMITS, origin()), Some(0));
             assert_eq!(
-                h.gauge_f64(names::PUSH_OLDEST_UNPUSHED_AGE, origin()),
+                h.metrics.gauge_u64(names::PUSH_UNPUSHED_COMMITS, origin()),
+                Some(0)
+            );
+            assert_eq!(
+                h.metrics
+                    .gauge_f64(names::PUSH_OLDEST_UNPUSHED_AGE, origin()),
                 Some(0.0)
             );
-            assert_eq!(h.gauge_u64(names::PUSH_DIVERGED, origin()), Some(0));
+            assert_eq!(h.metrics.gauge_u64(names::PUSH_DIVERGED, origin()), Some(0));
             assert_eq!(
-                h.sum(
+                h.metrics.sum(
                     names::PUSH_FAILURES,
                     &[("remote", "origin"), ("reason", "auth"), ("stage", "git")]
                 ),
@@ -5490,7 +5498,7 @@ mod tests {
             );
             assert_eq!(span_attr(span, "agentfs.lfs.objects"), None);
             assert_eq!(
-                h.sum(
+                h.metrics.sum(
                     names::PUSH_FAILURES,
                     &[("remote", "origin"), ("reason", "local"), ("stage", "lfs")]
                 ),
@@ -5510,7 +5518,7 @@ mod tests {
                 assert!(!pusher.push_once().is_success());
             }
             assert_eq!(
-                h.sum(
+                h.metrics.sum(
                     names::PUSH_FAILURES,
                     &[
                         ("remote", "gone"),
@@ -5573,10 +5581,13 @@ mod tests {
             else {
                 panic!("{outcome:?}");
             };
-            assert_eq!(h.gauge_u64(names::PUSH_DIVERGED, origin()), Some(1));
-            assert_eq!(h.gauge_u64(names::PUSH_UNPUSHED_COMMITS, origin()), Some(1));
+            assert_eq!(h.metrics.gauge_u64(names::PUSH_DIVERGED, origin()), Some(1));
             assert_eq!(
-                h.sum(
+                h.metrics.gauge_u64(names::PUSH_UNPUSHED_COMMITS, origin()),
+                Some(1)
+            );
+            assert_eq!(
+                h.metrics.sum(
                     names::PUSH_FAILURES,
                     &[
                         ("remote", "origin"),
@@ -5611,8 +5622,11 @@ mod tests {
                 .reference("refs/heads/agentfs/vol", pushed, true, "operator reset")
                 .unwrap();
             assert!(pusher.push_once().is_success());
-            assert_eq!(h.gauge_u64(names::PUSH_DIVERGED, origin()), Some(0));
-            assert_eq!(h.gauge_u64(names::PUSH_UNPUSHED_COMMITS, origin()), Some(0));
+            assert_eq!(h.metrics.gauge_u64(names::PUSH_DIVERGED, origin()), Some(0));
+            assert_eq!(
+                h.metrics.gauge_u64(names::PUSH_UNPUSHED_COMMITS, origin()),
+                Some(0)
+            );
         }
 
         #[test]
@@ -5640,15 +5654,19 @@ mod tests {
             let h = Harness::new();
             h.telemetry.observe_volume(&v.state, &settings);
             assert_eq!(
-                h.gauge_u64(names::REMOTE_MISCONFIGURED, &[("remote", "team/backup")]),
+                h.metrics
+                    .gauge_u64(names::REMOTE_MISCONFIGURED, &[("remote", "team/backup")]),
                 Some(1)
             );
             assert_eq!(
-                h.gauge_u64(names::REMOTE_MISCONFIGURED, origin()),
+                h.metrics.gauge_u64(names::REMOTE_MISCONFIGURED, origin()),
                 None,
                 "valid remotes are not reported"
             );
-            assert_eq!(h.gauge_u64(names::PUSH_UNPUSHED_COMMITS, origin()), Some(0));
+            assert_eq!(
+                h.metrics.gauge_u64(names::PUSH_UNPUSHED_COMMITS, origin()),
+                Some(0)
+            );
         }
 
         #[test]

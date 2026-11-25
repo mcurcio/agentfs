@@ -5499,7 +5499,8 @@ mod tests {
 
             for trigger in ["close", "unlink"] {
                 assert_eq!(
-                    h.histogram_count(names::RECORD_DURATION, &[("trigger", trigger)]),
+                    h.metrics
+                        .histogram_count(names::RECORD_DURATION, &[("trigger", trigger)]),
                     Some(1),
                     "{trigger}"
                 );
@@ -5541,9 +5542,9 @@ mod tests {
                     rec.record(Trigger::Close, CALLER, vec![write(dir.path(), name, "1")])
                         .unwrap();
                 }
-                assert_eq!(h.gauge_u64(names::JOURNAL_BACKLOG, &[]), Some(2));
+                assert_eq!(h.metrics.gauge_u64(names::JOURNAL_BACKLOG, &[]), Some(2));
                 com.commit_pending().unwrap();
-                assert_eq!(h.gauge_u64(names::JOURNAL_BACKLOG, &[]), Some(0));
+                assert_eq!(h.metrics.gauge_u64(names::JOURNAL_BACKLOG, &[]), Some(0));
                 rec.record(Trigger::Close, CALLER, vec![write(dir.path(), "c", "1")])
                     .unwrap();
                 // Crash before committing.
@@ -5551,13 +5552,13 @@ mod tests {
             let h = Harness::new();
             let (rec, com) = open_traced(&state, dir.path(), &h);
             assert_eq!(
-                h.gauge_u64(names::JOURNAL_BACKLOG, &[]),
+                h.metrics.gauge_u64(names::JOURNAL_BACKLOG, &[]),
                 Some(1),
                 "the recovered record"
             );
             drop((rec, com));
             assert_eq!(
-                h.gauge_u64(names::JOURNAL_BACKLOG, &[]),
+                h.metrics.gauge_u64(names::JOURNAL_BACKLOG, &[]),
                 None,
                 "a closed volume reports nothing"
             );
@@ -5580,7 +5581,7 @@ mod tests {
                 .collect();
             let report = com.commit_pending().unwrap();
             assert_eq!(report.commits, 1);
-            assert_eq!(h.sum(names::COMMIT_COUNT, &[]), Some(1));
+            assert_eq!(h.metrics.sum(names::COMMIT_COUNT, &[]), Some(1));
             let commits = h.spans(spans::COMMIT);
             assert_eq!(commits.len(), 1);
             let head = com.history().head().unwrap().unwrap().id();
@@ -5611,7 +5612,7 @@ mod tests {
                 .unwrap();
             let report = com.commit_pending().unwrap();
             assert_eq!((report.records, report.commits), (1, 0));
-            assert_eq!(h.sum(names::COMMIT_COUNT, &[]), Some(1));
+            assert_eq!(h.metrics.sum(names::COMMIT_COUNT, &[]), Some(1));
             let commits = h.spans(spans::COMMIT);
             assert_eq!(commits.len(), 2);
             assert_eq!(
@@ -5643,11 +5644,13 @@ mod tests {
                 .unwrap_err();
             assert!(matches!(&memory.take()[..], [Event::RecordFailed { .. }]));
             assert_eq!(
-                h.sum(names::RECORD_FAILURES, &[("trigger", "close")]),
+                h.metrics
+                    .sum(names::RECORD_FAILURES, &[("trigger", "close")]),
                 Some(1)
             );
             assert_eq!(
-                h.histogram_count(names::RECORD_DURATION, &[("trigger", "close")]),
+                h.metrics
+                    .histogram_count(names::RECORD_DURATION, &[("trigger", "close")]),
                 Some(1),
                 "failed records are timed too"
             );
@@ -5692,7 +5695,7 @@ mod tests {
                 )
                 .unwrap();
                 assert_eq!(
-                    h.sum(
+                    h.metrics.sum(
                         names::PRECHECK_REJECTED_PATHS,
                         &[("stage", "record"), ("reason", "symlinked_special_file")]
                     ),
@@ -5712,7 +5715,7 @@ mod tests {
             let (_, com) = open_traced(&state, dir.path(), &h);
             assert_eq!(com.commit_pending().unwrap().refused, 1);
             assert_eq!(
-                h.sum(
+                h.metrics.sum(
                     names::PRECHECK_REJECTED_PATHS,
                     &[("stage", "commit"), ("reason", "blob_too_large")]
                 ),
@@ -5754,12 +5757,17 @@ mod tests {
             assert!(usage["git"] > 0, "{usage:?}");
             assert_eq!(usage["lfs"], 0, "no lfs directory yet");
             assert_eq!(
-                h.gauge_u64(names::STATE_BYTES, &[("part", "pending")]),
+                h.metrics
+                    .gauge_u64(names::STATE_BYTES, &[("part", "pending")]),
                 Some(5)
             );
-            assert_eq!(h.gauge_u64(names::STATE_BYTES, &[("part", "lfs")]), Some(0));
             assert_eq!(
-                h.gauge_u64(names::STATE_BYTES, &[("part", "tmp_layer")]),
+                h.metrics.gauge_u64(names::STATE_BYTES, &[("part", "lfs")]),
+                Some(0)
+            );
+            assert_eq!(
+                h.metrics
+                    .gauge_u64(names::STATE_BYTES, &[("part", "tmp_layer")]),
                 Some(0)
             );
             // The sandbox overlay's tmp files count where they live.
@@ -5773,7 +5781,8 @@ mod tests {
             let usage: std::collections::HashMap<_, _> = state.usage().into_iter().collect();
             assert_eq!(usage["pending"], 0);
             assert_eq!(
-                h.gauge_u64(names::STATE_BYTES, &[("part", "pending")]),
+                h.metrics
+                    .gauge_u64(names::STATE_BYTES, &[("part", "pending")]),
                 Some(0)
             );
             // Symlinks are not followed.

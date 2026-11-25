@@ -45,7 +45,6 @@ use opentelemetry::{Context, ContextGuard, InstrumentationScope, KeyValue};
 use crate::config::Settings;
 use crate::events::{Event, EventSink, Events};
 use crate::journal::Journal;
-use crate::operator_settings::{Capability, NotBuilt};
 use crate::push::{self, RemoteBacklog};
 use crate::record::Trigger;
 use crate::volume::StateDir;
@@ -107,8 +106,6 @@ pub mod names {
     pub const PRECHECK_REJECTED_PATHS: &str = "agentfs.precheck.rejected_paths";
     pub const STATE_BYTES: &str = "agentfs.state.bytes";
     pub const REMOTE_MISCONFIGURED: &str = "agentfs.remote.misconfigured";
-    pub const NOT_BUILT: &str = "agentfs.not_built";
-    pub const HISTORY_UNVERIFIED: &str = "agentfs.history.unverified";
     pub const REMOTES_MODE: &str = "agentfs.remotes.mode";
     pub const PATCH_QUEUE_DEPTH: &str = "agentfs.patch.queue_depth";
     pub const PATCH_BLOCKED: &str = "agentfs.patch.blocked";
@@ -125,19 +122,6 @@ pub mod names {
     pub const RECONCILE_FAILURES: &str = "agentfs.reconcile.failures";
     pub const NESTED_GITDIR_HEURISTIC: &str = "agentfs.nested.gitdir_heuristic";
     pub const FORK_PUBLISH_DURATION: &str = "agentfs.fork.publish.duration";
-    pub const LOCK_HOLD: &str = "agentfs.lock.hold";
-    pub const LOCK_HOLDS: &str = "agentfs.lock.holds";
-    pub const LOCK_HOLD_LONGEST: &str = "agentfs.lock.hold.longest";
-    pub const LOCK_WAIT: &str = "agentfs.lock.wait";
-    pub const LOCK_WAITS: &str = "agentfs.lock.waits";
-    pub const LOCK_WAIT_LONGEST: &str = "agentfs.lock.wait.longest";
-    pub const GATE_WAIT: &str = "agentfs.gate.wait";
-    pub const GATE_WAITS: &str = "agentfs.gate.waits";
-    pub const GATE_WAIT_LONGEST: &str = "agentfs.gate.wait.longest";
-    pub const JOURNAL_CHECKPOINTS: &str = "agentfs.journal.checkpoints";
-    pub const REQUEST_TIME: &str = "agentfs.request.time";
-    pub const REQUESTS: &str = "agentfs.requests";
-    pub const REQUEST_LONGEST: &str = "agentfs.request.longest";
     /// Recorded by the binary, which owns the exporters.
     pub const TELEMETRY_EXPORT_FAILURES: &str = "agentfs.telemetry.export_failures";
 }
@@ -639,186 +623,6 @@ impl Telemetry {
                 .racy_rechecks
                 .add(1, &[KeyValue::new("outcome", outcome)]);
         }
-    }
-
-    /// Registers `agentfs.not_built` (unit `{setting}`): one point per
-    /// capability with configured settings not built, their count, attribute
-    /// `capability` = [`Capability::as_str`]. Call once per process; a noop
-    /// telemetry registers nothing.
-    pub fn observe_not_built(&self, not_built: &[NotBuilt]) {
-        let Some(inner) = &self.inner else {
-            return;
-        };
-        let mut counts = std::collections::BTreeMap::<Capability, u64>::new();
-        for setting in not_built {
-            *counts.entry(setting.capability).or_default() += 1;
-        }
-        inner
-            .meter
-            .u64_observable_gauge(names::NOT_BUILT)
-            .with_unit("{setting}")
-            .with_description(
-                "Configured operator settings whose capability this volume does not build yet",
-            )
-            .with_callback(move |observer| {
-                for (capability, count) in &counts {
-                    observer.observe(*count, &[KeyValue::new("capability", capability.as_str())]);
-                }
-            })
-            .build();
-    }
-
-    /// Registers the tree volume's latency figures, read from the process's
-    /// [`Stages`](crate::tree_actor::stages::Stages) at each collection, each
-    /// family as seconds, runs and the longest run: the volume lock's holds
-    /// by `kind` of work (`agentfs.lock.hold`, `.holds`, `.hold.longest`)
-    /// and the waits to take it (`agentfs.lock.wait`, `.waits`,
-    /// `.wait.longest`); the lag gate's waits by `cause`
-    /// (`agentfs.gate.wait`, `.waits`, `.wait.longest`); and the tree views'
-    /// FUSE requests by `op` (`agentfs.request.time`, `agentfs.requests`,
-    /// `agentfs.request.longest`); and the journal checkpoints history's
-    /// compactors published (`agentfs.journal.checkpoints`). Every attribute
-    /// value is observed, zero included. Call once per process; a noop
-    /// telemetry registers nothing.
-    pub fn observe_latency(&self) {
-        use crate::tree_actor::stages::{Stage, Stages};
-        let Some(inner) = &self.inner else {
-            return;
-        };
-        let seconds = |nanos: u64| nanos as f64 / 1e9;
-        inner
-            .meter
-            .u64_observable_counter(names::JOURNAL_CHECKPOINTS)
-            .with_unit("{checkpoint}")
-            .with_description("Journal checkpoints history's compactors published")
-            .with_callback(|observer| observer.observe(Stages::current().checkpoints, &[]))
-            .build();
-        type Read = fn(&Stages) -> Vec<(Option<KeyValue>, Stage)>;
-        let holds: Read = |stages| {
-            stages
-                .lock_hold
-                .by_kind()
-                .into_iter()
-                .map(|(kind, stage)| (Some(KeyValue::new("kind", kind)), stage))
-                .collect()
-        };
-        let waits: Read = |stages| vec![(None, stages.lock_wait)];
-        let gate: Read = |stages| {
-            stages
-                .gate_wait
-                .by_cause()
-                .into_iter()
-                .map(|(cause, stage)| (Some(KeyValue::new("cause", cause)), stage))
-                .collect()
-        };
-        let requests: Read = |stages| {
-            stages
-                .requests
-                .by_op()
-                .into_iter()
-                .map(|(op, latency)| (Some(KeyValue::new("op", op)), latency.stage()))
-                .collect()
-        };
-        for (read, time, count, unit, longest, what) in [
-            (
-                holds,
-                names::LOCK_HOLD,
-                names::LOCK_HOLDS,
-                "{hold}",
-                names::LOCK_HOLD_LONGEST,
-                "the tree volume's lock held",
-            ),
-            (
-                waits,
-                names::LOCK_WAIT,
-                names::LOCK_WAITS,
-                "{wait}",
-                names::LOCK_WAIT_LONGEST,
-                "waits to take the tree volume's lock",
-            ),
-            (
-                gate,
-                names::GATE_WAIT,
-                names::GATE_WAITS,
-                "{wait}",
-                names::GATE_WAIT_LONGEST,
-                "calls held at the lag gate",
-            ),
-            (
-                requests,
-                names::REQUEST_TIME,
-                names::REQUESTS,
-                "{request}",
-                names::REQUEST_LONGEST,
-                "the tree views' FUSE requests",
-            ),
-        ] {
-            inner
-                .meter
-                .f64_observable_counter(time)
-                .with_unit("s")
-                .with_description(format!("Seconds of {what}"))
-                .with_callback(move |observer| {
-                    for (attr, stage) in read(&Stages::current()) {
-                        observer.observe(seconds(stage.nanos), attr.as_slice());
-                    }
-                })
-                .build();
-            inner
-                .meter
-                .u64_observable_counter(count)
-                .with_unit(unit)
-                .with_description(format!("Runs of {what}"))
-                .with_callback(move |observer| {
-                    for (attr, stage) in read(&Stages::current()) {
-                        observer.observe(stage.count, attr.as_slice());
-                    }
-                })
-                .build();
-            inner
-                .meter
-                .f64_observable_gauge(longest)
-                .with_unit("s")
-                .with_description(format!("The longest run of {what}"))
-                .with_callback(move |observer| {
-                    for (attr, stage) in read(&Stages::current()) {
-                        observer.observe(seconds(stage.max_nanos), attr.as_slice());
-                    }
-                })
-                .build();
-        }
-    }
-
-    /// Registers `agentfs.history.unverified` (unit `{step}`): a tree
-    /// volume's saves history flagged because the builder could not check
-    /// them (docs/trees.md, "When history cannot check a save"), read from
-    /// `counts` at each collection, one point per `verdict`: `unresolved`
-    /// (no verdict yet) and `mismatch_confirmed` (checked again and still
-    /// disagreeing), both always observed, zero included. Call once per
-    /// process; a noop telemetry registers nothing.
-    pub fn observe_unverified(
-        &self,
-        counts: Weak<dyn Fn() -> crate::tree_actor::UnverifiedCounts + Send + Sync>,
-    ) {
-        let Some(inner) = &self.inner else {
-            return;
-        };
-        inner
-            .meter
-            .u64_observable_gauge(names::HISTORY_UNVERIFIED)
-            .with_unit("{step}")
-            .with_description("Saves history flagged because the builder could not check them")
-            .with_callback(move |observer| {
-                if let Some(counts) = counts.upgrade() {
-                    let counts = counts();
-                    observer.observe(counts.unresolved, &[KeyValue::new("verdict", "unresolved")]);
-                    observer.observe(
-                        counts.mismatch_confirmed,
-                        &[KeyValue::new("verdict", "mismatch_confirmed")],
-                    );
-                }
-            })
-            .build();
     }
 
     /// Registers `agentfs.history_service.fronts`, the number of distinct
@@ -1417,43 +1221,28 @@ impl<L: Logger + Send + Sync> AlarmLog for OtelAlarmLog<L> {
 
 #[cfg(test)]
 pub(crate) mod testing {
-    //! A [`Telemetry`] over the SDK's in-memory exporters, for tests.
+    //! A [`Telemetry`] over in-memory exporters, for tests: metrics through
+    //! `agentfs_test_metrics`, spans and logs through the SDK's own.
 
+    use agentfs_test_metrics::MetricReader;
     use opentelemetry::logs::LoggerProvider as _;
-    use opentelemetry::metrics::MeterProvider as _;
     use opentelemetry_sdk::logs::{InMemoryLogExporter, SdkLogRecord, SdkLoggerProvider};
-    use opentelemetry_sdk::metrics::data::{AggregatedMetrics, MetricData, ResourceMetrics};
-    use opentelemetry_sdk::metrics::{InMemoryMetricExporter, PeriodicReader, SdkMeterProvider};
     use opentelemetry_sdk::trace::{InMemorySpanExporter, SdkTracerProvider, SpanData};
 
     use super::*;
 
     pub(crate) struct Harness {
         pub(crate) telemetry: Telemetry,
-        meters: SdkMeterProvider,
-        metrics: InMemoryMetricExporter,
+        pub(crate) metrics: MetricReader,
         tracers: SdkTracerProvider,
         spans: InMemorySpanExporter,
         loggers: SdkLoggerProvider,
         logs: InMemoryLogExporter,
     }
 
-    /// One metric data point, flattened.
-    #[derive(Debug, Clone, PartialEq)]
-    pub(crate) enum Point {
-        U64(u64),
-        F64(f64),
-        I64(i64),
-        /// A histogram's count.
-        Count(u64),
-    }
-
     impl Harness {
         pub(crate) fn new() -> Self {
-            let metrics = InMemoryMetricExporter::default();
-            let meters = SdkMeterProvider::builder()
-                .with_reader(PeriodicReader::builder(metrics.clone()).build())
-                .build();
+            let metrics = MetricReader::new();
             let spans = InMemorySpanExporter::default();
             let tracers = SdkTracerProvider::builder()
                 .with_simple_exporter(spans.clone())
@@ -1467,7 +1256,7 @@ pub(crate) mod testing {
                 BoxedTracer::new(tracers.boxed_tracer(scope()))
             };
             let telemetry = Telemetry::new(
-                &meters.meter_with_scope(scope()),
+                &metrics.meter(scope()),
                 Some(tracer),
                 Some(Box::new(OtelAlarmLog::new(
                     loggers.logger_with_scope(scope()),
@@ -1475,52 +1264,11 @@ pub(crate) mod testing {
             );
             Self {
                 telemetry,
-                meters,
                 metrics,
                 tracers,
                 spans,
                 loggers,
                 logs,
-            }
-        }
-
-        /// Collects metrics now and returns the export (cumulative), or
-        /// `None` if there was nothing to export.
-        pub(crate) fn collect(&self) -> Option<ResourceMetrics> {
-            self.metrics.reset();
-            self.meters.force_flush().unwrap();
-            self.metrics.get_finished_metrics().unwrap().pop()
-        }
-
-        /// The data point of metric `name` whose attributes are exactly
-        /// `attrs`, from a fresh collection.
-        pub(crate) fn point(&self, name: &str, attrs: &[(&str, &str)]) -> Option<Point> {
-            let collected = self.collect()?;
-            find_point(&collected, name, attrs)
-        }
-
-        pub(crate) fn sum(&self, name: &str, attrs: &[(&str, &str)]) -> Option<u64> {
-            match self.point(name, attrs)? {
-                Point::U64(v) => Some(v),
-                other => panic!("{name} is {other:?}"),
-            }
-        }
-
-        pub(crate) fn gauge_u64(&self, name: &str, attrs: &[(&str, &str)]) -> Option<u64> {
-            self.sum(name, attrs)
-        }
-
-        pub(crate) fn gauge_f64(&self, name: &str, attrs: &[(&str, &str)]) -> Option<f64> {
-            match self.point(name, attrs)? {
-                Point::F64(v) => Some(v),
-                other => panic!("{name} is {other:?}"),
-            }
-        }
-
-        pub(crate) fn histogram_count(&self, name: &str, attrs: &[(&str, &str)]) -> Option<u64> {
-            match self.point(name, attrs)? {
-                Point::Count(v) => Some(v),
-                other => panic!("{name} is {other:?}"),
             }
         }
 
@@ -1544,54 +1292,6 @@ pub(crate) mod testing {
                 .into_iter()
                 .map(|l| l.record)
                 .collect()
-        }
-    }
-
-    fn attrs_match<'a>(got: impl Iterator<Item = &'a KeyValue>, want: &[(&str, &str)]) -> bool {
-        let mut got: Vec<(String, String)> = got
-            .map(|kv| (kv.key.to_string(), kv.value.to_string()))
-            .collect();
-        got.sort();
-        let mut want: Vec<(String, String)> = want
-            .iter()
-            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
-            .collect();
-        want.sort();
-        got == want
-    }
-
-    fn find_point(
-        collected: &ResourceMetrics,
-        name: &str,
-        attrs: &[(&str, &str)],
-    ) -> Option<Point> {
-        let metric = collected
-            .scope_metrics()
-            .flat_map(|s| s.metrics())
-            .find(|m| m.name() == name)?;
-        macro_rules! scan {
-            ($data:expr, $wrap:path) => {
-                match $data {
-                    MetricData::Sum(sum) => sum
-                        .data_points()
-                        .find(|p| attrs_match(p.attributes(), attrs))
-                        .map(|p| $wrap(p.value())),
-                    MetricData::Gauge(gauge) => gauge
-                        .data_points()
-                        .find(|p| attrs_match(p.attributes(), attrs))
-                        .map(|p| $wrap(p.value())),
-                    MetricData::Histogram(h) => h
-                        .data_points()
-                        .find(|p| attrs_match(p.attributes(), attrs))
-                        .map(|p| Point::Count(p.count())),
-                    MetricData::ExponentialHistogram(_) => None,
-                }
-            };
-        }
-        match metric.data() {
-            AggregatedMetrics::U64(data) => scan!(data, Point::U64),
-            AggregatedMetrics::F64(data) => scan!(data, Point::F64),
-            AggregatedMetrics::I64(data) => scan!(data, Point::I64),
         }
     }
 
@@ -1694,41 +1394,42 @@ mod tests {
         }
         let rejected = names::PRECHECK_REJECTED_PATHS;
         assert_eq!(
-            h.sum(
+            h.metrics.sum(
                 rejected,
                 &[("stage", "record"), ("reason", "blob_too_large")]
             ),
             Some(1)
         );
         assert_eq!(
-            h.sum(
+            h.metrics.sum(
                 rejected,
                 &[("stage", "commit"), ("reason", "symlink_into_git_dir")]
             ),
             Some(1)
         );
         assert_eq!(
-            h.sum(names::RECORD_FAILURES, &[("trigger", "close")]),
+            h.metrics
+                .sum(names::RECORD_FAILURES, &[("trigger", "close")]),
             Some(1)
         );
-        assert_eq!(h.sum(names::COMMIT_FAILURES, &[]), Some(1));
-        assert_eq!(h.sum(names::REPACK_FAILURES, &[]), Some(1));
+        assert_eq!(h.metrics.sum(names::COMMIT_FAILURES, &[]), Some(1));
+        assert_eq!(h.metrics.sum(names::REPACK_FAILURES, &[]), Some(1));
         assert_eq!(
-            h.sum(
+            h.metrics.sum(
                 names::PUSH_FAILURES,
                 &[("remote", "origin"), ("reason", "auth"), ("stage", "git")]
             ),
             Some(2)
         );
         assert_eq!(
-            h.sum(
+            h.metrics.sum(
                 names::PUSH_FAILURES,
                 &[("remote", "origin"), ("reason", "auth"), ("stage", "lfs")]
             ),
             Some(1)
         );
         assert_eq!(
-            h.sum(
+            h.metrics.sum(
                 names::PUSH_FAILURES,
                 &[
                     ("remote", "backup"),
@@ -1767,7 +1468,11 @@ mod tests {
             ("ownership", 1),
             ("xattr", 1),
         ] {
-            assert_eq!(h.sum(name, &[("reason", reason)]), Some(n), "{reason}");
+            assert_eq!(
+                h.metrics.sum(name, &[("reason", reason)]),
+                Some(n),
+                "{reason}"
+            );
         }
         Telemetry::noop().overlay_refused(OverlayRefusal::Xattr);
     }
@@ -1855,111 +1560,6 @@ mod tests {
         );
         // No span was current, so the records carry no trace context.
         assert!(logs.iter().all(|r| r.trace_context().is_none()));
-    }
-
-    /// One point per capability with settings not built, their count; none
-    /// for a capability with nothing configured.
-    #[test]
-    fn not_built_settings_are_counted_by_capability() {
-        let h = Harness::new();
-        let setting = |key: &str, capability| NotBuilt {
-            key: key.to_owned(),
-            capability,
-        };
-        h.telemetry.observe_not_built(&[
-            setting("remote.origin.url", Capability::Push),
-            setting("remote.origin.push", Capability::Push),
-            setting("agentfs.patchremote", Capability::Patches),
-        ]);
-        let gauge = |capability| h.gauge_u64(names::NOT_BUILT, &[("capability", capability)]);
-        assert_eq!(gauge("push"), Some(2));
-        assert_eq!(gauge("patches"), Some(1));
-        assert_eq!(gauge("lfs"), None);
-        assert_eq!(gauge("other"), None);
-    }
-
-    /// The latency figures: every kind of hold, gate cause and request op
-    /// observed, zeros included, and a hold and a wait through a real
-    /// volume counted.
-    #[test]
-    fn the_latency_figures_are_observed_by_attribute() {
-        use crate::tree_actor::Recording;
-        let h = Harness::new();
-        h.telemetry.observe_latency();
-        assert!(h.sum(names::JOURNAL_CHECKPOINTS, &[]).is_some());
-        for cause in ["lag", "overlay"] {
-            assert!(
-                h.sum(names::GATE_WAITS, &[("cause", cause)]).is_some(),
-                "{cause}"
-            );
-        }
-        for op in ["lookup", "getattr", "open", "read", "flush", "other"] {
-            assert!(h.sum(names::REQUESTS, &[("op", op)]).is_some(), "{op}");
-            assert!(h.gauge_f64(names::REQUEST_LONGEST, &[("op", op)]).is_some());
-        }
-        let holds = |kind| h.sum(names::LOCK_HOLDS, &[("kind", kind)]);
-        let kinds = [
-            "compaction",
-            "catch_up",
-            "drops",
-            "close",
-            "take",
-            "fork_copy",
-            "page_image",
-            "other",
-        ];
-        for kind in kinds {
-            assert!(holds(kind).is_some(), "{kind} observed");
-            assert!(
-                h.gauge_f64(names::LOCK_HOLD_LONGEST, &[("kind", kind)])
-                    .is_some()
-            );
-        }
-        let (other, waits) = (
-            holds("other").unwrap(),
-            h.sum(names::LOCK_WAITS, &[]).unwrap(),
-        );
-        let tmp = tempfile::tempdir().unwrap();
-        let identity = agentfs_contracts::volume::VolumeIdentity {
-            name: agentfs_contracts::name::VolumeName::parse("test").unwrap(),
-            id: agentfs_contracts::volume::VolumeId(uuid::Uuid::from_u128(1)),
-        };
-        let rec = Recording::create(
-            &tmp.path().join("state"),
-            &identity,
-            None,
-            &agentfs_contracts::pod::PodContext::default(),
-        )
-        .unwrap();
-        drop(rec.actor().unwrap());
-        assert!(holds("other").unwrap() > other);
-        assert!(h.sum(names::LOCK_WAITS, &[]).unwrap() > waits);
-        assert!(
-            h.point(names::LOCK_HOLD, &[("kind", "other")]).is_some()
-                && h.point(names::LOCK_WAIT, &[]).is_some()
-        );
-    }
-
-    /// A11: both verdicts are observed at every collection, zeros included,
-    /// read from the counts as they are then.
-    #[test]
-    fn unverified_saves_are_observed_by_verdict_zeros_included() {
-        use crate::tree_actor::UnverifiedCounts;
-        let h = Harness::new();
-        let counts = Arc::new(std::sync::Mutex::new(UnverifiedCounts::default()));
-        let read = Arc::clone(&counts);
-        let gauge: Arc<dyn Fn() -> UnverifiedCounts + Send + Sync> =
-            Arc::new(move || *read.lock().unwrap());
-        h.telemetry.observe_unverified(Arc::downgrade(&gauge));
-        let point = |verdict| h.gauge_u64(names::HISTORY_UNVERIFIED, &[("verdict", verdict)]);
-        assert_eq!(point("unresolved"), Some(0));
-        assert_eq!(point("mismatch_confirmed"), Some(0));
-        *counts.lock().unwrap() = UnverifiedCounts {
-            unresolved: 2,
-            mismatch_confirmed: 1,
-        };
-        assert_eq!(point("unresolved"), Some(2));
-        assert_eq!(point("mismatch_confirmed"), Some(1));
     }
 
     #[test]

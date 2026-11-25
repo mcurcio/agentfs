@@ -26,7 +26,7 @@ recorded; [guarantees](../guarantees.md) says what the engine promises.
 | Background commit and push loops | `service` | `Service`, `ServiceHandle`, `Stop` |
 | Push to remotes | `push` | `RemotePusher`, `open_all`, `PushOutcome` |
 | Alarms and events | `events` | `Event`, `EventSink`, `MemorySink`, `NullSink` |
-| OpenTelemetry signals | `telemetry` | `Telemetry`, `Telemetry::sink` |
+| OpenTelemetry signals | `telemetry`, `tree_telemetry` | `Telemetry`, `Telemetry::sink`; `observe_process`, `observe_unverified` (the tree engine's, on a `Meter` the caller makes) |
 | Exclusive use of a state area | `lock`, and `agentfs_os::file_lock` | `StateLock`, `FileLock` |
 | A binary's malloc arenas | `agentfs_os::allocator` | `limit_arenas` (glibc's `M_ARENA_MAX` to `ARENAS`, 2): a binary calls it first in `main`, before any thread; the library never does |
 | Settings from the git config | `config`, and `agentfs_contracts::units` | `Settings`, `Settings::load`, `KEYS`; `parse_duration`, `parse_size`, `duration_arg` (a duration flag's value parser) |
@@ -37,7 +37,7 @@ recorded; [guarantees](../guarantees.md) says what the engine promises.
 | Release decision for a worktree | `release` | `decide`, `Release` |
 | Several mounts, one writer | `history_service` | `HistoryServer`, `HistoryClient`, `FrontLease` |
 | Large files | `lfs` | `ObjectCache`, `Store`, `fetch`, `prune` |
-| Git-backed tree views | `tree_actor`, `state_area` | `TreeActor`, `TreeId` (a tree's identity, `root` or `fork/<n>`), `inspect`, `TreeStateArea` (the Volume domain's `StateArea` port) |
+| Git-backed tree views | `tree_actor`, `state_area` | `TreeActor`, `TreeId` (a tree's identity, `root` or `fork/<n>`), `TreeStateArea` (the Volume domain's `StateArea` port; its `inspect` reads what a state area holds) |
 | The domains' rows over a tree volume | `store`, `tree_actor` | `TreeStore` (the `VolumeStore`, `ForkStore`, `ClientStore` and `QueueFacts` ports), `Chain`, `RowDomain`, `RowWrite`, `RowEvent` |
 | Line identity across saves | `agentfs_lines` | `LineMap` (runs of lines, never bytes), `LineMap::align` (git's histogram diff over two `Image`s, read a line at a time), `LineMap::align_bytes_with`, `histogram_with` and `histogram_files_with` (the diff's `git` child started by the spawner passed: the tree engine passes `agentfs_git::git_cli::counted`), `LineMap::append`, `LineMap::expand` (line by line, for the landing rules), `pieces` (where a merged file's lines are in its sources): the line-map library, generic over the caller's numbered version (`Id`) |
 
@@ -324,6 +324,14 @@ logs. The library uses the OpenTelemetry API only. It does not start an
 exporter: the `agentfs` binary does that, from the standard `OTEL_*`
 variables. Open a volume once per process: each `open` registers another
 backlog gauge. The signal names are in [telemetry](../telemetry.md).
+
+The tree engine's instruments are `tree_telemetry`'s, registered on a
+`Meter` the caller makes (the `agentfs` binary's, the API's no-op meter when
+metrics are off, which drops them):
+`tree_telemetry::observe_process(&meter, &not_built)` once per process, for
+`agentfs.not_built` and the latency figures, and
+`tree_telemetry::observe_unverified(&meter, counts)` once per served volume,
+for `agentfs.history.unverified`, read from `counts` while it lives.
 
 ## Locks and sockets
 
@@ -664,9 +672,11 @@ content. `TreeActor::open(root, service)` recovers one and never creates
 (`Error::NotCreated`, `Error::Format` for another format). `service` is the pod
 context of the process that serves it, which its own commits carry. It holds
 an exclusive lease on its state area (`Error::Busy` if another process holds
-it); `tree_actor::inspect(root)` reads what a state area holds without it, and
-`state_area::TreeStateArea` offers both to the Volume domain as its
-`StateArea` port. Its recorded calls are `write_open`, `write`, `truncate`,
+it). `state_area::TreeStateArea` offers it to the Volume domain as its
+`StateArea` port, whose `inspect` reads what a state area holds (`Found`)
+without the lease, takes no lock and writes nothing: `TreeStateArea::at(root).inspect()`.
+A read that failed is `agentfs_contracts::volume::VolumeError::Unreadable`,
+naming the path and the I/O failure. Its recorded calls are `write_open`, `write`, `truncate`,
 `sync`, `close`, `mkdir`, `rmdir`, `symlink`, `rename`, `unlink`, `set_meta`,
 `set_times` and `replace_file`; each write-open and namespace call names its writer as an
 `agentfs_contracts::pod::WriterAt`, the writer and its pod context, which the
@@ -734,7 +744,7 @@ are flagged in their commits' `Agentfs-Unverified` trailer.
 `TreeActor::verification()` gives the volume's `Verification` handle, whose
 `counts()` (`UnverifiedCounts`: `unresolved`, `mismatch_confirmed`) never
 takes the actor's lock; a launcher hands it to
-`Telemetry::observe_unverified` for the `agentfs.history.unverified` gauge.
+`tree_telemetry::observe_unverified` for the `agentfs.history.unverified` gauge.
 `tree_actor::verify_flagged(root, by, release)` is `agentfs verify`: it takes
 the state area's lock (`Error::Busy`), opens only its `history.git`, and
 checks every standing flag with `release` (`tree_actor::release()`, this
@@ -785,7 +795,7 @@ the first match wins:
 
 `Capability::as_str` names each (`push`, `patches`, `lfs`, `other`) and
 `Capability::meaning` says in one sentence what the volume does without it, for
-the boot log. `Telemetry::observe_not_built(&not_built)` registers the
+the boot log. `tree_telemetry::observe_process(&meter, &not_built)` registers the
 `agentfs.not_built` gauge: per capability, the number of settings configured
 and not built ([telemetry](../telemetry.md)).
 

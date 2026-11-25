@@ -24,8 +24,8 @@ use std::process::{Command, Stdio};
 use std::sync::Arc;
 
 use agentfs_contracts::host::{Envelope, Reply, Request};
-use agentfs_contracts::ports::Found;
-use agentfs_core::tree_actor;
+use agentfs_contracts::ports::{Found, StateArea as _};
+use agentfs_core::state_area::TreeStateArea;
 use agentfs_csi::controller::ControllerService;
 use agentfs_csi::csi::v1::controller_client::ControllerClient;
 use agentfs_csi::csi::v1::node_client::NodeClient;
@@ -527,7 +527,7 @@ async fn create_volume_makes_a_tree_volume_and_delete_keeps_it() {
         ])
     );
     let state = d.layout.state("pvc-1");
-    let Found::Volume(identity) = tree_actor::inspect(&state).unwrap() else {
+    let Found::Volume(identity) = TreeStateArea::at(&state).inspect().unwrap() else {
         panic!("no tree volume at {}", state.display());
     };
     assert_eq!(identity.name.as_str(), "apps.data.pvc-1");
@@ -569,7 +569,7 @@ async fn create_volume_makes_a_tree_volume_and_delete_keeps_it() {
     assert!(!d.layout.csi_json("pvc-1").exists());
     assert!(d.layout.retained_json("pvc-1").exists());
     assert!(matches!(
-        tree_actor::inspect(&state).unwrap(),
+        TreeStateArea::at(&state).inspect().unwrap(),
         Found::Volume(_)
     ));
     // Gone already: done.

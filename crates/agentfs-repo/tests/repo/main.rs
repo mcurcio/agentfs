@@ -12,10 +12,12 @@
 //!   every script under ci/ is executable, registers its EXIT cleanup with
 //!   `on_exit`, and no pipe in one ends in a reader that exits early
 //!   (pipefail turns its SIGPIPE into a failure); publishing an image
-//!   retries a failed push.
+//!   retries a failed push; every path filter of a workflow names a path
+//!   that exists.
 //! - [`crates`]: every dependency follows the ranks, every `failpoints`
 //!   feature is forwarded, every cargo command in the workflows, scripts
-//!   and docs names packages, features and binaries the workspace has,
+//!   and docs names packages, features, binaries and test programs the
+//!   workspace has,
 //!   every failpoint call is in `agentfs_failpoints::POINTS`, the tree
 //!   engine starts `git` only through `agentfs_git::git_cli::counted`, and
 //!   the tree engine's modules in agentfs-core name no recording-engine

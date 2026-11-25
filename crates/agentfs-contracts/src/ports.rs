@@ -49,7 +49,7 @@ pub trait StateArea {
     ///
     /// # Errors
     ///
-    /// `NotDurable` for a read that failed.
+    /// `Unreadable` for a read that failed.
     fn inspect(&self) -> Result<Found, VolumeError>;
 
     /// Under the state area's lock, inspects again: still `Nothing`, writes the
@@ -62,7 +62,7 @@ pub trait StateArea {
     ///
     /// # Errors
     ///
-    /// `Busy`, `OtherFormat`, `NotDurable`.
+    /// `Busy`, `OtherFormat`, `Unreadable`, `NotDurable`.
     fn create(
         &mut self,
         name: &VolumeName,

@@ -462,7 +462,7 @@ struct Started {
 /// # Errors
 ///
 /// A directory or file that could not be read.
-pub fn inspect(root: &Path) -> io::Result<Found> {
+pub(crate) fn inspect(root: &Path) -> io::Result<Found> {
     let entries = match fs::read_dir(root) {
         Ok(entries) => entries,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Found::Nothing),

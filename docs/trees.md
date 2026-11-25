@@ -643,7 +643,8 @@ A view reads a map with the actor unlocked: the lock is held only to clone it.
 
 `agentfs_core::tree_actor::TreeActor` holds an exclusive state-area lease.
 `TreeActor::create` makes a volume, `TreeActor::open` recovers one and never creates,
-and `tree_actor::inspect` reads what a state area holds without the lease.
+and `state_area::TreeStateArea`'s `inspect` (the `StateArea` port) reads what a state
+area holds without the lease.
 `tree_actor::Recording` serves a volume: the actor behind its one lock, with
 `durable`, `durable_all` and their deferred forms waiting for durability outside it.
 `Recording::open` makes every recovered record durable and serves at once, from the

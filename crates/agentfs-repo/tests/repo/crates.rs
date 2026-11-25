@@ -15,9 +15,10 @@ use agentfs_repo::workspace::{Dependency, DependencyKind, Member, Rank, Target, 
 use crate::{Comments, files_under, is_separator, lex, root};
 
 /// Where `workspace` breaks its ranks: a rank listed twice, a rank using
-/// one listed after it, a member naming no rank or an unknown one, and a
+/// one listed after it, a member naming no rank or an unknown one, a
 /// normal or build dependency on a member in a rank its own rank does not
-/// use. Dev-dependencies are exempt.
+/// use, and a dev-dependency on another member of its own rank when that
+/// rank does not use itself. Other dev-dependencies may point anywhere.
 fn rank_problems(workspace: &Workspace) -> Vec<String> {
     let mut problems = Vec::new();
     let mut seen = BTreeSet::new();
@@ -52,9 +53,6 @@ fn rank_problems(workspace: &Workspace) -> Vec<String> {
             continue;
         };
         for dependency in &member.dependencies {
-            if dependency.kind == DependencyKind::Dev {
-                continue;
-            }
             let Some(their) = workspace
                 .member(&dependency.name)
                 .and_then(|d| d.rank.as_deref())
@@ -62,7 +60,19 @@ fn rank_problems(workspace: &Workspace) -> Vec<String> {
             else {
                 continue;
             };
-            if !rank.uses.iter().any(|u| u == their) {
+            let used = rank.uses.iter().any(|u| u == their);
+            if dependency.kind == DependencyKind::Dev {
+                // A test may drive anything but a sibling the rank keeps
+                // apart: one engine's tests would build the other.
+                if their == name && !used {
+                    edges.insert(format!(
+                        "{} -> {} (dev; {name} does not use {their})",
+                        member.name, dependency.name
+                    ));
+                }
+                continue;
+            }
+            if !used {
                 edges.insert(format!(
                     "{} -> {} ({name} does not use {their})",
                     member.name, dependency.name
@@ -218,13 +228,45 @@ fn the_ranks_refuse_sideways_and_upward_edges() {
         rank_problems(&two_engines),
         ["agentfs-core -> agentfs-engine (engine does not use engine)"]
     );
-    // A test may drive anything.
+    // A test may drive anything...
     let mut dev = today();
     dev.members[0].dependencies.push(Dependency {
         name: "agentfs-csi".into(),
         kind: DependencyKind::Dev,
     });
+    // ...a sibling of a rank that uses itself included...
+    dev.members[0].dependencies.push(Dependency {
+        name: "agentfs-lines".into(),
+        kind: DependencyKind::Dev,
+    });
     assert_eq!(rank_problems(&dev), Vec::<String>::new());
+    // ...but a sibling of a rank that does not.
+    let dev_edge = |workspace: &mut Workspace, from: &str, to: &str| {
+        let m = workspace
+            .members
+            .iter_mut()
+            .find(|m| m.name == from)
+            .unwrap();
+        m.dependencies.push(Dependency {
+            name: to.to_owned(),
+            kind: DependencyKind::Dev,
+        });
+    };
+    let mut domains = today();
+    dev_edge(&mut domains, "agentfs-trees", "agentfs-volume");
+    assert_eq!(
+        rank_problems(&domains),
+        ["agentfs-trees -> agentfs-volume (dev; domain does not use domain)"]
+    );
+    let mut engines = today();
+    engines
+        .members
+        .push(member("agentfs-engine", "engine", &[]));
+    dev_edge(&mut engines, "agentfs-core", "agentfs-engine");
+    assert_eq!(
+        rank_problems(&engines),
+        ["agentfs-core -> agentfs-engine (dev; engine does not use engine)"]
+    );
     // A build dependency counts.
     let mut build = today();
     build.members[0].dependencies.push(Dependency {
@@ -345,7 +387,8 @@ fn an_unforwarded_failpoints_feature_is_found() {
 
 /// What a cargo command selects: its subcommand (the first word that is
 /// not an option), the packages (`-p`, `--package`), the features
-/// (`--features`, `-F`) and the binaries (`--bin`). Only values made of
+/// (`--features`, `-F`), the binaries (`--bin`) and the test programs
+/// (`--test`). Only values made of
 /// `[A-Za-z0-9_-]` are kept: `<crate>` or `$pkg` is no name.
 #[derive(Debug, Default, PartialEq, Eq)]
 struct Selection {
@@ -356,6 +399,7 @@ struct Selection {
     /// `(Some(package), feature)` for `pkg/feat`, `(None, feature)` bare.
     features: Vec<(Option<String>, String)>,
     bins: Vec<String>,
+    tests: Vec<String>,
 }
 
 fn is_name(value: &str) -> bool {
@@ -435,6 +479,12 @@ fn selection(words: &[String]) -> Selection {
                 }
                 takes_next = true;
             }
+            "--test" => {
+                if let Some(v) = next.filter(|v| is_name(v)) {
+                    s.tests.push(v.to_owned());
+                }
+                takes_next = true;
+            }
             _ => {
                 if let Some(v) = word
                     .strip_prefix("--package=")
@@ -447,6 +497,10 @@ fn selection(words: &[String]) -> Selection {
                 } else if let Some(v) = word.strip_prefix("--bin=") {
                     if is_name(v) {
                         s.bins.push(v.to_owned());
+                    }
+                } else if let Some(v) = word.strip_prefix("--test=") {
+                    if is_name(v) {
+                        s.tests.push(v.to_owned());
                     }
                 } else if s.subcommand.is_none() && !word.starts_with(['-', '+']) {
                     s.subcommand = Some(word.to_owned());
@@ -461,8 +515,9 @@ fn selection(words: &[String]) -> Selection {
 /// Why `s` names what `workspace` does not have: a package, a package's
 /// feature, a feature no selected package declares (cargo's rule, read
 /// only when every selection is literal), a binary of no selected package
-/// (of no member when none is selected), or `cargo run` of a package with
-/// no binary.
+/// (of no member when none is selected), a test program of no selected
+/// package (of no member when none is selected), or `cargo run` of a
+/// package with no binary.
 fn selection_problems(workspace: &Workspace, s: &Selection) -> Vec<String> {
     let mut problems = Vec::new();
     let selected: Vec<&Member> = s
@@ -477,11 +532,12 @@ fn selection_problems(workspace: &Workspace, s: &Selection) -> Vec<String> {
             ));
         }
     }
-    let has_bin = |m: &Member, bin: Option<&str>| {
+    let has = |m: &Member, kind: &str, name: Option<&str>| {
         m.targets
             .iter()
-            .any(|t| t.kinds.iter().any(|k| k == "bin") && bin.is_none_or(|b| t.name == b))
+            .any(|t| t.kinds.iter().any(|k| k == kind) && name.is_none_or(|n| t.name == n))
     };
+    let has_bin = |m: &Member, bin: Option<&str>| has(m, "bin", bin);
     for (package, feature) in &s.features {
         match package {
             Some(p) => match workspace.member(p) {
@@ -513,6 +569,18 @@ fn selection_problems(workspace: &Workspace, s: &Selection) -> Vec<String> {
             };
             if !found {
                 problems.push(format!("--bin {bin}: no selected package has that binary"));
+            }
+        }
+        for test in &s.tests {
+            let found = if s.packages.is_empty() {
+                workspace.members.iter().any(|m| has(m, "test", Some(test)))
+            } else {
+                selected.iter().any(|m| has(m, "test", Some(test)))
+            };
+            if !found {
+                problems.push(format!(
+                    "--test {test}: no selected package has that test program"
+                ));
             }
         }
         if s.subcommand.as_deref() == Some("run") {
@@ -691,13 +759,15 @@ fn cargo_commands_are_read_as_sh_reads_them() {
         assert_eq!(named, *features, "{line}");
     }
     let s = one_selection(
-        "cargo nextest run -pagentfs-core --package=agentfs-fuse -p=x -p <crate> -F a,b --bin=y",
+        "cargo nextest run -pagentfs-core --package=agentfs-fuse -p=x -p <crate> -F a,b --bin=y \
+         --test it --test=z",
     );
     assert_eq!(s.subcommand.as_deref(), Some("nextest"));
     assert_eq!(s.packages, ["agentfs-core", "agentfs-fuse", "x"]);
     assert!(!s.literal);
     assert_eq!(s.features, [(None, "a".into()), (None, "b".into())]);
     assert_eq!(s.bins, ["y"]);
+    assert_eq!(s.tests, ["it", "z"]);
     assert_eq!(commands_in("cargo fmt; cargo test -p a | cargo x").len(), 3);
     assert!(commands_in("~/.cargo/bin and cargo-nextest").is_empty());
 }
@@ -708,13 +778,15 @@ fn cargo_commands_are_refused_where_the_workspace_lacks_their_names() {
         !selection_problems(workspace, &one_selection(line)).is_empty()
     };
     let csi = binary("agentfs-csi", &[]);
-    // Today: the binary's package is `agentfs`.
+    // Today: the binary's package is `agentfs`, with a test program.
+    let mut agentfs = binary("agentfs", &["https", "ssh", "otlp-tls"]);
+    agentfs.targets.push(Target {
+        name: "csi_trees".into(),
+        kinds: vec!["test".into()],
+    });
     let now = Workspace {
         ranks: ranks(),
-        members: vec![
-            binary("agentfs", &["https", "ssh", "otlp-tls"]),
-            csi.clone(),
-        ],
+        members: vec![agentfs, csi.clone()],
     };
     // Once the binary's package is renamed: no `agentfs` at all.
     let renamed = Workspace {
@@ -754,6 +826,20 @@ fn cargo_commands_are_refused_where_the_workspace_lacks_their_names() {
         "cargo nextest run -p agentfs --bin agentfs reference_tests"
     ));
     assert!(!refused(&now, "cargo run -p agentfs -- init"));
+    assert!(!refused(
+        &now,
+        "cargo nextest run -p agentfs --test csi_trees"
+    ));
+    assert!(!refused(&now, "cargo test --test=csi_trees"));
+    assert!(refused(
+        &now,
+        "cargo nextest run -p agentfs-csi --test csi_trees"
+    ));
+    assert!(refused(
+        &now,
+        "cargo nextest run -p agentfs --test=tree_stage"
+    ));
+    assert!(refused(&now, "cargo test --test nowhere"));
     assert!(!refused(&now, "cargo build --bin agentfs-csi"));
     assert!(!refused(
         &renamed,
@@ -999,13 +1085,14 @@ fn a_process_started_outside_counted_is_found() {
 
 /// The tree engine's modules in agentfs-core, the ones its own crate takes
 /// whole: each names only the others through `crate::`.
-const TREE_ENGINE: [&str; 6] = [
+const TREE_ENGINE: [&str; 7] = [
     "tree_actor",
     "tree_git",
     "session",
     "store",
     "state_area",
     "operator_settings",
+    "tree_telemetry",
 ];
 
 /// The production sources of the tree engine's modules in agentfs-core

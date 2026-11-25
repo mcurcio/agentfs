@@ -34,6 +34,7 @@ use agentfs_contracts::name::{ClientLabel, ForkKey, LauncherId};
 use agentfs_contracts::trees::{ForkPhase, ForkSettings, TreeError};
 use agentfs_contracts::views::{MountOptions, ViewError, ViewId};
 use agentfs_core::tree_actor::TreeId;
+use agentfs_core::tree_telemetry;
 use anyhow::{Context as _, Result};
 
 use super::serving::{self, Driver, Serving, Trigger};
@@ -114,14 +115,13 @@ pub fn host(state: &Path, args: HostArgs, minter: Minter) -> Result<ExitCode> {
         volume.name.as_str(),
         &identity(volume.name.as_str(), &args.pod),
     );
-    otel.telemetry().observe_not_built(&boot.not_built);
-    otel.telemetry().observe_latency();
+    tree_telemetry::observe_process(otel.meter(), &boot.not_built);
     let cap = LaunchCap::mint(&minter, launcher, LaunchScope::Root);
     let staged = match serving::stage::<Line>(state, &at, cap, minter, boot.overlay_limit)? {
         Ok(staged) => staged,
         Err(code) => return Ok(code),
     };
-    let _gauge = super::observe_unverified(otel.telemetry(), &staged.domains)?;
+    let _gauge = super::observe_unverified(otel.meter(), &staged.domains)?;
     let (mut serving, sender) = Serving::start(staged, state, None)?;
     let mut driver = HostDriver {
         control: control.try_clone().context("cloning the control channel")?,

@@ -13,8 +13,9 @@ rank = "kubernetes"
 [dependencies]
 # The view host's control messages, names and pod contexts.
 agentfs-contracts = { version = "0.1.0", path = "../agentfs-contracts" }
-# Only what reads a state area without serving it (tree_actor::inspect),
-# and installs the operator's rule files.
+# Only what reads a state area without serving it (TreeStateArea's
+# inspect, through the StateArea port), and installs the operator's rule
+# files.
 agentfs-core = { version = "0.1.0", path = "../agentfs-core" }
 # The allocator, atomic JSON, the network filesystem check and the
 # listening socket.

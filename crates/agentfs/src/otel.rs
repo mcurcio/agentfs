@@ -684,6 +684,8 @@ impl<E: LogExporter> LogExporter for OnRuntime<E> {
 /// most [`TELEMETRY_SHUTDOWN_GRACE`].
 pub struct Otel {
     telemetry: Telemetry,
+    /// The process's one meter: the provider's, else the API's no-op one.
+    meter: Meter,
     providers: Option<Providers>,
 }
 
@@ -700,12 +702,20 @@ impl Otel {
     pub fn noop() -> Self {
         Self {
             telemetry: Telemetry::noop(),
+            meter: meter_of(None),
             providers: None,
         }
     }
 
     pub fn telemetry(&self) -> &Telemetry {
         &self.telemetry
+    }
+
+    /// The meter the tree engine's instruments register on
+    /// (`agentfs_core::tree_telemetry`): the API's no-op meter, which
+    /// drops them, when metrics are not exported.
+    pub fn meter(&self) -> &Meter {
+        &self.meter
     }
 
     /// Flushes and shuts down every provider, waiting at most `grace`.
@@ -717,6 +727,7 @@ impl Otel {
         };
         // Callbacks and spans hold provider references; drop ours first.
         self.telemetry = Telemetry::noop();
+        self.meter = meter_of(None);
         let (tx, rx) = mpsc::channel();
         let spawned = std::thread::Builder::new()
             .name("agentfs-otel-shutdown".into())
@@ -915,12 +926,7 @@ pub fn init(volume: &str, ctx: &Context) -> Otel {
 
     // With metrics off the engine still gets a meter, from the API's no-op
     // provider, so the handle is uniform.
-    let meter_handle = match &meter {
-        Some(provider) => provider.meter_with_scope(telemetry::scope()),
-        None => {
-            opentelemetry::metrics::NoopMeterProvider::new().meter_with_scope(telemetry::scope())
-        }
-    };
+    let meter_handle = meter_of(meter.as_ref());
     if meter.is_some() {
         health.count_with(&meter_handle);
     }
@@ -933,12 +939,29 @@ pub fn init(volume: &str, ctx: &Context) -> Otel {
     });
     Otel {
         telemetry: Telemetry::new(&meter_handle, tracer_handle, alarms),
+        meter: meter_handle,
         providers: Some(Providers {
             tracer,
             meter,
             logger,
             runtime,
         }),
+    }
+}
+
+/// The process's meter, under [`telemetry::scope`]: `provider`'s, else
+/// the API's no-op provider's, which drops every instrument. The one place
+/// the binary makes a meter.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "the binary makes the process's one meter here"
+)]
+fn meter_of(provider: Option<&SdkMeterProvider>) -> Meter {
+    match provider {
+        Some(provider) => provider.meter_with_scope(telemetry::scope()),
+        None => {
+            opentelemetry::metrics::NoopMeterProvider::new().meter_with_scope(telemetry::scope())
+        }
     }
 }
 

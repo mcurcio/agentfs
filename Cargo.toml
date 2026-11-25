@@ -18,7 +18,8 @@ repository = "https://github.com/mcurcio/agentfs"
 # each listed after every rank it uses. Each package names its own in
 # `[package.metadata.agentfs] rank`. A normal or build dependency on another
 # member must be in a rank its own rank `uses`; a rank's packages depend on
-# one another only where it uses itself. Dev-dependencies are exempt.
+# one another only where it uses itself. A dev-dependency may point anywhere
+# but at a sibling of a rank that does not use itself.
 # crates/agentfs-repo checks it.
 [workspace.metadata.agentfs]
 ranks = [

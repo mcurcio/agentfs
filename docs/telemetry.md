@@ -46,9 +46,12 @@ agentfs run
 
 ## Signals
 
-agentfs exports these signals, all through `agentfs_core::telemetry`,
-which uses the OpenTelemetry API only. The binary picks the SDK and the
-exporter.
+agentfs exports these signals through the OpenTelemetry API only. The
+recording engine's go through `agentfs_core::telemetry`; the tree volumes'
+figures (`agentfs.not_built`, the latency figures, the journal's
+checkpoints and `agentfs.history.unverified`) through
+`agentfs_core::tree_telemetry`, on the binary's meter. The binary picks the
+SDK and the exporter.
 
 ## Metrics
 

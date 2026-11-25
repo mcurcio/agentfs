@@ -83,7 +83,7 @@ fn volume_error(root: &Path, error: &tree_actor::Error) -> VolumeError {
 impl StateArea for TreeStateArea {
     fn inspect(&self) -> Result<Found, VolumeError> {
         tree_actor::inspect(&self.root)
-            .map_err(|e| volume_error(&self.root, &tree_actor::Error::Io(e)))
+            .map_err(|e| VolumeError::Unreadable(format!("{}: {e}", self.root.display())))
     }
 
     /// [`Recording::create`] takes the state area's lock and inspects again

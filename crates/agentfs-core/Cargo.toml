@@ -90,7 +90,9 @@ agentfs-volume = { version = "0.1.0", path = "../agentfs-volume" }
 agentfs-trees = { version = "0.1.0", path = "../agentfs-trees" }
 # The Clients domain over the store adapter and sessions (tests/it/tree_clients.rs).
 agentfs-clients = { version = "0.1.0", path = "../agentfs-clients" }
-# In-memory exporters for the telemetry tests.
+# The in-memory metric reader of the telemetry tests.
+agentfs-test-metrics = { version = "0.0.0", path = "../agentfs-test-metrics" }
+# In-memory span and log exporters for the telemetry tests.
 opentelemetry_sdk = { version = "0.33.1", default-features = false, features = ["testing"] }
 tempfile = "3.27.0"
 # A port that refuses connections and that no other test can be handed
