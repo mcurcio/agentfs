@@ -5,7 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "agentfs's git leaves: the git program's environment, the one libgit2 setup, pack settings, and a tree volume's object store"
+description = "agentfs's git leaves: the git program's environment and child count, every repack's memory bounds, and the process's one libgit2 setup"
 
 [package.metadata.agentfs]
-layer = "leaf"
+rank = "leaf"

@@ -8,7 +8,7 @@ repository.workspace = true
 description = "The shared kernel of agentfs's domains: values, capabilities, traits, events and ports, with no I/O"
 
 [package.metadata.agentfs]
-layer = "kernel"
+rank = "shared-kernel"
 
 [dependencies]
 # Rows and journal records carry these values as JSON (the store adapter in

@@ -1,5 +1,5 @@
-//! Git as both of agentfs's engines use it: the `git` program run in an
-//! environment of its own with every repack's memory bounds, the process's
-//! one libgit2 setup, and a tree volume's object store
+//! Git as agentfs uses it below both engines: the `git` program run in an
+//! environment of its own, with the count of the children it starts and
+//! every repack's memory bounds, and the process's one libgit2 setup
 //! (docs/architecture.md, "Technology choices", says why each runs where it
-//! does). Nothing here knows a volume's recording rules.
+//! does). Nothing here knows a volume, a tree's layout or a recording rule.

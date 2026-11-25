@@ -8,7 +8,7 @@ repository.workspace = true
 description = "The clients domain of agentfs: pure, over the ports in agentfs-contracts"
 
 [package.metadata.agentfs]
-layer = "domain"
+rank = "domain"
 
 [dependencies]
 agentfs-contracts = { version = "0.1.0", path = "../agentfs-contracts" }

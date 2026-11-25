@@ -8,4 +8,4 @@ repository.workspace = true
 description = "Line maps for agentfs's tree landing: which version wrote each line of a file, never the line's bytes"
 
 [package.metadata.agentfs]
-layer = "leaf"
+rank = "line-identity"

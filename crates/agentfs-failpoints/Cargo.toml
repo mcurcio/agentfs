@@ -8,7 +8,7 @@ repository.workspace = true
 description = "agentfs's failpoints: named places on the durable path where a test build can kill, fail, stall or park the process"
 
 [package.metadata.agentfs]
-layer = "leaf"
+rank = "leaf"
 
 [features]
 # Test builds only: the registry acts on its spec. Never in a release or image.

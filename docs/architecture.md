@@ -15,44 +15,46 @@ is. The libraries behind it, and why each was chosen, are under
 | `agentfs` | binary | The `agentfs` command (every subcommand is listed in [configuration](configuration.md#commands)); OpenTelemetry export |
 | `agentfs-csi` | library and binary | The CSI driver: `agentfs-csi`, one per node beside csi-provisioner, which makes each claim's tree volume with `agentfs init` and supervises one `agentfs host` per volume in use on the node, each pod's view opened on it at the kubelet's target ([csi](csi.md)) |
 | `agentfs-rules` | library | The Rules domain of the tree views, pure: where each new name of a tree lives, recorded or in its untracked area, from the operator's `info/exclude` and `info/attributes` ([trees](trees.md#rules-and-the-untracked-area)). Depends on `gix-ignore` and `gix-attributes` only; `agentfs-core` and `agentfs-fuse` depend on it |
-| `agentfs-align` | library | Git's histogram diff, called one way, for line identity (git-model §7). `agentfs-core` and `agentfs-model` both depend on it, so line identity does not depend on how `git` is called; one module, `lib.rs` |
+| `agentfs-align` | library | Git's histogram diff, called one way, for line identity (git-model §7), and the `PATH` every `git` child gets. The engines and `agentfs-model` all reach the diff through it, so line identity does not depend on how `git` is called |
 | `agentfs-failpoints` | library | The one registry of failpoints, named places on the durable path where a test build can kill, fail, stall or park the process, and the gates a test drives over FIFOs. In a release build each point is an inlined `Ok(())` |
-| `agentfs-os` | library | The operating-system leaves both engines share: advisory file locks, atomic files, confined access to a directory tree, the mount table, the shared-filesystem check, listening and local Unix sockets, the allocator's arenas. Knows nothing of git, volumes or trees |
-| `agentfs-git` | library | Git as both engines use it: the `git` program in an environment of its own, the process's one libgit2 setup, every repack's memory bounds, and a tree volume's object store |
-| `agentfs-lines` | library | Line maps: which version wrote each line of a file, aligned across saves by `agentfs-align`'s histogram diff. Pure apart from the diff's `git` child, which the caller starts |
+| `agentfs-os` | library | The operating-system leaves used outside the recording engine too: advisory file locks, atomic files, confined access to a directory tree, the mount table, the shared-filesystem check, listening Unix sockets, the allocator's arenas. Knows nothing of git, volumes or trees |
+| `agentfs-git` | library | Git below both engines: the `git` program in an environment of its own and the count of the children it starts, every repack's memory bounds, and the process's one libgit2 setup. Knows no volume or tree layout |
+| `agentfs-lines` | library | Line maps: which version wrote each line of a file, aligned across saves by `agentfs-align`'s histogram diff. It reads the images it is given and starts no process: the diff's `git` child comes from the spawner its caller passes |
 | `agentfs-contracts` | library | The shared kernel of the domains around the git model ([the system](target-architecture/system.md)): values (the tree and volume identities, names, the pod context), capabilities and their minter, each domain's trait, errors and events, and the ports adapters implement. No I/O; depends on no other agentfs crate |
 | `agentfs-volume` | library | The Volume domain, pure over its ports: `ensure`, the lifecycle and the release verdict |
 | `agentfs-clients` | library | The Clients domain, pure over its ports: attachments, grants and each fork's one writer |
 | `agentfs-trees` | library | The Trees domain, pure over its ports: each fork's lifecycle |
 | `agentfs-conformance` | library and binary, tests only | The model's recorded calls against the real tree library and real mounts (git-model §18). Depends on `agentfs-core` and `agentfs-model`; nothing depends on it |
-| `agentfs-repo` | library, tests only | Checks over the whole repository, as its tests: the documentation against the code, the workflows and CI scripts, the crates and their layers. Its library is what the documentation tests share: a reader of the markdown in `docs/` and of the workspace as `cargo metadata` describes it. Depends on no other agentfs crate |
+| `agentfs-repo` | library, tests only | Checks over the whole repository, as its tests: the documentation against the code, the workflows and CI scripts, the sources' repository-wide rules, the crates and their ranks. Its library is what the documentation tests share: a reader of the markdown in `docs/` and of the workspace as `cargo metadata` describes it. Its library depends on no other agentfs crate |
 
-The dependencies run one way: `agentfs-csi` → (`agentfs` as a child
-process) → `agentfs-fuse` → `agentfs-core` → `agentfs-contracts`. The
-domain crates (`agentfs-volume`, `agentfs-clients`, `agentfs-trees`) depend
-on `agentfs-contracts` alone, and on no other domain. `agentfs-csi` links
-`agentfs-core` only to create state areas and read their status; it never
-records.
+Which crate may depend on which is set by the ranks below, and a test
+checks every manifest against them; there is no other list of the
+dependencies.
 
-## Layers
+## Ranks
 
-Every package names its layer in its manifest
-(`[package.metadata.agentfs] layer`), and the workspace manifest lists the
-layers, lowest first (`[workspace.metadata.agentfs] layers`). A normal or
-build dependency points to a package of the same layer or a lower one; a
-dev-dependency may point anywhere, as a test of the binary may drive the
-CSI driver. `crates/agentfs-repo` checks both, and this table against the
-workspace manifest.
+The owner's three layers (AGENTS.md principle 10: the library, the
+filesystem and the kubernetes adapter) are each made of one or more ranks;
+packages that exist only for tests have a rank of their own. Every package
+names its rank in its manifest (`[package.metadata.agentfs] rank`), and the
+workspace manifest lists the ranks, each after every rank it uses, with the
+ranks each may use (`[workspace.metadata.agentfs] ranks`). A normal or build
+dependency on another package of the workspace must be in a rank its own
+rank uses, so two packages of one rank never depend on each other unless the
+rank uses itself. A dev-dependency may point anywhere, as a test of the
+binary drives the CSI driver. `crates/agentfs-repo` checks the manifests,
+and this table against the workspace manifest.
 
-| Layer | What it holds |
-|---|---|
-| `leaf` | Mechanisms both engines share that know no domain value: the alignment, line maps, failpoints, the operating system, git |
-| `kernel` | The shared kernel of the domains: values, capabilities, traits, events and ports, with no I/O |
-| `domain` | The pure domains over the kernel's ports, and the tree views' rules |
-| `engine` | What implements the ports and owns the state on disk: the recording engine and the tree engine |
-| `filesystem` | The FUSE layer and the `agentfs` binary, the composition root |
-| `kubernetes` | The CSI driver |
-| `tests` | Packages that exist only for tests: the model, the conformance replay, the repository checks |
+| Rank | Uses | Layer | What it holds |
+|---|---|---|---|
+| `line-identity` | `line-identity` | the library | The alignment and the line maps: which version wrote each line of a file |
+| `leaf` | `line-identity`, `leaf` | the library | Mechanisms over the operating system, git and the test build's failpoints, which know no domain value and are used outside the recording engine too, so it can be deleted whole |
+| `shared-kernel` | none | the library | The shared kernel of the domains: values, capabilities, traits, events and ports, with no I/O |
+| `domain` | `shared-kernel` | the library | The pure domains over the shared kernel's ports, and the tree views' rules; no domain depends on another |
+| `engine` | `line-identity`, `leaf`, `shared-kernel`, `domain` | the library | What implements the ports and owns the state on disk; no engine depends on another |
+| `filesystem` | `leaf`, `shared-kernel`, `domain`, `engine`, `filesystem` | the filesystem | The FUSE layer and the `agentfs` binary, the composition root |
+| `kubernetes` | `leaf`, `shared-kernel`, `engine`, `filesystem` | the kubernetes adapter | The CSI driver |
+| `tests` | `line-identity`, `leaf`, `shared-kernel`, `domain`, `engine`, `filesystem`, `kubernetes`, `tests` | none | Packages that exist only for tests: the model, the conformance replay, the repository checks. No other rank uses it |
 
 ## Module map
 

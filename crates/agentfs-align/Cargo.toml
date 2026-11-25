@@ -8,7 +8,7 @@ repository.workspace = true
 description = "Git's histogram diff, called one way, for agentfs's line identity"
 
 [package.metadata.agentfs]
-layer = "leaf"
+rank = "line-identity"
 
 [dependencies]
 thiserror = "2.0.21"

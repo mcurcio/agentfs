@@ -9,7 +9,7 @@ description = "An executable model of the target architecture's landing rules, b
 publish = false
 
 [package.metadata.agentfs]
-layer = "tests"
+rank = "tests"
 
 # This models the target design (docs/target-architecture), not today's code, so the
 # one agentfs crate it depends on is the alignment's call, which it shares with the

@@ -9,7 +9,7 @@ description = "Replays the model's recorded calls against the real tree library 
 publish = false
 
 [package.metadata.agentfs]
-layer = "tests"
+rank = "tests"
 
 [dependencies]
 agentfs-contracts = { version = "0.1.0", path = "../agentfs-contracts" }

@@ -10,13 +10,23 @@ rust-version = "1.89"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/mcurcio/agentfs"
 
-# The layers of the workspace's packages, lowest first. Each package names its
-# own in `[package.metadata.agentfs] layer`; a normal or build dependency
-# points to a package of the same layer or a lower one, and a dev-dependency
-# may point anywhere (docs/architecture.md, "Layers"; crates/agentfs-repo
-# checks it).
+# The ranks of the workspace's packages (docs/architecture.md, "Ranks"),
+# each listed after every rank it uses. Each package names its own in
+# `[package.metadata.agentfs] rank`. A normal or build dependency on another
+# member must be in a rank its own rank `uses`; a rank's packages depend on
+# one another only where it uses itself. Dev-dependencies are exempt.
+# crates/agentfs-repo checks it.
 [workspace.metadata.agentfs]
-layers = ["leaf", "kernel", "domain", "engine", "filesystem", "kubernetes", "tests"]
+ranks = [
+    { name = "line-identity", uses = ["line-identity"] },
+    { name = "leaf", uses = ["line-identity", "leaf"] },
+    { name = "shared-kernel", uses = [] },
+    { name = "domain", uses = ["shared-kernel"] },
+    { name = "engine", uses = ["line-identity", "leaf", "shared-kernel", "domain"] },
+    { name = "filesystem", uses = ["leaf", "shared-kernel", "domain", "engine", "filesystem"] },
+    { name = "kubernetes", uses = ["leaf", "shared-kernel", "engine", "filesystem"] },
+    { name = "tests", uses = ["line-identity", "leaf", "shared-kernel", "domain", "engine", "filesystem", "kubernetes", "tests"] },
+]
 
 [patch.crates-io]
 fuser = { path = "vendor/fuser" }

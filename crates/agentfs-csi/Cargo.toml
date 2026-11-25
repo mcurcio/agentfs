@@ -8,7 +8,7 @@ repository.workspace = true
 description = "The agentfs CSI driver: tree volumes, each served by one agentfs host per volume on its node"
 
 [package.metadata.agentfs]
-layer = "kubernetes"
+rank = "kubernetes"
 
 [dependencies]
 # The view host's control messages, names and pod contexts.

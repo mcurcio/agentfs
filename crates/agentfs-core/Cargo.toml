@@ -8,7 +8,7 @@ repository.workspace = true
 description = "Recording, journal and history engine for agentfs"
 
 [package.metadata.agentfs]
-layer = "engine"
+rank = "engine"
 
 [dependencies]
 agentfs-align = { version = "0.1.0", path = "../agentfs-align" }
