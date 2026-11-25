@@ -6,8 +6,9 @@
 //! not-built log. With root and /dev/fuse (ignored by default; run by
 //! ci/fuse-tests.sh with sudo): views opened with a pod context, closed,
 //! landed from a fork, rebound and stacked after a kill, a fork's one
-//! writer, and a close held open by a file waiting alone while the requests
-//! that name nothing it holds are answered by id.
+//! writer, a close held open by a file waiting alone while the requests
+//! that name nothing it holds are answered by id, and a stopped host's
+//! lease free once its end returns.
 
 use std::io::{BufRead, BufReader, Read as _, Write as _};
 use std::os::fd::OwnedFd;
@@ -119,23 +120,25 @@ impl Volume {
             control: Some(ours),
             log: Some(log),
             next: 1,
+            lease: self.lease_path(),
+            held: false,
         }
     }
 
-    /// The volume's lease (`actor.lock`), taken once whoever holds it lets
-    /// go. A killed host's Git children keep its lease until each has
-    /// exited, which `wait` on the host does not wait for: a host started
-    /// before then exits 75, as the launcher's contract says.
+    /// The volume's lease file, `actor.lock` in its state area.
+    fn lease_path(&self) -> PathBuf {
+        self.p("state/actor.lock")
+    }
+
+    /// The volume's lease, taken once whoever holds it lets go.
     fn lease(&self) -> FileLock {
-        let file = FileLock::open(&self.p("state/actor.lock")).unwrap();
-        FileLock::wait(file, Mode::Exclusive).unwrap()
+        lease(&self.lease_path())
     }
 
     /// SIGKILL to `host`, which leaves its views stale, and the lease free:
     /// the next host of this volume is not busy.
     fn kill(&self, mut host: Host) {
         host.kill();
-        drop(self.lease());
     }
 
     /// Every file under the state area with its size and modification time.
@@ -192,6 +195,13 @@ struct Host {
     log: Option<JoinHandle<String>>,
     /// The next request's id.
     next: u64,
+    /// The volume's lease file.
+    lease: PathBuf,
+    /// Whether this host held the lease: it wrote its hello, which a host
+    /// writes only once it holds the lease. Its end waits for the lease
+    /// ([`Host::release`]); a host that never held it skips the wait, which
+    /// would never end while another holder keeps the lease.
+    held: bool,
 }
 
 impl Host {
@@ -213,6 +223,7 @@ impl Host {
                 log.unwrap_or_default()
             );
         };
+        self.held = true;
         serde_json::from_str(&line).unwrap()
     }
 
@@ -254,20 +265,35 @@ impl Host {
     }
 
     /// Shuts this test's end for writing (EOF; the reader is a clone of
-    /// the same socket): the host drains and exits.
+    /// the same socket): the host drains and exits. Returns once its lease
+    /// is free ([`Host::release`]).
     fn eof(&mut self) -> (ExitStatus, String) {
         if let Some(control) = self.control.take() {
             control.shutdown(std::net::Shutdown::Write).unwrap();
         }
         let status = self.child.wait().unwrap();
+        self.release();
         (status, self.log.take().unwrap().join().unwrap())
     }
 
-    /// SIGKILL: the host's views are left stale, and its lease is held
-    /// until its Git children have exited ([`Volume::kill`] waits for that).
+    /// SIGKILL: the host's views are left stale. Returns once its lease is
+    /// free ([`Host::release`]).
     fn kill(&mut self) {
         self.child.kill().unwrap();
         self.child.wait().unwrap();
+        self.release();
+    }
+
+    /// Waits, after the host has exited, until the lease it held is free:
+    /// taken and let go at once. The lease is shared with the host's tree
+    /// Git children, which keep it until each has exited, and the host's
+    /// exit does not wait for them when it does not drain (exit 3, a
+    /// kill): a host started before then exits 75, as the launcher's
+    /// contract says. Only a host that held the lease waits.
+    fn release(&mut self) {
+        if std::mem::take(&mut self.held) {
+            drop(lease(&self.lease));
+        }
     }
 }
 
@@ -275,7 +301,19 @@ impl Drop for Host {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
+        // No panic in a drop: a lease that cannot be opened is not waited for.
+        if std::mem::take(&mut self.held)
+            && let Ok(file) = FileLock::open(&self.lease)
+        {
+            let _ = FileLock::wait(file, Mode::Exclusive);
+        }
     }
+}
+
+/// The lease file at `path`, taken once whoever holds it lets go.
+fn lease(path: &Path) -> FileLock {
+    let file = FileLock::open(path).unwrap();
+    FileLock::wait(file, Mode::Exclusive).unwrap()
 }
 
 fn text(bytes: &[u8]) -> String {
@@ -823,6 +861,46 @@ fn a_stop_with_views_open_leaves_them_for_the_next_host() {
         assert_eq!(agentfs_fuse::stale::agentfs_layers(at).unwrap(), 0);
     }
     assert!(v.messages("f").contains("Agentfs-Pod: p1"));
+}
+
+/// (m) A host's end in this harness waits for its lease: a host stopped
+/// with a view open while its builder still packs what the view wrote
+/// exits 3, its Git children keeping the lease until each has exited, and
+/// [`Host::eof`] returns only once the lease is free. Each round ends the
+/// host right after a burst of files, which leaves the builder packing
+/// them; the window is a race, so the rounds repeat it.
+#[test]
+#[ignore = "needs root and /dev/fuse: ci/fuse-tests.sh"]
+fn a_stopped_hosts_lease_is_free_when_its_end_returns() {
+    const ROUNDS: usize = 20;
+    let Some(mut v) = Volume::mounted() else {
+        return;
+    };
+    let data = vec![b'x'; 64 << 10];
+    for round in 0..ROUNDS {
+        if round > 0 {
+            v = Volume::new();
+        }
+        let a = mkdir(&v, "a");
+        let mut host = v.host(&[]);
+        host.hello();
+        assert!(matches!(
+            host.ask(&open(TreeRef::Root, &a, "a", pod("ns", "p1", "u1"))),
+            Reply::Opened { .. }
+        ));
+        for i in 0..64 {
+            std::fs::write(a.join(format!("f{i}")), &data).unwrap();
+        }
+        let (status, log) = host.eof();
+        assert_eq!(status.code(), Some(3), "round {round}: {log}");
+        assert!(
+            FileLock::try_take(&v.lease_path(), Mode::Exclusive)
+                .unwrap()
+                .is_some(),
+            "round {round}: the lease is held after the host's end returned"
+        );
+        assert_eq!(agentfs_fuse::stale::detach_stale_layers(&a, 1).unwrap(), 1);
+    }
 }
 
 /// (n) A host killed with a view open leaves its client attached. A new
