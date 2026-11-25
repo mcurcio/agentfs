@@ -93,7 +93,7 @@ whether `git worktree add` or a plain checkout makes each working tree; snapshot
 
 ## Where it meets the existing code
 
-- **Confinement** (`agentfs-core` `confined.rs` and `agentfs-fuse` `backing.rs`, a duplicate by the module's own words) becomes one confined `fs` adapter.
+- **Confinement** (`agentfs-os` `confined.rs` and `agentfs-fuse` `backing.rs`, which share only the resolution flags and `proc_path`) becomes one confined `fs` adapter.
 - **The tmp layer** (`overlay/tmp.rs`) becomes a fork's working tree; recordable names stop going to the shared tree.
 - **The existing volume fork** (a whole volume cloned from another's latest commit) becomes an in-volume fork with its own branch. Cost: quotas, snapshots and the drop rule are new code.
 

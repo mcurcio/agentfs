@@ -19,8 +19,8 @@ use git2::Oid;
 use serde::{Deserialize, Serialize};
 
 use crate::checks::Refusal;
-use crate::paths::RepoPath;
 use crate::record::Trigger;
+use agentfs_contracts::paths::RepoPath;
 
 /// Where a path was refused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

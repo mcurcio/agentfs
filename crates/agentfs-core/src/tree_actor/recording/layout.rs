@@ -192,7 +192,7 @@ impl Layout {
         O: ExactSizeIterator<Item = &'a (u64, Call, L)> + Clone,
     {
         let mut keep = own.len();
-        if crate::failpoints::hit("tree.build_replay_skew").is_err() {
+        if agentfs_failpoints::hit("tree.build_replay_skew").is_err() {
             keep = keep.saturating_sub(1);
         }
         let Some(calls) = pages::recorded_close_calls(own.take(keep), writes, pieces) else {

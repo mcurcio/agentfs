@@ -1,0 +1,27 @@
+[package]
+name = "agentfs-failpoints"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "agentfs's failpoints: named places on the durable path where a test build can kill, fail, stall or park the process"
+
+[package.metadata.agentfs]
+rank = "leaf"
+
+# Only a failpoints build acts, so only it needs these: EIO for a gate's
+# `fail`, SIGKILL for a point's `kill`, and the spec's error.
+[dependencies]
+libc = { version = "0.2.190", optional = true }
+rustix = { version = "1.1.5", features = ["process"], optional = true }
+thiserror = { version = "2.0.21", optional = true }
+
+[dev-dependencies]
+# The FIFOs of the gate's test.
+rustix = { version = "1.1.5", features = ["fs"] }
+tempfile = "3.27.0"
+
+[features]
+# Test builds only: the registry acts on its spec. Never in a release or image.
+failpoints = ["dep:libc", "dep:rustix", "dep:thiserror"]

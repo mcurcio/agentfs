@@ -10,7 +10,7 @@ READMEs, generated from `values.yaml` and checked in CI
 **This page is checked against the code.** Tests fail when a config key,
 operator attribute, flag or environment variable that agentfs reads is
 missing here, or when a row names one it no longer has
-(`crates/agentfs-core/tests/docs_reference.rs`,
+(`crates/agentfs-core/tests/config_reference.rs`,
 `crates/agentfs/src/reference_tests.rs` and the `reference_tests` module
 of `crates/agentfs-csi/src/main.rs`; the `docs` CI job). They rely on
 these conventions, so keep them when editing:
@@ -1138,12 +1138,12 @@ in `+failpoints`, and it warns at start when the variable is set); release
 builds and the image have no failpoints and ignore it. Never set it in
 production. In the same builds, `AGENTFS_TAKE_GATE=<dir>` stops `mount`'s
 queue worker: it takes only when a test asks through the fifos `go` and `took`
-in that directory (`agentfs_core::failpoints::TakeGate`). `AGENTFS_COMPACT_GATE`, set to a directory,
+in that directory (`agentfs_failpoints::TakeGate`). `AGENTFS_COMPACT_GATE`, set to a directory,
 gives every tree volume the binary opens (`mount`, `host`, `init`, `fork end`) a
 compaction gate on the fifos `at` and `go` in that directory: one journal frame per
 segment, a compaction at every built event, and the compactor parked at each of its
 five gaps until a test answers `go` or `fail`; an empty line ends the gate
-(`agentfs_core::failpoints::FifoGate`, [trees](trees.md#recording-and-durability)).
+(`agentfs_failpoints::FifoGate`, [trees](trees.md#recording-and-durability)).
 
 **Tests only.** `AGENTFS_TEST_VOLUMES` is read by the test programs, never
 by a binary: it picks the slow tree tests' volume sizes

@@ -18,7 +18,7 @@ use super::journal::{Change, SaveOutcome, TakeRecord, TreeLocals};
 use super::meta::{Attrs, Kind, Meta, Perm, Times};
 use super::recording::FileMap;
 use super::{Error, Result, queue, referee};
-use crate::tree_reconcile::{Id, LineMap};
+use agentfs_lines::{Id, LineMap};
 
 /// A step's journal number. It numbers the step's name versions and line versions, and the object,
 /// handle or fork a step creates. Volume-wide; never reused.
@@ -2463,7 +2463,7 @@ mod tests {
         assert_eq!(serde_json::from_str::<NameHistory>(&stored).unwrap(), both);
     }
     use crate::tree_actor::referee::{Collision, CollisionKind, Version};
-    use crate::tree_reconcile::Line;
+    use agentfs_lines::Line;
 
     fn v(text: &str) -> LineVersion {
         text.parse().unwrap()
@@ -2471,7 +2471,7 @@ mod tests {
 
     #[test]
     fn the_stored_text_is_unchanged() {
-        let lines = Lines::from_expanded(&crate::tree_reconcile::Expanded {
+        let lines = Lines::from_expanded(&agentfs_lines::Expanded {
             lines: vec![
                 Line {
                     identity: v("9:1"),

@@ -11,21 +11,22 @@ use git2::{Oid, Repository};
 
 use std::sync::Mutex;
 
+use agentfs_os::confined::Dir;
+
 use super::create::{self, CreateError, CreateRequest};
 use super::finish::{
     self, AbandonError, FinishError, Finisher, ForkState, Met, PublishOutcome, RefusedReason,
     StatusError, refused_reason,
 };
 use super::identity::{ForkIdentity, ForkLink, PushTarget, change_ref, finish_ref};
-use crate::confined::Dir;
 use crate::events::{Event, Events, NullSink, PushFailureKind};
 use crate::identity::Context;
 use crate::lock::StateLock;
-use crate::paths::RepoPath;
 use crate::record::{Caller, OperationKind, Origin, Trigger};
 use crate::restore::{self, Applied, RecordMode};
 use crate::telemetry::Telemetry;
 use crate::volume::{self, StateDir};
+use agentfs_contracts::paths::RepoPath;
 
 const CALLER: Caller = Caller {
     uid: 10000,
@@ -786,6 +787,7 @@ fn publish_waits_for_an_unreachable_remote() {
 fn push_source_branch(source: &Vol) {
     let repo = source.repo();
     let head = source.head().unwrap();
+    #[expect(clippy::disallowed_methods, reason = "a test's remote")]
     let mut push = repo
         .remote_anonymous(&source.remote.display().to_string())
         .unwrap();
@@ -1902,7 +1904,7 @@ fn an_unlinked_fork_of_a_local_only_source_records_no_path() {
 /// Whether `git` is installed (the queue merges with it); says so when
 /// it is not.
 fn have_git() -> bool {
-    let found = crate::git_cli::find_git().is_some();
+    let found = agentfs_git::git_cli::find_git().is_some();
     if !found {
         eprintln!("skipping: git is not installed");
     }

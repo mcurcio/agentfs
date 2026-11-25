@@ -32,7 +32,7 @@ use std::collections::BTreeSet;
 use std::path::Path;
 
 use crate::checks::ATTR_MAX_LINE_LENGTH;
-use crate::paths::RepoPath;
+use agentfs_contracts::paths::RepoPath;
 
 /// The block's first line, exactly.
 pub const BEGIN: &str =

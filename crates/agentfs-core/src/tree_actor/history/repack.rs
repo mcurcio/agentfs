@@ -2,7 +2,7 @@
 //! trails the files"). Each batch the builder installs is one pack, and a
 //! read's cost grows with the pack count, so at each built event the task
 //! rolls the small packs up, one run at a time, with the memory bounds of
-//! the recording engine's repack ([`crate::repack::PACK_CONFIG`]). It runs
+//! every repack ([`agentfs_git::git_cli::PACK_CONFIG`]). It runs
 //! beside `git fast-import`, as a git server repacks beside receive-pack,
 //! never under the builder's lease and never stopping it. Only a built
 //! event starts a run ([`History::wait_batch_end`]), not a failed batch or a
@@ -81,7 +81,7 @@
 //! notes `git notes` writes) are not rolled up.
 //!
 //! The children are not counted with the actor's Git children
-//! ([`crate::git_cli::counted`]): they are not on the actor's path, and a
+//! ([`agentfs_git::git_cli::counted`]): they are not on the actor's path, and a
 //! count a background task adds to would not tell what an operation started.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -94,8 +94,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Stdio};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
+use agentfs_git::git_cli::PACK_CONFIG;
+
 use super::built::{Ends, History};
-use crate::repack::PACK_CONFIG;
 use crate::tree_actor::stages::{Timer, Which};
 
 /// The task's child and whether a stop was asked, behind one lock: a stop
@@ -407,7 +408,7 @@ fn in_doubt(git_dir: &Path) -> Midx {
     Midx::InDoubt
 }
 
-/// The `git` program, as `PATH` ([`crate::git_cli::GIT_PATH`]) finds it. A
+/// The `git` program, as `PATH` ([`agentfs_git::git_cli::GIT_PATH`]) finds it. A
 /// test stands a wrapper in the git directory to hold or skip a run.
 fn program(git_dir: &Path) -> PathBuf {
     #[cfg(test)]
@@ -724,7 +725,7 @@ fn command(
     if held.stopped {
         return Ok(Ran::Stopped);
     }
-    let mut cmd = crate::git_cli::command(git, git_dir);
+    let mut cmd = agentfs_git::git_cli::command(git, git_dir);
     cmd.args(FSYNC)
         .args(PACK_CONFIG)
         .args(args)

@@ -130,7 +130,7 @@ fn a_crash_between_the_placement_and_the_unlink_completes_at_the_next_open() {
     drop(v);
     mark_env(tmp.path());
     {
-        let _guard = agentfs_core::failpoints::configure("tree.untrack_after_place=error").unwrap();
+        let _guard = agentfs_failpoints::configure("tree.untrack_after_place=error").unwrap();
         assert!(TreeActor::open(tmp.path(), &Default::default()).is_err());
     }
     let placed = area(tmp.path(), ROOT).join("secret.env");

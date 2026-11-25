@@ -242,7 +242,7 @@ impl NotifyCursor {
 
     /// Writes atomically.
     pub fn save(&self, path: &Path) -> io::Result<()> {
-        crate::fsutil::write_json_atomic(path, self)
+        agentfs_os::fsutil::write_json_atomic(path, self)
     }
 }
 

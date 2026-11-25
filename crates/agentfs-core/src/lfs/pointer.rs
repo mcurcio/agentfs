@@ -146,6 +146,18 @@ impl Pointer {
     }
 }
 
+/// The SHA-256 and length of the regular file `rel` beneath `tree` (an LFS
+/// object id), read without following a symlink.
+pub fn sha256_at(tree: &agentfs_os::confined::Dir, rel: &str) -> io::Result<(LfsOid, u64)> {
+    use rustix::fs::{Mode, OFlags};
+    let fd = tree.open_at(rel, OFlags::RDONLY, Mode::empty())?;
+    if agentfs_os::confined::kind_of(&rustix::fs::fstat(&fd)?) != agentfs_os::confined::Kind::File {
+        return Err(io::Error::other(format!("{rel} is not a regular file")));
+    }
+    let pointer = Pointer::of_reader(std::fs::File::from(fd))?;
+    Ok((pointer.oid, pointer.size))
+}
+
 /// A SHA-256 being computed while bytes are written elsewhere.
 pub(crate) struct Hashing {
     hasher: Sha256,

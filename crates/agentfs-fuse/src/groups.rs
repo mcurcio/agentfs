@@ -455,7 +455,7 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::thread;
 
-    use agentfs_core::paths::RepoPath;
+    use agentfs_contracts::paths::RepoPath;
 
     use super::*;
 

@@ -41,11 +41,11 @@
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
+use agentfs_git::git_cli;
 use git2::{FileMode, Oid, Repository};
 
 use super::{BlockReason, MAX_PATCH_PATHS};
-use crate::git_cli;
-use crate::paths::RepoPath;
+use agentfs_contracts::paths::RepoPath;
 
 /// A patch as the queue reads it from its tip (see the module docs).
 ///

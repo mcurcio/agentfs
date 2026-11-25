@@ -25,16 +25,16 @@
 use std::io::{self, Read as _, Write as _};
 use std::path::{Path, PathBuf};
 
+use agentfs_os::confined::Dir;
 use git2::{Oid, Repository};
 
 use crate::config::{ConfigError, ForkRemote, Settings, validate_name};
-use crate::confined::Dir;
 use crate::history::HistoryError;
 use crate::lfs::fetch::LfsObjects;
 use crate::lfs::{LfsError, ObjectCache, Pointer, Store};
-use crate::paths::RepoPath;
 use crate::restore::{self, NotLive, Pathspec, RecordPolicy, Request, RestoreError};
 use crate::volume::{self, StateDir, VolumeError};
+use agentfs_contracts::paths::RepoPath;
 
 use super::identity::{ForkIdentity, ForkLink, PushTarget};
 
@@ -233,7 +233,7 @@ fn source_settings(source: &StateDir) -> Result<Settings, CreateError> {
             path: source.root().to_path_buf(),
         });
     }
-    crate::history::init_libgit2();
+    crate::history::init_git();
     Settings::load(&git).map_err(CreateError::SourceSettings)
 }
 
@@ -571,7 +571,7 @@ pub fn settings_files(source: &StateDir) -> Result<Vec<PathBuf>, CreateError> {
             path: source.root().to_path_buf(),
         });
     }
-    crate::history::init_libgit2();
+    crate::history::init_git();
     let settings = Settings::load(&git).map_err(CreateError::SourceSettings)?;
     let git_error = |e: git2::Error| CreateError::SourceSettings(ConfigError::Git(e));
     // libgit2 expands includes in place, so a key the own file sets is one

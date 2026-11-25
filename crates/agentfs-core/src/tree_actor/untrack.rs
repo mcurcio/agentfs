@@ -53,7 +53,7 @@ impl TreeActor {
                         .containers(&path, &mut |dir| t.dirs.get(dir).map(|state| state.meta))?;
                     writing.place(&path, &mut bytes.reader(), bytes.len(), meta)?;
                 }
-                crate::failpoints::hit("tree.untrack_after_place")?;
+                agentfs_failpoints::hit("tree.untrack_after_place")?;
                 self.unlink(tree, &path, &by)?;
                 eprintln!(
                     "tree Untracked: tree={tree} path={path}: {}",

@@ -208,7 +208,7 @@ pub(crate) fn fetch_branch(
     remote: &RemoteSettings,
     refname: &str,
 ) -> Result<Option<Oid>, (PushFailureKind, String)> {
-    crate::history::init_libgit2();
+    crate::history::init_git();
     let url = remote.push_url();
     let auth = RemoteAuth::new(remote);
     let state = AuthState::new();
@@ -230,6 +230,10 @@ pub(crate) fn fetch_branch(
         };
         (kind, message)
     };
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the recording engine opens a remote, after init_git"
+    )]
     let mut git_remote = repo.remote_anonymous(url).map_err(failed)?;
     let fetched = {
         let mut options = FetchOptions::new();
@@ -288,7 +292,7 @@ pub enum AcceptError {
 /// remote pushes it create-only with the branch and no longer raises the
 /// alarm for commits `tip` reaches.
 pub fn accept(state: &StateDir, tip: Oid) -> Result<String, AcceptError> {
-    crate::history::init_libgit2();
+    crate::history::init_git();
     let settings = Settings::load(&state.git()).map_err(AcceptError::Settings)?;
     let Some(start) = &settings.start else {
         return Err(AcceptError::NotStarted {

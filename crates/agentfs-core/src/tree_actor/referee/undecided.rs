@@ -6,7 +6,7 @@ use std::collections::BTreeSet;
 use super::{Record, Snapshot};
 use crate::tree_actor::Result;
 use crate::tree_actor::tree::{EventNumber, LineVersion, MergeFileIdentity};
-use crate::tree_reconcile::Id;
+use agentfs_lines::Id;
 
 /// History's answers the referee needs: whether the save numbered `save` is in the upstream's
 /// history, and whether the commit that wrote the fork's value of a record is.

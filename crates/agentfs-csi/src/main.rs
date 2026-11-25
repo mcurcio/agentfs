@@ -13,7 +13,8 @@ use std::time::Duration;
 
 use clap::Parser;
 
-use agentfs_core::config::parse_duration;
+use agentfs_contracts::units::duration_arg;
+
 use agentfs_csi::controller::ControllerService;
 use agentfs_csi::identity::IdentityService;
 use agentfs_csi::launcher::{AgentfsLauncher, PluginIdentity};
@@ -22,10 +23,6 @@ use agentfs_csi::mounter::KernelMounter;
 use agentfs_csi::node::NodeService;
 use agentfs_csi::server;
 use agentfs_csi::supervisor::{Backoff, NodeConfig, Supervisor};
-
-fn duration(value: &str) -> Result<Duration, String> {
-    parse_duration(value).ok_or_else(|| format!("{value:?} is not a duration (use e.g. 500ms, 5s)"))
-}
 
 /// The agentfs CSI driver.
 #[derive(Debug, Parser)]
@@ -52,7 +49,7 @@ struct Cli {
     #[arg(long, default_value = "/usr/local/bin/agentfs")]
     agentfs_bin: PathBuf,
     /// The longest delay between restarts of a crashed host.
-    #[arg(long, default_value = "30s", value_parser = duration)]
+    #[arg(long, default_value = "30s", value_parser = duration_arg)]
     backoff_max: Duration,
     /// The plugin pod's name, for its children's identity.
     #[arg(long, env = "AGENTFS_CSI_POD", default_value = "")]
@@ -64,7 +61,7 @@ struct Cli {
 
 fn main() -> ExitCode {
     // Before tokio's threads start: arenas made before it stay.
-    agentfs_core::allocator::limit_arenas();
+    agentfs_os::allocator::limit_arenas();
     let cli = Cli::parse();
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -104,7 +101,7 @@ async fn run(cli: Cli) -> Result<(), String> {
     std::fs::create_dir_all(&cli.base_path)
         .map_err(|e| agentfs_csi::volume::chain(&e))
         .and_then(|()| {
-            agentfs_core::shared_fs::network_filesystem(&cli.base_path)
+            agentfs_os::shared_fs::network_filesystem(&cli.base_path)
                 .map_err(|e| agentfs_csi::volume::chain(&e))
         })
         .and_then(|network| match network {
@@ -187,27 +184,20 @@ async fn shutdown_signal() {
     eprintln!("{name}: shutting down");
 }
 
-/// Shared with the `agentfs` binary's and `agentfs-core`'s doc tests.
-#[cfg(test)]
-#[path = "../../agentfs/src/doc_tables.rs"]
-mod doc_tables;
-
 /// Checks the `agentfs-csi` flags table of docs/configuration.md against
 /// [`Cli`]: every flag and its environment variable, and no stale rows.
 #[cfg(test)]
 mod reference_tests {
     use clap::CommandFactory;
 
+    use agentfs_repo::doc_tables;
+
     use super::Cli;
-    use super::doc_tables;
 
     /// The `agentfs-csi` flags table: the table headed `Flag` in the CSI
     /// section, and the section's text.
     fn table() -> (doc_tables::Table, String) {
-        let sections = doc_tables::sections(&doc_tables::read_doc(
-            env!("CARGO_MANIFEST_DIR"),
-            "configuration.md",
-        ));
+        let sections = doc_tables::sections(&doc_tables::read_doc("configuration.md"));
         let section = doc_tables::section(&sections, "The CSI driver (`agentfs-csi`)")
             .expect("docs/configuration.md has no `## The CSI driver (`agentfs-csi`)` section");
         let table = section

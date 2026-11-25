@@ -301,7 +301,7 @@ mod tests {
     use git2::Signature;
 
     use super::*;
-    use crate::paths::RepoPath;
+    use agentfs_contracts::paths::RepoPath;
 
     /// A repository with two commits and a patch branch of the second.
     fn fixture() -> (tempfile::TempDir, Repository, PatchBranch) {

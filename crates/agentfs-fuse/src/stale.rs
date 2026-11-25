@@ -6,7 +6,7 @@
 //! ([`crate::tree_view`]).
 //!
 //! An agentfs mount is a FUSE mount whose source starts `agentfs:`
-//! ([`agentfs_core::mountinfo`]); [`source_volume`] reads the volume it names.
+//! ([`agentfs_os::mountinfo`]); [`source_volume`] reads the volume it names.
 //! A daemon that dies leaves its mount answering `ENOTCONN`, or
 //! `ECONNABORTED` for a request caught by the abort ([`is_disconnected`]).
 //! Stacking mounts
@@ -21,7 +21,7 @@ use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use agentfs_core::mountinfo::{self, MountEntry};
+use agentfs_os::mountinfo::{self, MountEntry};
 
 use crate::privileges::Privileges;
 

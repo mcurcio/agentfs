@@ -1,5 +1,5 @@
 //! The LFS cache lock, `<state>/lfs/lock`: a `flock`
-//! ([`crate::file_lock`]) that keeps `agentfs lfs prune` from deleting an
+//! ([`agentfs_os::file_lock`]) that keeps `agentfs lfs prune` from deleting an
 //! object while anything that reads objects for writing them into the
 //! tree holds it.
 //!
@@ -17,7 +17,7 @@ use std::io;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use crate::file_lock::{Attempt, FileLock, Mode};
+use agentfs_os::file_lock::{Attempt, FileLock, Mode};
 
 /// The lock file's name in `<state>/lfs`.
 pub const LOCK_FILE: &str = "lock";
@@ -75,7 +75,7 @@ mod tests {
     #[test]
     fn a_lock_let_go_is_free_while_children_spawn() {
         let dir = tempfile::tempdir().unwrap();
-        let (busy, takes) = crate::file_lock::takes_while_children_spawn(|| {
+        let (busy, takes) = agentfs_os::file_lock::takes_while_children_spawn(|| {
             drop(CacheLock::shared(dir.path()).unwrap());
             CacheLock::exclusive(dir.path(), Duration::ZERO)
                 .unwrap()

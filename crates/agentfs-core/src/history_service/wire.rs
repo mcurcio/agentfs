@@ -14,7 +14,6 @@ use super::{Answer, Call, FrontInfo, PathStamp};
 use crate::checks::Refusal;
 use crate::lfs::Store;
 use crate::nested::{NestedKind, View};
-use crate::paths::RepoPath;
 use crate::pending::PendingId;
 use crate::record::{
     Caller, Change, Draft, Operation, OperationKind, Origin, PatchAuthor, Trigger,
@@ -22,6 +21,7 @@ use crate::record::{
 use crate::rules::{RuleSource, SkipReason};
 use crate::stamps::FreezeStamp;
 use crate::volume::Skipped;
+use agentfs_contracts::paths::RepoPath;
 
 /// `agentfs.history.v2`: the messages, the `History` client
 /// ([`pb::history_client`]) and server ([`pb::history_server`]).

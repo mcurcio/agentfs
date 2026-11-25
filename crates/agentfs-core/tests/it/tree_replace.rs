@@ -335,7 +335,7 @@ fn a_crash_before_the_step_leaves_the_old_bytes() {
     let tmp = tempfile::tempdir().unwrap();
     // Nothing is built: the reopen replays every record, the chunk records
     // the cut-short replace left among them.
-    let guard = agentfs_core::failpoints::configure(
+    let guard = agentfs_failpoints::configure(
         "tree.build_before_batch=error@*;tree.replace_before_step=error",
     )
     .unwrap();

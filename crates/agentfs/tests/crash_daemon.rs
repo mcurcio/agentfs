@@ -24,8 +24,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
-use agentfs_core::failpoints::ENV_VAR;
 use agentfs_core::volume::StateDir;
+use agentfs_failpoints::ENV_VAR;
 use git2::{Oid, Repository, Signature};
 
 const BRANCH: &str = "refs/heads/agentfs/demo";

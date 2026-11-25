@@ -14,8 +14,8 @@ use std::collections::BTreeSet;
 use std::path::Path;
 use std::process::{Command, Stdio};
 
+use agentfs_contracts::paths::RepoPath;
 use agentfs_core::lfs::attributes::{compose, split};
-use agentfs_core::paths::RepoPath;
 use agentfs_core::rules::{AttrState, RuleOptions, Rules};
 
 const MANAGED: &[&str] = &[

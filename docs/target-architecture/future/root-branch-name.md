@@ -68,7 +68,7 @@ Each is asked labelled "general guidance" or "absolute requirement".
 
 - M4's gate: a `phase-1.yml` run without the seed shards (about 20 min wall, [one engine](one-engine.md), "Costs"),
   and ci and image.
-- `docs_reference` passes with the key's row in [configuration](../../configuration.md).
+- `config_reference` passes with the key's row in [configuration](../../configuration.md).
 - The tracer publishes under a configured name, then under a changed one.
 - [Trees](../../trees.md), [remotes](../../remotes.md) and [configuration](../../configuration.md) are rewritten, and
   this page is deleted.

@@ -246,7 +246,7 @@ impl Mounted {
             .arg(&self.root)
             .env("AGENTFS_TAKE_GATE", &self.gate)
             .env(
-                agentfs_core::failpoints::COMPACT_GATE_VAR,
+                agentfs_core::tree_actor::COMPACT_GATE_VAR,
                 &self.compact_gate,
             )
             .stdin(Stdio::null())

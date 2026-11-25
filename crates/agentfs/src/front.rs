@@ -21,6 +21,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::{Context as _, Result, bail};
 use clap::Args;
 
+use agentfs_contracts::units::duration_arg;
+
 use agentfs_core::history::History;
 use agentfs_core::history_service::{
     Address, ClientConfig, FrontHooks, FrontInfo, FrontLease, HistoryClient, ListenerHandle,
@@ -31,7 +33,7 @@ use agentfs_core::volume::{self, Recorder, StateDir};
 use agentfs_fuse::{Mount, MountConfig, MountKind, Passthrough, UnmountReport, preflight};
 
 use crate::daemon::{Daemon, Wake};
-use crate::{HistoryArgs, Pod, Session, parse_grace};
+use crate::{HistoryArgs, Pod, Session};
 
 /// `agentfs front`'s flags: a FUSE mount of BACKING at MOUNTPOINT whose
 /// records go to the history service.
@@ -57,7 +59,7 @@ pub struct FrontArgs {
     pub no_allow_other: bool,
     /// How long shutdown waits for a busy mount (files still open) to be
     /// released after it is detached.
-    #[arg(long, default_value = "10s", value_parser = parse_grace)]
+    #[arg(long, default_value = "10s", value_parser = duration_arg)]
     pub unmount_grace: Duration,
     /// Where a workload sees the mount when not at MOUNTPOINT (a container's
     /// `mountPath`): `PATH`, or `PATH=DIR` for the tree's directory DIR (a
@@ -77,10 +79,10 @@ pub struct FrontArgs {
     pub history_service: String,
     /// How long a boundary waits for the history service before it fails
     /// with EIO.
-    #[arg(long, env = "AGENTFS_HISTORY_TIMEOUT", default_value = "10s", value_parser = parse_grace, value_name = "DURATION")]
+    #[arg(long, env = "AGENTFS_HISTORY_TIMEOUT", default_value = "10s", value_parser = duration_arg, value_name = "DURATION")]
     pub history_timeout: Duration,
     /// How long to wait at start for the history service to be up.
-    #[arg(long, env = "AGENTFS_HISTORY_WAIT", default_value = "30s", value_parser = parse_grace, value_name = "DURATION")]
+    #[arg(long, env = "AGENTFS_HISTORY_WAIT", default_value = "30s", value_parser = duration_arg, value_name = "DURATION")]
     pub history_wait: Duration,
     /// Prefer pending slot N (1..=1023), else the lowest free slot. A front
     /// restarted after a crash passes its predecessor's slot so it drains

@@ -212,7 +212,7 @@ fn write_tmp(dir: &Path, checkpoint: &Checkpoint) -> io::Result<()> {
 /// Fsyncs the journal's directory, with no lock held.
 fn sync_dir(dir: &Path) -> io::Result<()> {
     assert_unlocked(Unlocked::Fsync);
-    crate::fsutil::sync_dir(dir)
+    agentfs_os::fsutil::sync_dir(dir)
 }
 
 /// A new journal's first checkpoint, written and in place in `dir`, each
@@ -523,6 +523,20 @@ impl CompactGate for ChannelGate {
             .unwrap_or_else(PoisonError::into_inner)
             .recv()
             .unwrap_or(Ok(()))
+    }
+}
+
+/// The environment variable naming the compaction gate's directory: the
+/// FIFOs of an `agentfs_failpoints::FifoGate`, parked at each gap's
+/// [`Gap::name`]. Read only by the `agentfs` binary, and only in a
+/// `failpoints` build. Release builds ignore it.
+pub const COMPACT_GATE_VAR: &str = "AGENTFS_COMPACT_GATE";
+
+/// The test script's gate: parks at each gap's name.
+#[cfg(feature = "failpoints")]
+impl CompactGate for agentfs_failpoints::FifoGate {
+    fn at(&self, gap: Gap) -> io::Result<()> {
+        self.park(gap.name())
     }
 }
 

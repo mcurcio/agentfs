@@ -67,12 +67,12 @@ use serde::Serialize;
 use tiny_http::{Header, Method, Response, Server, StatusCode};
 
 use agentfs_core::config::Settings;
-use agentfs_core::git_cli;
 use agentfs_core::identity::IdentityRenderer;
 use agentfs_core::lock::{LockError, StateLock};
 use agentfs_core::patch::admit::{self, Pusher, RefUpdate, Right};
 use agentfs_core::patch::{Verdict, applied_prefix, approved_prefix, inbox_prefix, status_ref};
 use agentfs_core::volume::StateDir;
+use agentfs_git::git_cli;
 
 use crate::control::{self, ClientError, Reply, Request};
 use crate::daemon::Daemon;

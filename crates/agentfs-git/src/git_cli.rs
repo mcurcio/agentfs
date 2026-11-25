@@ -1,8 +1,9 @@
 //! Running the `git` program on a state area's git directory.
 //!
 //! agentfs runs the `git` program where git does the job better than
-//! libgit2 (AGENTS.md principle 4): `git repack` ([`crate::repack`]) and
-//! `git merge-tree` ([`crate::patch::integrate`]). Both run it here, in an
+//! libgit2 (AGENTS.md principle 4): `git repack` (agentfs-core's `repack`
+//! and the tree history's repack task) and `git merge-tree` (agentfs-core's
+//! `patch::integrate`). Both run it here, in an
 //! environment of its own: a fixed `PATH`, `LC_ALL=C`, `HOME` set to the
 //! git directory, and the system and global git config switched off, so the
 //! program reads only the repository's own config, as libgit2 does, and nothing in the daemon's environment (`GIT_CONFIG_*`,
@@ -17,17 +18,38 @@ pub use agentfs_align::GIT_PATH;
 
 static CHILDREN: AtomicU64 = AtomicU64::new(0);
 
-/// Starts a Git child on the tree actor's path, and counts it. The one spawn
-/// site there: children clear their `PATH`, so no wrapper could count them, and
-/// a source test (`tests/tree_stages.rs`) fails when another site appears.
-pub(crate) fn counted(cmd: &mut Command) -> io::Result<Child> {
+/// The memory bounds of every repack's `git`, before its subcommand: one
+/// pack thread, at most 64 MiB of delta window and 16 MiB of delta cache,
+/// blobs over 64 MiB stored whole, and 128 MiB of mapped packs. Both
+/// engines' repacks run with them (docs/library/core.md explains the
+/// recording engine's).
+pub const PACK_CONFIG: [&str; 12] = [
+    "-c",
+    "repack.writeBitmaps=false",
+    "-c",
+    "pack.threads=1",
+    "-c",
+    "pack.windowMemory=64m",
+    "-c",
+    "pack.deltaCacheSize=16m",
+    "-c",
+    "core.bigFileThreshold=64m",
+    "-c",
+    "core.packedGitLimit=128m",
+];
+
+/// Starts a Git child and counts it, for a caller whose count of children must
+/// be exact: its one spawn site, since children clear their `PATH` and no
+/// wrapper could count them. A caller's source test keeps every other site out
+/// (docs/architecture.md names the one there is).
+pub fn counted(cmd: &mut Command) -> io::Result<Child> {
     let child = cmd.spawn()?;
     CHILDREN.fetch_add(1, Ordering::Relaxed);
     Ok(child)
 }
 
 /// Git children started through [`counted`] in this process. A measurement.
-pub(crate) fn children() -> u64 {
+pub fn children() -> u64 {
     CHILDREN.load(Ordering::Relaxed)
 }
 
@@ -37,14 +59,9 @@ pub(crate) fn children() -> u64 {
 /// directory `git_dir`, stdin null. Stdout and stderr are left to the
 /// caller.
 pub fn command(git: &Path, git_dir: &Path) -> Command {
-    let mut cmd = Command::new(git);
-    cmd.env_clear()
-        .env("PATH", GIT_PATH)
-        .env("LC_ALL", "C")
-        .env("HOME", git_dir)
+    let mut cmd = agentfs_align::isolated(git);
+    cmd.env("HOME", git_dir)
         .env("GIT_DIR", git_dir)
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_TERMINAL_PROMPT", "0")
         .current_dir(git_dir)
         .stdin(Stdio::null());

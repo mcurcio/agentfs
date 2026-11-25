@@ -517,7 +517,7 @@ impl pb::history_server::History for Svc {
                 .recorder
                 .sequence(&origin, front.slot, draft, &stamps)
                 .and_then(|recorded| {
-                    crate::failpoints::hit("service.after_record")?;
+                    agentfs_failpoints::hit("service.after_record")?;
                     Ok(recorded)
                 })
         })
@@ -703,7 +703,7 @@ impl HistoryServer {
         // Stops the listener at the shutdown signal: tonic keeps its
         // incoming stream while connections drain, and a front's connect
         // then must be refused, not left unanswered
-        // (`crate::listening_socket`).
+        // (`agentfs_os::listening_socket`).
         let stopper = listener.stopper()?;
         let euid = shared.admission.euid;
         let incoming = listener.filter_map(move |accepted| {

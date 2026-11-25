@@ -2,7 +2,7 @@
 //! `csi.json` in each volume directory, and the node's published records,
 //! from which a restarted node plugin reconciles. Each is JSON written
 //! whole (a temporary file renamed over it, mode 0600) with
-//! [`agentfs_core::fsutil::write_json_atomic`]. A field this driver does not
+//! [`agentfs_os::fsutil::write_json_atomic`]. A field this driver does not
 //! know fails the load, so a record of another build (the recording
 //! driver's `csi.json` included) is refused, never half-read.
 
@@ -78,7 +78,7 @@ fn store<T: Serialize>(path: &Path, value: &T) -> Result<(), Error> {
         if let Some(dir) = path.parent() {
             DirBuilder::new().recursive(true).mode(0o700).create(dir)?;
         }
-        agentfs_core::fsutil::write_json_atomic(path, value)
+        agentfs_os::fsutil::write_json_atomic(path, value)
     };
     write().map_err(|e| Error::io(format!("writing {}", path.display()), e))
 }

@@ -13,7 +13,6 @@ use std::collections::BTreeSet;
 use std::fs::File;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::Once;
 
 use git2::{Index, IndexEntry, IndexTime, Oid, Repository, Signature, Time};
 
@@ -23,18 +22,13 @@ use crate::events::CheckStage;
 use crate::fork::finish::FinishRecord;
 use crate::identity::{Context, IdentityError, IdentityRenderer};
 use crate::lfs::{ObjectCache, Store, attributes};
-use crate::paths::{RepoPath, SpecialFile};
 use crate::pending::PendingStore;
 use crate::record::{Change, Operation, OperationKind, PatchAuthor, Record};
+use agentfs_contracts::paths::{RepoPath, SpecialFile};
 
 pub const SEQ_TRAILER: &str = "Agentfs-Seq";
 /// The inbox number of the patch a commit applies.
 pub const INBOX_TRAILER: &str = "Agentfs-Inbox";
-
-/// How long libgit2 waits for a remote to accept a connection.
-pub const SERVER_CONNECT_TIMEOUT_MS: std::ffi::c_int = 30_000;
-/// How long libgit2 waits on a stalled read or write to a remote.
-pub const SERVER_IO_TIMEOUT_MS: std::ffi::c_int = 300_000;
 
 const MODE_FILE: u32 = 0o100644;
 const MODE_EXECUTABLE: u32 = 0o100755;
@@ -63,75 +57,18 @@ pub enum HistoryError {
     ForkBaseMissing(Oid),
 }
 
-/// Process-wide libgit2 setup, done once before any repository is opened:
-///
-/// - objects and refs are fsynced (libgit2 does not by default; design);
-/// - the system, XDG, global and ProgramData config search paths are
-///   cleared, so no config outside the history repository's own file can
-///   reach a volume: not `url.<base>.insteadOf` redirecting a push, not
-///   `http.*`, not `core.excludesFile`;
-/// - the home directory is cleared, so `~/.ssh/known_hosts` never decides
-///   or steers an SSH host key check;
-/// - remote connections and reads/writes time out
-///   ([`SERVER_CONNECT_TIMEOUT_MS`], [`SERVER_IO_TIMEOUT_MS`]), so a hung
-///   remote ends as an unreachable push.
-pub(crate) fn init_libgit2() {
-    static ONCE: Once = Once::new();
-    ONCE.call_once(|| {
-        libgit2_sys::init();
-        // SAFETY: GIT_OPT_ENABLE_FSYNC_GITDIR takes a single int argument.
-        let rc = unsafe {
-            libgit2_sys::git_libgit2_opts(
-                libgit2_sys::GIT_OPT_ENABLE_FSYNC_GITDIR as std::ffi::c_int,
-                1 as std::ffi::c_int,
-            )
-        };
-        assert_eq!(rc, 0, "libgit2 rejected GIT_OPT_ENABLE_FSYNC_GITDIR");
-        for level in [
-            git2::ConfigLevel::System,
-            git2::ConfigLevel::XDG,
-            git2::ConfigLevel::Global,
-            git2::ConfigLevel::ProgramData,
-        ] {
-            // SAFETY: called once, inside `call_once`, before this process
-            // opens any repository or config through agentfs; libgit2's
-            // search paths are not otherwise touched by agentfs.
-            let result = unsafe { git2::opts::set_search_path(level, "") };
-            assert!(
-                result.is_ok(),
-                "libgit2 rejected clearing {level:?}: {result:?}"
-            );
-        }
-        // No home directory either: libgit2's SSH transport reads
-        // `~/.ssh/known_hosts` from it, and agentfs checks host keys only
-        // against each remote's own agentfsKnownHosts.
-        // SAFETY: GIT_OPT_SET_HOMEDIR takes one C string, which libgit2
-        // copies; called once, before any transport is created.
-        let rc = unsafe {
-            libgit2_sys::git_libgit2_opts(
-                libgit2_sys::GIT_OPT_SET_HOMEDIR as std::ffi::c_int,
-                c"".as_ptr(),
-            )
-        };
-        assert_eq!(rc, 0, "libgit2 rejected GIT_OPT_SET_HOMEDIR");
-        // A remote that accepts the connection and then stalls must end as
-        // a failed push, not hang its thread forever.
-        // SAFETY: plain integer options, set once before any transport is
-        // created.
-        let connect = unsafe {
-            git2::opts::set_server_connect_timeout_in_milliseconds(SERVER_CONNECT_TIMEOUT_MS)
-        };
-        assert!(
-            connect.is_ok(),
-            "libgit2 rejected the connect timeout: {connect:?}"
-        );
-        // SAFETY: as above.
-        let io = unsafe { git2::opts::set_server_timeout_in_milliseconds(SERVER_IO_TIMEOUT_MS) };
-        assert!(io.is_ok(), "libgit2 rejected the I/O timeout: {io:?}");
-        // SSH remotes go through agentfs's own transport.
-        #[cfg(feature = "ssh")]
-        crate::ssh_transport::register();
-    });
+/// The process's git setup, done once before any repository is opened or
+/// remote used: [`agentfs_git::init`], then, with the `ssh` feature, this
+/// engine's SSH transport (`ssh_transport::register`). The transport is
+/// registered inside this `Once`, so no call returns before it is, and
+/// every recording-engine path that opens a remote calls this first.
+pub(crate) fn init_git() {
+    agentfs_git::init();
+    #[cfg(feature = "ssh")]
+    {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(crate::ssh_transport::register);
+    }
 }
 
 pub struct History {
@@ -156,7 +93,7 @@ pub struct Committed {
 impl History {
     /// Creates a bare history repository for `volume` at `git_dir`.
     pub fn init(git_dir: &Path, volume: &str, branch: Option<&str>) -> Result<Self, HistoryError> {
-        init_libgit2();
+        init_git();
         let repo = Repository::init_opts(
             git_dir,
             git2::RepositoryInitOptions::new().bare(true).mkpath(true),
@@ -180,7 +117,7 @@ impl History {
     }
 
     pub fn open(git_dir: &Path) -> Result<Self, HistoryError> {
-        init_libgit2();
+        init_git();
         let repo = Repository::open_bare(git_dir)?;
         let settings = Settings::load(git_dir)?;
         Ok(Self { repo, settings })
@@ -346,7 +283,7 @@ impl History {
             self.keep_head_attributes(&mut index, head_tree.as_ref())?;
         }
         let tree_id = index.write_tree_to(&self.repo)?;
-        crate::failpoints::hit("commit.after_tree")?;
+        agentfs_failpoints::hit("commit.after_tree")?;
         if head.as_ref().is_some_and(|h| h.tree_id() == tree_id) {
             return Ok(Committed {
                 commit: None,
@@ -379,7 +316,7 @@ impl History {
             .commit(None, &author, &committer, &message, &tree, &parents)?;
         // Objects before the ref that names them.
         self.sync_object_dirs()?;
-        crate::failpoints::hit("commit.after_object")?;
+        agentfs_failpoints::hit("commit.after_object")?;
 
         let log = format!("agentfs: record through seq {}", last.seq);
         match &head {
@@ -394,9 +331,9 @@ impl History {
                 .repo
                 .reference(&self.settings.branch_ref, commit, false, &log)?,
         };
-        crate::failpoints::hit("commit.after_ref")?;
+        agentfs_failpoints::hit("commit.after_ref")?;
         self.sync_ref_dirs()?;
-        crate::failpoints::hit("commit.after_sync")?;
+        agentfs_failpoints::hit("commit.after_sync")?;
         Ok(Committed {
             commit: Some(commit),
             last_seq: last.seq,
@@ -430,7 +367,7 @@ impl History {
                         let pointer = lfs
                             .insert_file(&pending.path(*id))
                             .and_then(|p| {
-                                crate::failpoints::hit("lfs.after_cache_insert").map(|()| p)
+                                agentfs_failpoints::hit("lfs.after_cache_insert").map(|()| p)
                             })
                             .map_err(HistoryError::Lfs)?;
                         self.repo.blob(pointer.encode().as_bytes())?
@@ -565,7 +502,7 @@ impl History {
     /// the ref update could leave the branch naming a commit whose
     /// objects have no durable directory entry.
     fn sync_object_dirs(&self) -> io::Result<()> {
-        crate::failpoints::hit("commit.sync_objects")?;
+        agentfs_failpoints::hit("commit.sync_objects")?;
         File::open(self.repo.path().join("objects"))?.sync_all()
     }
 
@@ -1258,7 +1195,7 @@ fn message(records: &[Record], context: &Context) -> String {
 /// loading its settings first, so a missing or bad include can be
 /// replaced.
 pub fn write_includes(git_dir: &Path, includes: &[PathBuf]) -> Result<(), HistoryError> {
-    init_libgit2();
+    init_git();
     let mut config = git2::Config::open(&git_dir.join("config"))?;
     match config.remove_multivar("include.path", ".*") {
         Ok(()) => {}
@@ -1297,44 +1234,6 @@ mod tests {
     use crate::identity::Templates;
     use crate::lfs::Pointer;
     use crate::record::{Caller, Draft, Trigger};
-
-    #[test]
-    fn libgit2_home_directory_is_cleared() {
-        init_libgit2();
-        let mut buf = libgit2_sys::git_buf {
-            ptr: std::ptr::null_mut(),
-            reserved: 0,
-            size: 0,
-        };
-        // SAFETY: GIT_OPT_GET_HOMEDIR fills a git_buf, disposed below.
-        let rc = unsafe {
-            libgit2_sys::git_libgit2_opts(
-                libgit2_sys::GIT_OPT_GET_HOMEDIR as std::ffi::c_int,
-                &mut buf as *mut libgit2_sys::git_buf,
-            )
-        };
-        let size = buf.size;
-        // SAFETY: the buffer came from libgit2.
-        unsafe { libgit2_sys::git_buf_dispose(&mut buf) };
-        assert_eq!(rc, 0);
-        assert_eq!(size, 0, "libgit2 still has a home directory");
-    }
-
-    #[test]
-    fn libgit2_server_timeouts_are_set() {
-        init_libgit2();
-        // SAFETY: reads of integer options.
-        unsafe {
-            assert_eq!(
-                git2::opts::get_server_connect_timeout_in_milliseconds().unwrap(),
-                SERVER_CONNECT_TIMEOUT_MS
-            );
-            assert_eq!(
-                git2::opts::get_server_timeout_in_milliseconds().unwrap(),
-                SERVER_IO_TIMEOUT_MS
-            );
-        }
-    }
 
     struct Fixture {
         dir: tempfile::TempDir,
@@ -1453,12 +1352,12 @@ mod tests {
         f.commit(&[r]);
         let before = f.history.head().unwrap().unwrap().id();
 
-        let guard = crate::failpoints::configure("").unwrap();
+        let guard = agentfs_failpoints::configure("").unwrap();
         let change = f.write("a", b"two", false);
         let r = f.record(Trigger::Close, vec![change]);
         f.commit(&[r]);
         assert_eq!(
-            crate::failpoints::trace(),
+            agentfs_failpoints::trace(),
             [
                 "pending.after_freeze",
                 "commit.after_tree",
@@ -1473,7 +1372,7 @@ mod tests {
         // A failed object sync leaves the branch where it was.
         let head = f.history.head().unwrap().unwrap().id();
         assert_ne!(head, before);
-        let _guard = crate::failpoints::configure("commit.sync_objects=error").unwrap();
+        let _guard = agentfs_failpoints::configure("commit.sync_objects=error").unwrap();
         let change = f.write("a", b"three", false);
         let r = f.record(Trigger::Close, vec![change]);
         let err = f
@@ -1620,21 +1519,6 @@ mod tests {
             "{msg}"
         );
         assert_eq!(seq_from_message(msg), Some(1));
-    }
-
-    #[test]
-    fn init_libgit2_clears_config_search_paths() {
-        let _f = Fixture::new();
-        for level in [
-            git2::ConfigLevel::System,
-            git2::ConfigLevel::XDG,
-            git2::ConfigLevel::Global,
-            git2::ConfigLevel::ProgramData,
-        ] {
-            // SAFETY: reading the search path set once by init_libgit2.
-            let path = unsafe { git2::opts::get_search_path(level) }.unwrap();
-            assert!(path.as_bytes().is_empty(), "{level:?}: {path:?}");
-        }
     }
 
     fn managed(paths: &[&str]) -> BTreeSet<RepoPath> {

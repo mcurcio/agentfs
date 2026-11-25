@@ -971,7 +971,7 @@ impl Mount {
         gate: agentfs_core::visibility::Gate,
         tmp: Arc<TmpLayer>,
     ) -> Result<(), MountError> {
-        agentfs_core::failpoints::hit("mount.before_overlay")?;
+        agentfs_failpoints::hit("mount.before_overlay")?;
         let telemetry = self.ops.boundary().recorder().telemetry().clone();
         let refused: crate::overlay::RefusalCounter =
             Arc::new(move |reason| telemetry.overlay_refused(reason));
@@ -1166,7 +1166,7 @@ impl MountView {
 }
 
 impl agentfs_core::restore::Liveness for MountView {
-    fn open_for_writing(&self, path: &agentfs_core::paths::RepoPath) -> bool {
+    fn open_for_writing(&self, path: &agentfs_contracts::paths::RepoPath) -> bool {
         self.ops.open_for_writing(path.as_str().as_bytes())
     }
 
@@ -1198,7 +1198,7 @@ impl agentfs_core::history_service::FrontHooks for MountHooks {
         Ok((report.recorded + report.repaired, report.still_queued))
     }
 
-    fn open_for_writing(&self, paths: &[agentfs_core::paths::RepoPath]) -> Vec<bool> {
+    fn open_for_writing(&self, paths: &[agentfs_contracts::paths::RepoPath]) -> Vec<bool> {
         paths
             .iter()
             .map(|p| self.ops.open_for_writing(p.as_str().as_bytes()))
@@ -1207,7 +1207,7 @@ impl agentfs_core::history_service::FrontHooks for MountHooks {
 
     /// Every session's kernel drops what it caches along each path (node
     /// ids are the same in every session).
-    fn invalidate(&self, paths: &[agentfs_core::paths::RepoPath]) -> Result<(), String> {
+    fn invalidate(&self, paths: &[agentfs_contracts::paths::RepoPath]) -> Result<(), String> {
         let mut first = None;
         for path in paths {
             let cached = self.ops.cached_at(path.as_str().as_bytes());

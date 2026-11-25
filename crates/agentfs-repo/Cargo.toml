@@ -1,0 +1,24 @@
+[package]
+name = "agentfs-repo"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Checks over the whole agentfs repository: its documentation against its code, its workflows and its crates' ranks"
+publish = false
+
+[package.metadata.agentfs]
+rank = "tests"
+
+# The library reads `cargo metadata`'s JSON; no agentfs crate, so a
+# documentation change builds these two and nothing of the engines.
+[dependencies]
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+
+[dev-dependencies]
+# Its POINTS, against every failpoint call (tests/repo/crates.rs).
+agentfs-failpoints = { version = "0.1.0", path = "../agentfs-failpoints" }
+# The stand-in `docker` of the image-publishing test (tests/repo/ci.rs).
+tempfile = "3.27.0"

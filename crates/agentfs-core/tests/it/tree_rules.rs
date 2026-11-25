@@ -580,7 +580,7 @@ fn a_failed_copy_leaves_no_fork_and_no_area() {
         let mut v = new_actor(tmp.path());
         three_files(&mut v);
         {
-            let _guard = agentfs_core::failpoints::configure(spec).unwrap();
+            let _guard = agentfs_failpoints::configure(spec).unwrap();
             #[allow(
                 clippy::disallowed_methods,
                 reason = "a tree actor test forks below the store"
@@ -619,7 +619,7 @@ fn a_fork_killed_at_any_point_of_its_copy_has_its_whole_area_or_none() {
         let output = std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact", test_name!("copy_worker").as_str(), "--nocapture"])
             .env("AGENTFS_TREE_COPY_WORKER", &dir)
-            .env(agentfs_core::failpoints::ENV_VAR, spec)
+            .env(agentfs_failpoints::ENV_VAR, spec)
             .output()
             .unwrap();
         assert_eq!(

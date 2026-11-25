@@ -225,10 +225,10 @@ mod tests {
     use crate::events::NullSink;
     use crate::history::{checkpoint_from_message, inbox_from_message, seq_from_message};
     use crate::identity::Context;
-    use crate::paths::RepoPath;
     use crate::record::{Operation, OperationKind, Trigger};
     use crate::telemetry::Telemetry;
     use crate::volume::{self, Input, Recorder, StateDir};
+    use agentfs_contracts::paths::RepoPath;
 
     const CALLER: Caller = Caller {
         uid: 7,

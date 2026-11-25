@@ -42,10 +42,11 @@ use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
+use agentfs_os::confined::proc_path;
 use fuser::{Errno, FileAttr, FileType};
 use rustix::fs::{AtFlags, Mode, OFlags, RenameFlags, Timestamps};
 
-use crate::backing::{attr, proc_path};
+use crate::backing::attr;
 use crate::creds;
 use crate::ops::{DirEntry, Entry, Handle, OpResult, SetAttr, read_at, seek, timespec, write_at};
 use crate::overlay::ViewOwner;

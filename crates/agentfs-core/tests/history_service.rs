@@ -10,6 +10,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use agentfs_contracts::paths::RepoPath;
 use agentfs_core::events::{Event, Events, MemorySink, NullSink};
 use agentfs_core::history_service::wire::pb;
 use agentfs_core::history_service::{
@@ -18,14 +19,13 @@ use agentfs_core::history_service::{
 };
 use agentfs_core::identity::Context;
 use agentfs_core::lfs::Store;
-use agentfs_core::listening_socket::Listener;
-use agentfs_core::paths::RepoPath;
 use agentfs_core::pending::PendingId;
 use agentfs_core::record::{Caller, Change, Draft, Origin, Trigger};
 use agentfs_core::rules::SkipReason;
 use agentfs_core::stamps::FreezeStamp;
 use agentfs_core::telemetry::Telemetry;
 use agentfs_core::volume::{self, Committer, Input, Recorded, Recorder, StateDir, VolumeError};
+use agentfs_os::listening_socket::Listener;
 use hyper_util::rt::TokioIo;
 use pb::history_client::HistoryClient as RawClient;
 use tokio_stream::StreamExt;

@@ -2512,3 +2512,7 @@ One fix agent, the review's findings. Local runs as root with FUSE, debug builds
 **Closed here:** the 216c3a5 entry's follower stop (its fix, test and runbook are gone with the follower), its "nothing slower, missed" cost item, and its "one owner for applying built events" item. With no follower there is no second owner.
 
 **Open again:** the c26cb70 entry's 310 s `create` hold by the overlay gate. A held call is re-admitted only when a built event is applied to the actor, that is, by a host's take worker (`Recording::progress`) or at the volume's next step. A take worker busy in a long take therefore holds it. docs/trees.md, "The overlay limit", states this as a known open item. The waiting-primitive PR owns it.
+
+## 2026-11-25, crate split A and B, review fix round: the frozen pages' corrections
+
+The frozen pages of `.claude/handoff/crate-split-ab-pages.md` were wrong in places the built code corrects; its "Errata" block lists each (nine items). The two that change a check's failure class: the spawn check reads production text up to the first test *module*, not the first `#[cfg(test)]` (the page's rule left about 30 tree-engine files mostly unread); and B1's probe (4) could not fail, because git2 0.21 has `default = []` (the probe is `features = ["https"]`). The text checks' import holes (align's uncounted `histogram`, the git2 calls that open a remote) are now clippy bans in `clippy.toml`, which outlive PR C.

@@ -32,8 +32,8 @@ use tonic::Status;
 use super::lease::FrontLease;
 use super::wire::pb;
 use super::{Answer, Call, FrontInfo};
-use crate::paths::RepoPath;
 use crate::volume::StateDir;
+use agentfs_contracts::paths::RepoPath;
 
 /// How long a call may take, at least ([`Fronts::new`] scales it with the
 /// commit window: a settle waits for the front's records to be journaled).

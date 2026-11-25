@@ -57,9 +57,9 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
-use agentfs_core::listening_socket::Stopper;
 use agentfs_core::local_socket;
 use agentfs_core::volume::CONTROL_SOCKET;
+use agentfs_os::listening_socket::Stopper;
 
 /// The protocol version this build speaks.
 pub const PROTOCOL_VERSION: u32 = 1;
@@ -992,7 +992,7 @@ mod tests {
         // connects even while a child spawned by another thread of this
         // test binary shares it.
         drop(
-            agentfs_core::listening_socket::Listener::bind(socket_address(
+            agentfs_os::listening_socket::Listener::bind(socket_address(
                 &local_socket::open_dir(&dir).unwrap(),
             ))
             .unwrap(),

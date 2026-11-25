@@ -1,0 +1,19 @@
+[package]
+name = "agentfs-lines"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Line maps for agentfs's tree landing: which version wrote each line of a file, never the line's bytes"
+
+[package.metadata.agentfs]
+rank = "line-identity"
+
+[dependencies]
+# Git's histogram diff, called one way; its `Hunk` is in this crate's signatures.
+agentfs-align = { version = "0.1.0", path = "../agentfs-align" }
+# A line map's stored form is JSON.
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+thiserror = "2.0.21"

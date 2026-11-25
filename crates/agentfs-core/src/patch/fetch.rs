@@ -13,7 +13,7 @@
 //! `agentfs.patchFetchTimeout`. On the time limit the fetch is told to stop
 //! at its next progress callback and the caller goes on with the inbox refs
 //! it already has; libgit2's connect and I/O timeouts
-//! (`history::init_libgit2`) bound how long the abandoned thread can
+//! (`history::init_git`) bound how long the abandoned thread can
 //! linger. Authentication is the push's ([`crate::remote_auth`]): the
 //! remote's credentials, SSH key and known hosts, for its push URL.
 
@@ -29,7 +29,7 @@ use git2::{AutotagOption, ErrorCode, FetchOptions, FetchPrune, Repository};
 use super::{approved_prefix, inbox_prefix};
 use crate::config::RemoteSettings;
 use crate::events::PushFailureKind;
-use crate::history::init_libgit2;
+use crate::history::init_git;
 use crate::push::{classify, redact_url};
 use crate::remote_auth::{AuthState, RemoteAuth};
 
@@ -111,7 +111,7 @@ fn fetch_now(
     volume: &str,
     cancel: &AtomicBool,
 ) -> FetchOutcome {
-    init_libgit2();
+    init_git();
     let name = &remote.name;
     let url = remote.push_url();
     let repo = match Repository::open_bare(git_dir) {
@@ -127,6 +127,10 @@ fn fetch_now(
     let auth = RemoteAuth::new(remote);
     let state = AuthState::new();
     let _scope = auth.ssh_scope(&state);
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the recording engine opens a remote, after init_git"
+    )]
     let mut git_remote = match repo.remote_anonymous(url) {
         Ok(r) => r,
         Err(e) => return FetchOutcome::failed(name, PushFailureKind::Local, e.to_string()),

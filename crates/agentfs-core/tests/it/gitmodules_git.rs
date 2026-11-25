@@ -328,7 +328,7 @@ fn checks_match_git_fsck() {
     let mut failures = Vec::new();
     for (name, content) in &cases {
         let theirs = fsck_ids(dir.path(), name, content);
-        let path = agentfs_core::paths::RepoPath::new(name.as_str()).unwrap();
+        let path = agentfs_contracts::paths::RepoPath::new(name.as_str()).unwrap();
         let ours = checks.check_blob(&path, content);
         let shown = String::from_utf8_lossy(content);
         let ok = match &ours {
@@ -347,7 +347,7 @@ fn checks_match_git_fsck() {
     // (`CurlUrlCheck`). The installed git must agree exactly with one of
     // the two, and agentfs, which refuses what either refuses, must refuse
     // whatever it refuses.
-    let path = agentfs_core::paths::RepoPath::new(".gitmodules").unwrap();
+    let path = agentfs_contracts::paths::RepoPath::new(".gitmodules").unwrap();
     let mut verdicts = Vec::new();
     for url in URLS {
         let content = format!("[submodule \"x\"]\n\tpath = x\n\turl = {}\n", quote(url));

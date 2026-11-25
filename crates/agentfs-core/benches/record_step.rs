@@ -44,10 +44,10 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use agentfs_core::config::parse_size;
+use agentfs_contracts::paths::RepoPath;
+use agentfs_contracts::units::parse_size;
 use agentfs_core::events::{Events, NullSink};
 use agentfs_core::identity::Context;
-use agentfs_core::paths::RepoPath;
 use agentfs_core::pending::{FreezeMethod, PendingStore};
 use agentfs_core::record::{Caller, Trigger};
 use agentfs_core::service::Service;

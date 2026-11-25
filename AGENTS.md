@@ -84,8 +84,9 @@ When you learn something durable, write it to its home in the same commit. Never
 
 | Path | What |
 |---|---|
-| `crates/agentfs-contracts` | The shared kernel of the domains around the git model: values, capabilities, each domain's trait and events, and the ports adapters implement. No I/O |
+| `crates/agentfs-contracts` | The shared kernel of the domains around the git model: values (repository paths, durations and sizes among them), capabilities, each domain's trait and events, and the ports adapters implement. No I/O |
 | `crates/agentfs-volume`, `crates/agentfs-clients`, `crates/agentfs-trees` | The Volume, Clients and Trees domains, each pure over the ports in `agentfs-contracts` |
+| `crates/agentfs-failpoints`, `crates/agentfs-os`, `crates/agentfs-git`, `crates/agentfs-lines` | Below both engines (ranks in [architecture](docs/architecture.md#ranks)): the failpoints registry; file locks, atomic files, confinement, mounts, the shared-filesystem check, listening sockets and the allocator; the `git` program and the one libgit2 setup; and the line maps |
 | `crates/agentfs-core` | Engine: journal, pending, history, push, credentials, lfs, patch, history_service, telemetry |
 | `crates/agentfs-fuse` | FUSE operations, kernel-independent `Ops` plus a thin fuser adapter |
 | `crates/agentfs` | CLI binary: `init`, `mount`, `fork end` and `probe` on tree volumes; `front` and `serve-history`, which the CSI driver starts; the recording engine's one-shot commands (`record`, `push`, `restore`, `revert`, `patch`, ...) on its state areas |
@@ -94,6 +95,7 @@ When you learn something durable, write it to its home in the same commit. Never
 | `crates/agentfs-align` | Git's histogram diff, called one way: the alignment's one call, shared by the tree library and the model so line identity does not depend on how `git` is called |
 | `crates/agentfs-model` | Tests only: an executable model of the target architecture's landing rules (`docs/target-architecture`) on the `git` program, with seeded random interleavings. Depends only on `agentfs-align` |
 | `crates/agentfs-conformance` | Tests only: the model's recorded calls replayed on the real tree library and on real mounts, with invariants read from git (`crates/agentfs-model/VERIFYING.md`, "Phase 1") |
+| `crates/agentfs-repo` | Tests only: checks over the whole repository (docs against code, workflows, repository-wide source rules, the crates' ranks); its library, a reader of `docs/` and of `cargo metadata`, is shared with the binaries' documentation tests |
 | `ci/` | End-to-end scripts run by GitHub Actions; `ci/lib.sh` has the shared helpers |
 | `deploy/` | Kubernetes manifests for the sidecar and CSI, plus examples (Hermes) |
 | `examples/docker` | Docker examples: `docker run` and compose (docs/docker.md) |
@@ -125,7 +127,7 @@ Tests run with [cargo-nextest](https://nexte.st), each in its own process, all p
 curl -LsSf https://get.nexte.st/0.9.152/linux | tar zxf - -C ~/.cargo/bin
 ```
 
-A doc change also runs `cargo nextest run -p agentfs-core --test docs_reference`. Run one module of a merged test program with `cargo nextest run -p agentfs-core --test it tree_actor::` ([development](docs/development.md#test-programs)); `-E 'test(/^tree_actor::/)'` is nextest's exact form. `--all-features` needs OpenSSL and libssh2. CI builds it; a minimal container may not be able to.
+A doc change also runs `cargo nextest run -p agentfs-repo`; a change to docs/configuration.md also `cargo nextest run -p agentfs-core --test config_reference`, `cargo nextest run -p agentfs --bin agentfs reference_tests plan_reads_only_env_vars` and `cargo nextest run -p agentfs-csi --bin agentfs-csi reference_tests`; to docs/runbooks/fork-refused.md or patch-queue.md also `cargo nextest run -p agentfs --bin agentfs fork_cmd::`; to the rules ledger or git-model.md also `cargo nextest run -p agentfs-model --test ledger`. Run one module of a merged test program with `cargo nextest run -p agentfs-core --test it tree_actor::` ([development](docs/development.md#test-programs)); `-E 'test(/^tree_actor::/)'` is nextest's exact form. `--all-features` needs OpenSSL and libssh2. CI builds it; a minimal container may not be able to.
 
 ## What only CI can test
 

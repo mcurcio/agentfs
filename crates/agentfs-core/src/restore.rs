@@ -58,18 +58,80 @@ use std::fmt;
 use std::io::{self, Read};
 use std::path::Path;
 
+use agentfs_os::confined::{Dir, Kind, Owner, kind_of, proc_path, read_link_fd};
 use git2::{ObjectType, Oid, Repository, TreeWalkMode, TreeWalkResult};
 
 use crate::checks::Refusal;
-use crate::confined::{Current, Dir, FileState, Kind, Owner};
 use crate::lfs::fetch::LfsObjects;
 use crate::lfs::{Pointer, Store, attributes};
-use crate::paths::{PathError, RepoPath};
 use crate::record::OperationKind;
 use crate::rules::SkipReason;
+use agentfs_contracts::paths::{PathError, RepoPath};
 
 const MODE_EXECUTABLE: i32 = 0o100755;
 const MODE_SYMLINK: i32 = 0o120000;
+
+/// What is at a path in the tree.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Current {
+    Absent,
+    File(FileState),
+    Symlink {
+        target: Vec<u8>,
+    },
+    Dir,
+    /// A FIFO, socket or device.
+    Other,
+}
+
+/// A regular file as a restore sees it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FileState {
+    /// Its content's git blob id.
+    oid: git2::Oid,
+    /// Any execute bit is set (git's executable bit).
+    executable: bool,
+    /// Permission bits (`mode & 0o7777`).
+    mode: u32,
+    nlink: u64,
+    uid: u32,
+    gid: u32,
+    /// Its length in bytes.
+    size: u64,
+}
+
+/// What is at `path` beneath `tree`, with a regular file's content hashed
+/// as a git blob.
+// `stat` field types differ between architectures, so conversions written
+// to be portable are identities on some targets.
+#[allow(clippy::useless_conversion, clippy::unnecessary_cast)]
+fn current_entry(tree: &Dir, path: &RepoPath) -> io::Result<Current> {
+    let Some((fd, st)) = tree.stat_at(path.as_str())? else {
+        return Ok(Current::Absent);
+    };
+    Ok(match kind_of(&st) {
+        Kind::Absent => Current::Absent,
+        Kind::Dir => Current::Dir,
+        Kind::Other => Current::Other,
+        Kind::Symlink => Current::Symlink {
+            target: read_link_fd(&fd)?,
+        },
+        Kind::File => {
+            let mode = u32::from(st.st_mode);
+            let oid = git2::Oid::hash_file(git2::ObjectType::Blob, proc_path(&fd))
+                .map_err(io::Error::other)?;
+            Current::File(FileState {
+                oid,
+                executable: mode & 0o111 != 0,
+                mode: mode & 0o7777,
+                nlink: st.st_nlink as u64,
+                uid: st.st_uid,
+                gid: st.st_gid,
+                size: st.st_size as u64,
+            })
+        }
+    })
+}
 
 /// Which paths a restore covers.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -732,7 +794,9 @@ fn same_content(tree: &Dir, path: &str, f: &FileState, entry: &Entry) -> io::Res
     Ok(match entry.stored {
         Stored::Blob => f.oid == entry.oid,
         Stored::ManagedAttributes { user } => f.oid == user,
-        Stored::Lfs(p) => f.size == p.size && tree.sha256_at(path)?.0 == p.oid,
+        Stored::Lfs(p) => {
+            f.size == p.size && crate::lfs::pointer::sha256_at(tree, path)?.0 == p.oid
+        }
     })
 }
 
@@ -958,7 +1022,7 @@ pub fn check(
         let current = if blocked {
             Current::Absent
         } else {
-            tree.current_entry(&step.path)?
+            current_entry(tree, &step.path)?
         };
         if matches(repo, tree, path, &current, step.target.as_ref())? {
             if step.current == step.target {
@@ -1069,7 +1133,7 @@ impl ApplyError {
             return None;
         }
         let step = plan.steps.iter().find(|s| s.path.as_str() == self.path)?;
-        let current = tree.current_entry(&step.path).ok()?;
+        let current = current_entry(tree, &step.path).ok()?;
         let unchanged =
             matches(repo, tree, &self.path, &current, step.current.as_ref()).unwrap_or(false);
         (!unchanged).then(|| step.path.clone())
@@ -1106,7 +1170,7 @@ fn recheck(
     if !force && live.open_for_writing(&step.path) {
         return Err(changed_since_check("opened for writing through the mount"));
     }
-    let current = tree.current_entry(&step.path)?;
+    let current = current_entry(tree, &step.path)?;
     let accepted = match &current {
         // A directory in the way was checked to hold only removed paths;
         // removing it fails if anything else appeared.
@@ -1140,7 +1204,7 @@ pub fn apply(
     live: &dyn Liveness,
     force: bool,
 ) -> Result<Applied, ApplyError> {
-    let chown = crate::confined::can_chown();
+    let chown = agentfs_os::confined::can_chown();
     let mut applied = Applied::default();
     let fail = |applied: &mut Applied, path: &str, error: io::Error, started: bool| ApplyError {
         applied: std::mem::take(applied),
@@ -1354,17 +1418,17 @@ fn input_at(
 ) -> Result<Option<crate::volume::Input>, String> {
     use crate::volume::Input;
     match tree.stat_at(path.as_str()) {
-        Ok(Some((fd, st))) => match crate::confined::kind_of(&st) {
+        Ok(Some((fd, st))) => match kind_of(&st) {
             Kind::File => {
                 let input = Input::Write {
                     path,
-                    backing: crate::confined::proc_path(&fd),
+                    backing: proc_path(&fd),
                     executable: st.st_mode & 0o111 != 0,
                 };
                 fds.push(fd);
                 Ok(Some(input))
             }
-            Kind::Symlink => match crate::confined::read_link_fd(&fd).map(String::from_utf8) {
+            Kind::Symlink => match read_link_fd(&fd).map(String::from_utf8) {
                 Ok(Ok(target)) => Ok(Some(Input::Symlink { path, target })),
                 _ => Err(format!("{path}: unreadable symlink")),
             },

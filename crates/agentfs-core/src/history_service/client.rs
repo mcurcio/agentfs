@@ -46,11 +46,11 @@ use super::wire::pb::history_client::HistoryClient as Grpc;
 use super::{Address, FrontInfo, MAX_MESSAGE, PROTOCOL_VERSION, PathStamp, SERVICE_NAME};
 use crate::events::{Event, Events};
 use crate::local_socket;
-use crate::paths::RepoPath;
 use crate::pending::PendingId;
 use crate::record::Draft;
 use crate::telemetry::Telemetry;
 use crate::volume::{Recorded, Skipped};
+use agentfs_contracts::paths::RepoPath;
 
 /// How to reach the service.
 #[derive(Debug, Clone)]
@@ -342,7 +342,7 @@ impl HistoryClient {
             |mut grpc, request| async move { grpc.record(request).await },
             request,
         )?;
-        if let Err(e) = crate::failpoints::hit("front.after_reply") {
+        if let Err(e) = agentfs_failpoints::hit("front.after_reply") {
             return Err(ClientError::Lost {
                 address: self.address.clone(),
                 sent: true,

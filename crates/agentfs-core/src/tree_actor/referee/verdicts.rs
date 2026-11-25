@@ -7,7 +7,7 @@ use super::ancestry::{self, Broken, Graph, descends};
 use super::{ByLine as Snapshot, CollisionKind, PriorDecisions, Verdict, Version};
 use crate::tree_actor::tree::{LineVersion, MergeFileIdentity, NameHistory};
 use crate::tree_actor::{Error, Result};
-use crate::tree_reconcile::Line;
+use agentfs_lines::Line;
 
 /// A version as rule 3 reads it: which one, and whether it is live (a line's bytes, a file's
 /// name) or ended.

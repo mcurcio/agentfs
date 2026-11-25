@@ -85,7 +85,7 @@ fn a_creates_overlay_estimate_is_within_twice_its_live_bytes() {
     create(&rec, "warm");
     rec.settle().unwrap();
     rec.progress().unwrap();
-    let held = agentfs_core::failpoints::configure("tree.build_before_batch=error@*").unwrap();
+    let held = agentfs_failpoints::configure("tree.build_before_batch=error@*").unwrap();
     let overlay_before = rec.history().overlay_bytes(TreeId::Root);
     let before = LIVE.load(Ordering::Relaxed);
     for i in 0..CREATES {

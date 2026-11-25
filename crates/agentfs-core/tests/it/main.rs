@@ -38,7 +38,6 @@ mod tree_line_rules;
 mod tree_overlay_limit;
 mod tree_pages;
 mod tree_pending_saves;
-mod tree_reconcile;
 mod tree_replace;
 mod tree_rules;
 mod tree_store;

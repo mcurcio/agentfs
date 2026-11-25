@@ -11,7 +11,7 @@
 //!
 //! The sandbox overlay ([`crate::overlay`]) is never a workload view, even
 //! where it shares the mount's device: no `.git` name can be created or
-//! shown through it (a [`agentfs_core::paths::RepoPath`] is never `.git`,
+//! shown through it (a [`agentfs_contracts::paths::RepoPath`] is never `.git`,
 //! and nested repositories are hidden), so no `gitdir:` target is ever
 //! written through it. Its mounts are told apart by their source
 //! ([`crate::mount::MountSource`]).
@@ -19,8 +19,8 @@
 use std::io;
 use std::path::Path;
 
-use agentfs_core::mountinfo::{self, MountEntry};
 use agentfs_core::nested::View;
+use agentfs_os::mountinfo::{self, MountEntry};
 
 use crate::mount::{MountKind, MountSource};
 

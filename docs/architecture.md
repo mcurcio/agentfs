@@ -15,26 +15,53 @@ is. The libraries behind it, and why each was chosen, are under
 | `agentfs` | binary | The `agentfs` command (every subcommand is listed in [configuration](configuration.md#commands)); OpenTelemetry export |
 | `agentfs-csi` | library and binary | The CSI driver: `agentfs-csi`, one per node beside csi-provisioner, which makes each claim's tree volume with `agentfs init` and supervises one `agentfs host` per volume in use on the node, each pod's view opened on it at the kubelet's target ([csi](csi.md)) |
 | `agentfs-rules` | library | The Rules domain of the tree views, pure: where each new name of a tree lives, recorded or in its untracked area, from the operator's `info/exclude` and `info/attributes` ([trees](trees.md#rules-and-the-untracked-area)). Depends on `gix-ignore` and `gix-attributes` only; `agentfs-core` and `agentfs-fuse` depend on it |
-| `agentfs-align` | library | Git's histogram diff, called one way, for line identity (git-model §7). `agentfs-core` and `agentfs-model` both depend on it, so line identity does not depend on how `git` is called; one module, `lib.rs` |
-| `agentfs-contracts` | library | The shared kernel of the domains around the git model ([the system](target-architecture/system.md)): values (the tree and volume identities, names, the pod context), capabilities and their minter, each domain's trait, errors and events, and the ports adapters implement. No I/O; depends on no other agentfs crate |
+| `agentfs-align` | library | Git's histogram diff, called one way, for line identity (git-model §7), and the `git` program's isolated environment (`isolated`, with the `PATH` every `git` child gets). It is the lowest crate with no git2, so the model and the line maps run `git` as the engines do. The engines and `agentfs-model` all reach the diff through it, so line identity does not depend on how `git` is called |
+| `agentfs-failpoints` | library | The one registry of failpoints, named places on the durable path where a test build can kill, fail, stall or park the process, and the gates a test drives over FIFOs. In a release build each point is an inlined `Ok(())` |
+| `agentfs-os` | library | The operating-system leaves used outside the recording engine too: advisory file locks, atomic files, confined access to a directory tree, the mount table, the shared-filesystem check, listening Unix sockets, the allocator's arenas. Knows nothing of git, volumes or trees |
+| `agentfs-git` | library | Git below both engines: the `git` program in an environment of its own and the count of the children it starts, every repack's memory bounds, and the process's one libgit2 setup. Knows no volume or tree layout |
+| `agentfs-lines` | library | Line maps: which version wrote each line of a file, aligned across saves by `agentfs-align`'s histogram diff. It reads the images it is given and starts no process: the diff's `git` child comes from the spawner its caller passes |
+| `agentfs-contracts` | library | The shared kernel of the domains around the git model ([the system](target-architecture/system.md)): values (the tree and volume identities, names, repository paths, the pod context, durations and sizes), capabilities and their minter, each domain's trait, errors and events, and the ports adapters implement. No I/O; depends on no other agentfs crate |
 | `agentfs-volume` | library | The Volume domain, pure over its ports: `ensure`, the lifecycle and the release verdict |
 | `agentfs-clients` | library | The Clients domain, pure over its ports: attachments, grants and each fork's one writer |
 | `agentfs-trees` | library | The Trees domain, pure over its ports: each fork's lifecycle |
 | `agentfs-conformance` | library and binary, tests only | The model's recorded calls against the real tree library and real mounts (git-model §18). Depends on `agentfs-core` and `agentfs-model`; nothing depends on it |
+| `agentfs-repo` | library, tests only | Checks over the whole repository, as its tests: the documentation against the code, the workflows and CI scripts, the sources' repository-wide rules, the crates and their ranks. Its library is what the documentation tests share: a reader of the markdown in `docs/` and of the workspace as `cargo metadata` describes it. Its library depends on no other agentfs crate |
 
-The dependencies run one way: `agentfs-csi` → (`agentfs` as a child
-process) → `agentfs-fuse` → `agentfs-core` → `agentfs-contracts`. The
-domain crates (`agentfs-volume`, `agentfs-clients`, `agentfs-trees`) depend
-on `agentfs-contracts` alone, and on no other domain. `agentfs-csi` links
-`agentfs-core` only to create state areas and read their status; it never
-records.
+Which crate may depend on which is set by the ranks below, and a test
+checks every manifest against them; there is no other list of the
+dependencies.
+
+## Ranks
+
+The owner's three layers (AGENTS.md principle 10: the library, the
+filesystem and the kubernetes adapter) are each made of one or more ranks;
+packages that exist only for tests have a rank of their own. Every package
+names its rank in its manifest (`[package.metadata.agentfs] rank`), and the
+workspace manifest lists the ranks, each after every rank it uses, with the
+ranks each may use (`[workspace.metadata.agentfs] ranks`). A normal or build
+dependency on another package of the workspace must be in a rank its own
+rank uses, so two packages of one rank never depend on each other unless the
+rank uses itself. A dev-dependency may point anywhere, as a test of the
+binary drives the CSI driver. `crates/agentfs-repo` checks the manifests,
+and this table against the workspace manifest.
+
+| Rank | Uses | Layer | What it holds |
+|---|---|---|---|
+| `line-identity` | `line-identity` | the library | The alignment and the line maps: which version wrote each line of a file |
+| `leaf` | `line-identity`, `leaf` | the library | Mechanisms over the operating system, git and the test build's failpoints, which know no domain value and are used outside the recording engine too, so it can be deleted whole |
+| `shared-kernel` | none | the library | The shared kernel of the domains: values, capabilities, traits, events and ports, with no I/O |
+| `domain` | `shared-kernel` | the library | The pure domains over the shared kernel's ports, and the tree views' rules; no domain depends on another |
+| `engine` | `line-identity`, `leaf`, `shared-kernel`, `domain` | the library | What implements the ports and owns the state on disk; no engine depends on another |
+| `filesystem` | `leaf`, `shared-kernel`, `domain`, `engine`, `filesystem` | the filesystem | The FUSE layer and the `agentfs` binary, the composition root |
+| `kubernetes` | `leaf`, `shared-kernel`, `engine`, `filesystem` | the kubernetes adapter | The CSI driver |
+| `tests` | `line-identity`, `leaf`, `shared-kernel`, `domain`, `engine`, `filesystem`, `kubernetes`, `tests` | none | Packages that exist only for tests: the model, the conformance replay, the repository checks. No other rank uses it |
 
 ## Module map
 
 Every module of every crate, one line each. A test
-(`crates/agentfs-core/tests/docs_reference.rs`) fails when a module is
-missing from these tables or a row names a module that no longer exists;
-`tests.rs` files are not listed.
+(`crates/agentfs-repo/tests/repo/docs.rs`) fails when a member of the
+workspace has no section here, a module is missing from these tables or a
+row names a module that no longer exists; `tests.rs` files are not listed.
 
 ### `agentfs-contracts`
 
@@ -46,10 +73,12 @@ missing from these tables or a row names a module that no longer exists;
 | `clients.rs` | The Clients domain's contract: client ids, grants, bindings, errors, events and the `Clients` trait |
 | `host.rs` | The view host's control messages, one JSON object per line on `agentfs host`'s standard input and back: the hello, requests (open, close, reconcile, fork create, fork end), replies and refusal kinds |
 | `name.rs` | Validated names and labels (volume, pod field, writer, client, launcher, fork key) and the one safe-name rule |
+| `paths.rs` | Repository-relative paths (`RepoPath`) and the names git refuses to store |
 | `pod.rs` | The pod context a writer ran in, and a writer with it (`WriterAt`), as commits name them |
 | `ports.rs` | The ports adapters implement: the state area, each domain's rows as journal steps, queue facts, sessions and the event sink |
 | `tree.rs` | A tree's identity, `root` or `fork/<n>`, and a fork's number: the text history, refs and checkouts name a tree by |
 | `trees.rs` | The Trees domain's contract: fork settings, facts, phases, errors, events and the `Trees` trait |
+| `units.rs` | The units settings and flags are written in: `parse_duration`, `parse_size` (git's `k`, `m`, `g`), and `duration_arg`, the binaries' one value parser for a duration flag |
 | `views.rs` | The Views domain's contract: mount points, mount options, errors and the `Views` trait |
 | `volume.rs` | The Volume domain's contract: identity, spec, lifecycle, the release verdict's facts and blockers, errors, events and the `Volume` trait |
 
@@ -60,6 +89,45 @@ missing from these tables or a row names a module that no longer exists;
 | `lib.rs` | Crate root: the Rules domain's overview |
 | `operator.rs` | `OperatorRules`: `info/exclude` and `info/attributes` parsed from buffers with `gix-ignore` and `gix-attributes`, case-sensitive, never a system, global or tree file |
 | `set.rs` | `RuleSet`: one volume's rules, built once at open, refusing rules tree volumes do not build (`RulesError`); `place` judges a new name `Tracked` or `Untracked` with its reason, built-ins first |
+
+### `agentfs-align`
+
+| Module | Role |
+|---|---|
+| `lib.rs` | Git's histogram diff, called one way: one program lookup, one environment, one parse of the hunks, shared by the tree library and the model; `isolated`, the `git` program's environment of its own (every `git` child's `PATH`, `LC_ALL=C`, no system or global config), which `agentfs-git` and the tree store build on |
+
+### `agentfs-failpoints`
+
+| Module | Role |
+|---|---|
+| `lib.rs` | Named failpoints on the durable path, the one list of every point (`POINTS`), acting only in test builds with the `failpoints` feature ([crash model](#crash-model)), and the two test gates on FIFOs: the take gate (`TakeGate`) and `FifoGate`, a process parked at named places by a test script (the tree engine's compaction gate) |
+
+### `agentfs-os`
+
+| Module | Role |
+|---|---|
+| `lib.rs` | Crate root: the operating-system leaves' overview |
+| `allocator.rs` | The process's allocator settings, one home: `limit_arenas` caps glibc's malloc arenas (`M_ARENA_MAX`), called first thing by each binary, never by the library |
+| `confined.rs` | `openat2`-confined access to a directory tree (`Dir`, and the resolution flags `RESOLVE` and `proc_path` that agentfs-fuse's `backing.rs` shares), for restores, the recording engine's reads of the backing tree and the tree engine's untracked areas |
+| `file_lock.rs` | `FileLock`, the one way agentfs takes an advisory file lock (`flock`, shared or exclusive, waiting or not), unlocked before its file is closed so a child process still sharing the file cannot hold it on; `clippy.toml` disallows the lock calls elsewhere. With the `test-util` feature, the lock tests' shared helper |
+| `fsutil.rs` | Small filesystem helpers: atomic JSON state files under `<state>/meta`, fsyncing a directory, making directories durably, and a file's bytes reflinked or copied, shared by the recording engine, the tree engine and agentfs-csi |
+| `listening_socket.rs` | `Listener`, the one way agentfs listens on a Unix socket (control socket, history service, agentfs-csi), shut down (`SHUT_RDWR`) when stopped or dropped so a child process still sharing it cannot take connections no one answers; `clippy.toml` disallows raw listener construction elsewhere |
+| `mountinfo.rs` | The one parser of `/proc/self/mountinfo`: device, root, mount point, fstype, source and super options of each mount, and the mount holding a path |
+| `shared_fs.rs` | Which filesystems a state area may live on: refuses NFS below 4.1, `nolock` and `local_lock` other than `none` whenever the lock is taken; tells a network filesystem from a node's own disk for agentfs-csi's base path |
+
+### `agentfs-git`
+
+| Module | Role |
+|---|---|
+| `lib.rs` | Crate root: git as both engines use it |
+| `git_cli.rs` | Running the `git` program on a state area's git directory, in an environment of its own: the one home for both engines' repacks and the patch merge; every repack's memory bounds (`PACK_CONFIG`); `counted`, the one site that starts the tree engine's Git children, and their count |
+| `setup.rs` | The process's one libgit2 setup (`init`): fsync, cleared config search paths and home directory, and the remote timeouts; `clippy.toml` disallows every libgit2 option setter elsewhere |
+
+### `agentfs-lines`
+
+| Module | Role |
+|---|---|
+| `lib.rs` | The line-map library: line identities as runs, never bytes; histogram alignment streamed over images, its `git` child started by the caller's spawner (the `_with` calls); a merged file's pieces of its sources. Generic over the caller's numbered version (`Id`) |
 
 ### `agentfs-volume`
 
@@ -134,12 +202,11 @@ missing from these tables or a row names a module that no longer exists;
 | `tree_actor/referee/undecided.rs` | A fork's undecided versions and metadata and directory records, through the referee's questions to history (`Landed`) |
 | `tree_actor/referee/verdicts.rs` | Rule 3 for one change, for names and lines alike: each changed version's verdict and its loss so far |
 | `tree_actor/referee/whole.rs` | R3e: a change lands whole or not at all; the collisions in their order |
-| `tree_actor/stages.rs` | Measurements only, never read by a decision: runs and time per actor stage, the actor lock's holds by kind of work and the waits to take it, the lag gate's waits by cause, the tree views' FUSE requests by op, and the Git children the actor's path has started (counted at `git_cli::counted`, the one spawn site; target git-model §18) |
+| `tree_actor/stages.rs` | Measurements only, never read by a decision: runs and time per actor stage, the actor lock's holds by kind of work and the waits to take it, the lag gate's waits by cause, the tree views' FUSE requests by op, and the Git children the actor's path has started (counted at `agentfs_git::git_cli::counted`, the one spawn site; target git-model §18) |
 | `tree_actor/takes.rs` | Queue takes off the actor: a take's inputs read under the actor's lock, its decision made on a built snapshot with the lock released (`decide`, pure over the snapshot), and its land under the lock, refused (`FilesChanged`, `Held`, `HeadMoved`, `EntryGone`) when a step after the decision changed what it read in its tree; takes run one at a time |
 | `tree_actor/untrack.rs` | Untrack at open: each tracked file or link the operator's `info/attributes` now marks `-agentfs` is placed in its tree's untracked area, then its unlink is recorded as writer `agentfs`; a crash between the two places it again at the next open |
 | `tree_actor/untracked.rs` | Each tree's untracked area (`UntrackedArea`): its files the rules leave out, under `<state>/untracked/<tree>/`, reached only beneath it through `confined::Dir`; containers for tracked directories, atomic placement, a new fork's copy of its upstream's area taken while the upstream's untracked changes are held, and the sweep at open of copies no fork owns |
 | `tree_actor/tree.rs` | A tree's shared types: the event number a step is given, the line versions (`<event>:<index>`, ordered as their text) and line maps it writes; a tree's shape (names, directories, objects, identities, metadata and times) with its one transition per step (`Shape::apply`, POSIX's errors checked before a record), the actor's saved state (`SavedTree`) and the builder's (`Tree`, with line maps and name histories) |
-| `tree_reconcile.rs` | The line-map library: line identities as runs, never bytes; histogram alignment streamed over images; a merged file's pieces of its sources. Generic over the caller's numbered version (`Id`) |
 | `tree_git.rs` | The tree actor's Git store: durable objects, the rebuildable copy of the pointer refs in files format (the rebuild leaves `refs/notes/`, which is not a copy, as it is), git notes read and written in git's layout with a compare-and-swap of the notes ref, and the private checkouts through libgit2 in process (each file written to a temporary name and renamed into place); `config` and `HEAD`; the history walks and `init` as Git children, which retain the actor lease. It knows no ref layout and no trailer |
 | `journal.rs` | The durable change log: framed, checksummed records with group-commit `fsync` |
 | `pending.rs` | Frozen copies in `pending/`: `FICLONE` reflink, else copy plus `fsync`; slot-numbered ids for fronts |
@@ -152,7 +219,6 @@ missing from these tables or a row names a module that no longer exists;
 | `nested.rs` | Detects nested git repositories, including ones being created |
 | `non_empty.rs` | A list with at least one element by construction (`config::Remotes::Pushed`) |
 | `probe.rs` | Bounded, non-blocking reads of small workload files (`.gitignore`, `.git` files) during the synchronous step |
-| `paths.rs` | Repository-relative paths and the names git refuses to store |
 | `checks.rs` | git fsck rules and remote limits, checked at record time and again at commit |
 | `gitmodules.rs` | A port of git fsck's `.gitmodules` rules |
 | `fsync_class.rs` | The `fsync` class for databases: membership and groups |
@@ -180,24 +246,15 @@ missing from these tables or a row names a module that no longer exists;
 | `known_hosts.rs` | OpenSSH known_hosts parsing and matching, and `@cert-authority` host certificate checks |
 | `watched.rs` | Files re-read when their stat stamp changes: credentials, keys, known_hosts |
 | `repack.rs` | Periodic `git repack --geometric=2` of the history |
-| `allocator.rs` | The process's allocator settings, one home: `limit_arenas` caps glibc's malloc arenas (`M_ARENA_MAX`), called first thing by each binary, never by the library |
 | `checkpoint.rs` | Checkpoints: one change-line commit per intent (`refs/agentfs/<volume>/change-line`), with the head's tree and the patches landed since as parents, merged back into the branch by a two-parent marker |
-| `git_cli.rs` | Running the `git` program on a state area's git directory, in an environment of its own: the one home for `repack.rs` and the patch merge |
 | `command.rs` | Running an operator's program without a shell: `PATH` only, its own process group killed at the deadline, input on stdin; the one runner of fork delivery's command method and the `patch-accept` hook |
 | `restore.rs` | Restore and revert: plan from history, check, apply to a tree |
-| `confined.rs` | `openat2`-confined access to the tree for restores |
 | `operations.rs` | Restores and reverts in progress: their writes become one operation commit |
-| `file_lock.rs` | `FileLock`, the one way agentfs takes an advisory file lock (`flock`, shared or exclusive, waiting or not), unlocked before its file is closed so a child process still sharing the file cannot hold it on; `clippy.toml` disallows the lock calls elsewhere |
 | `lock.rs` | The state-area lock, an `flock` on `meta/lock`, taken only on a filesystem whose locks keep other nodes out |
-| `shared_fs.rs` | Which filesystems a state area may live on: refuses NFS below 4.1, `nolock` and `local_lock` other than `none` whenever the lock is taken; tells a network filesystem from a node's own disk for agentfs-csi's base path |
-| `mountinfo.rs` | The one parser of `/proc/self/mountinfo`: device, root, mount point, fstype, source and super options of each mount, and the mount holding a path |
 | `local_socket.rs` | Unix sockets in the state area with peer-credential checks, for the control socket and the history service |
-| `listening_socket.rs` | `Listener`, the one way agentfs listens on a Unix socket (control socket, history service, agentfs-csi), shut down (`SHUT_RDWR`) when stopped or dropped so a child process still sharing it cannot take connections no one answers; `clippy.toml` disallows raw listener construction elsewhere |
-| `fsutil.rs` | Small filesystem helpers: atomic JSON state files under `<state>/meta`, fsyncing a directory, making directories durably, and a file's bytes reflinked or copied, shared by the recording engine and the tree engine |
 | `config.rs` | Operator settings from the history repository's own git config, and `config::KEYS` |
 | `operator_settings.rs` | A tree volume's operator settings: `<state>/config`, its `include.path` lines written whole and read with libgit2 following them, `classify`, the one table of keys tree volumes do not build yet (push, patches, LFS, other), `overlay_limit` (`agentfs.overlayLimit`, checked), and `install_rules`, which installs a launcher's operator rule files as `info/exclude` and `info/attributes`, each written whole |
 | `events.rs` | Alarm and event signals, handed to a non-blocking sink |
-| `failpoints.rs` | Named failpoints on the durable path, acting only in test builds with the `failpoints` feature ([crash model](#crash-model)), and the two test gates on FIFOs: the take gate and the compaction gate (`FifoGate`) |
 | `telemetry.rs` | OpenTelemetry instruments and spans over the API only, the `agentfs.not_built` gauge among them; the binary picks exporters |
 | `history_service/mod.rs` | One history service per volume fed by fronts |
 | `history_service/wire.rs` | The gRPC contract `agentfs.history.v2` (generated from `proto/`) and its validated conversions to agentfs types |
@@ -253,13 +310,13 @@ missing from these tables or a row names a module that no longer exists;
 | `dirty.rs` | Whether an inode changed since it was last recorded, so clean closes record nothing |
 | `inodes.rs` | The inode table: FUSE node ids, backing inodes and their paths |
 | `names.rs` | What a path in the mount is, for recording |
-| `views.rs` | Where workloads see the mount: the mount point, its bind mounts (mountinfo read through `agentfs_core::mountinfo`), `--workload-mount` |
-| `backing.rs` | Confined access to the backing tree |
+| `views.rs` | Where workloads see the mount: the mount point, its bind mounts (mountinfo read through `agentfs_os::mountinfo`), `--workload-mount` |
+| `backing.rs` | Confined access to the backing tree, with `agentfs_os::confined`'s resolution flags and `proc_path`: paths as bytes and the kernel's attributes, the recording engine's FUSE half, which goes with that engine |
 | `groups.rs` | fsync-class groups: holding writes while a group is captured, and scheduling captures |
 | `sweep.rs` | The periodic sweep: files held open, failed records, the fsync-class timer |
 | `privileges.rs` | What the daemon may do as the caller or as itself |
 | `mount.rs` | Layout checks, mounting (also stacked over a stale mount, for `--on-stale-mount recover`) and unmounting |
-| `stale.rs` | Stale agentfs mounts, shared by `mount.rs` and `tree_view.rs`: the mount state at a path (mountinfo read through `agentfs_core::mountinfo`), the volume a source names, detaching stale layers, and stacking a new mount over a stale one |
+| `stale.rs` | Stale agentfs mounts, shared by `mount.rs` and `tree_view.rs`: the mount state at a path (mountinfo read through `agentfs_os::mountinfo`), the volume a source names, detaching stale layers, and stacking a new mount over a stale one |
 
 ### `agentfs`
 
@@ -293,8 +350,34 @@ missing from these tables or a row names a module that no longer exists;
 | `lfs_cmd.rs` | `agentfs lfs`: fetching objects into the local LFS cache, and pruning it |
 | `otel.rs` | Telemetry export: the OpenTelemetry SDK, exporters (http/protobuf, http/json, gRPC on its own runtime) and the environment it reads |
 | `otel/tls.rs` | The `otlp-tls` feature: TLS to the collector (CA bundle or system store, client certificate) for the HTTP and gRPC exporters |
-| `doc_tables.rs` | Test only: a small markdown reader for the documentation tests |
 | `reference_tests.rs` | Test only: checks docs/configuration.md against the CLI's flags and variables |
+
+### `agentfs-model`
+
+| Module | Role |
+|---|---|
+| `lib.rs` | Crate root: the executable model of the owner's landing rules, in plain words in its `MODEL.md` |
+| `world.rs` | The model: the root and each fork as a git branch, each save a commit naming one writer, and the rules on top |
+| `service.rs` | The model's history service, its composition root: the trees and one mirror, with the step list over both |
+| `recording.rs` | Recording: the opens and their byte calls, the object each open holds, the orphans, and each close's save with its line identities |
+| `queue.rs` | Each tree's landing queue, the locks a take holds and the opens it waits for, the prefix a sync may deliver, the calls deferred behind a transaction |
+| `referee/mod.rs` | The referee: every line and name rule of one fork and its upstream, a plan to land or to sync, read from git through its port |
+| `referee/ancestry.rs` | The referee's ancestry: what git answers about versions and commits, and whether a writer saw a version |
+| `referee/names.rs` | The referee's names: two files claiming one path at a landing, the fork's names shown back at a sync |
+| `referee/placing.rs` | The referee's placing: where applied and kept versions go, and the joins no tree may show |
+| `referee/undecided.rs` | The referee's undecided versions, at a landing and at a sync |
+| `referee/verdicts.rs` | The referee's verdicts: each line identity's, then a file's existence coupled with its content |
+| `referee/whole.rs` | The referee's whole: a change lands whole or loses whole |
+| `entries.rs` | Directories, metadata and links: what a tree holds beside its files' lines, how a landing judges it, what a sync keeps |
+| `content.rs` | File content as a sequence of lines, each a version of a line identity |
+| `program.rs` | A program's line edits as the byte calls a program makes |
+| `mirror.rs` | A mirror: a remote copy of the root's history, pushed in its own step |
+| `git.rs` | The one adapter: the `git` program with a fixed identity and pinned dates |
+| `check.rs` | The invariants, read back from the repository and the trees after every step |
+| `check/lineage.rs` | What each version was written over, read from the version records in git, the checks' oracle |
+| `digest.rs` | A run's outcome as one digest, read only from git |
+| `calls.rs` | The calls a test makes of a tree system, shared by the model and the real system, recorded with what each tree showed |
+| `bin/phase1-oracle.rs` | Fixed phase 1 mounted conformance cases driven by the model, written as JSON |
 
 ### `agentfs-conformance`
 
@@ -308,6 +391,14 @@ missing from these tables or a row names a module that no longer exists;
 | `mounted.rs` | `Mounted`: the shared calls as real system calls on a mount of a failpoints build, each take through the take gate |
 | `invariants.rs` | What must hold in the real system, read from `git`, its own reader of line maps and name histories and its own byte oracle, never `tree_actor` |
 | `bin/phase1-replay.rs` | `phase1-replay model\|library\|mount DIR [--record OUT]`: replays the traces, with floors, against `open-findings.txt`; `--record` writes what the system did with each |
+
+### `agentfs-repo`
+
+| Module | Role |
+|---|---|
+| `lib.rs` | Crate root: the repository checks' overview |
+| `doc_tables.rs` | A small markdown reader (headings, tables, code spans) for the documentation tests of this crate, `agentfs-core`, `agentfs` and `agentfs-csi` |
+| `workspace.rs` | The workspace as `cargo metadata` describes it: members, their dependencies, features and targets, and the ranks |
 
 ### `agentfs-csi`
 
@@ -470,7 +561,7 @@ program where git does the job better.
 | Need | Choice | Why |
 |---|---|---|
 | FUSE | `fuser` 0.18, vendored with the upstream `FUSE_TMPFILE` dispatch backport | Multi-threaded dispatch with cloned fds and passthrough (`BackingId`). Its default features are pure Rust: `mount(2)` as root, `fusermount3` otherwise, no libfuse. The backport exposes anonymous file creation; provenance is in `vendor/fuser/AGENTFS-PATCH.md`. It sends the attribute inode number as the node id, so `st_ino` is the node id |
-| Git objects, commits, push, credentials | `git2` (libgit2) | It has no filter or merge-driver registration, and its fsync option is only reachable through `libgit2-sys` |
+| Git objects, commits, push, credentials | `git2` (libgit2), set up once per process by `agentfs_git::init` | It has no filter or merge-driver registration, and its fsync option is only reachable through `libgit2-sys`. libgit2's options are process-wide, so one function sets them all (fsync, no config outside the repository, no home directory, the remote timeouts) and `clippy.toml` disallows every setter elsewhere; agentfs-core's `init_git` then registers its SSH transport, inside a `Once` every path that opens a remote passes first. `clippy.toml` also disallows every git2 call that creates a transport (a remote, a clone, a submodule's clone or update), so each site that opens one is marked, and the tree engine opens none |
 | TLS and SSH transports | `git2`'s `https` feature (OpenSSL) behind agentfs's `https` cargo feature. For SSH, agentfs's own libgit2 subtransport over `russh` (ring and the pure-Rust `rsa` crate), with libgit2 built without libssh2 | `https` is a C library, so it is feature-gated and default builds stay free of OpenSSL. `ssh` needs no OpenSSL or libssh2 (`ci/check-deps.sh` checks), and russh gives the transport the host key before authentication, a host key algorithm preference and host certificates, which libssh2 cannot negotiate. The `rsa` crate has a timing side-channel advisory on private-key operations: Ed25519 keys are recommended |
 | SSH host keys | agentfs's own known_hosts parser over `base64` and `sha1_smol` | Pure Rust. The transport checks host keys with it before any authentication and never reads `~/.ssh` |
 | Ignore and attribute rules | `gix-ignore`, `gix-attributes` | Pure Rust, fed only buffers agentfs reads itself, so nothing global can leak in. libgit2's rules cannot do this: it always loads every working-tree `.gitignore` on the path, merges every source by git's precedence without saying which file an attribute came from, takes `core.excludesFile` from the merged system and global config, and `git2::Repository` is not `Sync`. gitoxide has no push, so it does not replace `git2` |
@@ -478,7 +569,7 @@ program where git does the job better.
 | Telemetry | `opentelemetry` (API) in the core; `opentelemetry_sdk` and `opentelemetry-otlp` in the binary, with `tokio` (one worker, started only for gRPC). The `otlp-tls` feature adds rustls (ring) | OTLP http/protobuf, http/json and gRPC. The default build is pure Rust with no OpenSSL, ring, aws-lc, cmake or protoc. `otlp-tls` adds ring only. `ci/check-deps.sh` checks both |
 | Patch pushes to agentfs | `agentfs serve-git`: git's own `git http-backend` behind `tiny_http` | git's server is the prior art for serving git: receive-pack's quarantine and `pre-receive` give "admit before keeping", and `transfer.hideRefs` limits visible refs (names only). `tiny_http` over `hyper`: the binary has no async runtime outside OTLP gRPC, and a request is a CGI run. Plain HTTP, with TLS left to a fronting proxy. Only the smart endpoints are routed, since dumb HTTP would hand out every object |
 | Patch submission | the producer's `git` CLI (`ls-remote`, `fetch`, `commit-tree`, `push --force-with-lease`) | It runs with the producer's own credentials and config, and the lease makes a number create-only |
-| Tree actor | Its call path runs no git: a step's journal record is the change itself. A builder thread makes the commits behind it: `git fast-import` packs each batch, `git2` (libgit2) reads history and writes the copy of the refs and the private checkouts; the `git` program for history walks; serde and CRC32 for the journal and the built log; histogram alignment and a line and name referee in the core | The call path's cost then grows with the change, not the tree, and a save is power-cut safe once an fsync, an FSYNCDIR, an `O_SYNC` write or the builder made its records durable (a close does not wait for the disk). `git fast-import` over libgit2 for the builder: it builds each commit's trees from path edits of its parent's, deltifies a listing rewritten per commit, streams a large blob in bounded memory, and writes one pack per batch, where libgit2 would write each object loose or hold a batch in memory. Its durability is agentfs's: fast-import installs the pack before its index, the builder fsyncs every new pack file and `objects/pack`, then fsyncs the batch's built-log entry, and only then copies refs, so nothing names an object that might be lost. Its commits are the bytes `git commit-tree` writes for the record's date in `+0000`. Pointer refs are a copy in git's files format, written in one locked libgit2 transaction that checks every old value; `refs/notes/` is not a copy, and the rebuild leaves it alone; fast-import's own refs (`refs/build/*`) are scratch: fast-import writes them before the batch's built-log entry, so they may name commits not yet built; nothing reads them, and they are deleted after each install and at recovery. The `git` program stays where it does the job: `rev-list --missing=print` checks each tip at recovery, `log` rebuilds each save's commit at open. agentfs writes `config` and `HEAD` itself, because git's `config` rename has no fsync. Every git child on the actor's path starts at one counted site (`git_cli::counted`): the builder's alignment `git diff` and its `git fast-import` |
+| Tree actor | Its call path runs no git: a step's journal record is the change itself. A builder thread makes the commits behind it: `git fast-import` packs each batch, `git2` (libgit2) reads history and writes the copy of the refs and the private checkouts; the `git` program for history walks; serde and CRC32 for the journal and the built log; histogram alignment and a line and name referee in the core | The call path's cost then grows with the change, not the tree, and a save is power-cut safe once an fsync, an FSYNCDIR, an `O_SYNC` write or the builder made its records durable (a close does not wait for the disk). `git fast-import` over libgit2 for the builder: it builds each commit's trees from path edits of its parent's, deltifies a listing rewritten per commit, streams a large blob in bounded memory, and writes one pack per batch, where libgit2 would write each object loose or hold a batch in memory. Its durability is agentfs's: fast-import installs the pack before its index, the builder fsyncs every new pack file and `objects/pack`, then fsyncs the batch's built-log entry, and only then copies refs, so nothing names an object that might be lost. Its commits are the bytes `git commit-tree` writes for the record's date in `+0000`. Pointer refs are a copy in git's files format, written in one locked libgit2 transaction that checks every old value; `refs/notes/` is not a copy, and the rebuild leaves it alone; fast-import's own refs (`refs/build/*`) are scratch: fast-import writes them before the batch's built-log entry, so they may name commits not yet built; nothing reads them, and they are deleted after each install and at recovery. The `git` program stays where it does the job: `rev-list --missing=print` checks each tip at recovery, `log` rebuilds each save's commit at open. agentfs writes `config` and `HEAD` itself, because git's `config` rename has no fsync. Every git child on the actor's path starts at one counted site (`agentfs_git::git_cli::counted`): the builder's alignment `git diff` and its `git fast-import` |
 | Memory allocator | glibc's malloc, capped at two arenas (`allocator::limit_arenas`, `M_ARENA_MAX`), set first in each binary's `main` before any thread starts; the library never sets it | glibc keeps up to eight arenas per CPU, and memory one thread frees stays resident in its own arena. Capped, a tree view's `memory_create` figure (anonymous memory per file, release build, local ext4, 50,000 files) went from 2.67 to 1.64 KiB a file, with the many-file `create` unchanged. jemalloc (`tikv-jemallocator` as the global allocator, measured on the same build) gave 2.02 KiB a file, a restart peak of 100,000 files within a few MiB of capped glibc's (322 MiB against 328 to 333) and a slower start (48 s against 38 to 39), so it would add a C library built from source for no gain. `malloc_trim` after the fact is not used: it returns memory already wasted instead of not wasting it |
 | Persistent maps | `imbl` 7 (`OrdMap`, `OrdSet`, `Vector`) | A tree view's state crosses from the builder to History and the actor as a snapshot: a clone is O(1) and shares every node a batch did not change, so a batch allocates in proportion to its own changes, never the tree's (Okasaki's persistent trees, as Clojure's maps). A large file map's pieces use the same map. A point lookup costs about 1.5 to 2 times a `BTreeMap`'s; the many-file `create` figure measures it |
 | Line identity | `agentfs-align`: git's histogram diff, called one way | The library and the model use the same call, so line identity does not depend on how `git` is called. The release of `git` still decides what a diff answers, so one release is pinned (`ci/git-release`) |
@@ -520,7 +611,7 @@ What a crash at each point leaves, and what the next open does. "Returned" means
 | A CSI volume's `agentfs host` | A stale mount at each of its pods' targets | The supervisor starts the host again with backoff (1 s to 30 s); it opens each recorded view again, stacked over its stale target, rebinding its client, then reconciles | none |
 | The CSI node plugin (deleted, upgraded or crashed) | Its hosts see EOF on their standard input and drain; the published records on the hostPath | Reconcile at plugin start: records whose target the kubelet removed are dropped, and one host per volume opens the rest again, stacked over the stale mounts. Containers that mount with `HostToContainer` see the new mount; others after a container restart ([runbook](runbooks/csi-recovery.md)) | none |
 
-The Failpoint column names the failpoints (`agentfs_core::failpoints`,
+The Failpoint column names the failpoints (`agentfs_failpoints`,
 test builds only) that stop the process at that point; the crash
 harnesses kill or fail at each of them and check
 that nothing promised is lost and nothing is committed twice: the engine

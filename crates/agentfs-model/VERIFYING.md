@@ -105,7 +105,7 @@ cargo fmt --all --check
 cargo clippy --workspace --all-targets --locked -- -D warnings
 
 # Links: every relative link in README.md and docs/** resolves.
-cargo test --locked -p agentfs-core --test docs_reference
+cargo nextest run --locked -p agentfs-repo
 ```
 
 Run the model's tests locally, not the whole workspace's: the FUSE crates' tests belong to CI (see

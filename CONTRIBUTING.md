@@ -49,7 +49,8 @@ The documentation is tested against the code:
 [docs/configuration.md](docs/configuration.md) must list every key, flag
 and environment variable, [docs/architecture.md](docs/architecture.md)
 every module, and every relative link in the README and docs must resolve
-(`cargo test -p agentfs-core --test docs_reference`).
+(`cargo nextest run -p agentfs-repo`, and for the keys and attributes
+`cargo nextest run -p agentfs-core --test config_reference`).
 
 A change to the target architecture's rules (`crates/agentfs-model`,
 [docs/target-architecture](docs/target-architecture/README.md)) is verified

@@ -11,21 +11,23 @@
 //! Content is handed to the recorder as `/proc/self/fd/<n>` of a
 //! descriptor opened here, so a freeze reads exactly that inode, never a
 //! path that may have been renamed or replaced meanwhile.
+//!
+//! The resolution flags and the `/proc/self/fd` path are
+//! [`agentfs_os::confined`]'s. What this keeps apart from its `Dir` is the
+//! recording engine's FUSE half: paths as bytes, the root's descriptor for
+//! the operations, and the kernel's attributes. That half goes with the
+//! recording engine, and this copy with it.
 
 use std::ffi::OsStr;
 use std::io;
-use std::os::fd::{AsFd, AsRawFd, OwnedFd};
+use std::os::fd::{AsFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use agentfs_os::confined::{RESOLVE, proc_path};
 use fuser::{FileAttr, FileType, INodeNo};
-use rustix::fs::{Mode, OFlags, ResolveFlags, Stat};
-
-/// How every path is resolved.
-const RESOLVE: ResolveFlags = ResolveFlags::BENEATH
-    .union(ResolveFlags::NO_SYMLINKS)
-    .union(ResolveFlags::NO_MAGICLINKS);
+use rustix::fs::{Mode, OFlags, Stat};
 
 /// The backing tree's root.
 #[derive(Debug)]
@@ -105,12 +107,6 @@ impl Backing {
     pub fn open_dir(&self, rel: &[u8]) -> io::Result<OwnedFd> {
         self.open_at(rel, OFlags::PATH | OFlags::DIRECTORY, Mode::empty())
     }
-}
-
-/// The `/proc/self/fd` path of `fd`, which opens the very inode `fd`
-/// refers to.
-pub fn proc_path(fd: &impl AsFd) -> PathBuf {
-    PathBuf::from(format!("/proc/self/fd/{}", fd.as_fd().as_raw_fd()))
 }
 
 /// `parent/name`, or `name` under the root.

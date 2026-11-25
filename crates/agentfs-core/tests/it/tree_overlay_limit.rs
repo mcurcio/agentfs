@@ -46,8 +46,7 @@ fn the_overlay_stays_bounded_under_a_create_burst() {
         )
         .unwrap(),
     );
-    let _slow =
-        agentfs_core::failpoints::configure("tree.build_before_batch=sleep(100)@*").unwrap();
+    let _slow = agentfs_failpoints::configure("tree.build_before_batch=sleep(100)@*").unwrap();
     let rec = Recording::open(&state, &agentfs_contracts::pod::PodContext::default()).unwrap();
     rec.set_overlay_limit(LIMIT);
     // The view's take worker: at each built or failed event it calls

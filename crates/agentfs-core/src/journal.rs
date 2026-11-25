@@ -166,11 +166,11 @@ impl Journal {
         }
         let before = file.metadata()?.len();
         let written = (self.before_sync)()
-            .and_then(|()| crate::failpoints::hit("journal.before_write"))
+            .and_then(|()| agentfs_failpoints::hit("journal.before_write"))
             .and_then(|()| file.write_all(&buf))
-            .and_then(|()| crate::failpoints::hit("journal.before_fsync"))
+            .and_then(|()| agentfs_failpoints::hit("journal.before_fsync"))
             .and_then(|()| file.sync_data())
-            .and_then(|()| crate::failpoints::hit("journal.after_fsync"));
+            .and_then(|()| agentfs_failpoints::hit("journal.after_fsync"));
         if written.is_err() {
             // Leave no partial frame for the next batch to follow.
             let _ = file.set_len(before);
@@ -372,14 +372,14 @@ fn rewrite(path: &Path, records: &[Record]) -> io::Result<File> {
         let mut f = File::create(&tmp)?;
         f.write_all(&buf)?;
         f.sync_all()?;
-        crate::failpoints::hit("journal.truncate.after_tmp")
+        agentfs_failpoints::hit("journal.truncate.after_tmp")
     })();
     if let Err(e) = written {
         let _ = fs::remove_file(&tmp);
         return Err(e);
     }
     fs::rename(&tmp, path)?;
-    crate::failpoints::hit("journal.truncate.after_rename")?;
+    agentfs_failpoints::hit("journal.truncate.after_rename")?;
     sync_parent(path)?;
     OpenOptions::new().read(true).append(true).open(path)
 }
@@ -407,8 +407,8 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
-    use crate::paths::RepoPath;
     use crate::record::{Caller, Change, Trigger};
+    use agentfs_contracts::paths::RepoPath;
 
     fn draft(path: &str) -> Draft {
         Draft {
@@ -547,7 +547,7 @@ mod tests {
         }
         {
             let _guard =
-                crate::failpoints::configure("journal.truncate.after_rename=error").unwrap();
+                agentfs_failpoints::configure("journal.truncate.after_rename=error").unwrap();
             assert!(j.truncate_through(1).is_err());
         }
         assert_eq!(j.uncommitted().len(), 1);
@@ -560,7 +560,7 @@ mod tests {
 
         // Before the rename: the old journal stays, whole.
         {
-            let _guard = crate::failpoints::configure("journal.truncate.after_tmp=error").unwrap();
+            let _guard = agentfs_failpoints::configure("journal.truncate.after_tmp=error").unwrap();
             assert!(j.truncate_through(2).is_err());
         }
         assert!(!path.with_extension("rewrite").exists());

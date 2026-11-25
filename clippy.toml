@@ -1,35 +1,83 @@
 disallowed-methods = [
-    # Every advisory file lock goes through agentfs_core::file_lock::FileLock,
+    # Every advisory file lock goes through agentfs_os::file_lock::FileLock,
     # which unlocks before it closes: a lock released only by closing stays
     # held by a child process between its fork and its exec.
-    { path = "std::fs::File::lock", reason = "take file locks through agentfs_core::file_lock::FileLock" },
-    { path = "std::fs::File::lock_shared", reason = "take file locks through agentfs_core::file_lock::FileLock" },
-    { path = "std::fs::File::try_lock", reason = "take file locks through agentfs_core::file_lock::FileLock" },
-    { path = "std::fs::File::try_lock_shared", reason = "take file locks through agentfs_core::file_lock::FileLock" },
-    { path = "std::fs::File::unlock", reason = "take file locks through agentfs_core::file_lock::FileLock" },
-    { path = "rustix::fs::flock", reason = "take file locks through agentfs_core::file_lock::FileLock", allow-invalid = true },
-    { path = "libc::flock", reason = "take file locks through agentfs_core::file_lock::FileLock", allow-invalid = true },
+    { path = "std::fs::File::lock", reason = "take file locks through agentfs_os::file_lock::FileLock" },
+    { path = "std::fs::File::lock_shared", reason = "take file locks through agentfs_os::file_lock::FileLock" },
+    { path = "std::fs::File::try_lock", reason = "take file locks through agentfs_os::file_lock::FileLock" },
+    { path = "std::fs::File::try_lock_shared", reason = "take file locks through agentfs_os::file_lock::FileLock" },
+    { path = "std::fs::File::unlock", reason = "take file locks through agentfs_os::file_lock::FileLock" },
+    { path = "rustix::fs::flock", reason = "take file locks through agentfs_os::file_lock::FileLock", allow-invalid = true },
+    { path = "libc::flock", reason = "take file locks through agentfs_os::file_lock::FileLock", allow-invalid = true },
     # POSIX record locks (F_SETLK, F_OFD_SETLK) are another family with the
     # same trap; agentfs takes none.
-    { path = "libc::fcntl", reason = "take file locks through agentfs_core::file_lock::FileLock; fcntl's other uses go through rustix", allow-invalid = true },
-    { path = "rustix::fs::fcntl_lock", reason = "take file locks through agentfs_core::file_lock::FileLock", allow-invalid = true },
-    { path = "nix::fcntl::flock", reason = "take file locks through agentfs_core::file_lock::FileLock", allow-invalid = true },
-    { path = "nix::fcntl::Flock", reason = "take file locks through agentfs_core::file_lock::FileLock", allow-invalid = true },
+    { path = "libc::fcntl", reason = "take file locks through agentfs_os::file_lock::FileLock; fcntl's other uses go through rustix", allow-invalid = true },
+    { path = "rustix::fs::fcntl_lock", reason = "take file locks through agentfs_os::file_lock::FileLock", allow-invalid = true },
+    { path = "nix::fcntl::flock", reason = "take file locks through agentfs_os::file_lock::FileLock", allow-invalid = true },
+    { path = "nix::fcntl::Flock", reason = "take file locks through agentfs_os::file_lock::FileLock", allow-invalid = true },
 
     # Every listening Unix socket goes through
-    # agentfs_core::listening_socket::Listener, which shuts the socket down
+    # agentfs_os::listening_socket::Listener, which shuts the socket down
     # when it is stopped or dropped: a listener only closed goes on taking
     # connections no one answers while a child process shares it between its
     # fork and its exec.
-    { path = "std::os::unix::net::UnixListener::bind", reason = "listen through agentfs_core::listening_socket::Listener" },
-    { path = "std::os::unix::net::UnixListener::bind_addr", reason = "listen through agentfs_core::listening_socket::Listener" },
-    { path = "tokio::net::UnixListener::bind", reason = "listen through agentfs_core::listening_socket::Listener::into_async", allow-invalid = true },
-    { path = "tokio::net::UnixListener::from_std", reason = "listen through agentfs_core::listening_socket::Listener::into_async", allow-invalid = true },
-    { path = "tokio::net::UnixSocket::listen", reason = "listen through agentfs_core::listening_socket::Listener", allow-invalid = true },
-    { path = "socket2::Socket::listen", reason = "listen through agentfs_core::listening_socket::Listener", allow-invalid = true },
-    { path = "rustix::net::listen", reason = "listen through agentfs_core::listening_socket::Listener", allow-invalid = true },
-    { path = "libc::listen", reason = "listen through agentfs_core::listening_socket::Listener", allow-invalid = true },
-    { path = "nix::sys::socket::listen", reason = "listen through agentfs_core::listening_socket::Listener", allow-invalid = true },
+    { path = "std::os::unix::net::UnixListener::bind", reason = "listen through agentfs_os::listening_socket::Listener" },
+    { path = "std::os::unix::net::UnixListener::bind_addr", reason = "listen through agentfs_os::listening_socket::Listener" },
+    { path = "tokio::net::UnixListener::bind", reason = "listen through agentfs_os::listening_socket::Listener::into_async", allow-invalid = true },
+    { path = "tokio::net::UnixListener::from_std", reason = "listen through agentfs_os::listening_socket::Listener::into_async", allow-invalid = true },
+    { path = "tokio::net::UnixSocket::listen", reason = "listen through agentfs_os::listening_socket::Listener", allow-invalid = true },
+    { path = "socket2::Socket::listen", reason = "listen through agentfs_os::listening_socket::Listener", allow-invalid = true },
+    { path = "rustix::net::listen", reason = "listen through agentfs_os::listening_socket::Listener", allow-invalid = true },
+    { path = "libc::listen", reason = "listen through agentfs_os::listening_socket::Listener", allow-invalid = true },
+    { path = "nix::sys::socket::listen", reason = "listen through agentfs_os::listening_socket::Listener", allow-invalid = true },
+
+    # libgit2's options are process-wide: they are set once, in
+    # agentfs_git::init, and nowhere else (two setups would disagree on
+    # fsync, config search paths, the home directory or the timeouts).
+    { path = "libgit2_sys::init", reason = "libgit2 is set up once, by agentfs_git::init", allow-invalid = true },
+    { path = "libgit2_sys::git_libgit2_opts", reason = "libgit2 is set up once, by agentfs_git::init", allow-invalid = true },
+    { path = "git2::opts::set_search_path", reason = "libgit2 is set up once, by agentfs_git::init", allow-invalid = true },
+    { path = "git2::opts::reset_search_path", reason = "libgit2 is set up once, by agentfs_git::init", allow-invalid = true },
+    { path = "git2::opts::enable_caching", reason = "libgit2 is set up once, by agentfs_git::init", allow-invalid = true },
+    { path = "git2::opts::set_cache_object_limit", reason = "libgit2 is set up once, by agentfs_git::init", allow-invalid = true },
+    { path = "git2::opts::set_cache_max_size", reason = "libgit2 is set up once, by agentfs_git::init", allow-invalid = true },
+    { path = "git2::opts::strict_object_creation", reason = "libgit2 is set up once, by agentfs_git::init", allow-invalid = true },
+    { path = "git2::opts::strict_hash_verification", reason = "libgit2 is set up once, by agentfs_git::init", allow-invalid = true },
+    { path = "git2::opts::set_extensions", reason = "libgit2 is set up once, by agentfs_git::init", allow-invalid = true },
+    { path = "git2::opts::set_verify_owner_validation", reason = "libgit2 is set up once, by agentfs_git::init", allow-invalid = true },
+    { path = "git2::opts::set_ssl_cert_file", reason = "libgit2 is set up once, by agentfs_git::init", allow-invalid = true },
+    { path = "git2::opts::set_ssl_cert_dir", reason = "libgit2 is set up once, by agentfs_git::init", allow-invalid = true },
+    { path = "git2::opts::set_mwindow_size", reason = "libgit2 is set up once, by agentfs_git::init", allow-invalid = true },
+    { path = "git2::opts::set_mwindow_mapped_limit", reason = "libgit2 is set up once, by agentfs_git::init", allow-invalid = true },
+    { path = "git2::opts::set_mwindow_file_limit", reason = "libgit2 is set up once, by agentfs_git::init", allow-invalid = true },
+    { path = "git2::opts::set_server_connect_timeout_in_milliseconds", reason = "libgit2 is set up once, by agentfs_git::init", allow-invalid = true },
+    { path = "git2::opts::set_server_timeout_in_milliseconds", reason = "libgit2 is set up once, by agentfs_git::init", allow-invalid = true },
+
+    # A transport registered while another is being created is undefined
+    # behaviour in libgit2: the one registration runs inside core's init_git.
+    { path = "git2::transport::register", reason = "transports are registered by agentfs_core::ssh_transport::register", allow-invalid = true },
+
+    # Every way libgit2 creates a transport: a remote (from which connect,
+    # fetch and push), a clone, a submodule's clone or update. Only the
+    # recording engine opens one, each site after its init_git (which
+    # registers the transports) and marked with an #[expect]; the tree engine
+    # opens none. This is what ssh_transport::register's SAFETY rests on.
+    { path = "git2::Repository::remote", reason = "only the recording engine opens a remote, after init_git", allow-invalid = true },
+    { path = "git2::Repository::remote_anonymous", reason = "only the recording engine opens a remote, after init_git", allow-invalid = true },
+    { path = "git2::Repository::remote_with_fetch", reason = "only the recording engine opens a remote, after init_git", allow-invalid = true },
+    { path = "git2::Repository::find_remote", reason = "only the recording engine opens a remote, after init_git", allow-invalid = true },
+    { path = "git2::Remote::create_detached", reason = "only the recording engine opens a remote, after init_git", allow-invalid = true },
+    { path = "git2::Repository::clone", reason = "only the recording engine opens a remote, after init_git", allow-invalid = true },
+    { path = "git2::Repository::clone_recurse", reason = "only the recording engine opens a remote, after init_git", allow-invalid = true },
+    { path = "git2::build::RepoBuilder::clone", reason = "only the recording engine opens a remote, after init_git", allow-invalid = true },
+    { path = "git2::Submodule::clone", reason = "only the recording engine opens a remote, after init_git", allow-invalid = true },
+    { path = "git2::Submodule::update", reason = "only the recording engine opens a remote, after init_git", allow-invalid = true },
+
+    # Each Git child the tree engine starts is counted (agentfs_git::git_cli::counted):
+    # align's own diff starts its child uncounted, so it is for callers off
+    # that path, each marked with an #[expect]. Pass a spawner to
+    # agentfs_align::histogram_with or agentfs_lines' `_with` calls.
+    { path = "agentfs_align::histogram", reason = "pass the spawner: agentfs_align::histogram_with (the tree engine's is git_cli::counted)", allow-invalid = true },
 
     # A tree volume's Git store is opened only by its History (the tree
     # actor's `history` module): nothing else reads history past what is built.

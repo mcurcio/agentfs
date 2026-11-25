@@ -7,9 +7,15 @@ license.workspace = true
 repository.workspace = true
 description = "The agentfs FUSE layer: a recording passthrough filesystem over a backing tree"
 
+[package.metadata.agentfs]
+rank = "filesystem"
+
 [dependencies]
 agentfs-contracts = { version = "0.1.0", path = "../agentfs-contracts" }
 agentfs-core = { version = "0.1.0", path = "../agentfs-core" }
+agentfs-failpoints = { version = "0.1.0", path = "../agentfs-failpoints" }
+# Mounts (stale.rs, views.rs), and confined access (tree_view, backing.rs).
+agentfs-os = { version = "0.1.0", path = "../agentfs-os" }
 # The Rules domain: where a view's new names go (tree_view).
 agentfs-rules = { version = "0.1.0", path = "../agentfs-rules" }
 # Default features only: pure Rust (mount(2) as root, fusermount3
@@ -29,4 +35,4 @@ uuid = { version = "1", default-features = false, features = ["std"] }
 [features]
 # Test builds only: agentfs-core's failpoints, and the FUSE layer's own.
 # Never in a release or image.
-failpoints = ["agentfs-core/failpoints"]
+failpoints = ["agentfs-core/failpoints", "agentfs-failpoints/failpoints"]

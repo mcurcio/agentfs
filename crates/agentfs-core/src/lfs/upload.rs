@@ -11,7 +11,7 @@
 use git2::{Oid, Repository};
 
 use super::{LfsError, Pointer};
-use crate::paths::RepoPath;
+use agentfs_contracts::paths::RepoPath;
 
 /// The objects the commits in `head ^ last_pushed` reference, each with
 /// one path that references it, deduplicated and sorted by oid.

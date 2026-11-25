@@ -7,7 +7,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use super::{ByLine as Snapshot, Expanded as Lines, Verdict, ancestry};
 use crate::tree_actor::tree::{LineVersion, MergeFileIdentity};
 use crate::tree_actor::{Error, Result};
-use crate::tree_reconcile::Line;
+use agentfs_lines::Line;
 
 /// One file's lines placed, and the joins that lose: each as the losing version and the
 /// upstream's version it loses to.

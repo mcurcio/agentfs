@@ -26,7 +26,7 @@
 //! then needs up to about 256 MiB besides the daemon.
 //!
 //! **Environment.** The child starts from an empty environment
-//! ([`crate::git_cli::command`]): a fixed `PATH`, `LC_ALL=C`, `HOME` set to
+//! ([`agentfs_git::git_cli::command`]): a fixed `PATH`, `LC_ALL=C`, `HOME` set to
 //! the git directory, and the system and global git config switched off, so
 //! the CLI reads only the repository's own config, as libgit2 does, and nothing in the daemon's environment (`GIT_CONFIG_*`,
 //! `GIT_EXEC_PATH`) reaches it.
@@ -47,26 +47,10 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-use crate::file_lock::{FileLock, Mode};
-use crate::git_cli;
-use crate::service::Stop;
+use agentfs_git::git_cli::{self, PACK_CONFIG};
+use agentfs_os::file_lock::{FileLock, Mode};
 
-/// The memory bounds of every repack's `git` (see the module docs), before
-/// its subcommand; the tree history's repack task runs with them too.
-pub const PACK_CONFIG: [&str; 12] = [
-    "-c",
-    "repack.writeBitmaps=false",
-    "-c",
-    "pack.threads=1",
-    "-c",
-    "pack.windowMemory=64m",
-    "-c",
-    "pack.deltaCacheSize=16m",
-    "-c",
-    "core.bigFileThreshold=64m",
-    "-c",
-    "core.packedGitLimit=128m",
-];
+use crate::service::Stop;
 
 /// The repack after [`PACK_CONFIG`].
 const REPACK: [&str; 4] = ["repack", "-d", "-q", "--geometric=2"];
@@ -154,7 +138,7 @@ pub fn repack(
     }
     let start = Instant::now();
     let mut child = command(git, git_dir).spawn().map_err(RepackError::Spawn)?;
-    if let Err(e) = crate::failpoints::hit("repack.running") {
+    if let Err(e) = agentfs_failpoints::hit("repack.running") {
         let _ = child.kill();
         let _ = child.wait();
         return Err(RepackError::Spawn(e));
@@ -382,7 +366,7 @@ mod tests {
         };
         // Killed at once (a crash right after the spawn).
         {
-            let _guard = crate::failpoints::configure("repack.running=error").unwrap();
+            let _guard = agentfs_failpoints::configure("repack.running=error").unwrap();
             let failed = run(&Stop::default());
             assert!(matches!(failed, Err(RepackError::Spawn(_))), "{failed:?}");
             fsck();

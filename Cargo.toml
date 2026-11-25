@@ -1,14 +1,32 @@
 [workspace]
 resolver = "3"
 exclude = ["vendor/fuser"]
-members = ["crates/agentfs-align", "crates/agentfs-rules", "crates/agentfs-contracts", "crates/agentfs-volume", "crates/agentfs-clients", "crates/agentfs-trees", "crates/agentfs-core", "crates/agentfs-fuse", "crates/agentfs", "crates/agentfs-csi", "crates/agentfs-model", "crates/agentfs-conformance"]
+members = ["crates/agentfs-align", "crates/agentfs-lines", "crates/agentfs-failpoints", "crates/agentfs-os", "crates/agentfs-git", "crates/agentfs-rules", "crates/agentfs-contracts", "crates/agentfs-volume", "crates/agentfs-clients", "crates/agentfs-trees", "crates/agentfs-core", "crates/agentfs-fuse", "crates/agentfs", "crates/agentfs-csi", "crates/agentfs-model", "crates/agentfs-conformance", "crates/agentfs-repo"]
 
 [workspace.package]
 edition = "2024"
-# File::lock and its family (agentfs_core::file_lock).
+# File::lock and its family (agentfs_os::file_lock).
 rust-version = "1.89"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/mcurcio/agentfs"
+
+# The ranks of the workspace's packages (docs/architecture.md, "Ranks"),
+# each listed after every rank it uses. Each package names its own in
+# `[package.metadata.agentfs] rank`. A normal or build dependency on another
+# member must be in a rank its own rank `uses`; a rank's packages depend on
+# one another only where it uses itself. Dev-dependencies are exempt.
+# crates/agentfs-repo checks it.
+[workspace.metadata.agentfs]
+ranks = [
+    { name = "line-identity", uses = ["line-identity"] },
+    { name = "leaf", uses = ["line-identity", "leaf"] },
+    { name = "shared-kernel", uses = [] },
+    { name = "domain", uses = ["shared-kernel"] },
+    { name = "engine", uses = ["line-identity", "leaf", "shared-kernel", "domain"] },
+    { name = "filesystem", uses = ["leaf", "shared-kernel", "domain", "engine", "filesystem"] },
+    { name = "kubernetes", uses = ["leaf", "shared-kernel", "engine", "filesystem"] },
+    { name = "tests", uses = ["line-identity", "leaf", "shared-kernel", "domain", "engine", "filesystem", "kubernetes", "tests"] },
+]
 
 [patch.crates-io]
 fuser = { path = "vendor/fuser" }

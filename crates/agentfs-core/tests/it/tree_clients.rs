@@ -483,7 +483,7 @@ fn a_detached_clients_open_file_is_saved() {
 #[test]
 fn clients_go_on_while_the_builder_fails() {
     let tmp = tempfile::tempdir().unwrap();
-    let held = agentfs_core::failpoints::configure("tree.build_before_batch=error@*").unwrap();
+    let held = agentfs_failpoints::configure("tree.build_before_batch=error@*").unwrap();
     let recording = serve(tmp.path());
     let fork = fork(&recording);
     let mut one = run(&recording);

@@ -10,10 +10,12 @@ pub mod caps;
 pub mod clients;
 pub mod host;
 pub mod name;
+pub mod paths;
 pub mod pod;
 pub mod ports;
 pub mod tree;
 pub mod trees;
+pub mod units;
 pub mod views;
 pub mod volume;
 

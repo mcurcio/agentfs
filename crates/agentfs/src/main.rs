@@ -58,8 +58,6 @@
 mod checkpoint_cmd;
 mod control;
 mod daemon;
-#[cfg(test)]
-mod doc_tables;
 mod domain_events;
 mod fork_cmd;
 mod front;
@@ -88,13 +86,15 @@ use std::time::Duration;
 use anyhow::{Context as _, Result, bail};
 use clap::{Args, Parser, Subcommand};
 
-use agentfs_core::config::{Remotes, parse_duration};
+use agentfs_contracts::paths::{PathError, RepoPath};
+use agentfs_contracts::units::duration_arg;
+
+use agentfs_core::config::Remotes;
 use agentfs_core::events::{Event, Events, PushStage};
 use agentfs_core::history::History;
 use agentfs_core::identity::Context;
 use agentfs_core::lfs;
 use agentfs_core::lock::{LockError, StateLock};
-use agentfs_core::paths::{PathError, RepoPath};
 use agentfs_core::push::{self, LeaseOutcome, PushOutcome, RemotePusher, RemoteStatus};
 use agentfs_core::record::{Caller, Trigger};
 use agentfs_core::service::{FinalPush, Service};
@@ -126,7 +126,7 @@ struct Cli {
     /// How long to wait for another agentfs process to release the state
     /// area (every command that writes it takes it). By
     /// default a busy state area exits 75 at once.
-    #[arg(long, global = true, env = "AGENTFS_WAIT_LOCK", default_value = "0s", value_parser = parse_grace, value_name = "DURATION")]
+    #[arg(long, global = true, env = "AGENTFS_WAIT_LOCK", default_value = "0s", value_parser = duration_arg, value_name = "DURATION")]
     wait_lock: Duration,
     #[command(subcommand)]
     command: Command,
@@ -186,10 +186,10 @@ enum Command {
         pod: Pod,
         /// How long shutdown may spend on a last push of the final commit;
         /// 0s skips it.
-        #[arg(long, default_value = "5s", value_parser = parse_grace)]
+        #[arg(long, default_value = "5s", value_parser = duration_arg)]
         push_grace: Duration,
         /// How long shutdown waits for fronts' requests in progress.
-        #[arg(long, default_value = "10s", value_parser = parse_grace)]
+        #[arg(long, default_value = "10s", value_parser = duration_arg)]
         shutdown_grace: Duration,
         /// A workload may be attached to the volume (the CSI node plugin
         /// passes it while a pod of the volume is published): the patch
@@ -225,7 +225,7 @@ enum Command {
         /// How long to wait for a running daemon's push (1s to 10m); a push
         /// still running then carries on in the background. Pushing
         /// directly ignores it.
-        #[arg(long, default_value = "120s", value_parser = parse_grace, value_name = "DURATION")]
+        #[arg(long, default_value = "120s", value_parser = duration_arg, value_name = "DURATION")]
         timeout: Duration,
         /// Replace this volume's own branch on one remote, leased on OID (runbooks only).
         #[arg(long, value_name = "OID")]
@@ -253,7 +253,7 @@ enum Command {
         pod: Pod,
         /// How long shutdown may spend on a last push of the final commit;
         /// 0s skips it.
-        #[arg(long, default_value = "5s", value_parser = parse_grace)]
+        #[arg(long, default_value = "5s", value_parser = duration_arg)]
         push_grace: Duration,
     },
     /// Write PATH (a file, symlink or directory, or `.` for the whole
@@ -350,10 +350,10 @@ struct HistoryArgs {
     history_service: Option<String>,
     /// How long a boundary waits for the history service before it fails
     /// with EIO.
-    #[arg(long, env = "AGENTFS_HISTORY_TIMEOUT", default_value = "10s", value_parser = parse_grace, value_name = "DURATION")]
+    #[arg(long, env = "AGENTFS_HISTORY_TIMEOUT", default_value = "10s", value_parser = duration_arg, value_name = "DURATION")]
     history_timeout: Duration,
     /// How long to wait at start for the history service to be up.
-    #[arg(long, env = "AGENTFS_HISTORY_WAIT", default_value = "30s", value_parser = parse_grace, value_name = "DURATION")]
+    #[arg(long, env = "AGENTFS_HISTORY_WAIT", default_value = "30s", value_parser = duration_arg, value_name = "DURATION")]
     history_wait: Duration,
     /// Prefer pending slot N (1..=1023) when leasing as a front, else the
     /// lowest free slot. A front restarted after a crash passes its
@@ -361,10 +361,6 @@ struct HistoryArgs {
     /// driver does this).
     #[arg(long, env = "AGENTFS_HISTORY_SLOT", value_name = "N", value_parser = clap::value_parser!(u16).range(1..=1023))]
     history_slot: Option<u16>,
-}
-
-fn parse_grace(value: &str) -> Result<Duration, String> {
-    parse_duration(value).ok_or_else(|| format!("{value:?} is not a duration (use e.g. 500ms, 5s)"))
 }
 
 /// Where the volume is mounted. In Kubernetes these come from the downward
@@ -406,12 +402,11 @@ impl Pod {
 const EXIT_LOCKED: u8 = 75;
 
 fn main() -> ExitCode {
-    agentfs_core::allocator::limit_arenas();
-    if cfg!(feature = "failpoints") && std::env::var_os(agentfs_core::failpoints::ENV_VAR).is_some()
-    {
+    agentfs_os::allocator::limit_arenas();
+    if cfg!(feature = "failpoints") && std::env::var_os(agentfs_failpoints::ENV_VAR).is_some() {
         eprintln!(
             "agentfs: warning: failpoints are set ({}): a test build, never for production",
-            agentfs_core::failpoints::ENV_VAR
+            agentfs_failpoints::ENV_VAR
         );
     }
     match real_main() {

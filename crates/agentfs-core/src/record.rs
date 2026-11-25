@@ -10,8 +10,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::identity::Context;
 use crate::lfs::Store;
-use crate::paths::RepoPath;
 use crate::pending::PendingId;
+use agentfs_contracts::paths::RepoPath;
 
 /// The FUSE event (or other cause) that ended a change.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

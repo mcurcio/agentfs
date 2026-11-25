@@ -23,12 +23,12 @@ use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
+use agentfs_os::confined;
+use agentfs_os::fsutil::{self, create_dir_durably, sync_dir};
 use rustix::fs::{AtFlags, FileType, Mode, OFlags, Stat, Timestamps};
 
 use super::TreeId;
 use super::meta::{Kind, Meta};
-use crate::confined;
-use crate::fsutil::{self, create_dir_durably, sync_dir};
 
 /// The state area's directory of untracked areas.
 pub(in crate::tree_actor) const UNTRACKED: &str = "untracked";
@@ -418,7 +418,7 @@ impl Areas {
         std::fs::rename(temporary, target)?;
         sync_dir(parent)?;
         sync_dir(&self.root.join(STAGING))?;
-        crate::failpoints::hit("tree.fork_after_copy")
+        agentfs_failpoints::hit("tree.fork_after_copy")
     }
 
     /// Removes `tree`'s area, if it has one.
@@ -535,7 +535,7 @@ fn copy_tree(source: &confined::Dir, target: &Path) -> io::Result<()> {
                     fsutil::clone_or_copy(&src, &dst)?;
                     set_meta(&dst, &st, chown)?;
                     rustix::fs::fsync(&dst)?;
-                    crate::failpoints::hit("tree.fork_copy_file")?;
+                    agentfs_failpoints::hit("tree.fork_copy_file")?;
                 }
                 FileType::Symlink => {
                     let link = rustix::fs::readlinkat(&from, name, Vec::new())?;

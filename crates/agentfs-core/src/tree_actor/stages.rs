@@ -5,7 +5,7 @@
 //! enclose another (`queue_plan` encloses `snapshot_read` and `sync_merge`;
 //! `journal_append` encloses `journal_fsync`). `event_owners` is the one Git
 //! child that rebuilds the map of each save's commit at open. Totals are
-//! process-wide, like the counters of Git children in [`crate::git_cli`] and
+//! process-wide, like the counters of Git children in [`agentfs_git::git_cli`] and
 //! of objects in [`crate::tree_git`]: one
 //! actor runs per process, so a reader compares two snapshots.
 //!
@@ -513,7 +513,7 @@ impl Stages {
                     other: op(Op::Other),
                 }
             },
-            git_children: crate::git_cli::children(),
+            git_children: agentfs_git::git_cli::children(),
             object_writes: crate::tree_git::object_writes() + super::history::feed::fed(),
             object_dir_syncs: crate::tree_git::object_dir_syncs()
                 + super::history::feed::pack_syncs(),

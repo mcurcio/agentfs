@@ -26,7 +26,6 @@ use clap::{Args, Subcommand};
 use serde::Serialize;
 
 use agentfs_core::config::Settings;
-use agentfs_core::confined::Dir;
 use agentfs_core::events::{Event, Events};
 use agentfs_core::history::History;
 use agentfs_core::identity::Identity;
@@ -45,6 +44,7 @@ use agentfs_core::patch::{BlockReason, PatchError, Verdict};
 use agentfs_core::record::Caller;
 use agentfs_core::telemetry::Telemetry;
 use agentfs_core::volume::{Committer, Recorder, StateDir};
+use agentfs_os::confined::Dir;
 
 use crate::control::{self, ClientError, Reply, Request};
 use crate::{EXIT_LOCKED, Pod, Session, current_gid, current_uid};

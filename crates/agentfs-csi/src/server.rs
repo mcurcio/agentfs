@@ -6,7 +6,7 @@ use std::io;
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
-use agentfs_core::listening_socket::{AsyncListener, Listener, Stopper};
+use agentfs_os::listening_socket::{AsyncListener, Listener, Stopper};
 
 use crate::controller::ControllerService;
 use crate::csi::v1::controller_server::ControllerServer;
@@ -111,7 +111,7 @@ impl BoundSocket {
         } = self;
         // Stops the listener once `shutdown` completes: tonic keeps its
         // incoming stream while calls finish, and a connect then must be
-        // refused, not left unanswered (`agentfs_core::listening_socket`).
+        // refused, not left unanswered (`agentfs_os::listening_socket`).
         let shutdown = async move {
             shutdown.await;
             let _ = stopper.stop();

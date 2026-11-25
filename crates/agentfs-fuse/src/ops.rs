@@ -69,11 +69,12 @@ use std::time::Instant;
 
 use agentfs_core::record::{Caller, Origin, Trigger};
 use agentfs_core::volume::{MoveOutcome, Recorded, Recorder, VolumeError};
+use agentfs_os::confined::proc_path;
 use fuser::{Errno, FileAttr, FileType, TimeOrNow};
 use rustix::fs::{AtFlags, Mode, OFlags, RenameFlags, Stat, Timespec, Timestamps};
 
 use crate::access::{self, Object, Want, Who};
-use crate::backing::{self, Backing, attr, join, proc_path};
+use crate::backing::{self, Backing, attr, join};
 use crate::boundary::{Boundary, Change, REPAIR_TRIGGER, State};
 use crate::creds;
 use crate::dirty::{FrozenRef, Stamp, now_ns, same_bytes, timestamp_granularity_ns};
@@ -693,7 +694,7 @@ impl Ops {
             .filter_map(|m| {
                 std::str::from_utf8(m)
                     .ok()
-                    .and_then(|m| agentfs_core::paths::RepoPath::new(m).ok())
+                    .and_then(|m| agentfs_contracts::paths::RepoPath::new(m).ok())
             })
             .collect();
         let error = io::Error::new(
@@ -1956,7 +1957,7 @@ impl Ops {
         }
         self.record_node(h.node, &h.fd, Trigger::Close, caller)?;
         // Recorded, not yet answered.
-        agentfs_core::failpoints::hit("fuse.after_record").map_err(|_| Errno::EIO)
+        agentfs_failpoints::hit("fuse.after_record").map_err(|_| Errno::EIO)
     }
 
     /// Records node `id` from `fd` if it changed. Ok(true) if a record was

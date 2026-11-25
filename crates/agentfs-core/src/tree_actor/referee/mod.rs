@@ -41,7 +41,7 @@ pub(super) struct File<L = Lines> {
 }
 
 /// A file's lines one by one, every version with its ancestor: what the rules read.
-pub(super) type Expanded = crate::tree_reconcile::Expanded<LineVersion>;
+pub(super) type Expanded = agentfs_lines::Expanded<LineVersion>;
 
 /// A snapshot line by line.
 pub(super) type ByLine = Snapshot<Expanded>;
@@ -385,7 +385,7 @@ pub(super) mod test_bytes {
 
     use super::Expanded;
     use crate::tree_actor::tree::{EventNumber, LineVersion, Lines, Versions};
-    use crate::tree_reconcile::Line;
+    use agentfs_lines::Line;
 
     thread_local! {
         static NOTED: RefCell<HashMap<LineVersion, Vec<u8>>> = RefCell::new(HashMap::new());
@@ -423,7 +423,11 @@ pub(super) mod test_bytes {
     pub(in crate::tree_actor) fn save(base: &Lines, bytes: &[u8], event: u64) -> Lines {
         let old = of_map(base);
         let mut versions = Versions::of(EventNumber::new(event));
-        let map = base.align_bytes(&old, bytes, |n| versions.take(n)).unwrap();
+        let map = base
+            .align_bytes_with(&old, bytes, agentfs_git::git_cli::counted, |n| {
+                versions.take(n)
+            })
+            .unwrap();
         note_live(&map.expand(), bytes);
         map
     }

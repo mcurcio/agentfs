@@ -14,7 +14,7 @@
 use clap::CommandFactory;
 
 use crate::Cli;
-use crate::doc_tables::{self, Section};
+use agentfs_repo::doc_tables::{self, Section};
 
 /// A long flag of a (sub)command.
 struct Flag {
@@ -68,10 +68,7 @@ pub(crate) fn named_flags(cell: &str) -> Vec<String> {
 }
 
 fn doc() -> Vec<Section> {
-    doc_tables::sections(&doc_tables::read_doc(
-        env!("CARGO_MANIFEST_DIR"),
-        "configuration.md",
-    ))
+    doc_tables::sections(&doc_tables::read_doc("configuration.md"))
 }
 
 fn flag_tables(sections: &[Section]) -> &Section {
@@ -159,8 +156,8 @@ fn every_environment_variable_is_documented() {
         .filter_map(|f| f.env.as_deref())
         .chain(crate::otel::ENV_VARS.iter().copied())
         .chain(crate::otel::SDK_ENV_VARS.iter().copied())
-        .chain(std::iter::once(agentfs_core::failpoints::ENV_VAR))
-        .chain(std::iter::once(agentfs_core::failpoints::COMPACT_GATE_VAR))
+        .chain(std::iter::once(agentfs_failpoints::ENV_VAR))
+        .chain(std::iter::once(agentfs_core::tree_actor::COMPACT_GATE_VAR))
         .filter(|var| !spans.iter().any(|s| s == var))
         .collect();
     assert!(

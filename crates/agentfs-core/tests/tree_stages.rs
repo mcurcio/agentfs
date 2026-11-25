@@ -194,7 +194,7 @@ fn the_call_path_runs_no_git() {
     )
     .unwrap();
     let w = writer("test-writer");
-    let held = agentfs_core::failpoints::configure("tree.build_before_batch=error@*").unwrap();
+    let held = agentfs_failpoints::configure("tree.build_before_batch=error@*").unwrap();
     let before = Stages::current();
     let h = rec
         .actor()
@@ -846,51 +846,5 @@ fn a_sync_costs_the_same_children_for_any_number_of_lines() {
     assert_eq!(
         few, many,
         "children per save and sync: {few} for 10 lines, {many} for 600"
-    );
-}
-
-/// Production sources of the actor's path, up to their first test module.
-fn production(path: &Path) -> String {
-    let source = std::fs::read_to_string(path).unwrap();
-    let end = source.find("#[cfg(test)]").unwrap_or(source.len());
-    let end = source[..end].find("#[cfg(all(test").unwrap_or(end);
-    source[..end].to_owned()
-}
-
-#[test]
-fn one_spawn_site() {
-    let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-    let mut files = vec![src.join("tree_git.rs"), src.join("tree_reconcile.rs")];
-    let mut dirs = vec![src.join("tree_actor")];
-    while let Some(dir) = dirs.pop() {
-        for entry in std::fs::read_dir(dir).unwrap() {
-            let path = entry.unwrap().path();
-            if path.is_dir() {
-                dirs.push(path);
-            } else {
-                files.push(path);
-            }
-        }
-    }
-    // The history's repack task starts its own `git repack`: it is not on the
-    // actor's path, so it stays uncounted and each operation's count of Git
-    // children stays exact.
-    let repack = src.join("tree_actor/history/repack.rs");
-    for file in files.into_iter().filter(|file| *file != repack) {
-        let source = production(&file);
-        // `Command` methods take no argument; a thread scope's `spawn` takes one.
-        for spawn in [".spawn()", ".output()", ".status()"] {
-            assert!(
-                !source.contains(spawn),
-                "{} starts a process with `{spawn}` outside git_cli::counted",
-                file.display()
-            );
-        }
-    }
-    let git_cli = production(&src.join("git_cli.rs"));
-    assert_eq!(
-        git_cli.matches(".spawn()").count(),
-        1,
-        "git_cli::counted is the one site"
     );
 }

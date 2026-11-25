@@ -17,7 +17,8 @@ pub struct NameError {
 
 /// The safe-name rule, its one home: an ASCII letter or digit first, then
 /// letters, digits, `.`, `_` and `-`; no `..`, no trailing `.` or `.lock`.
-/// A volume name, a client label and a launcher id follow it, and so does
+/// A volume name, a client label, a launcher id and the CSI driver's volume
+/// handles and node ids follow it, and so does
 /// `agentfs_core::config::validate_name` (it calls this).
 pub fn is_safe_name(value: &str) -> bool {
     let bytes = value.as_bytes();

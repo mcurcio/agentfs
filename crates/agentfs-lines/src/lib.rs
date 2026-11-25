@@ -1,5 +1,9 @@
-//! Line maps for tree landing (target architecture §7): which version wrote each
-//! line of a file and which line it is, never the line's bytes.
+//! Line maps for tree landing (docs/target-architecture/git-model.md §7):
+//! which version wrote each line of a file and which line it is, never the
+//! line's bytes, aligned across saves by git's histogram diff
+//! (`agentfs-align`). It reads the images it is given, which may be files,
+//! and starts no process itself: a diff's `git` child is started by the
+//! spawner its caller passes. docs/library/core.md explains its use.
 //!
 //! A file's bytes have one home: its blob, its checkout or the journal frames
 //! that hold them. A [`LineMap`] says how those bytes divide into lines and names
@@ -23,6 +27,7 @@ use std::hash::Hash;
 use std::io;
 use std::os::unix::fs::FileExt;
 use std::path::Path;
+use std::process::{Child, Command};
 
 pub use agentfs_align::Hunk;
 use serde::de::DeserializeOwned;
@@ -1005,18 +1010,20 @@ impl<V: Id> LineMap<V> {
         Ok(result)
     }
 
-    /// [`LineMap::align`] of two images in memory, diffed by [`histogram`].
+    /// [`LineMap::align`] of two images in memory, diffed by
+    /// [`histogram_with`], whose `git` child `spawn` starts.
     ///
     /// # Errors
     ///
     /// As [`LineMap::align`].
-    pub fn align_bytes(
+    pub fn align_bytes_with(
         &self,
         old: &[u8],
         new: &[u8],
+        spawn: impl FnOnce(&mut Command) -> io::Result<Child>,
         next: impl FnMut(u64) -> V,
     ) -> Result<Self, Error> {
-        self.align(&old, &new, || histogram(old, new), next)
+        self.align(&old, &new, || histogram_with(old, new, spawn), next)
     }
 }
 
@@ -1147,14 +1154,19 @@ pub fn render(sources: &[&dyn Image], pieces: &[Piece]) -> io::Result<Vec<u8>> {
 }
 
 /// Git's text-mode histogram diff of two images in memory, through the one call
-/// the model shares. Against an empty old image every new line is an insert,
-/// the one hunk `git diff` gives (`@@ -0,0 +1,n @@`): answered with no child, so
-/// a new file's first save starts no `git diff`.
+/// the model shares, its `git` child started by `spawn`: `agentfs_align`'s
+/// `histogram_with`, but for an empty old image. Against one every new line is
+/// an insert, the one hunk `git diff` gives (`@@ -0,0 +1,n @@`): answered with
+/// no child, so a new file's first save starts no `git diff`.
 ///
 /// # Errors
 ///
 /// The diff's.
-pub fn histogram(old: &[u8], new: &[u8]) -> Result<Vec<Hunk>, Error> {
+pub fn histogram_with(
+    old: &[u8],
+    new: &[u8],
+    spawn: impl FnOnce(&mut Command) -> io::Result<Child>,
+) -> Result<Vec<Hunk>, Error> {
     if old.is_empty() {
         let count = LineIndex::of(&new)?.count();
         return Ok(if count == 0 {
@@ -1168,26 +1180,22 @@ pub fn histogram(old: &[u8], new: &[u8]) -> Result<Vec<Hunk>, Error> {
             }]
         });
     }
-    Ok(agentfs_align::histogram_with(
-        old,
-        new,
-        crate::git_cli::counted,
-    )?)
+    Ok(agentfs_align::histogram_with(old, new, spawn)?)
 }
 
 /// Git's text-mode histogram diff of two files, through the one call the model
-/// shares, read as it streams: what a save's alignment runs on images too large
-/// to hold.
+/// shares, read as it streams, its `git` child started by `spawn`: what a
+/// save's alignment runs on images too large to hold.
 ///
 /// # Errors
 ///
 /// The diff's.
-pub fn histogram_files(old: &Path, new: &Path) -> Result<Vec<Hunk>, Error> {
-    Ok(agentfs_align::histogram_files(
-        old,
-        new,
-        crate::git_cli::counted,
-    )?)
+pub fn histogram_files_with(
+    old: &Path,
+    new: &Path,
+    spawn: impl FnOnce(&mut Command) -> io::Result<Child>,
+) -> Result<Vec<Hunk>, Error> {
+    Ok(agentfs_align::histogram_files_with(old, new, spawn)?)
 }
 
 #[cfg(test)]
@@ -1226,7 +1234,8 @@ mod tests {
     }
 
     fn save(base: &LineMap<V>, old: &[u8], new: &[u8], w: u64) -> LineMap<V> {
-        base.align_bytes(old, new, writer(w)).unwrap()
+        base.align_bytes_with(old, new, Command::spawn, writer(w))
+            .unwrap()
     }
 
     fn bytes(map: &LineMap<V>, image: &[u8]) -> Vec<u8> {
@@ -1383,7 +1392,7 @@ mod tests {
     fn a_bad_map_is_refused() {
         let map = save(&LineMap::default(), b"", b"a\nb\n", 1);
         assert!(matches!(
-            map.align_bytes(b"a\n", b"x\n", writer(2)),
+            map.align_bytes_with(b"a\n", b"x\n", Command::spawn, writer(2)),
             Err(Error::InvalidMap(_))
         ));
         let mut runs = map.runs().to_vec();

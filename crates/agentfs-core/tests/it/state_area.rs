@@ -297,7 +297,7 @@ fn run_killed(root: &Path, spec: &str) {
             "--nocapture",
         ])
         .env(WORKER, root)
-        .env(agentfs_core::failpoints::ENV_VAR, spec)
+        .env(agentfs_failpoints::ENV_VAR, spec)
         .output()
         .unwrap();
     assert_eq!(
@@ -395,7 +395,7 @@ fn a_drain_goes_on_while_the_builder_fails() {
     let root = tmp.path().join("state");
     let at = PodContext::default();
     volume(&root).ensure(spec("t"), &at, &root_cap()).unwrap();
-    let held = agentfs_core::failpoints::configure("tree.build_before_batch=error@*").unwrap();
+    let held = agentfs_failpoints::configure("tree.build_before_batch=error@*").unwrap();
     let events = Events::default();
     let mut volume = volume_with(&root, events.clone());
     assert_eq!(volume.stage(&at, &root_cap()), Ok(VolumeState::Staged));

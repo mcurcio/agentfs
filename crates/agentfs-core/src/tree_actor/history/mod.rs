@@ -23,13 +23,13 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use agentfs_os::file_lock::FileLock;
 use git2::Oid;
 
 use super::pointers::Pointers;
 use super::stages::{Timer, Which};
 use super::tree::{FileBytes, Shape, Tree};
 use super::{Error, Result, TreeId, referee};
-use crate::file_lock::FileLock;
 use crate::tree_git::TreeGit;
 
 /// One tree's object numbers: each named file's object, by its identity's

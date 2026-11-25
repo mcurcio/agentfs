@@ -1,0 +1,22 @@
+[package]
+name = "agentfs-git"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "agentfs's git leaves: the git program's environment and child count, every repack's memory bounds, and the process's one libgit2 setup"
+
+[package.metadata.agentfs]
+rank = "leaf"
+
+[dependencies]
+# GIT_PATH: where the `git` program is looked up.
+agentfs-align = { version = "0.1.0", path = "../agentfs-align" }
+# libgit2's options, set once in `init`. No default features: TLS and SSH
+# are agentfs-core's `https` and `ssh` features.
+git2 = { version = "0.21.0", default-features = false }
+libgit2-sys = { version = "0.18.8", default-features = false }
+
+[dev-dependencies]
+tempfile = "3.27.0"

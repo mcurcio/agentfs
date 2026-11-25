@@ -18,9 +18,9 @@
 
 use std::time::Duration;
 
-use crate::config::{parse_duration, parse_size};
-use crate::paths::RepoPath;
 use crate::rules::{AttrState, Attributes};
+use agentfs_contracts::paths::RepoPath;
+use agentfs_contracts::units::{parse_duration, parse_size};
 
 /// `agentfs.commit`: the boundary class.
 pub const COMMIT_ATTR: &str = "agentfs.commit";

@@ -42,9 +42,9 @@ use agentfs_contracts::volume::VolumeIdentity;
 use git2::Oid;
 use serde::Serialize;
 
-use crate::file_lock::{FileLock, Mode};
-use crate::fsutil::sync_dir;
 pub use agentfs_contracts::{NotATree, TreeId};
+use agentfs_os::file_lock::{FileLock, Mode};
+use agentfs_os::fsutil::sync_dir;
 pub(crate) use call_path::ActorGuard;
 pub use call_path::{Closing, PathStep, Progress, Recording, SavePending, SaveToDecide, Then};
 use history::builder::{BuildState, Builder, JournalReader, copy_all};
@@ -63,7 +63,7 @@ pub use history::verify::{
     VerifyReport, release, verify_flagged,
 };
 use history::{check_objects, clean_packs, read_trees, refs, remove_stale_locks, sync_marker};
-pub use journal::compaction::{ChannelGate, CompactGate, Gap};
+pub use journal::compaction::{COMPACT_GATE_VAR, ChannelGate, CompactGate, Gap};
 use journal::compaction::{Checkpoint, JournalCompaction, Published};
 pub use journal::durable::{Durability, DurableError, RecordNo};
 use journal::segment::SEGMENT_BYTES;
@@ -175,7 +175,7 @@ pub enum Error {
     #[error(transparent)]
     Json(#[from] serde_json::Error),
     #[error(transparent)]
-    Reconcile(#[from] crate::tree_reconcile::Error),
+    Reconcile(#[from] agentfs_lines::Error),
     #[error("tree volume is busy")]
     Busy,
     #[error("not a tree state area (or unsupported format)")]
@@ -271,9 +271,7 @@ impl Error {
             Self::TreeGit(crate::tree_git::Error::NoSpace(_)) => libc::ENOSPC,
             Self::Io(e)
             | Self::TreeGit(crate::tree_git::Error::Io(e))
-            | Self::Reconcile(crate::tree_reconcile::Error::Io(e)) => {
-                e.raw_os_error().unwrap_or(libc::EIO)
-            }
+            | Self::Reconcile(agentfs_lines::Error::Io(e)) => e.raw_os_error().unwrap_or(libc::EIO),
             _ => libc::EIO,
         }
     }
@@ -685,7 +683,7 @@ impl TreeActor {
         service: &PodContext,
         upkeep: Upkeep,
     ) -> Result<Self> {
-        crate::history::init_libgit2();
+        agentfs_git::init();
         if !root.exists() {
             fs::DirBuilder::new()
                 .recursive(true)
@@ -761,7 +759,7 @@ impl TreeActor {
             },
         )?;
         drop(repo);
-        crate::failpoints::hit("tree.init_before_format")?;
+        agentfs_failpoints::hit("tree.init_before_format")?;
         write_durably(&root, "format", FORMAT.as_bytes())?;
         fs::remove_file(&marker)?;
         sync_dir(&root)?;
@@ -800,7 +798,7 @@ impl TreeActor {
     /// As [`TreeActor::open`].
     pub fn open_with(root: &Path, service: &PodContext, upkeep: Upkeep) -> Result<Self> {
         found_volume(root)?;
-        crate::history::init_libgit2();
+        agentfs_git::init();
         let root = root.canonicalize()?;
         let lock = lock_area(&root)?;
         // Again under the lock: a create may have been cut short since.
@@ -960,11 +958,11 @@ impl TreeActor {
             stale: false,
             verification: verification.clone(),
         };
-        let owner = crate::failpoints::owner();
+        let owner = agentfs_failpoints::owner();
         let handle = std::thread::Builder::new()
             .name("tree-builder".into())
             .spawn(move || {
-                crate::failpoints::adopt(owner);
+                agentfs_failpoints::adopt(owner);
                 let history = builder.history.clone();
                 builder.run();
                 history.builder_gone();
@@ -1699,7 +1697,7 @@ impl TreeActor {
             SourceChanges,
         );
         let recorded = (|| -> Result<Appended> {
-            crate::failpoints::hit("tree.before_step")?;
+            agentfs_failpoints::hit("tree.before_step")?;
             if before {
                 self.before_record();
             }

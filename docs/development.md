@@ -118,7 +118,7 @@ cargo nextest run -p agentfs --test cli cli_fork::
 A test file stays a program of its own when it needs the process to
 itself or CI runs it by name: `tree_stages` and `tree_close` read
 process-wide counters, `tree_batch_alloc` and `tree_overlay_alloc` set
-their own allocator, `docs_reference`, `crash_points`, `crash_daemon`,
+their own allocator, `config_reference`, `crash_points`, `crash_daemon`,
 `launcher_mount`, `launcher_host` and `csi_trees` are named by CI, and
 `history_service` keeps its timings in a program of its own. Its 5 s
 deadlines hold with the other tests running beside it. A
@@ -198,6 +198,17 @@ process to itself; CI runs it at full size (above), and its run lasts
 about as long. `agentfs`'s run gains nothing: most of its tests are in one program
 (`tests/cli/`), which already ran them several at a time (14 s), and its
 slowest test takes about 5 s.
+
+The checks over the whole repository (`agentfs-repo`) build no engine: its
+library depends only on serde and serde_json. Measured on 2026-11-25 in a
+container with 4 CPUs and 15 GB:
+
+| Step | Time |
+|---|---|
+| `cargo nextest run -p agentfs-repo`, from an empty target directory | 6.9 s (8.8 s at `--build-jobs 2`) |
+| The same again, nothing changed | 1.1 s |
+| After an edit to a page under `docs/` | 1.0 s |
+| Of which the run, its 29 tests | 0.6 s |
 
 ## CI
 
@@ -456,7 +467,7 @@ evidence. CI scripts judge the build:
 - **Runners are pinned.** Every CI job runs on GitHub's runner image named
   `ubuntu-24.04`, never `ubuntu-latest`, so the kernel, FUSE, kind and nginx
   the tests rely on change only when the pin does.
-  `crates/agentfs-core/tests/docs_reference.rs` fails on any other runner.
+  `agentfs-repo`'s `workflows_pin_runners` fails on any other runner.
 - **CI pulls Docker Hub through mirror.gcr.io**, Google's pull-through
   cache, because anonymous pulls from shared runners hit Docker Hub's rate
   limit. The mirror's one home is

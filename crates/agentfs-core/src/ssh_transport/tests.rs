@@ -18,7 +18,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use super::*;
 use crate::config::RemoteSettings;
 use crate::events::PushFailureKind;
-use crate::history::init_libgit2;
+use crate::history::init_git;
 use crate::push::classify;
 use crate::remote_auth::RemoteAuth;
 
@@ -324,7 +324,7 @@ struct Fixture {
 
 impl Fixture {
     fn new() -> Self {
-        init_libgit2();
+        init_git();
         let dir = tempfile::tempdir().unwrap();
         let repo = Repository::init_bare(dir.path().join("local.git")).unwrap();
         let blob = repo.blob(b"hello\n").unwrap();
@@ -383,6 +383,7 @@ impl Fixture {
         let state = AuthState::new();
         let _scope = auth.ssh_scope(&state);
         let result = (|| {
+            #[expect(clippy::disallowed_methods, reason = "a test's remote")]
             let mut remote = self.repo.remote_anonymous(settings.push_url())?;
             let mut options = PushOptions::new();
             options.remote_callbacks(auth.callbacks(&state));
@@ -453,6 +454,7 @@ fn push_and_fetch_over_ssh() {
     let state = AuthState::new();
     {
         let _scope = auth.ssh_scope(&state);
+        #[expect(clippy::disallowed_methods, reason = "a test's remote")]
         let mut remote = other.remote_anonymous(&url).unwrap();
         let mut options = git2::FetchOptions::new();
         options.remote_callbacks(auth.callbacks(&state));
@@ -579,6 +581,7 @@ fn connections_outside_a_remote_scope_fail_closed() {
     let server = TestServer::start(ed25519(9), vec![client.public_key().clone()], Mode::Git);
     let url = server.url(&f.served);
     // No scope at all.
+    #[expect(clippy::disallowed_methods, reason = "a test's remote")]
     let mut remote = f.repo.remote_anonymous(&url).unwrap();
     let err = remote
         .push(&["refs/heads/main:refs/heads/main"], None)
@@ -591,6 +594,7 @@ fn connections_outside_a_remote_scope_fail_closed() {
     let state = AuthState::new();
     {
         let _scope = auth.ssh_scope(&state);
+        #[expect(clippy::disallowed_methods, reason = "a test's remote")]
         let mut remote = f.repo.remote_anonymous(&other).unwrap();
         let err = remote
             .push(&["refs/heads/main:refs/heads/main"], None)
@@ -603,6 +607,7 @@ fn connections_outside_a_remote_scope_fail_closed() {
     Repository::init_bare(&colon).unwrap();
     {
         let _scope = auth.ssh_scope(&state);
+        #[expect(clippy::disallowed_methods, reason = "a test's remote")]
         let mut remote = f
             .repo
             .remote_anonymous(&colon.display().to_string())
@@ -880,7 +885,7 @@ impl TestAgent {
         let _ = fs::remove_file(&socket);
         let connections = {
             let _guard = runtime.enter();
-            crate::listening_socket::Listener::bind(&socket)
+            agentfs_os::listening_socket::Listener::bind(&socket)
                 .unwrap()
                 .into_async()
                 .unwrap()

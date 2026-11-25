@@ -575,7 +575,7 @@ Each node keeps its volumes under its own `--base-path`, on its own disk.
   Hermes on a claim of the driver with a `hermes` profile, its remote and patch
   source logged as not built, and a pod restart onto a new host that reads what
   Hermes wrote.
-- **NFS**: the unit tests of `agentfs_core::shared_fs` check that a base path
+- **NFS**: the unit tests of `agentfs_os::shared_fs` check that a base path
   on a network filesystem is recognised from the mount table and refused,
   naming the type.
 - **Not tested**: a base path on a real NFS export, Talos and other hardened

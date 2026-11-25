@@ -33,10 +33,10 @@ use std::io;
 use std::path::{Component, Path};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use agentfs_os::fsutil::write_json_atomic;
+use agentfs_os::mountinfo::{self, MountEntry};
 use serde::{Deserialize, Serialize};
 
-use crate::fsutil::write_json_atomic;
-use crate::mountinfo::{self, MountEntry};
 use crate::volume::StateDir;
 
 /// Why a start does not land the queue.

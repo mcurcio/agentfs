@@ -27,10 +27,10 @@ recorded; [guarantees](../guarantees.md) says what the engine promises.
 | Push to remotes | `push` | `RemotePusher`, `open_all`, `PushOutcome` |
 | Alarms and events | `events` | `Event`, `EventSink`, `MemorySink`, `NullSink` |
 | OpenTelemetry signals | `telemetry` | `Telemetry`, `Telemetry::sink` |
-| Exclusive use of a state area | `lock`, `file_lock` | `StateLock`, `FileLock` |
-| A binary's malloc arenas | `allocator` | `limit_arenas` (glibc's `M_ARENA_MAX` to `ARENAS`, 2): a binary calls it first in `main`, before any thread; the library never does |
-| Settings from the git config | `config` | `Settings`, `Settings::load`, `KEYS` |
-| Path rules and checks | `rules`, `checks`, `paths` | `Rules`, `Checks`, `RepoPath` |
+| Exclusive use of a state area | `lock`, and `agentfs_os::file_lock` | `StateLock`, `FileLock` |
+| A binary's malloc arenas | `agentfs_os::allocator` | `limit_arenas` (glibc's `M_ARENA_MAX` to `ARENAS`, 2): a binary calls it first in `main`, before any thread; the library never does |
+| Settings from the git config | `config`, and `agentfs_contracts::units` | `Settings`, `Settings::load`, `KEYS`; `parse_duration`, `parse_size`, `duration_arg` (a duration flag's value parser) |
+| Path rules and checks | `rules`, `checks`, and `agentfs_contracts::paths` | `Rules`, `Checks`, `RepoPath` |
 | Restore and revert | `restore`, `operations` | `plan`, `check`, `apply`, `record_applied` |
 | Patch queue | `patch` | `Queue`, `Verdict`, `PatchBranch`, `submit` |
 | Forks and start points | `fork` | `create`, `Finisher`, `start_from`, `delivery` |
@@ -39,7 +39,7 @@ recorded; [guarantees](../guarantees.md) says what the engine promises.
 | Large files | `lfs` | `ObjectCache`, `Store`, `fetch`, `prune` |
 | Git-backed tree views | `tree_actor`, `state_area` | `TreeActor`, `TreeId` (a tree's identity, `root` or `fork/<n>`), `inspect`, `TreeStateArea` (the Volume domain's `StateArea` port) |
 | The domains' rows over a tree volume | `store`, `tree_actor` | `TreeStore` (the `VolumeStore`, `ForkStore`, `ClientStore` and `QueueFacts` ports), `Chain`, `RowDomain`, `RowWrite`, `RowEvent` |
-| Line identity across saves | `tree_reconcile` | `LineMap` (runs of lines, never bytes), `LineMap::align` (git's histogram diff over two `Image`s, read a line at a time), `LineMap::append`, `LineMap::expand` (line by line, for the landing rules), `pieces` (where a merged file's lines are in its sources): the line-map library, generic over the caller's numbered version (`Id`) |
+| Line identity across saves | `agentfs_lines` | `LineMap` (runs of lines, never bytes), `LineMap::align` (git's histogram diff over two `Image`s, read a line at a time), `LineMap::align_bytes_with`, `histogram_with` and `histogram_files_with` (the diff's `git` child started by the spawner passed: the tree engine passes `agentfs_git::git_cli::counted`), `LineMap::append`, `LineMap::expand` (line by line, for the landing rules), `pieces` (where a merged file's lines are in its sources): the line-map library, generic over the caller's numbered version (`Id`) |
 
 ## The state area
 
@@ -79,7 +79,7 @@ recorder, the committer and what recovery found:
 use std::sync::Arc;
 use agentfs_core::events::NullSink;
 use agentfs_core::identity::Context;
-use agentfs_core::paths::RepoPath;
+use agentfs_contracts::paths::RepoPath;
 use agentfs_core::record::{Caller, Trigger};
 use agentfs_core::telemetry::Telemetry;
 use agentfs_core::volume::{self, Input, StateDir};
@@ -211,7 +211,8 @@ idempotent. See the [recording-failures runbook](../runbooks/recording-failures.
 - one push loop per remote (thread `agentfs-push-<remote>`), so a slow or
   hung remote never delays another;
 - the periodic repack, on the commit thread: `git repack --geometric=2`
-  every `agentfs.repackInterval`, with memory bounds (`repack::PACK_CONFIG`).
+  every `agentfs.repackInterval`, with memory bounds (`agentfs_git::git_cli::PACK_CONFIG`, which the tree
+  history's repack task uses too).
   A failed round raises `Event::RepackFailed` and is tried again later.
 
 ```rust
@@ -326,11 +327,14 @@ backlog gauge. The signal names are in [telemetry](../telemetry.md).
 
 ## Locks and sockets
 
-Every advisory lock agentfs takes is an `flock` through `file_lock::FileLock`.
-It unlocks before it closes the file. A child process spawned by any thread
-shares an open file from its fork until its exec, and a lock released only
-by closing would stay held for that whole window. Nothing else in the
-crate calls `flock`.
+The file locks, the shared-filesystem check and the listening sockets are
+in `agentfs-os`, the operating-system leaf both engines and agentfs-csi use.
+
+Every advisory lock agentfs takes is an `flock` through
+`agentfs_os::file_lock::FileLock`. It unlocks before it closes the file. A
+child process spawned by any thread shares an open file from its fork until
+its exec, and a lock released only by closing would stay held for that whole
+window. Nothing else in agentfs calls `flock`: `clippy.toml` disallows it.
 
 `lock::StateLock::acquire(&state, "command", wait)` takes the
 state-area lock, `meta/lock`. It is exclusive and the kernel releases it
@@ -351,12 +355,12 @@ match StateLock::acquire(&state, "my-tool", Duration::ZERO) {
 
 `volume::open` assumes the caller holds this lock. It does not take it.
 
-`shared_fs` refuses a state area on a filesystem whose locks would not keep
+`agentfs_os::shared_fs` refuses a state area on a filesystem whose locks would not keep
 other nodes out (NFS below 4.1, `nolock`, `local_lock` other than `none`).
 That check runs inside `StateLock::acquire`.
 
 Every Unix socket agentfs listens on goes through
-`listening_socket::Listener`, which is shut down (`SHUT_RDWR`) when stopped
+`agentfs_os::listening_socket::Listener`, which is shut down (`SHUT_RDWR`) when stopped
 or dropped. A socket that is only closed keeps taking connections for as
 long as a forked child shares it before its exec, and each connection would
 wait for a reply no one sends. A socket's path exists before it listens:
@@ -394,7 +398,7 @@ mode (nothing mounted) records with `record_applied` under a running
 operation:
 
 ```rust
-use agentfs_core::confined::Dir;
+use agentfs_os::confined::Dir;
 use agentfs_core::restore::{self, NotLive, Pathspec, RecordMode, Request};
 
 let tree = Dir::open(backing)?;

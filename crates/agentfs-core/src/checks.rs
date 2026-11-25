@@ -6,7 +6,7 @@
 //! for records journaled before the limits changed). A path that fails is
 //! not recorded; its earlier content, if any, stays in history.
 //!
-//! Rules, beyond those [`crate::paths::RepoPath`] already enforces:
+//! Rules, beyond those [`agentfs_contracts::paths::RepoPath`] already enforces:
 //!
 //! | Rule | Threshold | git fsck id |
 //! |---|---|---|
@@ -48,7 +48,7 @@ use crate::config::RemoteSettings;
 use crate::events::CheckStage;
 use crate::gitmodules;
 use crate::lfs::Store;
-use crate::paths::{PathError, RepoPath, SpecialFile, is_dotgit, special_file};
+use agentfs_contracts::paths::{PathError, RepoPath, SpecialFile, is_dotgit, special_file};
 
 /// Longest path recorded, in bytes.
 pub const MAX_PATH_BYTES: usize = 4096;

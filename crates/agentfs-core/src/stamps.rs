@@ -54,8 +54,8 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
-use crate::paths::RepoPath;
 use crate::pending::PendingId;
+use agentfs_contracts::paths::RepoPath;
 
 /// How long the book keeps a path's last stamp.
 pub const HORIZON: Duration = Duration::from_secs(300);

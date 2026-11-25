@@ -157,8 +157,10 @@ impl Drop for FileLock {
 /// takes, and until at least 100 children have been spawned. `take` takes a
 /// lock nobody else holds and lets it go, returning whether it was free.
 /// Returns how many takes found it busy, and how many takes there were.
-#[cfg(test)]
-pub(crate) fn takes_while_children_spawn(mut take: impl FnMut() -> bool) -> (usize, usize) {
+/// For tests: built with the `test-util` feature, which core's tests turn
+/// on for the locks they own.
+#[cfg(any(test, feature = "test-util"))]
+pub fn takes_while_children_spawn(mut take: impl FnMut() -> bool) -> (usize, usize) {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 

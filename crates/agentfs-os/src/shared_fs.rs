@@ -1,6 +1,6 @@
 //! Which filesystems a state area may live on.
 //!
-//! The state lock ([`crate::lock::StateLock`]) is the only thing that keeps
+//! The state lock (agentfs-core's `lock::StateLock`) is the only thing that keeps
 //! a second history service off a volume. On NFS it holds across nodes
 //! only when the server enforces it: NFS 4.1 or later, without `nolock`
 //! and with `local_lock=none`. [`require_safe_locks`] is checked whenever

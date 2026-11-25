@@ -39,8 +39,8 @@ use crate::checks::Refusal;
 use crate::config::{Nested, Settings};
 use crate::fsync_class::{self, FsyncClass};
 use crate::nested::{self, NestedKind};
-use crate::paths::RepoPath;
 use crate::probe;
+use agentfs_contracts::paths::RepoPath;
 
 #[derive(Debug, thiserror::Error)]
 pub enum RulesError {
@@ -207,7 +207,7 @@ pub const RECORD_ATTR: &str = "agentfs";
 
 /// Every operator-only attribute agentfs reads, in
 /// the order docs/configuration.md lists them; `"agentfs"` is the one set
-/// as `-agentfs`. `tests/docs_reference.rs` checks the configuration
+/// as `-agentfs`. `tests/config_reference.rs` checks the configuration
 /// reference against this list.
 pub const OPERATOR_ATTRIBUTES: &[&str] = &[
     RECORD_ATTR,
@@ -562,7 +562,7 @@ impl Rules {
 
     /// Reads a rule file from the backing tree. Only regular files count:
     /// symlinks are skipped, as git (2.32 and later) does and as
-    /// [`crate::paths::must_not_be_symlink`] requires. A file over
+    /// [`agentfs_contracts::paths::must_not_be_symlink`] requires. A file over
     /// [`probe::RULE_FILE`] bytes is ignored, as git ignores oversized
     /// attribute files, so the synchronous step stays bounded.
     fn read_tree_rule_file(&self, rel: &str) -> Result<Option<Vec<u8>>, RulesError> {

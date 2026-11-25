@@ -1,10 +1,14 @@
 //! Failpoints: named places on the durable path where a test build can
-//! kill the process, fail with an I/O error, panic or stall.
+//! kill the process, fail with an I/O error, panic or stall, and the gates a
+//! test drives over FIFOs, which know no engine's types (docs/development.md
+//! explains crash injection; docs/configuration.md lists the variables).
 //!
 //! Every step of record → commit → ref update → push that leaves
-//! something on disk calls [`hit`] with its name, listed in [`POINTS`].
+//! something on disk calls [`hit`] with its name, listed in [`POINTS`]: the
+//! one list of every point, so a test's spec that names no point fails
+//! instead of passing by never firing.
 //! In a normal build (`failpoints` feature off, as in every release and
-//! image) [`hit`] is an inlined `Ok(())` and nothing else of this module
+//! image) [`hit`] is an inlined `Ok(())` and nothing else of this crate
 //! exists beyond the names. With the feature on, a point does what the
 //! [`ENV_VAR`] variable (read once, on the first hit) or
 //! `configure` (in-process tests) says:
@@ -31,15 +35,13 @@ use std::io;
 /// Release builds have no failpoints and ignore it.
 pub const ENV_VAR: &str = "AGENTFS_FAILPOINTS";
 
-/// The environment variable naming the compaction gate's directory
-/// ([`FifoGate`]): read only by the `agentfs` binary, and only in a
-/// `failpoints` build. Release builds ignore it.
-pub const COMPACT_GATE_VAR: &str = "AGENTFS_COMPACT_GATE";
-
-/// Every failpoint, in the order a change passes them. A test
-/// (`every_hit_is_listed`) keeps this list equal to the `hit` calls in
-/// the source.
+/// Every failpoint, in the order a change passes them, grouped by engine.
+/// A test (`every_hit_is_listed`, in crates/agentfs-repo) keeps this list
+/// equal to the `hit` calls in the workspace's sources.
 pub const POINTS: &[&str] = &[
+    // The tree engine (agentfs_core::tree_actor, tree_git), and the tree
+    // view's FUSE layer.
+    //
     // Tree actor recording and publication (target git-model §3, §12).
     "tree.init_before_format",
     "tree.ref_rebuild_after_remove",
@@ -62,6 +64,8 @@ pub const POINTS: &[&str] = &[
     "tree.build_after_pack",
     "tree.build_after_built_log",
     "tree.build_after_ref_copy",
+    // The recording engine, and its FUSE layer and daemon.
+    //
     // The synchronous step.
     "pending.after_freeze",
     "journal.before_write",
@@ -127,25 +131,23 @@ pub fn adopt(_owner: Option<std::thread::ThreadId>) {}
 pub use take_gate::{TakeGate, take_gate};
 
 #[cfg(feature = "failpoints")]
-pub use compact_gate::FifoGate;
+pub use fifo_gate::FifoGate;
 
-/// A tree volume's compactor parked at each gap by a test script.
+/// A process parked at named places by a test script.
 #[cfg(feature = "failpoints")]
-mod compact_gate {
+mod fifo_gate {
     use std::fs::{File, OpenOptions};
     use std::io::{self, BufRead, BufReader, Write};
     use std::path::Path;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Mutex, PoisonError};
 
-    use crate::tree_actor::{CompactGate, Gap};
-
-    /// `AGENTFS_COMPACT_GATE=<dir>`'s gate: FIFOs `at` and `go` in `dir`,
-    /// both opened read and write so neither end blocks or sees end of file.
-    /// At each gap it writes the gap's name ([`Gap::name`]) and a newline to
-    /// `at`, then reads one line from `go`: `go` goes on, `fail` returns an
-    /// EIO error (the gap's fault), and an empty line or end of file ends the
-    /// gate, after which every gap passes without a line.
+    /// A process parked at named places by a test script: FIFOs `at` and
+    /// `go` in a directory, both opened read and write so neither end blocks
+    /// or sees end of file. At each place it writes the place's name and a
+    /// newline to `at`, then reads one line from `go`: `go` goes on, `fail`
+    /// returns an EIO error (the place's fault), and an empty line or end of
+    /// file ends the gate, after which every place passes without a line.
     pub struct FifoGate {
         at: Mutex<File>,
         go: Mutex<BufReader<File>>,
@@ -171,17 +173,20 @@ mod compact_gate {
                 ended: AtomicBool::new(false),
             })
         }
-    }
 
-    impl CompactGate for FifoGate {
-        fn at(&self, gap: Gap) -> io::Result<()> {
+        /// Parks at `place`: writes its name to `at` and waits for the
+        /// script's line on `go`.
+        ///
+        /// # Errors
+        ///
+        /// `fail` from the script (EIO), or either FIFO failing.
+        pub fn park(&self, place: &str) -> io::Result<()> {
             if self.ended.load(Ordering::Acquire) {
                 return Ok(());
             }
             writeln!(
                 self.at.lock().unwrap_or_else(PoisonError::into_inner),
-                "{}",
-                gap.name()
+                "{place}"
             )?;
             let mut line = String::new();
             self.go
@@ -203,7 +208,7 @@ mod compact_gate {
     mod tests {
         use super::*;
 
-        /// Each line a script answers: `go` passes the gap, `fail` fails it
+        /// Each line a script answers: `go` passes the place, `fail` fails it
         /// with EIO, and an empty line ends the gate, which then writes and
         /// reads nothing.
         #[test]
@@ -226,14 +231,14 @@ mod compact_gate {
                 options.open(dir.path().join(name)).unwrap()
             };
             both("go").write_all(b"go\nfail\n\n").unwrap();
-            gate.at(Gap::Covered).unwrap();
-            let failed = gate.at(Gap::Written).unwrap_err();
+            gate.park("one").unwrap();
+            let failed = gate.park("two").unwrap_err();
             assert_eq!(failed.raw_os_error(), Some(libc::EIO));
-            gate.at(Gap::Renamed).unwrap();
-            gate.at(Gap::DirSynced).unwrap();
+            gate.park("three").unwrap();
+            gate.park("four").unwrap();
             let mut reached = BufReader::new(both("at")).lines();
-            for gap in [Gap::Covered, Gap::Written, Gap::Renamed] {
-                assert_eq!(reached.next().unwrap().unwrap(), gap.name());
+            for place in ["one", "two", "three"] {
+                assert_eq!(reached.next().unwrap().unwrap(), place);
             }
             // Nothing after the gate ended: a line written now is the next.
             writeln!(both("at"), "end").unwrap();
@@ -320,7 +325,7 @@ mod imp {
     /// A spec that cannot be used.
     #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
     pub enum FailpointError {
-        #[error("unknown failpoint {0:?} (see agentfs_core::failpoints::POINTS)")]
+        #[error("unknown failpoint {0:?} (see agentfs_failpoints::POINTS)")]
         UnknownPoint(String),
         #[error("bad failpoint spec {0:?}: expected name=kill|error|panic|sleep(ms)[@n|@*]")]
         BadSpec(String),
@@ -665,42 +670,7 @@ mod imp {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeSet;
-    use std::path::Path;
-
     use super::*;
-
-    fn scan(dir: &Path, found: &mut BTreeSet<String>) {
-        for entry in std::fs::read_dir(dir).unwrap() {
-            let path = entry.unwrap().path();
-            if path.is_dir() {
-                scan(&path, found);
-            } else if path.extension().is_some_and(|e| e == "rs") {
-                let text = std::fs::read_to_string(&path).unwrap();
-                let needle = "failpoints::hit(\"";
-                let mut rest = text.as_str();
-                while let Some(i) = rest.find(needle) {
-                    rest = &rest[i + needle.len()..];
-                    let end = rest.find('"').unwrap();
-                    found.insert(rest[..end].to_owned());
-                }
-            }
-        }
-    }
-
-    /// [`POINTS`] is exactly the set of failpoint calls (`hit` with a name) in
-    /// the workspace's sources, so a renamed or removed point fails here.
-    #[test]
-    fn every_hit_is_listed() {
-        let crates = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
-        let mut found = BTreeSet::new();
-        for krate in ["agentfs-core", "agentfs-fuse", "agentfs"] {
-            scan(&crates.join(krate).join("src"), &mut found);
-        }
-        let listed: BTreeSet<String> = POINTS.iter().map(|p| (*p).to_owned()).collect();
-        assert_eq!(found, listed);
-        assert_eq!(listed.len(), POINTS.len(), "a point is listed twice");
-    }
 
     #[test]
     fn hit_is_a_no_op_without_a_spec() {

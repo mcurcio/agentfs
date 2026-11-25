@@ -61,13 +61,13 @@ use crate::identity::Context;
 use crate::lock::StateLock;
 use crate::patch::submit::{DEFAULT_ATTEMPTS, listed_as, next_seq};
 use crate::patch::{applied_prefix, inbox_prefix, inbox_ref, seq_of_ref};
-use crate::paths::RepoPath;
 use crate::push::{
     CreateOnlyOutcome, CreateOnlyRef, PUSH_BACKOFF_CAP, PushOutcome, RemotePusher, backoff,
 };
 use crate::record::{Caller, Trigger, read_repairs};
 use crate::telemetry::{Telemetry, spans};
 use crate::volume::{self, Committer, Input, Recorder, StateDir, VolumeError};
+use agentfs_contracts::paths::RepoPath;
 
 use super::identity::{ForkIdentity, ForkLink, change_ref, finish_ref};
 use super::receive::{ReceiveError, Receiver, ReceiverError, SOURCE_HISTORY, UnderLock};
@@ -1234,7 +1234,7 @@ fn update_mark(state: &StateDir, change: impl FnOnce(&mut ForkMark)) -> Result<(
     let mut mark = read_mark(state)?.unwrap_or_else(ForkMark::empty);
     change(&mut mark);
     mark.version = MARK_VERSION;
-    crate::fsutil::write_json_atomic(&state.fork_mark(), &mark).map_err(StatusError::Mark)
+    agentfs_os::fsutil::write_json_atomic(&state.fork_mark(), &mark).map_err(StatusError::Mark)
 }
 
 /// [`FinishError::Abandoned`] once the operator has abandoned `fork`.
@@ -1310,7 +1310,7 @@ fn now_ms() -> u64 {
 /// ([`crate::config::declares_fork`]), so a volume that is not one is
 /// `Ok(None)` even when its settings cannot be loaded.
 pub fn status(state: &StateDir) -> Result<Option<ForkStatus>, StatusError> {
-    crate::history::init_libgit2();
+    crate::history::init_git();
     if !crate::config::declares_fork(&state.git()).map_err(HistoryError::from)? {
         return Ok(None);
     }

@@ -1,0 +1,32 @@
+[package]
+name = "agentfs-os"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "agentfs's operating-system leaves: file locks, atomic files, confined directory access, mounts, the shared-filesystem check, listening sockets, the allocator"
+
+[package.metadata.agentfs]
+rank = "leaf"
+
+[dependencies]
+# fsutil's atomic write passes `state.json.before_rename`.
+agentfs-failpoints = { version = "0.1.0", path = "../agentfs-failpoints" }
+# mallopt, and shutdown(2) of a listening socket: bindings only, no C build.
+libc = "0.2.190"
+rustix = { version = "1.1.5", features = ["fs"] }
+serde = "1.0.229"
+serde_json = "1.0.154"
+thiserror = "2.0.21"
+# A listener for tokio, and its stream of connections.
+tokio = { version = "1.53", default-features = false, features = ["net"] }
+tokio-stream = { version = "0.1.19", features = ["net"] }
+
+[dev-dependencies]
+tempfile = "3.27.0"
+tokio = { version = "1.53", default-features = false, features = ["rt", "net", "macros"] }
+
+[features]
+# Test helpers other crates' tests share (file_lock::takes_while_children_spawn).
+test-util = []

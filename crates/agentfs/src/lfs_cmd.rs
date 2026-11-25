@@ -19,12 +19,13 @@ use std::time::Duration;
 use anyhow::{Context as _, Result, bail};
 use clap::Subcommand;
 
-use agentfs_core::config::parse_duration;
+use agentfs_contracts::paths::RepoPath;
+use agentfs_contracts::units::duration_arg;
+
 use agentfs_core::history::History;
 use agentfs_core::lfs::fetch::{self, FetchReport};
 use agentfs_core::lfs::prune::{self, PrunePlan};
 use agentfs_core::lfs::{ObjectCache, Pointer, referenced};
-use agentfs_core::paths::RepoPath;
 use agentfs_core::volume::{self, StateDir};
 
 #[derive(Subcommand)]
@@ -59,13 +60,9 @@ pub enum LfsCommand {
         #[arg(long)]
         dry_run: bool,
         /// Keep objects cached less than DURATION ago (e.g. 24h).
-        #[arg(long, value_name = "DURATION", value_parser = parse_age)]
+        #[arg(long, value_name = "DURATION", value_parser = duration_arg)]
         older_than: Option<Duration>,
     },
-}
-
-fn parse_age(value: &str) -> Result<Duration, String> {
-    parse_duration(value).ok_or_else(|| format!("{value:?} is not a duration (use e.g. 30m, 24h)"))
 }
 
 /// Exit status when the cache lock is busy (`EX_TEMPFAIL`).
