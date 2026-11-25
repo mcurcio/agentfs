@@ -1,8 +1,9 @@
 //! What `mount` and `host` share once their flags are read (docs/trees.md,
-//! "Volume lifecycle"): the volume staged through Volume, its domains
-//! restored as one launcher, the view host started, each view's client
-//! detached as its view ends, and the drain at a stop (every client of the
-//! launcher ended, every view closed) until Volume releases. One channel
+//! "Volume lifecycle"): the volume staged and its domains restored as one
+//! launcher through the service (`agentfs_service::Domains`), the view host
+//! started, each view's client detached as its view ends, and the drain at
+//! a stop (every client of the launcher ended, every view closed) until
+//! Volume releases. One channel
 //! carries every trigger of the loop; a [`Driver`] adds the command's own.
 //! It wires domains to adapters and decides nothing.
 
@@ -11,22 +12,18 @@ use std::path::Path;
 use std::process::ExitCode;
 use std::sync::{Arc, mpsc};
 
-use agentfs_contracts::caps::{LaunchCap, Minter};
-use agentfs_contracts::clients::{Binding, ClientId, ClientSet};
-use agentfs_contracts::pod::PodContext;
+use agentfs_contracts::clients::{Binding, ClientId};
 use agentfs_contracts::views::{MountOptions, MountPoint, ViewError, ViewId, Views};
-use agentfs_contracts::volume::{Volume, VolumeError};
-use agentfs_engine::state_area::TreeStateArea;
+use agentfs_contracts::volume::VolumeError;
+use agentfs_engine::operator_settings::OperatorSettings;
 use agentfs_fuse::stale::{MountState, mount_state};
 use agentfs_fuse::tree_view::{HostEvent, ViewHost};
-use agentfs_volume::VolumeService;
+use agentfs_service::{Domains, Launcher, ServiceError, Unstaged};
 use anyhow::{Context as _, Result, bail};
 use signal_hook::consts::{SIGINT, SIGTERM};
 use signal_hook::iterator::Signals;
 
-use super::domains::{ClientsSlot, Domains};
 use super::{busy, other_format};
-use crate::domain_events::DomainEvents;
 
 /// Every trigger of the loop, on its one channel: the view host's events, a
 /// stop (SIGTERM or SIGINT, or the command's own), and the command's own
@@ -44,48 +41,32 @@ pub(super) struct Staged<T> {
     triggers: mpsc::Receiver<Trigger<T>>,
 }
 
-/// Stages the volume as `cap` (it recovers it, and never creates one),
-/// sets the lag gate's `overlay_limit` before any view opens, installs the
-/// stop on SIGTERM and SIGINT, and restores Trees and Clients on one store.
-/// `Err` holds the exit status of a refusal: busy (75) or another format (1).
+/// Stages the volume as `launcher` with the operator settings read at boot
+/// ([`Domains::stage`]: it recovers it, and never creates one; the lag
+/// gate's overlay limit is set before any view opens; Trees and Clients
+/// are restored on one store), then installs the stop on SIGTERM and
+/// SIGINT. `Err` holds the exit status of a refusal: busy (75) or another
+/// format (1).
 ///
 /// # Errors
 ///
-/// A failed stage, signal install or restore.
+/// A failed stage or restore, or signal install.
 pub(super) fn stage<T: Send + 'static>(
     state: &Path,
-    at: &PodContext,
-    cap: LaunchCap,
-    minter: Minter,
-    overlay_limit: u64,
+    launcher: Launcher,
+    settings: &OperatorSettings,
 ) -> Result<std::result::Result<Staged<T>, ExitCode>> {
-    let events = DomainEvents::default();
-    let clients = ClientsSlot::new(None);
-    let mut volume = VolumeService::new(
-        TreeStateArea::at(state).with_upkeep(super::upkeep()),
-        clients.clone(),
-        events.clone(),
-    );
-    match volume.stage(at, &cap) {
-        Ok(_) => {}
-        Err(VolumeError::Busy) => return Ok(Err(busy())),
-        Err(VolumeError::OtherFormat) => return Ok(Err(other_format(state))),
-        Err(e) => bail!("opening tree state: {e}"),
-    }
+    let domains = match Domains::stage(state, launcher, settings) {
+        Ok(domains) => domains,
+        Err(ServiceError::Volume(VolumeError::Busy)) => return Ok(Err(busy())),
+        Err(ServiceError::Volume(VolumeError::OtherFormat)) => {
+            return Ok(Err(other_format(state)));
+        }
+        Err(ServiceError::Volume(e)) => bail!("opening tree state: {e}"),
+        Err(e) => return Err(e.into()),
+    };
     let (sender, triggers) = mpsc::channel();
     stop_on_signals(sender.clone())?;
-    let recording = volume
-        .area()
-        .recording()
-        .context("opening tree state: the staged volume is not served")?;
-    recording.set_overlay_limit(overlay_limit);
-    let domains = Domains::restore(
-        recording,
-        (minter, cap, at.clone()),
-        events,
-        clients,
-        Some(volume),
-    )?;
     Ok(Ok(Staged {
         domains,
         sender,
@@ -94,8 +75,8 @@ pub(super) fn stage<T: Send + 'static>(
 }
 
 /// Sends a [`Trigger::Stop`] at each SIGTERM or SIGINT, from a thread of its
-/// own: installed once the volume is staged, so a signal while it boots
-/// waits in the channel for the loop.
+/// own: installed once the volume is staged and its domains restored, so a
+/// signal while it boots waits in the channel for the loop.
 fn stop_on_signals<T: Send + 'static>(sender: mpsc::Sender<Trigger<T>>) -> Result<()> {
     let mut signals = Signals::new([SIGTERM, SIGINT]).context("installing signal handlers")?;
     std::thread::Builder::new()
@@ -158,7 +139,7 @@ impl<T: Send + 'static> Serving<T> {
                 let _ = sender.send(Trigger::Host(event));
             })
         };
-        let host = ViewHost::new(domains.sessions.clone(), state, metrics_output, notify)
+        let host = ViewHost::new(domains.sessions().clone(), state, metrics_output, notify)
             .context("serving tree views")?;
         Ok((
             Self {
@@ -214,11 +195,14 @@ impl<T> Serving<T> {
         }
     }
 
-    /// The Stop drain begins: the volume unstages; a stopped actor records
-    /// nothing more, so its views are closed at once.
+    /// The Stop drain begins: the volume unstages, its views' clients
+    /// detached if that begins the drain ([`Domains::unstage`]); every view
+    /// is closed then, or at once when the actor has stopped, as it records
+    /// nothing more. Every unstage goes through here.
     pub(super) fn stop(&mut self) {
-        self.domains.unstage();
-        if self.domains.stopped() {
+        let views: Vec<ClientId> = self.views.values().cloned().collect();
+        let unstaged = self.domains.unstage(&views);
+        if unstaged == Unstaged::Draining || self.domains.stopped() {
             self.close_all();
         }
     }
@@ -262,21 +246,10 @@ impl<T> Serving<T> {
     pub(super) fn run(&mut self, driver: &mut impl Driver<T>) {
         loop {
             if self.left
-                || self.domains.released
+                || self.domains.released()
                 || (self.views.is_empty() && self.domains.stopped())
             {
                 break;
-            }
-            if self.domains.draining {
-                self.domains.draining = false;
-                let ids: Vec<ClientId> = self.views.values().cloned().collect();
-                self.domains.detach_all(&ids);
-                // Every client of this launcher ends, not only the views':
-                // the release is judged from the Clients index alone.
-                self.domains.reconcile(&ClientSet::new());
-                self.domains.log_foreign_clients();
-                self.close_all();
-                continue;
             }
             let Some(trigger) = self.next() else { break };
             match trigger {

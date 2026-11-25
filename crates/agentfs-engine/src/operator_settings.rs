@@ -92,8 +92,9 @@ pub enum SettingsError {
     },
 }
 
-/// The settings `<state>/config` holds, its includes followed.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+/// The settings `<state>/config` holds, its includes followed. Only
+/// [`OperatorSettings::read`] makes one.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OperatorSettings {
     /// Every entry, key and value, in file order with includes resolved in
     /// place.
@@ -117,7 +118,10 @@ impl OperatorSettings {
             path: path.clone(),
             source,
         };
-        let mut settings = Self::default();
+        let mut settings = Self {
+            entries: Vec::new(),
+            includes: Vec::new(),
+        };
         if !path.exists() {
             return Ok(settings);
         }

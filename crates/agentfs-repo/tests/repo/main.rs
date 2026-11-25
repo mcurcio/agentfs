@@ -18,7 +18,8 @@
 //!   that exists.
 //! - [`crates`]: every dependency follows the ranks, the library front
 //!   `agentfs` re-exports, and only re-exports, every library of the ranks
-//!   it uses but the recording engine, every `failpoints`
+//!   it uses but the recording engine, only the service crate (with the
+//!   front and the tests) depends on the domains it composes, every `failpoints`
 //!   feature is forwarded, every cargo command in `.github/`, the scripts,
 //!   docs, the crates' doc comments and Python scripts names packages,
 //!   features, binaries and test programs the workspace has, and in a file

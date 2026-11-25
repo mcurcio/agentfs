@@ -1,8 +1,8 @@
-//! The composition root's event queue (docs/library/domains.md, "Rows and
-//! domain events"): each domain publishes to it once its step is durable, and
-//! the root hands each event, in order, to its consumers after the call that
-//! caused it returns. In-process and not durable: at boot every consumer
-//! re-judges from asked facts.
+//! One volume's event queue (docs/library/service.md): each domain publishes
+//! to it once its step is durable, and the service's dispatcher hands each
+//! event, in order, to its consumers after the call that caused it returns.
+//! In-process and not durable: at boot every consumer re-judges from asked
+//! facts.
 
 use std::cell::RefCell;
 use std::collections::VecDeque;

@@ -10,13 +10,13 @@
 //! command's exit, or its last view gone) unstages and exits once Volume
 //! releases; `host` serves one volume's views on its parent's requests
 //! ([`host`]); `fork end` ends a keyed fork. `mount` and `host` share their
-//! boot and drain ([`serving`]). One dispatcher ([`domains`]) hands each
-//! domain event to its consumers after the call that caused it returns, and
-//! one channel carries every trigger of the loop. It wires domains to
-//! adapters and decides nothing.
+//! boot and drain ([`serving`]). The volume is composed by the service
+//! (`agentfs_service`), whose one dispatcher hands each domain event to its
+//! consumers after the call that caused it returns; this module mints the
+//! launcher it opens as, and one channel carries every trigger of the loop.
+//! It wires domains to adapters and decides nothing.
 
 mod command;
-mod domains;
 mod host;
 mod mountpoint;
 mod serving;
@@ -32,30 +32,26 @@ use std::process::ExitCode;
 
 use agentfs_contracts::caps::{LaunchCap, LaunchScope, Minter};
 use agentfs_contracts::clients::FileOwner;
-use agentfs_contracts::clients::{
-    Access, AttachedLookup, Binding, ClientError, ClientId, ClientSet,
-};
+use agentfs_contracts::clients::{Access, Binding, ClientError, ClientId, ClientSet};
 use agentfs_contracts::name::{ClientLabel, ForkKey, LauncherId, VolumeName};
 use agentfs_contracts::pod::PodContext;
 use agentfs_contracts::ports::{Found, StateArea};
 use agentfs_contracts::trees::{ForkSettings, Landing, TreeError};
 use agentfs_contracts::views::{MountOptions, ViewError, ViewId};
 use agentfs_contracts::volume::{
-    EnsureOutcome, StartPoint, Volume, VolumeError, VolumeIdentity, VolumeSpec,
+    EnsureOutcome, StartPoint, VolumeError, VolumeIdentity, VolumeSpec,
 };
 use agentfs_core::identity::Context as Identity;
-use agentfs_engine::operator_settings;
+use agentfs_engine::operator_settings::OperatorSettings;
 use agentfs_engine::state_area::TreeStateArea;
 use agentfs_engine::telemetry;
-use agentfs_engine::tree_actor::{self, Recording, TreeId, Upkeep};
-use agentfs_volume::VolumeService;
+use agentfs_engine::tree_actor::{self, TreeId, Upkeep};
+use agentfs_service::{Domains, Launcher, ServiceError};
 use anyhow::{Context, Result, bail};
 use opentelemetry::metrics::Meter;
 
-use self::domains::{ClientsSlot, Domains};
 use self::serving::{Serving, Trigger};
 use crate::daemon::Daemon;
-use crate::domain_events::DomainEvents;
 use crate::pod_args::PodArgs;
 
 /// Exit status when another process holds the state area (`EX_TEMPFAIL`).
@@ -76,7 +72,7 @@ const UPGRADE_RUNBOOK: &str = "docs/runbooks/upgrading-the-sidecar.md";
 /// The actor stopped before the gauge could be registered.
 fn observe_unverified(meter: &Meter, domains: &Domains) -> Result<UnverifiedGauge> {
     let verification = domains
-        .sessions
+        .sessions()
         .recording()
         .actor()
         .context("reading the volume's flagged saves")?
@@ -219,15 +215,6 @@ pub enum OnStaleMount {
     Recover,
 }
 
-/// `init`'s Clients: it attaches none and judges no release.
-struct NoClients;
-
-impl AttachedLookup for NoClients {
-    fn attached_any(&self) -> ClientSet {
-        ClientSet::new()
-    }
-}
-
 fn context(pod: &PodArgs) -> Result<PodContext> {
     pod.context().context("reading the pod flags")
 }
@@ -268,13 +255,17 @@ fn guard(name: &VolumeName, wanted: &str) -> Result<()> {
     Ok(())
 }
 
-/// The volume's own launcher: the CLI.
-fn root_cap(minter: &Minter) -> Result<LaunchCap> {
-    Ok(LaunchCap::mint(
-        minter,
-        LauncherId::parse("cli")?,
-        LaunchScope::Root,
-    ))
+/// The volume's own launcher, the CLI, at `at`: its capability minted from
+/// `minter`, which it then carries for Clients.
+fn root_launcher(minter: Minter, at: PodContext) -> Result<Launcher> {
+    let cap = LaunchCap::mint(&minter, LauncherId::parse("cli")?, LaunchScope::Root);
+    Ok(launcher(minter, cap, at))
+}
+
+/// The launcher every tree command opens a volume as: `cap` at `at`, its
+/// journal kept by [`upkeep`].
+fn launcher(minter: Minter, cap: LaunchCap, at: PodContext) -> Launcher {
+    Launcher::new(minter, cap, at).with_upkeep(upkeep())
 }
 
 /// One view `mount` serves: its tree, mount point and client, and whether
@@ -340,31 +331,17 @@ pub fn init(state: &Path, args: InitArgs, minter: Minter) -> Result<ExitCode> {
         start: StartPoint::Empty,
         root_owner: args.owner,
     };
-    let cap = root_cap(&minter)?;
-    let mut volume = VolumeService::new(
-        TreeStateArea::at(state).with_upkeep(upkeep()),
-        NoClients,
-        DomainEvents::default(),
-    );
-    let ensured = match volume.ensure(spec.clone(), &at, &cap) {
+    let launcher = root_launcher(minter, at)?;
+    let ensured = match agentfs_service::init(state, spec.clone(), &launcher, &args.includes) {
         Ok(ensured) => ensured,
-        Err(VolumeError::Busy) => return Ok(busy()),
-        Err(VolumeError::OtherFormat) => return Ok(other_format(state)),
-        Err(refused) => {
+        Err(ServiceError::Volume(VolumeError::Busy)) => return Ok(busy()),
+        Err(ServiceError::Volume(VolumeError::OtherFormat)) => return Ok(other_format(state)),
+        Err(ServiceError::Volume(refused)) => {
             eprintln!("error: {refused}");
             return Ok(ExitCode::FAILURE);
         }
+        Err(e) => return Err(e.into()),
     };
-    let mut area = TreeStateArea::at(state).with_upkeep(upkeep());
-    match area.open(&at) {
-        Ok(_) => {}
-        Err(VolumeError::Busy) => return Ok(busy()),
-        Err(e) => bail!("recovering the volume: {e}"),
-    }
-    if !args.includes.is_empty() {
-        operator_settings::write_includes(state, &args.includes)?;
-    }
-    drop(area);
     let outcome = match ensured.outcome {
         EnsureOutcome::Created => "created",
         EnsureOutcome::Found => {
@@ -446,7 +423,7 @@ pub fn mount(state: &Path, args: MountArgs, minter: Minter) -> Result<ExitCode> 
         metrics_output: args.metrics_output,
         command: args.command,
         volume: name,
-        overlay_limit: boot.overlay_limit,
+        settings: boot.settings,
         meter: otel.meter().clone(),
     };
     let code = mount.run(state, root, fork, minter);
@@ -473,7 +450,8 @@ fn identity(volume: &str, pod: &PodArgs) -> Identity {
 }
 
 /// How every tree volume this binary opens keeps its journal: `mount` and
-/// `host` (through `serving`), `init` and `fork end`. A failpoints build
+/// `host` (through `serving`), `init` and `fork end`, each through its
+/// [`Launcher`]. A failpoints build
 /// with `AGENTFS_COMPACT_GATE` set gives each a compaction gate on the FIFOs
 /// in that directory: one frame per segment, a compaction at every built
 /// event, parked at each gap until the gate's holder answers
@@ -507,26 +485,17 @@ pub(crate) fn upkeep() -> Upkeep {
 pub fn end_fork(state: &Path, args: EndArgs, minter: Minter) -> Result<ExitCode> {
     let at = context(&args.pod)?;
     let key = ForkKey::parse(&args.fork_key)?;
-    let recording = match Recording::open_with(state, &at, upkeep()) {
-        Ok(recording) => recording,
-        Err(tree_actor::Error::Busy) => return Ok(busy()),
-        Err(e) => return Err(e).context("opening tree state"),
-    };
-    let cap = root_cap(&minter)?;
-    let mut domains = Domains::restore(
-        recording,
-        (minter, cap, at.clone()),
-        DomainEvents::default(),
-        ClientsSlot::new(None),
-        None,
-    )?;
-    match domains.end_keyed(&key) {
+    let launcher = root_launcher(minter, at)?;
+    match agentfs_service::end_fork(state, launcher, &key) {
         Ok(()) => Ok(ExitCode::SUCCESS),
-        Err(refused @ TreeError::KeyUnknown) => {
+        Err(ServiceError::Volume(VolumeError::Busy)) => Ok(busy()),
+        Err(ServiceError::Volume(e)) => bail!("opening tree state: {e}"),
+        Err(ServiceError::Fork(refused @ TreeError::KeyUnknown)) => {
             eprintln!("error: {refused}");
             Ok(ExitCode::FAILURE)
         }
-        Err(e) => bail!("ending the fork: {e}"),
+        Err(ServiceError::Fork(e)) => bail!("ending the fork: {e}"),
+        Err(e) => Err(e.into()),
     }
 }
 
@@ -544,8 +513,8 @@ struct Mount {
     /// `-- COMMAND`: empty for none.
     command: Vec<OsString>,
     volume: VolumeName,
-    /// The lag gate's overlay limit, from the operator settings.
-    overlay_limit: u64,
+    /// The operator settings read at boot: the volume is staged with them.
+    settings: OperatorSettings,
     /// The process's meter: the flagged saves' gauge registers on it.
     meter: Meter,
 }
@@ -580,7 +549,7 @@ impl serving::Driver<MountTrigger> for MountDriver {
 
     fn view_ended(&mut self, serving: &mut Serving<MountTrigger>, _: ViewId) {
         if serving.views.is_empty() {
-            serving.domains.unstage();
+            serving.stop();
         }
     }
 
@@ -591,7 +560,7 @@ impl serving::Driver<MountTrigger> for MountDriver {
         if let Err(e) = &exited {
             eprintln!("error: waiting for the command: {e}");
         }
-        serving.domains.unstage();
+        serving.stop();
     }
 }
 
@@ -613,9 +582,8 @@ impl Mount {
         fork: Option<ForkView>,
         minter: Minter,
     ) -> Result<ExitCode> {
-        let cap = root_cap(&minter)?;
-        let staged =
-            serving::stage::<MountTrigger>(state, &self.at, cap, minter, self.overlay_limit)?;
+        let launcher = root_launcher(minter, self.at.clone())?;
+        let staged = serving::stage::<MountTrigger>(state, launcher, &self.settings)?;
         let mut staged = match staged {
             Ok(staged) => staged,
             Err(code) => return Ok(code),
@@ -685,7 +653,7 @@ impl Mount {
             status: None,
         };
         if serving.views.is_empty() {
-            serving.domains.unstage();
+            serving.stop();
         } else if failed.is_none() {
             let mut line = format!("mounted volume {}", self.volume);
             for (i, (at, tree)) in opened.iter().enumerate() {
@@ -702,7 +670,7 @@ impl Mount {
                     Err(e) => {
                         eprintln!("error: starting {}: {e}", self.command[0].to_string_lossy());
                         driver.status = Some(EXIT_NOT_STARTED);
-                        serving.domains.unstage();
+                        serving.stop();
                     }
                 }
             }

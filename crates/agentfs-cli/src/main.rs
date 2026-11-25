@@ -58,7 +58,6 @@
 mod checkpoint_cmd;
 mod control;
 mod daemon;
-mod domain_events;
 mod fork_cmd;
 mod front;
 mod hold;
@@ -74,7 +73,6 @@ mod recovery;
 mod reference_tests;
 mod serve_git;
 mod serve_history;
-mod shared;
 mod start_cmd;
 
 use std::os::unix::fs::PermissionsExt;

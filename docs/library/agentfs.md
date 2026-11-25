@@ -14,6 +14,7 @@ it uses but the recording engine ([ranks](../architecture.md#ranks)).
 | `agentfs::volume` | `agentfs-volume` | The Volume domain: `ensure`, the lifecycle and the release verdict ([page](domains.md)) |
 | `agentfs::clients` | `agentfs-clients` | The Clients domain: attachments, grants and each fork's one writer ([page](domains.md)) |
 | `agentfs::trees` | `agentfs-trees` | The Trees domain: each fork's lifecycle ([page](domains.md)) |
+| `agentfs::service` | `agentfs-service` | One volume composed: its domains wired onto one store, their events dispatched, the drain ([page](service.md)) |
 | `agentfs::rules` | `agentfs-rules` | The Rules domain: where each new name of a tree lives, recorded or untracked ([trees](../trees.md#rules-and-the-untracked-area)) |
 
 ## Depending on it
@@ -32,13 +33,13 @@ It has no features. It builds libgit2 (through `agentfs-engine`) and links
 no TLS, no SSH, no FUSE and no OpenTelemetry SDK or exporter:
 [`ci/check-deps.sh`](../../ci/check-deps.sh) checks what it links.
 
-The crate's documentation carries one example, a doctest: a tree volume
-made and opened through the engine's state area, which gives the volume its
-id, then one file written, closed and read back, every name reached through
-`agentfs::` alone. It takes two routes outside the consumer API (below):
-the `StateArea` port called directly, and the actor guard's open with a
-named writer. `cargo test --doc -p agentfs` runs it and is the crate's
-gate: nextest does not run doctests, so `cargo nextest run -p agentfs`
+The crate's documentation carries one example, a doctest, on the consumer
+API's route alone: the composition root mints the launcher's capability, the
+service's `init` makes the volume and `Domains::stage` serves it, one client
+bound to the root writes a file through its session's guard, closes it and
+reads it back, and `unstage` drains and releases the volume, every name
+reached through `agentfs::` alone. `cargo test --doc -p agentfs` runs it and
+is the crate's gate: nextest does not run doctests, so `cargo nextest run -p agentfs`
 fails with exit status 4, "no tests to run".
 
 ## Not re-exported
@@ -56,24 +57,28 @@ fails with exit status 4, "no tests to run".
 
 ## The consumer API
 
-A consumer that serves a volume is its own composition root: it wires the
-domains onto the engine's ports, as the `agentfs` binary does. What it is
-meant to call:
+A consumer serves a volume through the service ([its page](service.md)):
+it is the composition root that mints the capabilities, and the service
+wires the domains onto the engine's ports, as the `agentfs` binary does.
+What it is meant to call:
 
-- The shared kernel's values, traits, events and ports (`agentfs::contracts`),
-  and `contracts::caps::Minter::new`: the composition root mints the
-  capabilities (C1 in the [domain invariants](domains.md#domain-invariants)).
-- The domains' services (`VolumeService`, `ClientsService`, `TreesService`)
-  over those ports ([the shared kernel and the domains](domains.md)).
-- The engine's `state_area::TreeStateArea`: the Volume domain's `StateArea`,
-  `VolumeStore` and `QueueFacts` ports, which `VolumeService` is built on;
-  its `recording()` is the served volume once it is open.
-- `tree_actor::Recording`, a served volume, and the reads of the guard
-  `Recording::actor` answers ([the engine](engine.md#git-backed-tree-views)).
-- `session::Sessions`, a client's one route to its tree
-  ([sessions](engine.md#sessions)).
-- `store::TreeStore`, the domains' ports over a served volume
-  ([the domains' store](engine.md#the-domains-store)).
+- `contracts::caps::Minter::new` and `LaunchCap::mint`: the composition root
+  mints the capabilities (C1 in the [domain
+  invariants](domains.md#domain-invariants)) and hands them to a
+  `service::Launcher`.
+- The service: `service::init`, `service::end_fork`, `service::Domains::stage`
+  and the calls of the `Domains` it answers, `unstage` among them.
+- The shared kernel's values, errors and events (`agentfs::contracts`), and
+  the domains' values they carry.
+- `operator_settings::OperatorSettings::read`, the one value `stage` takes.
+- `session::Sessions` and its `TreeSession`, a bound client's one route to
+  its tree ([sessions](engine.md#sessions)), reached through
+  `Domains::sessions`.
+
+The domains' services (`VolumeService`, `ClientsService`, `TreesService`),
+the engine's `state_area::TreeStateArea` and `store::TreeStore` stay public
+for the service and the tests: a consumer that wires them itself composes a
+volume a second way, outside the consumer API.
 
 ### Outside the consumer API
 
@@ -83,9 +88,10 @@ are not for a consumer. Inside this workspace `clippy.toml` bans most of them
 outside their one caller; a consumer's build does not read this workspace's
 `clippy.toml`, so nothing stops a consumer from calling them:
 
-- The `StateArea` port's `create`, called directly: `VolumeService::ensure`
-  calls it after its launch-scope check (VO6) and its judgement of what the
-  state area holds (VO5).
+- The `StateArea` port's `create`, called directly: the service's `init`
+  makes a volume through `VolumeService::ensure`, which calls it after its
+  launch-scope check (VO6) and its judgement of what the state area holds
+  (VO5).
 - The guard's calls that name a tree and a writer (`write_open` and the
   other file calls `Recording::actor`'s guard takes a `WriterAt` for): a
   writer no Clients row knows of. A client writes through its session,

@@ -1,7 +1,8 @@
 //! The workspace's crates: their dependencies against the ranks
 //! (docs/architecture.md, "Ranks"), the library front `agentfs` holding
 //! re-exports only, of every library of the ranks it uses but the recording
-//! engine, the `failpoints` feature forwarded to
+//! engine, the domains composed by the service crate alone, the
+//! `failpoints` feature forwarded to
 //! every dependency that has it, every cargo command the repository
 //! writes down naming what the workspace has, every failpoint call listed,
 //! the tree engine's `git` children all counted, and the tree engine naming
@@ -599,6 +600,106 @@ fn a_front_that_is_more_or_less_than_reexports_is_found() {
         [
             "agentfs re-exports agentfs_core as core: not a library of a rank it uses, under its own name",
             "agentfs -> agentfs-core: not a crate it re-exports",
+        ]
+    );
+}
+
+/// The rank of the one crate that composes a volume's domains
+/// (docs/library/service.md).
+const SERVICE_RANK: &str = "service";
+
+/// The ranks that may depend on the domains the service composes: the
+/// service, the library front that re-exports them, and the tests.
+const COMPOSERS: &[&str] = &[SERVICE_RANK, FRONT_RANK, "tests"];
+
+/// Where a crate outside [`COMPOSERS`] depends (normal or build) on a
+/// domain the [`SERVICE_RANK`] crate depends on: it could wire a volume's
+/// domains a second way. The domains are derived from the service's
+/// dependencies, so a domain the service comes to compose is held too.
+fn composition_problems(workspace: &Workspace) -> Vec<String> {
+    let rank_of = |name: &str| workspace.member(name).and_then(|m| m.rank.clone());
+    let composed: BTreeSet<String> = workspace
+        .members
+        .iter()
+        .filter(|m| m.rank.as_deref() == Some(SERVICE_RANK))
+        .flat_map(|m| &m.dependencies)
+        .filter(|d| d.kind != DependencyKind::Dev)
+        .filter(|d| rank_of(&d.name).as_deref() == Some("domain"))
+        .map(|d| d.name.clone())
+        .collect();
+    let mut problems = BTreeSet::new();
+    for member in &workspace.members {
+        if member
+            .rank
+            .as_deref()
+            .is_some_and(|r| COMPOSERS.contains(&r))
+        {
+            continue;
+        }
+        for dependency in &member.dependencies {
+            if dependency.kind != DependencyKind::Dev && composed.contains(&dependency.name) {
+                problems.insert(format!(
+                    "{} -> {}: only the {SERVICE_RANK} crate composes the domains \
+                     (ranks {} may depend on them)",
+                    member.name,
+                    dependency.name,
+                    COMPOSERS.join(", ")
+                ));
+            }
+        }
+    }
+    problems.into_iter().collect()
+}
+
+#[test]
+fn only_the_service_composes_the_domains() {
+    let workspace = Workspace::load();
+    assert!(
+        workspace
+            .members
+            .iter()
+            .any(|m| m.rank.as_deref() == Some(SERVICE_RANK) && !m.dependencies.is_empty()),
+        "no {SERVICE_RANK} crate with dependencies: is cargo metadata read right?"
+    );
+    let problems = composition_problems(&workspace);
+    assert!(
+        problems.is_empty(),
+        "one composition of a volume (docs/library/service.md):\n  {}",
+        problems.join("\n  ")
+    );
+}
+
+#[test]
+fn a_second_composer_of_the_domains_is_found() {
+    let mut workspace = today();
+    workspace
+        .members
+        .push(member("agentfs-rules", "domain", &[]));
+    workspace.members.push(member(
+        "agentfs-service",
+        "service",
+        &["agentfs-contracts", "agentfs-volume", "agentfs-trees"],
+    ));
+    let mut composed = with_edge(workspace.clone(), "agentfs", "agentfs-trees");
+    // A domain the service does not compose, and a test's dev edge.
+    composed = with_edge(composed, "agentfs-fuse", "agentfs-rules");
+    composed
+        .members
+        .iter_mut()
+        .find(|m| m.name == "agentfs-fuse")
+        .unwrap()
+        .dependencies
+        .push(Dependency {
+            name: "agentfs-volume".into(),
+            kind: DependencyKind::Dev,
+        });
+    assert_eq!(composition_problems(&composed), Vec::<String>::new());
+    let second = with_edge(composed, "agentfs-fuse", "agentfs-volume");
+    assert_eq!(
+        composition_problems(&second),
+        [
+            "agentfs-fuse -> agentfs-volume: only the service crate composes the domains \
+          (ranks service, umbrella, tests may depend on them)"
         ]
     );
 }

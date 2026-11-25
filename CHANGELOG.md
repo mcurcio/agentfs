@@ -106,6 +106,14 @@ design was reviewed on 2026-10-12.
 
 ### Added
 
+- **`agentfs-service`: a working volume from the library.** A consumer
+  serves a tree volume through `agentfs::service`: its composition root
+  mints a `Launcher`'s capabilities, `init` makes or finds the volume,
+  `Domains::stage` serves it with the operator settings it read, and
+  `unstage` drains it until it is released. The binary's `init`, `mount`,
+  `host` and `fork end` use the same crate, the only one that composes the
+  domains (docs/library/service.md). `agentfs init` now prints a failed
+  recovery as `error: <reason>`.
 - **The library crate `agentfs`.** The one crate a consumer depends on: the
   tree engine, the shared kernel and the Volume, Clients, Trees and Rules
   domains under one name (`agentfs::engine`, `agentfs::contracts`, ...), with

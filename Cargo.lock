@@ -64,7 +64,6 @@ dependencies = [
 name = "agentfs-cli"
 version = "0.1.0"
 dependencies = [
- "agentfs-clients",
  "agentfs-contracts",
  "agentfs-core",
  "agentfs-csi",
@@ -75,8 +74,7 @@ dependencies = [
  "agentfs-os",
  "agentfs-repo",
  "agentfs-rules",
- "agentfs-trees",
- "agentfs-volume",
+ "agentfs-service",
  "anyhow",
  "clap",
  "git2",
@@ -335,6 +333,15 @@ dependencies = [
 [[package]]
 name = "agentfs-service"
 version = "0.1.0"
+dependencies = [
+ "agentfs-clients",
+ "agentfs-contracts",
+ "agentfs-engine",
+ "agentfs-trees",
+ "agentfs-volume",
+ "tempfile",
+ "thiserror",
+]
 
 [[package]]
 name = "agentfs-test-metrics"

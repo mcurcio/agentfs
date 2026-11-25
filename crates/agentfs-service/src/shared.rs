@@ -1,6 +1,6 @@
-//! One domain service shared by the composition root and another service
-//! that asks it questions (docs/library/domains.md, "Rows and domain events"):
-//! Clients asks Trees `facts` while the root also calls Trees, and Volume asks
+//! One domain service shared by the service's dispatcher and another domain
+//! service that asks it questions (docs/library/service.md): Clients asks
+//! Trees `facts` while the dispatcher also calls Trees, and Volume asks
 //! Clients `attached_any`, Clients being restored only once Volume has staged.
 //! In-process and on one thread, as the services and their event queue are.
 
@@ -32,7 +32,7 @@ impl<T> Shared<T> {
         not(test),
         expect(
             dead_code,
-            reason = "the root writes Trees; Clients reads it through ForkLookup"
+            reason = "the dispatcher writes Trees; Clients reads it through ForkLookup"
         )
     )]
     pub(crate) fn get(&self) -> Ref<'_, T> {

@@ -72,8 +72,8 @@ while the tree's lag and overlay are under their limits or the builder has
 failed, else at the built event that brings them under
 ([trees](../trees.md#history-trails-the-files)). Each release of the actor's
 lock (`ActorGuard`'s drop) reports every tree's overlay to the gate.
-`Recording::set_overlay_limit(bytes)` sets the overlay limit (the launcher
-passes `OperatorSettings::overlay_limit()`); `History::overlay_bytes(tree)`
+`Recording::set_overlay_limit(bytes)` sets the overlay limit (the service's
+`Domains::stage` passes `OperatorSettings::overlay_limit()`); `History::overlay_bytes(tree)`
 gives a tree's overlay as last reported, in estimated bytes (0 before any
 report), and `History::lag()` the lags and the builder's health.
 
@@ -139,7 +139,8 @@ its `git` children read.
   rename, a directory fsync) with mode 0600. Each include must be absolute
   (`SettingsError::RelativeInclude`, nothing written).
 - `OperatorSettings::read(state)` reads the file with libgit2, which follows its
-  includes. A missing file is empty settings; a file or include that cannot be
+  includes. It is the only way to make an `OperatorSettings` (the type has
+  no `Default`), so the settings a volume is staged with were read. A missing file is empty settings; a file or include that cannot be
   read is `SettingsError::Read`. `includes()` gives the top-level includes as
   written, and `missing_includes()` those that do not exist: git skips them
   silently, so the launcher warns.

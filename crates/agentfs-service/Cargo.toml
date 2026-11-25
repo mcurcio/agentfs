@@ -9,3 +9,14 @@ description = "One agentfs tree volume composed: its domains wired onto one stor
 
 [package.metadata.agentfs]
 rank = "service"
+
+[dependencies]
+agentfs-clients = { version = "0.1.0", path = "../agentfs-clients" }
+agentfs-contracts = { version = "0.1.0", path = "../agentfs-contracts" }
+agentfs-engine = { version = "0.1.0", path = "../agentfs-engine" }
+agentfs-trees = { version = "0.1.0", path = "../agentfs-trees" }
+agentfs-volume = { version = "0.1.0", path = "../agentfs-volume" }
+thiserror = "2.0.21"
+
+[dev-dependencies]
+tempfile = "3.27.0"

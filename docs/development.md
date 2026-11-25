@@ -216,7 +216,14 @@ The tree engine's run is bound by its four CPUs more than by its slowest
 test, `tree_batch_alloc` (about 33 s).
 
 The checks over the whole repository (`agentfs-repo`) build no engine: its
-library depends only on serde and serde_json. Measured on 2026-11-25 in a
+library depends only on serde and serde_json. Its checks of the crates
+(`tests/repo/crates.rs`): dependencies follow the
+[ranks](architecture.md#ranks); the crate `agentfs` only re-exports the
+ranks it uses; only `agentfs-service`, the crate `agentfs` and the tests
+depend on the domains the service composes; every `failpoints` feature is
+forwarded; every cargo command the repository writes down names what the
+workspace has; every failpoint hit is listed; and the tree engine starts
+`git` only through `counted`. Measured on 2026-11-25 in a
 container with 4 CPUs and 15 GB:
 
 | Step | Time |

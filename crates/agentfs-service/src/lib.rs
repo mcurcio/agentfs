@@ -8,3 +8,13 @@
 //! capabilities. It wires domains to adapters; the domains decide.
 //!
 //! See docs/library/service.md.
+
+mod domains;
+mod error;
+mod events;
+mod launch;
+mod shared;
+
+pub use self::domains::{Domains, Unstaged};
+pub use self::error::ServiceError;
+pub use self::launch::{Launcher, end_fork, init};

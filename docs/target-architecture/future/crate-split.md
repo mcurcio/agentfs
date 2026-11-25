@@ -39,7 +39,7 @@ hands consumers a working volume: "Q1 A"; cargo-nextest locally and in CI: "Q2 A
 | agentfs-referee | The landing rules are pure; as a crate with no git2 dependency, and `std::fs` banned in its `clippy.toml`, that is checked, and its tests run in seconds |
 | agentfs-lines | `tree_reconcile.rs` depends only on std, serde and align; the referee's values build on it |
 | agentfs-os, agentfs-git, agentfs-failpoints | The leaves both engines share; once out, M9 deletes agentfs-core whole |
-| agentfs-service | The library is an integration point (principle 10); today only the binary wires a volume (`agentfs-cli/src/launcher/domains.rs`) |
+| agentfs-service | The library is an integration point (principle 10); before F only the binary wired a volume (its launcher's `domains.rs`, which F moved to `crates/agentfs-service/src/domains.rs`) |
 | agentfs (front) | Consumers' one name; internal crates keep names that say what they hold |
 | agentfs-repo | The repository-wide checks, out of core's documentation test; a docs-only change stops compiling core |
 | agentfs-test-metrics | Both engines' tests read their instruments; a dev edge between the engines is refused, so the reader is its own crate (rank `tests`). After M9 the engine is its one user |

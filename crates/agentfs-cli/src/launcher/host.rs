@@ -117,7 +117,8 @@ pub fn host(state: &Path, args: HostArgs, minter: Minter) -> Result<ExitCode> {
     );
     telemetry::observe_process(otel.meter(), &boot.not_built);
     let cap = LaunchCap::mint(&minter, launcher, LaunchScope::Root);
-    let staged = match serving::stage::<Line>(state, &at, cap, minter, boot.overlay_limit)? {
+    let launcher = super::launcher(minter, cap, at);
+    let staged = match serving::stage::<Line>(state, launcher, &boot.settings)? {
         Ok(staged) => staged,
         Err(code) => return Ok(code),
     };

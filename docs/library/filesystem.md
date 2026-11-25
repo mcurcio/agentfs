@@ -653,8 +653,10 @@ is unmounted, or the open fork under `--fork-key`; it never creates a volume.
 Each view is a client of its tree: the command rebinds the client a killed mount
 left (same launcher, tree, label and access), else attaches one, then ends its
 launcher's other clients and drops the ended forks nothing holds, and detaches
-each client as its view ends ([trees](../trees.md#clients)). One dispatcher
-hands each domain event to its consumer after the call that caused it:
+each client as its view ends ([trees](../trees.md#clients)). The volume is
+composed by the service ([`agentfs-service`](service.md)), whose one
+dispatcher hands each domain event to its consumer after the call that
+caused it:
 `LastDetached` to Trees (an unkeyed fork ends), `ForkDropped` to Clients (its
 writer claim is released), and each landing the view host takes makes Trees
 judge the drops again ([forks](../trees.md#forks-keys-end-and-the-drop)).

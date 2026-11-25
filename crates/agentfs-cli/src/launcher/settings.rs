@@ -16,8 +16,9 @@ use super::mountpoint::resolved;
 pub(super) struct BootSettings {
     /// Each configured key tree volumes do not build yet, logged.
     pub not_built: Vec<NotBuilt>,
-    /// The lag gate's overlay limit (`agentfs.overlayLimit`).
-    pub overlay_limit: u64,
+    /// The settings read, their overlay limit checked: the one read the
+    /// volume is staged with.
+    pub settings: OperatorSettings,
 }
 
 /// Reads the operator settings of the volume at `state`, served at
@@ -48,7 +49,8 @@ pub(super) fn at_boot(state: &Path, views: &[&Path]) -> Result<BootSettings> {
             missing.display()
         );
     }
-    let overlay_limit = settings.overlay_limit()?;
+    // Refused here, before any mount point is touched; stage applies it.
+    settings.overlay_limit()?;
     let not_built = settings.not_built();
     for gap in &not_built {
         eprintln!(
@@ -60,7 +62,7 @@ pub(super) fn at_boot(state: &Path, views: &[&Path]) -> Result<BootSettings> {
     }
     Ok(BootSettings {
         not_built,
-        overlay_limit,
+        settings,
     })
 }
 
@@ -87,7 +89,11 @@ mod tests {
     fn the_overlay_limit_is_read_at_boot() {
         let state = tempfile::tempdir().unwrap();
         assert_eq!(
-            at_boot(state.path(), &[]).unwrap().overlay_limit,
+            at_boot(state.path(), &[])
+                .unwrap()
+                .settings
+                .overlay_limit()
+                .unwrap(),
             agentfs_engine::operator_settings::DEFAULT_OVERLAY_LIMIT
         );
         std::fs::write(
@@ -96,7 +102,7 @@ mod tests {
         )
         .unwrap();
         let boot = at_boot(state.path(), &[]).unwrap();
-        assert_eq!(boot.overlay_limit, 1 << 20);
+        assert_eq!(boot.settings.overlay_limit().unwrap(), 1 << 20);
         assert!(boot.not_built.is_empty());
     }
 }

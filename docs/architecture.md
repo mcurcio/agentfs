@@ -311,7 +311,12 @@ row names a module that no longer exists; `tests.rs` files are not listed.
 
 | Module | Role |
 |---|---|
-| `lib.rs` | The crate's documentation: one tree volume composed on one store as one launcher |
+| `lib.rs` | The crate's documentation and its API: one tree volume composed on one store as one launcher |
+| `launch.rs` | `Launcher` (the minter, capability, pod context and upkeep its caller's composition root made), `init` (Volume's `ensure`, the recovery every start makes, the operator settings' includes under its lock) and `end_fork` (Trees and Clients restored with no Volume, a keyed fork ended) |
+| `domains.rs` | `Domains`: the volume staged through the Volume domain (its overlay limit set from the operator settings), Trees and Clients restored on one store, the one dispatcher that hands each domain event to its consumers, a view's client rebound or attached, forks made, found and ended, and `unstage`, which begins the drain (`Unstaged`) |
+| `error.rs` | `ServiceError`: what the service's calls refuse with |
+| `shared.rs` | One domain service shared on the service's thread (`Shared`): Trees, asked `facts` by Clients; Clients, asked `attached_any` by Volume (none until restored) |
+| `events.rs` | The in-process event queue (`DomainEvents`): every domain service of a volume publishes to one, in order |
 
 ### `agentfs`
 
@@ -351,17 +356,14 @@ row names a module that no longer exists; `tests.rs` files are not listed.
 
 | Module | Role |
 |---|---|
-| `launcher/mod.rs` | The tree engine's composition root: `init` (`ensure` through the Volume domain, then recovery and the operator settings' includes), `mount` and `fork end` (`mount` prepares its mount points, reads the operator settings, stages through the Volume domain; a fork through the Trees domain on the store adapter; per view a client rebound or attached through the Clients domain, the rest reconciled, each served by the view host and detached as its view ends; SIGTERM, SIGINT, the command's exit or the last view's end unstages, and it exits once Volume releases) |
-| `launcher/serving.rs` | What `mount` and `host` share: the volume staged and its domains restored as one launcher, the view host started, each view's client detached as its view ends, and the drain at a stop until Volume releases; one channel carries every trigger of the loop, and each command adds its own |
+| `launcher/mod.rs` | The tree engine's composition root: the launcher minted (`Launcher`, with the upkeep of a failpoints build's compaction gate), then `init`, `mount` and `fork end` through the service (`agentfs-service`; `mount` prepares its mount points, reads the operator settings, stages the volume; a fork; per view a client rebound or attached, the rest reconciled, each served by the view host and detached as its view ends; SIGTERM, SIGINT, the command's exit or the last view's end unstages, and it exits once Volume releases) |
+| `launcher/serving.rs` | What `mount` and `host` share: the volume staged through the service with the settings read at boot, the stop on signals installed, the view host started, each view's client detached as its view ends, and every unstage, closing the views once the drain begins, until Volume releases; one channel carries every trigger of the loop, and each command adds its own |
 | `launcher/host.rs` | `agentfs host`: its standard input checked as a Unix stream socket, the boot as `mount`'s under `--launcher`, the hello line, then each request of its parent answered in order (a view opened, rebinding or attaching its client with the request's pod context and stacking over a stale mount of its own source; closed once it has ended; reconcile; a keyed fork created or ended); EOF, SIGTERM or SIGINT drains it |
-| `launcher/domains.rs` | One volume's domains restored on one store as one launcher, the one dispatcher that hands each domain event to its consumers, and a view's client rebound or attached |
 | `launcher/mountpoint.rs` | Each view's mount point before staging: a live or foreign mount refused, a stale one refused, held or stacked over (`--on-stale-mount`), a bare one created, checked empty and sealed |
-| `launcher/settings.rs` | The operator settings at every mount: includes under a view refused, missing ones warned of, each not-built key logged and counted |
+| `launcher/settings.rs` | The operator settings at every mount, read once: includes under a view refused, missing ones warned of, a bad overlay limit refused, each not-built key logged and counted; the volume is staged with the settings read |
 | `launcher/verify.rs` | `agentfs verify`: every save history flagged unverified whose flag stands checked again by this release, one line per flag, and the one home of its exit status (0 none standing, 2 one standing, 1 an error, 75 the volume in use) |
 | `launcher/command.rs` | `mount -- COMMAND`: the command spawned once every view is up, its exit a trigger of the loop, a stop sent on as SIGTERM through a pidfd |
 | `mountpoint.rs` | Creating and sealing a bare mount point, shared by the launcher and the front |
-| `shared.rs` | One domain service shared on the composition root's thread (`Shared`): Trees, asked `facts` by Clients; Clients, asked `attached_any` by Volume (none until restored) |
-| `domain_events.rs` | The composition root's in-process event queue (`DomainEvents`): every domain service of a volume publishes to one, in order |
 | `pod_args.rs` | The pod flags (`--namespace`, `--pod`, `--pod-uid`, `--node`) one clap group shares between the recording engine's commands and `init`, `mount` and `fork end` |
 | `main.rs` | The CLI (`Cli`), command dispatch, the tree-volume guard of every recording command, `probe`, `status`, `record`, `flush`, `push` (direct) and `run` |
 | `daemon.rs` | Signals and shutdown for `run`, `front` and a held `mount` |

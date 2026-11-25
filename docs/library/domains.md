@@ -64,8 +64,9 @@ a refusal (`ClientError::UnknownClient`, `TreeError::ForkUnknown`), and
 `NotDurable` or `Io` for a write that changed nothing.
 
 A domain publishes its event to its `EventSink` once the store returns. The
-composition root's queue hands each on in order, after the call that caused
-it returns, and dispatches the events between the domains: a `LastDetached`
+service's queue ([`agentfs-service`](service.md#dispatch)) hands each on in
+order, after the call that caused it returns, and dispatches the events
+between the domains: a `LastDetached`
 settles Trees, a `ForkDropped` releases Clients' writer claim,
 `VolumeDraining` and `VolumeStaged` refuse and allow attaches, and each end
 re-judges the volume's release ([trees](../trees.md#forks-keys-end-and-the-drop)). Each event is on record as
