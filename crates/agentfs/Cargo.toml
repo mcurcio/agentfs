@@ -1,0 +1,22 @@
+[package]
+name = "agentfs"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "The agentfs library: tree volumes that record every change into git history, under one name"
+
+[package.metadata.agentfs]
+rank = "library"
+
+# Re-exports only (src/lib.rs): each dependency is one module of the front.
+# No feature, no FUSE and no recording engine until M9
+# (docs/target-architecture/future/crate-split.md).
+[dependencies]
+agentfs-clients = { version = "0.1.0", path = "../agentfs-clients" }
+agentfs-contracts = { version = "0.1.0", path = "../agentfs-contracts" }
+agentfs-engine = { version = "0.1.0", path = "../agentfs-engine" }
+agentfs-rules = { version = "0.1.0", path = "../agentfs-rules" }
+agentfs-trees = { version = "0.1.0", path = "../agentfs-trees" }
+agentfs-volume = { version = "0.1.0", path = "../agentfs-volume" }

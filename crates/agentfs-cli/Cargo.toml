@@ -13,6 +13,9 @@ rank = "filesystem"
 [[bin]]
 name = "agentfs"
 path = "src/main.rs"
+# Not documented: rustdoc writes a crate's pages under its name, and the
+# library crate `agentfs` has this one (cargo's output collision, #6313).
+doc = false
 
 [dependencies]
 agentfs-clients = { version = "0.1.0", path = "../agentfs-clients" }

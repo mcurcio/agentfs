@@ -56,6 +56,7 @@ and this table against the workspace manifest.
 | `shared-kernel` | none | the library | The shared kernel of the domains: values, capabilities, traits, events and ports, with no I/O |
 | `domain` | `shared-kernel` | the library | The pure domains over the shared kernel's ports, and the tree views' rules; no domain depends on another |
 | `engine` | `line-identity`, `leaf`, `shared-kernel`, `domain` | the library | What implements the ports and owns the state on disk; no engine depends on another |
+| `library` | `shared-kernel`, `domain`, `engine` | the library | The crate `agentfs`, consumers' one name for the library: re-exports only. No rank uses it, so no package of the workspace depends on it |
 | `filesystem` | `leaf`, `shared-kernel`, `domain`, `engine`, `filesystem` | the filesystem | The FUSE layer and `agentfs-cli`, whose binary `agentfs` is the composition root |
 | `kubernetes` | `leaf`, `shared-kernel`, `engine`, `filesystem` | the kubernetes adapter | The CSI driver |
 | `tests` | `line-identity`, `leaf`, `shared-kernel`, `domain`, `engine`, `filesystem`, `kubernetes`, `tests` | none | Packages that exist only for tests: the model, the conformance replay, the metric reader, the repository checks. No other rank uses it |
@@ -300,6 +301,12 @@ row names a module that no longer exists; `tests.rs` files are not listed.
 | `patch/notify.rs` | Telling the integrator of every verdict change: the `patch-notify` hook and the notify webhook, with the delivered cursor in `meta/notify.json` |
 | `patch/queue.rs` | Applying the queue at mount, before the workload sees the tree; judging it read only while a daemon holds the volume |
 | `patch/status.rs` | The status ref iac reads, and the local cache in `meta/patch.json` |
+
+### `agentfs`
+
+| Module | Role |
+|---|---|
+| `lib.rs` | The library under one name: each module a re-export of one crate, whole |
 
 ### `agentfs-fuse`
 

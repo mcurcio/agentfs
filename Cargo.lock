@@ -40,6 +40,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "agentfs"
+version = "0.1.0"
+dependencies = [
+ "agentfs-clients",
+ "agentfs-contracts",
+ "agentfs-engine",
+ "agentfs-rules",
+ "agentfs-trees",
+ "agentfs-volume",
+]
+
+[[package]]
 name = "agentfs-align"
 version = "0.1.0"
 dependencies = [
