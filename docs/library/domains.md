@@ -16,14 +16,15 @@ architecture](../target-architecture/README.md)).
 
 ## Rows and domain events
 
-Each domain keeps its records as rows on the volume's one tree actor,
-through the ports in `agentfs_contracts::ports`. Each write is one journal
-step, made durable before the port returns. Each row is the domain's value
-with its audit stamps (`agentfs_contracts::audit::Audited`), set by the
-store.
+Each domain keeps its records as rows through the ports in
+`agentfs_contracts::ports`. A port's write is durable before it returns, and
+a row comes back as the domain's value with its audit stamps
+(`agentfs_contracts::audit::Audited`). How the tree engine keeps that promise
+(journal steps, chains, stamping) is on [the domains'
+store](engine.md#the-domains-store).
 
 Clients' `ClientStore` (`load`, `attach`, `rebind`, `end`) keeps one row per
-tree on `Chain::Clients(tree)`: its attached clients (`ClientRow`: the id, the
+tree: its attached clients (`ClientRow`: the id, the
 grant and the pod context) and a fork's writer claim, each entry stamped. An
 attach's step number is the client's ordinal. One `end` step removes every
 ended client with its `AttachmentEnded`, then writes `LastDetached` for each
@@ -42,8 +43,8 @@ boot and at the drain) also releases the claim of every fork Trees reports
 dropped. `detach` is idempotent within a run: rows are removed at an end, so
 a client ended in an earlier run answers `UnknownClient`.
 
-Volume's `VolumeStore` (`load`, `record`) keeps the lifecycle row on
-`Chain::Volume` (`refs/agentfs/volume`): one row step per move, `VolumeStaged`,
+Volume's `VolumeStore` (`load`, `record`) keeps the volume's lifecycle row:
+one row step per move, `VolumeStaged`,
 `VolumeDraining` (detail `Stop`) or `VolumeReleased` (detail `Keep`). Its
 `StateArea` port makes and opens the volume, and `QueueFacts` reports what
 the queues hold. `VolumeService` (`agentfs-volume`) stages the volume (`stage`
@@ -56,8 +57,8 @@ release on facts nobody read.
 
 A store answers a failure as one `StoreError`: `Stopped` (the store stopped,
 or the outcome of a step is unknown), `NotDurable` (nothing recorded),
-`Damaged` or `Refused` (a step the store refused: a drop while anything holds
-the fork, a row or upstream that is not there). Each domain's error has one
+`Damaged` or `Refused` (a step the store refused; [the domains'
+store](engine.md#the-domains-store) says which). Each domain's error has one
 `From<StoreError>`: `Stopped` for a stopped or damaged store, its own word for
 a refusal (`ClientError::UnknownClient`, `TreeError::ForkUnknown`), and
 `NotDurable` or `Io` for a write that changed nothing.
@@ -78,7 +79,7 @@ workspace only: a consumer's build does not read it.
 
 | # | Invariant | Enforced by |
 |---|---|---|
-| C1 | Only Clients mints a `ClientCap`, so only Clients makes a client writer | private fields; `ClientCap::mint` takes the composition root's `Minter`; in this workspace only, clippy bans `Minter::new` outside it ([the library](agentfs.md#outside-the-consumer-api)) |
+| C1 | Only Clients mints a `ClientCap`, so only Clients makes a client writer | private fields; `ClientCap::mint` takes the composition root's `Minter`; in this workspace only, clippy bans `Minter::new` outside it; a consumer of the library is its own composition root ([the library](agentfs.md#the-consumer-api)) |
 | C2 | A `ForksItCreates` launcher reaches only the forks it created, never the root | `ClientsService` checks the launcher against Trees' `facts(fork)` before any row |
 | C3 | A read-only client has no `ClientCap`: its session writes nothing | the session's authority is `Read` for a read-only grant |
 | C4 | A fork has at most one read-write client, for life | the writer claim in the fork's clients row, kept after its client ends and released only at `ForkDropped` |

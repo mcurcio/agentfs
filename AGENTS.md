@@ -121,7 +121,7 @@ Run fmt, then clippy and the tests of the packages the change touches; CI is the
 cargo fmt --all --check
 cargo clippy -p <crate> -p <crate> --all-targets -- -D warnings
 cargo nextest run -p <crate> -p <crate>   # add --features failpoints where the change touches failpoints
-cargo test --doc -p <crate>               # only for a crate with doctests: nextest does not run them
+cargo test --doc -p <crate>               # only for a crate with doctests: nextest does not run them (on `agentfs`, whose one test is its doctest, nextest exits 4)
 ```
 
 Tests run with [cargo-nextest](https://nexte.st), each in its own process, all programs at once; `.config/nextest.toml` sets its profiles, and the workflows select the `ci` profile with `NEXTEST_PROFILE: ci`, and on GitHub Actions the slow tree tests build their full sizes ([development](docs/development.md#running-tests)). Where it is missing, install the release CI pins (the archive's SHA-256 is in `ci/dev-image.sh`):

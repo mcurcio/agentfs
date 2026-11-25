@@ -16,7 +16,9 @@
 //!   (pipefail turns its SIGPIPE into a failure); publishing an image
 //!   retries a failed push; every path filter of a workflow names a path
 //!   that exists.
-//! - [`crates`]: every dependency follows the ranks, every `failpoints`
+//! - [`crates`]: every dependency follows the ranks, the library front
+//!   `agentfs` re-exports, and only re-exports, every library of the ranks
+//!   it uses but the recording engine, every `failpoints`
 //!   feature is forwarded, every cargo command in `.github/`, the scripts,
 //!   docs, the crates' doc comments and Python scripts names packages,
 //!   features, binaries and test programs the workspace has, and in a file

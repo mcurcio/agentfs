@@ -74,9 +74,9 @@ docker build -t agentfs:dev .                 # https, ssh and otlp-tls features
 once, so a test never shares globals, an allocator or counters with
 another. nextest does not run doctests: `cargo test --doc` does, for a
 package with a library (`agentfs-cli` is a binary only and has none). The
-library crate `agentfs` has no tests but its doctest:
-`cargo test --doc -p agentfs` runs it, and `cargo nextest run -p agentfs`
-finds nothing to run. AGENTS.md
+library crate `agentfs` has no tests but its doctest, so its gate is
+`cargo test --doc -p agentfs`: `cargo nextest run -p agentfs` fails with
+exit status 4, "no tests to run". AGENTS.md
 gives the pinned nextest release and how to install it.
 
 [`.config/nextest.toml`](../.config/nextest.toml) holds two profiles. Both

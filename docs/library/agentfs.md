@@ -3,7 +3,9 @@
 `agentfs` is the library under one name: the one crate a consumer depends
 on. It holds no code of its own. Each of its modules re-exports one crate of
 this workspace whole, so each item keeps the one home its crate gives it.
-No crate of the workspace depends on it.
+No crate of the workspace depends on it. `crates/agentfs-repo` checks that
+its source holds re-exports only, one module for each library of the ranks
+it uses but the recording engine ([ranks](../architecture.md#ranks)).
 
 | Module | Crate | What it is |
 |---|---|---|
@@ -33,9 +35,11 @@ no TLS, no SSH, no FUSE and no OpenTelemetry SDK or exporter:
 The crate's documentation carries one example, a doctest: a tree volume
 made and opened through the engine's state area, which gives the volume its
 id, then one file written, closed and read back, every name reached through
-`agentfs::` alone. `cargo test --doc -p agentfs` runs it;
-`cargo nextest run -p agentfs` finds no tests, as nextest does not run
-doctests.
+`agentfs::` alone. It takes two routes outside the consumer API (below):
+the `StateArea` port called directly, and the actor guard's open with a
+named writer. `cargo test --doc -p agentfs` runs it and is the crate's
+gate: nextest does not run doctests, so `cargo nextest run -p agentfs`
+fails with exit status 4, "no tests to run".
 
 ## Not re-exported
 
@@ -52,14 +56,19 @@ doctests.
 
 ## The consumer API
 
-What a consumer is meant to call:
+A consumer that serves a volume is its own composition root: it wires the
+domains onto the engine's ports, as the `agentfs` binary does. What it is
+meant to call:
 
-- The shared kernel's values, traits, events and ports (`agentfs::contracts`).
+- The shared kernel's values, traits, events and ports (`agentfs::contracts`),
+  and `contracts::caps::Minter::new`: the composition root mints the
+  capabilities (C1 in the [domain invariants](domains.md#domain-invariants)).
 - The domains' services (`VolumeService`, `ClientsService`, `TreesService`)
   over those ports ([the shared kernel and the domains](domains.md)).
-- The engine's `state_area::TreeStateArea`: volumes made and opened through
-  the `StateArea` port, which gives a new volume its id.
-- `tree_actor::Recording`, a served volume, and the tree calls of the guard
+- The engine's `state_area::TreeStateArea`: the Volume domain's `StateArea`,
+  `VolumeStore` and `QueueFacts` ports, which `VolumeService` is built on;
+  its `recording()` is the served volume once it is open.
+- `tree_actor::Recording`, a served volume, and the reads of the guard
   `Recording::actor` answers ([the engine](engine.md#git-backed-tree-views)).
 - `session::Sessions`, a client's one route to its tree
   ([sessions](engine.md#sessions)).
@@ -74,13 +83,19 @@ are not for a consumer. Inside this workspace `clippy.toml` bans most of them
 outside their one caller; a consumer's build does not read this workspace's
 `clippy.toml`, so nothing stops a consumer from calling them:
 
-- `contracts::caps::Minter::new`: capabilities are minted only in the
-  composition root (C1 in the [domain invariants](domains.md#domain-invariants)).
+- The `StateArea` port's `create`, called directly: `VolumeService::ensure`
+  calls it after its launch-scope check (VO6) and its judgement of what the
+  state area holds (VO5).
+- The guard's calls that name a tree and a writer (`write_open` and the
+  other file calls `Recording::actor`'s guard takes a `WriterAt` for): a
+  writer no Clients row knows of. A client writes through its session,
+  which Clients binds (C5).
 - `TreeActor::fork_with`, `record_rows` and `drop_fork`: row writes the
   domains' store makes; call the store.
 - `TreeActor::close_writer`: a client's end, which `Sessions::unbind` makes.
 - `TreeActor::create` and `create_with`: a volume made with a hand-made id;
-  make it through `TreeStateArea`, which gives it one (VO5).
+  `VolumeService::ensure` makes it through `TreeStateArea`, which gives it
+  one (VO5).
 - `tree_git::TreeGit::open`, `open_with_lease`, `init` and
   `init_with_lease`: a tree volume's git store is history's.
 - `tree_actor::COMPACT_GATE_VAR`, `ChannelGate`, `CompactGate` and `Gap`:

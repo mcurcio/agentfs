@@ -47,9 +47,9 @@ rank uses, so two packages of one rank never depend on each other unless the
 rank uses itself. A dev-dependency may point anywhere, as a test of the binary
 drives the CSI driver, but at a package that builds a sibling of a rank that
 does not use itself: the sibling, or a package whose normal and build
-dependencies reach it. So one engine's tests never build the other. A rank no
-rank uses takes no dependency, dev included: no package depends on one of its
-packages. `crates/agentfs-repo` checks the manifests,
+dependencies reach it. So one engine's tests never build the other. No
+package depends, dev included, on a package of a rank that no rank uses.
+`crates/agentfs-repo` checks the manifests,
 and this table against the workspace manifest.
 
 | Rank | Uses | Layer | What it holds |
@@ -61,7 +61,7 @@ and this table against the workspace manifest.
 | `engine` | `line-identity`, `leaf`, `shared-kernel`, `domain` | the library | What implements the ports and owns the state on disk; no engine depends on another |
 | `filesystem` | `leaf`, `shared-kernel`, `domain`, `engine`, `filesystem` | the filesystem | The FUSE layer and `agentfs-cli`, whose binary `agentfs` is the composition root |
 | `kubernetes` | `leaf`, `shared-kernel`, `engine`, `filesystem` | the kubernetes adapter | The CSI driver |
-| `umbrella` | `shared-kernel`, `domain`, `engine` | the library | The crate `agentfs`, consumers' one name for the library: re-exports only. No rank uses it, so no package of the workspace depends on it: a workspace crate names each item by the crate that holds it |
+| `umbrella` | `shared-kernel`, `domain`, `engine` | the library | The crate `agentfs`, consumers' one name for the library: re-exports only, one module for each library of the ranks it uses but the recording engine `agentfs-core`, which `crates/agentfs-repo` checks. No rank uses it, so no package of the workspace depends on it: a workspace crate names each item by the crate that holds it |
 | `tests` | `line-identity`, `leaf`, `shared-kernel`, `domain`, `engine`, `filesystem`, `kubernetes`, `tests` | none | Packages that exist only for tests: the model, the conformance replay, the metric reader, the repository checks. No other rank uses it |
 
 ## Module map

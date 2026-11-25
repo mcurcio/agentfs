@@ -1,5 +1,7 @@
 //! The workspace's crates: their dependencies against the ranks
-//! (docs/architecture.md, "Ranks"), the `failpoints` feature forwarded to
+//! (docs/architecture.md, "Ranks"), the library front `agentfs` holding
+//! re-exports only, of every library of the ranks it uses but the recording
+//! engine, the `failpoints` feature forwarded to
 //! every dependency that has it, every cargo command the repository
 //! writes down naming what the workspace has, every failpoint call listed,
 //! the tree engine's `git` children all counted, and the tree engine naming
@@ -410,6 +412,181 @@ fn the_ranks_themselves_are_checked() {
         [
             "agentfs-align names no rank: add [package.metadata.agentfs] rank",
             "agentfs-lines names rank nowhere, which [workspace.metadata.agentfs] ranks does not list",
+        ]
+    );
+}
+
+/// The front's rank: the library under one name (`agentfs`), which no rank
+/// uses (docs/architecture.md, "Ranks").
+const FRONT_RANK: &str = "umbrella";
+
+/// The libraries of the ranks the front uses that it does not re-export:
+/// the recording engine, until M9 deletes it
+/// (docs/target-architecture/future/crate-split.md).
+const NOT_REEXPORTED: &[&str] = &["agentfs-core"];
+
+/// Where `front`, a member of [`FRONT_RANK`] whose `src/lib.rs` is
+/// `source`, is more or less than re-exports: its source holds anything
+/// but comments and `pub use <crate> as <module>;` items; it does not
+/// re-export, as its own module named for it without `agentfs_`, every
+/// library of the ranks its rank uses but [`NOT_REEXPORTED`]; or it
+/// depends (normal or build) on anything else.
+fn front_problems(workspace: &Workspace, front: &Member, source: &str) -> Vec<String> {
+    let mut problems = Vec::new();
+    let file = front.dir.join("src/lib.rs");
+    let mut reexported = BTreeSet::new();
+    for (n, line) in source.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with("//") {
+            continue;
+        }
+        let words: Vec<&str> = line
+            .strip_suffix(';')
+            .unwrap_or_default()
+            .split_whitespace()
+            .collect();
+        match words[..] {
+            ["pub", "use", krate, "as", module] => {
+                reexported.insert((krate.to_owned(), module.to_owned()));
+            }
+            _ => problems.push(format!(
+                "{}:{}: not a re-export: {line}",
+                file.display(),
+                n + 1
+            )),
+        }
+    }
+    let uses = front
+        .rank
+        .as_deref()
+        .and_then(|r| workspace.rank(r))
+        .map(|r| r.uses.clone())
+        .unwrap_or_default();
+    let mut expected = BTreeSet::new();
+    let mut crates = BTreeSet::new();
+    for m in &workspace.members {
+        let used = m.rank.as_ref().is_some_and(|r| uses.contains(r));
+        let lib = m
+            .targets
+            .iter()
+            .find(|t| t.kinds.iter().any(|k| k == "lib"));
+        let (true, Some(lib)) = (used, lib) else {
+            continue;
+        };
+        if NOT_REEXPORTED.contains(&m.name.as_str()) {
+            continue;
+        }
+        let module = lib.name.strip_prefix("agentfs_").unwrap_or(&lib.name);
+        expected.insert((lib.name.clone(), module.to_owned()));
+        crates.insert(m.name.clone());
+    }
+    for (krate, module) in expected.difference(&reexported) {
+        problems.push(format!(
+            "{} does not re-export {krate} as {module}",
+            front.name
+        ));
+    }
+    for (krate, module) in reexported.difference(&expected) {
+        problems.push(format!(
+            "{} re-exports {krate} as {module}: not a library of a rank it uses, under its own name",
+            front.name
+        ));
+    }
+    let depends: BTreeSet<String> = front
+        .dependencies
+        .iter()
+        .filter(|d| d.kind != DependencyKind::Dev)
+        .map(|d| d.name.clone())
+        .collect();
+    for name in crates.difference(&depends) {
+        problems.push(format!("{} does not depend on {name}", front.name));
+    }
+    for name in depends.difference(&crates) {
+        problems.push(format!(
+            "{} -> {name}: not a crate it re-exports",
+            front.name
+        ));
+    }
+    problems
+}
+
+#[test]
+fn the_front_only_reexports_the_ranks_it_uses() {
+    let workspace = Workspace::load();
+    let fronts: Vec<&Member> = workspace
+        .members
+        .iter()
+        .filter(|m| m.rank.as_deref() == Some(FRONT_RANK))
+        .collect();
+    assert_eq!(fronts.len(), 1, "one member of rank {FRONT_RANK}");
+    let front = fronts[0];
+    let source = std::fs::read_to_string(root().join(&front.dir).join("src/lib.rs"))
+        .unwrap_or_else(|e| panic!("reading {}'s src/lib.rs: {e}", front.name));
+    let problems = front_problems(&workspace, front, &source);
+    assert!(
+        problems.is_empty(),
+        "the library front (docs/library/agentfs.md):\n  {}",
+        problems.join("\n  ")
+    );
+}
+
+#[test]
+fn a_front_that_is_more_or_less_than_reexports_is_found() {
+    let workspace = today();
+    let front = workspace.member("agentfs").unwrap().clone();
+    let source = "//! The library.\n//! ```\n//! let x = 1;\n//! ```\n\n\
+        pub use agentfs_contracts as contracts;\n\
+        pub use agentfs_trees as trees;\n\
+        pub use agentfs_volume as volume;\n";
+    let mut whole = front.clone();
+    whole.dependencies.push(Dependency {
+        name: "agentfs-trees".into(),
+        kind: DependencyKind::Normal,
+    });
+    whole.dependencies.push(Dependency {
+        name: "tempfile".into(),
+        kind: DependencyKind::Dev,
+    });
+    assert_eq!(
+        front_problems(&workspace, &whole, source),
+        Vec::<String>::new()
+    );
+    // A domain left out, in the source and the manifest.
+    assert_eq!(
+        front_problems(&workspace, &front, source),
+        ["agentfs does not depend on agentfs-trees"]
+    );
+    let missing = source.replace("pub use agentfs_trees as trees;\n", "");
+    assert_eq!(
+        front_problems(&workspace, &whole, &missing),
+        ["agentfs does not re-export agentfs_trees as trees"]
+    );
+    // Code of its own, a renamed module, a crate it should not reach.
+    let code = format!("{source}pub fn open() {{}}\n");
+    assert_eq!(
+        front_problems(&workspace, &whole, &code),
+        ["crates/agentfs/src/lib.rs:9: not a re-export: pub fn open() {}"]
+    );
+    let renamed = source.replace("as trees;", "as forks;");
+    assert_eq!(
+        front_problems(&workspace, &whole, &renamed),
+        [
+            "agentfs does not re-export agentfs_trees as trees",
+            "agentfs re-exports agentfs_trees as forks: not a library of a rank it uses, under its own name",
+        ]
+    );
+    let core = with_edge(workspace.clone(), "agentfs", "agentfs-core");
+    let mut reaching = core.member("agentfs").unwrap().clone();
+    reaching.dependencies.extend(whole.dependencies.clone());
+    assert_eq!(
+        front_problems(
+            &core,
+            &reaching,
+            &format!("{source}pub use agentfs_core as core;\n")
+        ),
+        [
+            "agentfs re-exports agentfs_core as core: not a library of a rank it uses, under its own name",
+            "agentfs -> agentfs-core: not a crate it re-exports",
         ]
     );
 }

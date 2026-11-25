@@ -82,7 +82,7 @@ are their own crates. What remains:
 | C (built) | agentfs-engine: `tree_actor/`, `tree_git`, `session`, `store`, `state_area`, `operator_settings`, their tests (`it/tree_*`, `tree_*.rs`, the tree half of `crash_points.rs`); its instruments registered on a `Meter` the binary makes; csi through the `StateArea` port; `docs/library/core.md`'s tree half becomes `engine.md`. The crate boundary replaces agentfs-repo's recording-module check; the engine keeps git2, so the ban on opening a remote stays clippy's (`clippy.toml`, the SSH transport's registration rests on it) | B | ci, image, phase-1 | a recording-engine edit builds and runs only the recording engine's tests (23 s and 20 s), a tree edit only the tree engine's (25 s and 64 s), against the 77 s nextest run of all of core [measured, 2026-11-25, development.md "Build settings"] |
 | D (built) | The CLI package renamed `agentfs-cli` (directory too), its binary still `agentfs` (`[[bin]] name`, which clap reads through `CARGO_BIN_NAME`); every `-p agentfs` rewritten; agentfs-repo refuses, in a file that runs, a package, feature, binary or test program selected through a variable and a `cargo build` of a package with no binary, and, in any tracked file, a path under `crates/` that names nothing | C | ci, image, docker, hermes | none; with no package named `agentfs`, a missed reference fails |
 | E (built) | The front `agentfs`, in a new rank `umbrella` that no rank uses (it uses `shared-kernel`, `domain` and `engine`; listed after `kubernetes`, so M9 only adds `filesystem` to its uses): re-exports of the engine, contracts and the domains; a doctest opens a tree volume through it; AGENTS.md principle 10's mapping updated; the domain invariants and the rows-and-events contract out of `engine.md` to a library page of the shared kernel and the domains, which `engine.md` links | D | ci, docs | the owner's one name |
-| F | agentfs-service, in a rank of its own below `umbrella`, which `umbrella` and `filesystem` use: `launcher/domains.rs`, `shared.rs`, `domain_events.rs` and the drain, used by the binary; the front re-exports it; the launch's reads of core (`identity::Context` to contracts, the telemetry scope and the export counter's name to the binary) | E | ci, image | consumers compose a volume in one call |
+| F | agentfs-service, in a rank of its own below `umbrella`, which `umbrella` and `filesystem` use: `launcher/domains.rs`, `shared.rs`, `domain_events.rs` and the drain, used by the binary; the front re-exports it; the launch's reads of core (`identity::Context` to contracts, the telemetry scope and the export counter's name to the binary). Acceptance: the front's doctest goes through the one-call service, and docs/library/agentfs.md's consumer API names that route alone | E | ci, image | consumers compose a volume in one call |
 | G | agentfs-referee: its own error enum (`From` into the engine's); the line values (`tree.rs:27-205`) to lines; `MergeFileIdentity`, `NameHistory`, `Meta`, `queue::Key` public; `queue::held` (`queue.rs:50`, takes `&Shape`) up to its caller; ref naming for `Upstreams::merges` (`upstreams.rs:69`) resolved | C | ci, phase-1 | purity checked; rule tests in seconds |
 
 The waiting-marks PR lands in the engine after C, beside G (disjoint files); whether its `Waiters` gets a crate is its
@@ -110,12 +110,17 @@ one `agentfs_git::init`. Visibility widened in C: module paths kept, the 497 cou
 `Meter`: clippy bans `opentelemetry::global::meter*`, `MeterProvider::{meter, meter_with_scope}` and `Meter::new`,
 allowed only in the binary's `otel::meter_of` and agentfs-test-metrics (a library building an SDK provider is not
 checked). Two crates documented under one name (cargo#6313: rustdoc writes `target/doc/<crate>/`, so the bin `agentfs`
-overwrote the front's pages under `cargo doc --workspace`, with a cargo warning only): `doc = false` on agentfs-cli's
-bin; no check, as no gate, workflow or page runs `cargo doc --workspace`. The front reaching the recording engine:
+overwrote the front's pages under `cargo doc --workspace`; with both crates rebuilt the run can fail outright, as both
+write `target/doc/agentfs/` at once): `doc = false` on agentfs-cli's bin; no check, as no gate, workflow or page runs `cargo doc --workspace`. The front reaching the recording engine:
 `ci/check-deps.sh` reads what `cargo tree -p agentfs` links and refuses agentfs-core, fuser, the OpenTelemetry SDK and
 every TLS and SSH crate. The ranks cannot say it while both engines share the rank `engine`, and two engine ranks would
 lose the dev-dependency rule that keeps one engine's tests from building the other (the reason agentfs-test-metrics is
 a crate); M9 deletes core and with it that line.
+The front growing code of its own, or missing a crate it should re-export (a domain added at M4, F's service):
+agentfs-repo reads the front's `src/lib.rs` and refuses anything but comments and `pub use <crate> as <module>;`, and
+requires one such module, named for its crate without `agentfs_`, for each library of the ranks the front's rank uses
+but agentfs-core (named as the one exception until M9), with its normal dependencies exactly those crates. Not read:
+what each re-exported crate makes `pub`.
 
 ## 4. What this gives up
 
@@ -132,8 +137,13 @@ a crate); M9 deletes core and with it that line.
   never reads this workspace's `clippy.toml`: minting capabilities (`caps::Minter::new`), the store-only row writes
   (`TreeActor::fork_with`, `record_rows`, `drop_fork`), `TreeActor::close_writer`, a volume made with a hand-made id
   (`TreeActor::create`), `tree_git::TreeGit`'s opens, and the compaction gate (`COMPACT_GATE_VAR`, `ChannelGate`,
-  `CompactGate`). docs/library/agentfs.md lists them. F owns the fix: the service's one-call volume is the consumer's
-  route, and F decides what the front re-exports of the engine once it exists. The engine's re-export of the shared
+  `CompactGate`). docs/library/agentfs.md lists them. Until F a consumer that serves a volume is its own composition
+  root, so `Minter::new` is its to call and is consumer API; the routes around the Volume and Clients domains are not:
+  the `StateArea` port's `create` called directly (around VO5 and VO6) and the actor guard's calls that name a tree and
+  a writer (around C1 and C5). E's doctest takes both, as no one-call route exists yet. F owns the fix: the service's
+  one-call volume is the consumer's route, and F decides what the front re-exports of the engine once it exists. F or
+  G decides whether the engine's `Error::Reconcile` keeps exposing a leaf's type (`agentfs_lines::Error`), which a
+  consumer can name only by depending on agentfs-lines. The engine's re-export of the shared
   kernel's `TreeId` and `NotATree` (`tree_actor/mod.rs`) gives the library two paths to one value: G removes it, or
   records why it stays.
 - Without release `lto`, calls across the new boundaries are not inlined unless generic or `#[inline]`; C and G re-run
