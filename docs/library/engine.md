@@ -22,7 +22,7 @@ module; [trees](../trees.md) says what a tree view does and promises.
 
 | Need | Module | Main items |
 |---|---|---|
-| Git-backed tree views | `tree_actor`, `state_area` | `TreeActor`, `TreeId` (a tree's identity, `root` or `fork/<n>`), `TreeStateArea` (the Volume domain's `StateArea` port; its `inspect` reads what a state area holds) |
+| Git-backed tree views | `tree_actor`, `state_area` | `TreeActor`, `TreeStateArea` (the Volume domain's `StateArea` port; its `inspect` reads what a state area holds) |
 | The domains' rows over a tree volume | `store`, `tree_actor` | `TreeStore` (the `VolumeStore`, `ForkStore`, `ClientStore` and `QueueFacts` ports), `Chain`, `RowDomain`, `RowWrite`, `RowEvent` |
 | Line identity across saves | `agentfs_lines`, a leaf the library crate does not re-export: depend on `agentfs-lines` by name | `LineMap` (runs of lines, never bytes), `LineMap::align` (git's histogram diff over two `Image`s, read a line at a time), `LineMap::align_bytes_with`, `histogram_with` and `histogram_files_with` (the diff's `git` child started by the spawner passed: the tree engine passes `agentfs_git::git_cli::counted`), `LineMap::append`, `LineMap::expand` (line by line, for the landing rules), `pieces` (where a merged file's lines are in its sources): the line-map library, generic over the caller's numbered version (`Id`) |
 | OpenTelemetry instruments | `telemetry` | `observe_process`, `observe_unverified`, on a `Meter` the caller makes |
@@ -53,7 +53,7 @@ naming the path and the I/O failure. Its recorded calls are `write_open`, `write
 `sync`, `close`, `mkdir`, `rmdir`, `symlink`, `rename`, `unlink`, `set_meta`,
 `set_times` and `replace_file`; each write-open and namespace call names its writer as an
 `agentfs_contracts::pod::WriterAt`, the writer and its pod context, which the
-commit carries ([trees](../trees.md#volume-identity-and-trailers)). Every call names its tree by a `TreeId`: `root`, the
+commit carries ([trees](../trees.md#volume-identity-and-trailers)). Every call names its tree by a `TreeId`, the shared kernel's (`agentfs_contracts::TreeId`; the engine does not re-export it): `root`, the
 tree with no upstream, or `fork/<n>`, made at journal event `n`. `trees()`
 lists them, the root first and then the forks by number; `TreeId` parses from
 and prints as that text. A fork is made with its row, through the store
@@ -107,12 +107,10 @@ Compaction runs on history's compactor, behind the call path
 | Call | Returns |
 |---|---|
 | `History::checkpointed()` | The last checkpoint counted (`Checkpointed`): its `generation`, 0 for the one the volume opened at and one more for each this open published, and its `built` point |
-| `History::wait_checkpointed(after)` | Once a checkpoint of a generation after `after` is published. `WaitError::Stopped` at shutdown or once a compaction stopped the actor |
-| `History::wait_compacted(generation)` | Once the compaction that published that generation has ended: the segments it covers are unlinked, or its unlink failed and was logged. The publish comes before the unlink |
 | `History::compactor_through()` | The built point of the last built event the compactor is done with, compacted or not due |
 
-Read the generation, act, then wait past it. Nothing waits on a length or a
-timer.
+A [test build](#test-builds) also waits on them: read the generation, act,
+then wait past it. Nothing waits on a length or a timer.
 
 Saves history could not check ([trees](../trees.md#when-history-cannot-check-a-save))
 are flagged in their commits' `Agentfs-Unverified` trailer.
@@ -183,7 +181,9 @@ directory, wherever a call reads an entry (`node`, `children`, `set_meta`,
 
 ```rust
 use agentfs_contracts::clients::FileOwner;
-use agentfs_engine::tree_actor::{Attrs, Perm, RenameMode, SetTime, TreeId};
+use agentfs_contracts::TreeId;
+use agentfs_contracts::meta::{Attrs, Perm};
+use agentfs_engine::tree_actor::{RenameMode, SetTime};
 
 let me = FileOwner { uid: 1000, gid: 1000 };
 let exec = Attrs { perm: Perm::from_mode(0o755), owner: me };
@@ -198,7 +198,7 @@ for entry in v.children(TreeId::Root, "", 0, 100)? { /* name, number, kind */ }
 ```
 
 - `write_open(tree, path, by, create)` creates a missing file when `create`
-  gives its `Attrs` (permission bits and owner); `anonymous_open(tree, by,
+  gives its `Attrs` (permission bits and owner, `agentfs_contracts::meta`); `anonymous_open(tree, by,
   attrs)` is `O_TMPFILE`. `Attrs` is the part of an entry's `Meta` a caller
   chooses: the call gives the kind. In a set-group-ID directory a new entry
   takes the directory's group, and a new directory keeps the bit (Linux's
@@ -505,6 +505,14 @@ its build would (`ok   library features`). With it:
   open}`, `tree_actor::wait_for_lease`, `TreeGit::{open, init}`,
   `Upkeep::gated`, and `tree_actor::COMPACT_GATE_VAR`, `ChannelGate` and
   `Gap`.
+- Present only with it, compaction's waits and the lock's count:
+
+  | Call | Returns |
+  |---|---|
+  | `History::wait_checkpointed(after)` | Once a checkpoint of a generation after `after` is published. `WaitError::Stopped` at shutdown or once a compaction stopped the actor |
+  | `History::wait_compacted(generation)` | Once the compaction that published that generation has ended: the segments it covers are unlinked, or its unlink failed and was logged. The publish comes before the unlink |
+  | `History::wait_compactor(through)` | Once the compactor is done with a built event at or past `through` (`History::compactor_through`) |
+  | `stages::holds_on_this_thread()` | How many holds of the actor's lock the calling thread has begun |
 
 `TreeActor::record_rows` and `close_writer` are crate-private in every build.
 The engine's own tests reach these items through a dev-dependency on itself

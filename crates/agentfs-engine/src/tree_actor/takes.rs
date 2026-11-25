@@ -19,7 +19,8 @@ use super::journal::{Change, TakeHead, TakeRecord, Target};
 use super::queue::{self, Key};
 use super::stages::{Hold, Timer, Which, section};
 use super::tree::EventNumber;
-use super::{Error, Result, Took, TreeActor, TreeId, referee};
+use super::{Error, Result, Took, TreeActor, referee};
+use agentfs_contracts::TreeId;
 
 /// What a decision needs from the actor, read under its lock.
 #[derive(Clone, Debug)]
@@ -275,8 +276,7 @@ impl TreeActor {
     pub(in crate::tree_actor) fn take_inputs(&self, tree: TreeId) -> Result<TakeInputs> {
         let _kind = section(Hold::Take);
         let t = self.tree(tree)?;
-        let held = queue::held(
-            t,
+        let held = t.held(
             self.handles
                 .values()
                 .filter(|h| h.tree == tree)
@@ -506,7 +506,7 @@ pub(in crate::tree_actor) type TakeDiff = (
         crate::tree_actor::tree::MergeFileIdentity,
         Option<crate::tree_actor::tree::NameHistory>,
     )>,
-    Vec<(String, Option<crate::tree_actor::meta::Meta>)>,
+    Vec<(String, Option<agentfs_contracts::meta::Meta>)>,
 );
 
 /// A take's decision on a built tree as a record: the files, names and

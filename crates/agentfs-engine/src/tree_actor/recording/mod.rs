@@ -31,11 +31,13 @@ use super::journal::{
     Change, Entry, FoldedOpen, PagePiece, RunHead, SaveOutcome, TAKE_CHUNK, Tail, TakeRecord,
     chunk_map,
 };
-use super::meta::{Attrs, Kind, Meta, Perm, SetTime, Times};
+use super::meta::{SetTime, Times};
 use super::queue::Key;
 use super::stages::{Hold, section};
 use super::tree::{DirState, EventNumber, SavedTree};
-use super::{Error, Result, SavePending, Saved, TreeActor, TreeId};
+use super::{Error, Result, SavePending, Saved, TreeActor};
+use agentfs_contracts::TreeId;
+use agentfs_contracts::meta::{Attrs, Kind, Meta, Perm};
 use agentfs_contracts::paths::RepoPath;
 pub use file_map::FileMap;
 use layout::{Layout, Positions};
@@ -2310,9 +2312,10 @@ mod tests {
         assert!(rule.on(1).is_err());
     }
 
+    use crate::tree_actor::JOURNAL;
     use crate::tree_actor::journal::{Journal, fold};
     use crate::tree_actor::test_support::{ATTRS, new_actor, writer};
-    use crate::tree_actor::{JOURNAL, TreeId};
+    use agentfs_contracts::TreeId;
 
     const PATH: &str = "f";
 

@@ -35,8 +35,9 @@ use super::super::recording::pages::Run;
 use super::message;
 use super::refs;
 use crate::tree_actor::pointers::Pointers;
-use crate::tree_actor::{Error, Result, TreeId};
+use crate::tree_actor::{Error, Result};
 use crate::tree_git::TreeGit;
+use agentfs_contracts::TreeId;
 
 /// The verdicts' notes ref: one note per flagged commit, each line an
 /// `Agentfs-Verdict:` (git's own notes layout, fan-out included).

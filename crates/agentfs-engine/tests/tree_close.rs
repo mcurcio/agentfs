@@ -7,9 +7,10 @@
 //! process-wide stage counters, so one test runs at a time.
 use std::sync::{Arc, Mutex, PoisonError};
 
+use agentfs_contracts::TreeId;
 use agentfs_contracts::pod::PodContext;
 use agentfs_engine::tree_actor::stages::{Stages, holds_on_this_thread};
-use agentfs_engine::tree_actor::{Recording, Saved, TreeId};
+use agentfs_engine::tree_actor::{Recording, Saved};
 use trees::{ATTRS, identity, writer};
 
 #[path = "support/trees.rs"]

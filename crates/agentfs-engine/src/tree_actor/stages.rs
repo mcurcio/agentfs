@@ -591,6 +591,7 @@ pub(super) struct Held {
     _lock: Timer,
 }
 
+#[cfg(any(test, feature = "test-util"))]
 thread_local! {
     /// How many holds of the actor's lock this thread has begun.
     static HOLDS_HERE: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
@@ -600,6 +601,7 @@ thread_local! {
 /// the same [`Held`] as `actor_lock`'s count. Other threads (the gate
 /// thread's answers, a host's workers) hold the lock at events of their
 /// own, so a test counting one call's holds counts its own thread's.
+#[cfg(any(test, feature = "test-util"))]
 pub fn holds_on_this_thread() -> u64 {
     HOLDS_HERE.with(std::cell::Cell::get)
 }
@@ -608,6 +610,7 @@ impl Held {
     /// The lock was just taken: the hold's time is `other`'s until a
     /// [`section`] claims it.
     pub(super) fn start() -> Self {
+        #[cfg(any(test, feature = "test-util"))]
         HOLDS_HERE.with(|n| n.set(n.get() + 1));
         let lock = Timer::start(Which::ActorLock);
         let mut ran = [false; HOLD_COUNT];

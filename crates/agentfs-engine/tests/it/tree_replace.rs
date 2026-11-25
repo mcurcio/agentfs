@@ -11,8 +11,10 @@ use std::fs;
 use std::io::Read;
 use std::path::Path;
 
+use agentfs_contracts::TreeId;
 use agentfs_contracts::clients::FileOwner;
-use agentfs_engine::tree_actor::{Attrs, Error, Kind, Perm, Saved, SetTime, TreeActor, TreeId};
+use agentfs_contracts::meta::{Attrs, Kind, Perm};
+use agentfs_engine::tree_actor::{Error, Saved, SetTime, TreeActor};
 use agentfs_engine::tree_git::TreeGit;
 use trees::{ATTRS, fanned, new_actor, reopen, rowless_fork, writer};
 

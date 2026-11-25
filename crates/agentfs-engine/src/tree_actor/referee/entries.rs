@@ -13,9 +13,10 @@ use std::ops::Bound;
 use serde::{Deserialize, Serialize};
 
 use super::{File, NameHistory, Snapshot};
-use crate::tree_actor::meta::Meta;
-use crate::tree_actor::tree::{MergeFileIdentity, parent_of};
+use crate::tree_actor::tree::MergeFileIdentity;
 use crate::tree_actor::{Error, Result, queue};
+use agentfs_contracts::meta::Meta;
+use agentfs_contracts::paths::parent_of;
 
 /// Why a change lost by rule 13 or 14: the cause its collision names.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]

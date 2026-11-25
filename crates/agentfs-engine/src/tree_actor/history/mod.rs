@@ -29,8 +29,9 @@ use git2::Oid;
 use super::pointers::Pointers;
 use super::stages::{Timer, Which};
 use super::tree::{FileBytes, Shape, Tree};
-use super::{Error, Result, TreeId, referee};
+use super::{Error, Result, referee};
 use crate::tree_git::TreeGit;
+use agentfs_contracts::TreeId;
 
 /// One tree's object numbers: each named file's object, by its identity's
 /// number. The journal's, never history's (git-model §3): a checkpoint holds

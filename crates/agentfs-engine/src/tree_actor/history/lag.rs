@@ -7,10 +7,10 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::time::Duration;
 
-use super::super::TreeId;
 use super::super::journal::durable::RecordNo;
 use super::built::{Health, TreeLag};
 pub(in crate::tree_actor) use crate::tree_actor::stages::GateCause;
+use agentfs_contracts::TreeId;
 
 /// Over this, `tree HistoryLagging` is logged once (a placeholder, one home).
 pub(in crate::tree_actor) const LAG_ALARM: Duration = Duration::from_secs(30);

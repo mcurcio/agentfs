@@ -42,7 +42,8 @@ use agentfs_contracts::volume::VolumeIdentity;
 use git2::Oid;
 use serde::Serialize;
 
-pub use agentfs_contracts::{NotATree, TreeId};
+use agentfs_contracts::meta::{Kind, Meta, Perm};
+use agentfs_contracts::{NotATree, TreeId};
 use agentfs_os::file_lock::{FileLock, Mode};
 use agentfs_os::fsutil::sync_dir;
 pub(crate) use call_path::ActorGuard;
@@ -73,7 +74,7 @@ use journal::segment::SEGMENT_BYTES;
 use journal::{
     Change, Entry, Journal, PointerChange, Replay, RowRecord, SaveOutcome, Target, fold,
 };
-pub use meta::{Attrs, Kind, Meta, Perm, SetTime, Times};
+pub use meta::{SetTime, Times};
 use pointers::Pointers;
 pub use recording::file_map::FileMapReader;
 pub use recording::layout::Fingerprint;
@@ -180,7 +181,7 @@ pub enum Error {
     #[error(transparent)]
     Json(#[from] serde_json::Error),
     #[error(transparent)]
-    Reconcile(#[from] agentfs_lines::Error),
+    Lines(#[from] agentfs_lines::Error),
     #[error("tree volume is busy")]
     Busy,
     #[error("not a tree state area (or unsupported format)")]
@@ -276,7 +277,7 @@ impl Error {
             Self::TreeGit(crate::tree_git::Error::NoSpace(_)) => libc::ENOSPC,
             Self::Io(e)
             | Self::TreeGit(crate::tree_git::Error::Io(e))
-            | Self::Reconcile(agentfs_lines::Error::Io(e)) => e.raw_os_error().unwrap_or(libc::EIO),
+            | Self::Lines(agentfs_lines::Error::Io(e)) => e.raw_os_error().unwrap_or(libc::EIO),
             _ => libc::EIO,
         }
     }
@@ -1932,8 +1933,10 @@ pub(crate) mod test_support {
 
     use super::journal::Target;
     use super::pointers::Pointers;
-    use super::{Attrs, ChannelGate, Checkpointed, Perm, RecordNo, TreeActor, TreeId, Upkeep};
+    use super::{ChannelGate, Checkpointed, RecordNo, TreeActor, Upkeep};
     use super::{JournalCompaction, history::compactor::compact_once};
+    use agentfs_contracts::TreeId;
+    use agentfs_contracts::meta::{Attrs, Perm};
 
     /// A volume's upkeep that never compacts on its own: one frame per
     /// segment, never due, no gate. What [`compact_now`] runs on.

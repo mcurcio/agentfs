@@ -5,7 +5,8 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use agentfs_engine::tree_actor::{TreeActor, TreeId};
+use agentfs_contracts::TreeId;
+use agentfs_engine::tree_actor::TreeActor;
 use trees::{ATTRS, checkout, new_actor, reopen, rowless_fork, writer};
 
 use crate::trees;

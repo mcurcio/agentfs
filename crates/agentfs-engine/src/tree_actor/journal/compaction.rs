@@ -34,6 +34,12 @@
 //!   always opens: the salt, the redo start `built + 1` and "no record after
 //!   `built`" come from the checkpoint file; a missing or wholly torn segment
 //!   after `built` is judged as the first invalid frame (`Journal::open`).
+//! - **JC6.** An unlinked segment a holder still reads stays readable
+//!   through its `Arc` and counts in `Durability::len` until the last holder
+//!   lets go.
+//! - **JC8.** Every field of the checkpoint has one named source at `built`:
+//!   History's state read in one hold, and the fold of the records at or
+//!   below it.
 //! - **JC9.** No method holds the lock of Durability's state, of the segment
 //!   table or of the relocations across I/O or a wait, and the volume's gate
 //!   ([`CompactGate`]) is called with no lock held.

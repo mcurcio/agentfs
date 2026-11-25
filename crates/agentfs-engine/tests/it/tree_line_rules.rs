@@ -4,7 +4,8 @@
     clippy::disallowed_methods,
     reason = "a test reads the store History writes"
 )]
-use agentfs_engine::tree_actor::{TreeActor, TreeId};
+use agentfs_contracts::TreeId;
+use agentfs_engine::tree_actor::TreeActor;
 use trees::{ATTRS, fanned, new_actor, rowless_fork, writer};
 
 const ROOT: TreeId = TreeId::Root;

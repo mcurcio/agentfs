@@ -47,8 +47,9 @@ use crate::tree_actor::stages::{Timer, Which};
 use crate::tree_actor::tree::{
     EventNumber, FileBytes, Lines, MergeFileIdentity, NameHistory, Tree, Versions,
 };
-use crate::tree_actor::{Error, Result, TreeId};
+use crate::tree_actor::{Error, Result};
 use crate::tree_git::{RefUpdate, TreeGit};
+use agentfs_contracts::TreeId;
 use agentfs_lines::{Window, histogram_files_with};
 
 /// The most steps one batch builds: a batch's built event wakes the lag gate,

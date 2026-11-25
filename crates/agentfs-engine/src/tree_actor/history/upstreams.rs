@@ -3,7 +3,8 @@
 use std::collections::BTreeMap;
 
 use super::refs;
-use crate::tree_actor::{Error, Result, TreeId};
+use crate::tree_actor::{Error, Result};
+use agentfs_contracts::TreeId;
 
 /// Each fork's upstream.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]

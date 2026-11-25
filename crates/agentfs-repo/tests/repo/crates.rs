@@ -1,7 +1,9 @@
 //! The workspace's crates: their dependencies against the ranks
 //! (docs/architecture.md, "Ranks"), the library front `agentfs` holding
 //! re-exports only, of every library of the ranks it uses but the recording
-//! engine, the domains composed by the service crate alone, the
+//! engine, each item of the library with one path (no crate it re-exports
+//! re-exporting another crate's item), the domains composed by the service
+//! crate alone, the
 //! `failpoints` feature forwarded to
 //! every dependency that has it, every cargo command the repository
 //! writes down naming what the workspace has, every failpoint call listed,
@@ -609,6 +611,137 @@ fn a_front_that_is_more_or_less_than_reexports_is_found() {
             "agentfs re-exports agentfs_core as core: not a library of a rank it uses, under its own name",
             "agentfs -> agentfs-core: not a crate it re-exports",
         ]
+    );
+}
+
+/// The statements of `source` that give another crate's item a second path:
+/// each statement (up to its `;`) starting `pub use` or `pub type` (not
+/// `pub(..)`) that names a path of a crate `agentfs_<name>`, written
+/// `agentfs_<name>::` or `::agentfs_<name>`. The whole text is read, test
+/// modules included; a name such as `stale::agentfs_layers` is a path's
+/// last segment, not a crate. Not read: a private import re-exported
+/// through `self::` or `crate::`, a crate alias, a macro (docs/development.md).
+fn reexport_problems(source: &str) -> Vec<String> {
+    let ident = |c: char| c.is_alphanumeric() || c == '_';
+    let mut problems = Vec::new();
+    for keyword in ["use", "type"] {
+        let mut from = 0;
+        while let Some(at) = source[from..].find("pub ").map(|i| i + from) {
+            from = at + 4;
+            let starts = source[..at]
+                .chars()
+                .next_back()
+                .is_none_or(|c| c.is_whitespace() || matches!(c, ';' | '{' | '}'));
+            let rest = source[from..].trim_start();
+            let Some(after) = rest.strip_prefix(keyword) else {
+                continue;
+            };
+            if !starts || after.chars().next().is_some_and(ident) {
+                continue;
+            }
+            let statement = &rest[..rest.find(';').map_or(rest.len(), |end| end + 1)];
+            let names_a_crate = statement.match_indices("agentfs_").any(|(i, _)| {
+                let before = &statement[..i];
+                if before.chars().next_back().is_some_and(ident) {
+                    return false;
+                }
+                let after = statement[i..].trim_start_matches(ident).trim_start();
+                match before.trim_end().strip_suffix("::") {
+                    // A leading `::` starts a path at a crate; one after a
+                    // segment makes this name a module's item.
+                    Some(head) => !head
+                        .chars()
+                        .next_back()
+                        .is_some_and(|c| ident(c) || c == '>' || c == '}'),
+                    None => after.starts_with("::"),
+                }
+            });
+            if names_a_crate {
+                problems.push(format!(
+                    "pub {}",
+                    statement.split_whitespace().collect::<Vec<_>>().join(" ")
+                ));
+            }
+        }
+    }
+    problems
+}
+
+/// Each item of the library has one path, its own crate's: no crate the
+/// front re-exports (its normal dependencies) re-exports another crate's
+/// item, so `agentfs::engine::tree_actor::TreeId` cannot stand beside
+/// `agentfs::contracts::TreeId` (docs/library/agentfs.md).
+#[test]
+fn the_library_gives_each_item_one_path() {
+    let workspace = Workspace::load();
+    let root = root();
+    let front = workspace
+        .members
+        .iter()
+        .find(|m| m.rank.as_deref() == Some(FRONT_RANK))
+        .expect("a member of the front's rank");
+    let mut files = Vec::new();
+    for dependency in front
+        .dependencies
+        .iter()
+        .filter(|d| d.kind == DependencyKind::Normal)
+    {
+        let member = workspace.member(&dependency.name).unwrap();
+        files_under(&root.join(&member.dir).join("src"), &mut files);
+    }
+    files.retain(|f| f.extension().is_some_and(|e| e == "rs"));
+    let mut problems = Vec::new();
+    for file in &files {
+        let source = std::fs::read_to_string(file).unwrap();
+        for statement in reexport_problems(&source) {
+            problems.push(format!(
+                "{}: {statement}",
+                file.strip_prefix(&root).unwrap_or(file).display()
+            ));
+        }
+    }
+    assert!(
+        files.len() > 20,
+        "only {} files read: is the scan broken?",
+        files.len()
+    );
+    assert!(
+        problems.is_empty(),
+        "another crate's item re-exported (name it from its own crate):\n  {}",
+        problems.join("\n  ")
+    );
+}
+
+#[test]
+fn a_second_path_is_found() {
+    assert_eq!(
+        reexport_problems(
+            "pub use agentfs_contracts::TreeId;\n\
+             pub use {agentfs_contracts::TreeId};\n\
+             pub type T = agentfs_contracts::TreeId;\n\
+             pub use ::agentfs_contracts::NotATree;\n\
+             #[cfg(test)]\nmod tests {\n    pub use agentfs_contracts::meta::Meta;\n}\n"
+        ),
+        [
+            "pub use agentfs_contracts::TreeId;",
+            "pub use {agentfs_contracts::TreeId};",
+            "pub use ::agentfs_contracts::NotATree;",
+            "pub use agentfs_contracts::meta::Meta;",
+            "pub type T = agentfs_contracts::TreeId;",
+        ]
+    );
+    assert!(
+        reexport_problems(
+            "pub(crate) use agentfs_contracts::TreeId;\n\
+             pub(in crate::x) use agentfs_contracts::TreeId;\n\
+             use agentfs_contracts::TreeId;\n\
+             pub use stale::{MountState, agentfs_layers, detach};\n\
+             pub use stale::agentfs_layers;\n\
+             pub use self::meta::{Kind, Meta};\n\
+             pub user: u32,\n\
+             pub typed: u32,\n"
+        )
+        .is_empty()
     );
 }
 

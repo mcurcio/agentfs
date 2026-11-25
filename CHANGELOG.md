@@ -12,6 +12,15 @@ design was reviewed on 2026-10-12.
 
 ### Changed
 
+- **Each library item has one path.** An entry's metadata (`Kind`, `Perm`,
+  `Attrs`, `Meta`) is the shared kernel's, `agentfs::contracts::meta`, and a
+  tree's identity is `agentfs::contracts::TreeId` only: the engine no longer
+  re-exports them, and agentfs-repo refuses a crate the library re-exports
+  that re-exports another crate's item. A permission that is not four octal
+  digits is `NotAPerm`. The engine's `Error::Reconcile` is `Error::Lines`.
+  `History::wait_checkpointed`, `wait_compacted`, `wait_compactor` and
+  `stages::holds_on_this_thread` are behind the engine's `test-util`
+  feature (docs/library/engine.md, "Test builds").
 - **The CLI's package is `agentfs-cli`.** Its directory is `crates/agentfs-cli`
   and its binary is still `agentfs`; build it from source with
   `cargo build --release -p agentfs-cli`. The package `agentfs` is the

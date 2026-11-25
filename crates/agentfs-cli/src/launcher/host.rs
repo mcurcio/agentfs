@@ -24,6 +24,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::mpsc;
 
+use agentfs_contracts::TreeId;
 use agentfs_contracts::caps::{LaunchCap, LaunchScope, Minter};
 use agentfs_contracts::clients::{Access, ClientError, ClientSet};
 use agentfs_contracts::host::{
@@ -34,7 +35,6 @@ use agentfs_contracts::name::{ClientLabel, ForkKey, LauncherId};
 use agentfs_contracts::trees::{ForkPhase, ForkSettings, TreeError};
 use agentfs_contracts::views::{MountOptions, ViewError, ViewId};
 use agentfs_engine::telemetry;
-use agentfs_engine::tree_actor::TreeId;
 use anyhow::{Context as _, Result};
 
 use super::serving::{self, Driver, Serving, Trigger};

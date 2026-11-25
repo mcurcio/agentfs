@@ -15,6 +15,7 @@ use std::path::Path;
 use std::process::Command;
 use std::sync::{Arc, mpsc};
 
+use agentfs_contracts::TreeId;
 use agentfs_contracts::caps::{ClientCap, Minter};
 use agentfs_contracts::clients::{ClientId, Ordinal, SessionId};
 use agentfs_contracts::name::{ClientLabel, LauncherId};
@@ -22,7 +23,7 @@ use agentfs_contracts::pod::{PodContext, WriterAt};
 use agentfs_contracts::ports::{SessionAuthority, SessionBinder};
 use agentfs_engine::session::{Sessions, TreeSession};
 use agentfs_engine::tree_actor::{
-    Closing, PathStep, Recording, RenameMode, SaveToDecide, Saved, Took, TreeId,
+    Closing, PathStep, Recording, RenameMode, SaveToDecide, Saved, Took,
 };
 use trees::{ATTRS, fanned, identity, rowless_fork, writer};
 

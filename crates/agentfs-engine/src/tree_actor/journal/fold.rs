@@ -16,12 +16,13 @@ use super::{
 };
 use crate::tree_actor::history::Objects;
 use crate::tree_actor::history::upstreams::Upstreams;
-use crate::tree_actor::meta::Meta;
 use crate::tree_actor::pointers::Pointers;
 use crate::tree_actor::recording::layout::{Layout, Positions};
 use crate::tree_actor::recording::{Call, FileMap, pages};
 use crate::tree_actor::tree::{EventNumber, SavedTree};
-use crate::tree_actor::{Error, Result, TreeId};
+use crate::tree_actor::{Error, Result};
+use agentfs_contracts::TreeId;
+use agentfs_contracts::meta::Meta;
 
 /// A live write-open: a journal [`OpenRecord`] with its tree parsed.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -632,7 +633,8 @@ mod close_records {
     use super::fold;
     use crate::tree_actor::recording::{Handle, close_rank};
     use crate::tree_actor::test_support::{ATTRS, never_due, new_actor_with, writer};
-    use crate::tree_actor::{Error, JOURNAL, TreeActor, TreeId};
+    use crate::tree_actor::{Error, JOURNAL, TreeActor};
+    use agentfs_contracts::TreeId;
 
     const ROOT: TreeId = TreeId::Root;
 
@@ -746,7 +748,8 @@ mod tests {
         Entry, HEADER, Journal, crc_body, header_bytes, read_frame, segment, u32_at,
     };
     use crate::tree_actor::test_support::{ATTRS, new_actor, reopen, writer};
-    use crate::tree_actor::{JOURNAL, TreeActor, TreeId};
+    use crate::tree_actor::{JOURNAL, TreeActor};
+    use agentfs_contracts::TreeId;
 
     /// Rewrites the tail of the first chunk record ([`super::Entry::Bytes`])
     /// in the journal's one segment with `tail` (the same length), and fixes

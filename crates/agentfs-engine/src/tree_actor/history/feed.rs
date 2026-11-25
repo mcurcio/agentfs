@@ -31,8 +31,8 @@ use std::process::{Child, ChildStdin};
 use git2::Oid;
 
 use super::built::BuildError;
-use crate::tree_actor::TreeId;
 use crate::tree_git::TreeGit;
+use agentfs_contracts::TreeId;
 
 /// A commit's parent: one built already, or one this batch made.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

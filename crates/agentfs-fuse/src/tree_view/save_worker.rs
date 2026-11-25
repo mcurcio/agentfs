@@ -13,7 +13,7 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::{Mutex, PoisonError, mpsc};
 use std::thread::JoinHandle;
 
-use agentfs_engine::tree_actor::TreeId;
+use agentfs_contracts::TreeId;
 
 /// One unit of the worker's work: the view's finish of one pending save,
 /// with its logging.

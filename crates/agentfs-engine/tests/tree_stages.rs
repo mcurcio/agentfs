@@ -6,9 +6,10 @@ use std::collections::BTreeSet;
 use std::path::Path;
 use std::sync::{Mutex, PoisonError};
 
+use agentfs_contracts::TreeId;
 use agentfs_contracts::pod::PodContext;
 use agentfs_engine::tree_actor::stages::Stages;
-use agentfs_engine::tree_actor::{Recording, Saved, Took, TreeActor, TreeId};
+use agentfs_engine::tree_actor::{Recording, Saved, Took, TreeActor};
 use trees::{ATTRS, Volumes, identity, new_actor, reopen, rowless_fork, writer};
 
 #[path = "support/trees.rs"]

@@ -27,8 +27,8 @@ use agentfs_os::confined;
 use agentfs_os::fsutil::{self, create_dir_durably, sync_dir};
 use rustix::fs::{AtFlags, FileType, Mode, OFlags, Stat, Timestamps};
 
-use super::TreeId;
-use super::meta::{Kind, Meta};
+use agentfs_contracts::TreeId;
+use agentfs_contracts::meta::{Kind, Meta};
 
 /// The state area's directory of untracked areas.
 pub(in crate::tree_actor) const UNTRACKED: &str = "untracked";

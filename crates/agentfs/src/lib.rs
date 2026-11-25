@@ -22,11 +22,11 @@
 //! use agentfs::contracts::TreeId;
 //! use agentfs::contracts::caps::{LaunchCap, LaunchScope, Minter};
 //! use agentfs::contracts::clients::{Access, FileOwner};
+//! use agentfs::contracts::meta::{Attrs, Perm};
 //! use agentfs::contracts::name::{ClientLabel, LauncherId, VolumeName};
 //! use agentfs::contracts::pod::PodContext;
 //! use agentfs::contracts::volume::{StartPoint, VolumeSpec};
 //! use agentfs::engine::operator_settings::OperatorSettings;
-//! use agentfs::engine::tree_actor::{Attrs, Perm};
 //! use agentfs::service::{Domains, Launcher, Unstaged};
 //! # fn main() -> Result<(), Box<dyn std::error::Error>> {
 //! # let dir = tempfile::tempdir()?;

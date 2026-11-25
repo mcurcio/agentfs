@@ -25,12 +25,12 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
+use agentfs_contracts::meta::{Kind, Meta};
 use git2::Oid;
 
 use super::Objects;
 use super::feed::Edit;
 use super::message;
-use crate::tree_actor::meta::{Kind, Meta};
 use crate::tree_actor::queue::Key;
 use crate::tree_actor::stages::{Timer, Which};
 use crate::tree_actor::tree::{FileBytes, Lines, MergeFileIdentity, NameHistory, Tree};
@@ -137,6 +137,18 @@ pub(in crate::tree_actor) fn root_tree(repo: &TreeGit, root: &Meta) -> Result<Oi
     }])?)
 }
 
+/// Git's own mode for an entry: `0o120000` a link; `0o100755` a file whose
+/// owner may execute it (`S_IXUSR`), else `0o100644`; `0o040000` a directory
+/// (never a `files/` entry).
+pub(in crate::tree_actor) const fn git_mode(meta: &Meta) -> u32 {
+    match meta.kind {
+        Kind::Symlink => 0o120000,
+        Kind::Dir => 0o040000,
+        Kind::File if meta.mode.bits() & 0o100 != 0 => 0o100755,
+        Kind::File => 0o100644,
+    }
+}
+
 /// Where a file's bytes are for a commit: a blob already stored, or one this
 /// batch fed.
 #[derive(Clone, Copy)]
@@ -162,7 +174,7 @@ pub(in crate::tree_actor) fn edits(
         let lines = after.lines.get(&object).ok_or(Error::Format)?;
         let meta = after.meta_of(object).ok_or(Error::Format)?;
         let path = file_path(name);
-        let mode = meta.git_mode();
+        let mode = git_mode(meta);
         edits.push(match blob(bytes)? {
             BlobRef::Stored(oid) => Edit::Stored { path, oid, mode },
             BlobRef::Mark(mark) => Edit::Blob { path, mark, mode },
@@ -502,7 +514,29 @@ pub(in crate::tree_actor) fn empty_tree() -> Oid {
 
 #[cfg(test)]
 mod tests {
+    use agentfs_contracts::clients::FileOwner;
+    use agentfs_contracts::meta::{Attrs, Perm};
+
     use super::*;
+
+    #[test]
+    fn git_modes_follow_the_owners_execute_bit() {
+        let attrs = Attrs {
+            perm: Perm::from_mode(0o100755),
+            owner: FileOwner {
+                uid: 1000,
+                gid: 1001,
+            },
+        };
+        assert_eq!(git_mode(&Meta::new(Kind::File, attrs)), 0o100755);
+        let plain = Attrs {
+            perm: Perm::from_mode(0o655),
+            ..attrs
+        };
+        assert_eq!(git_mode(&Meta::new(Kind::File, plain)), 0o100644);
+        assert_eq!(git_mode(&Meta::new(Kind::Symlink, attrs)), 0o120000);
+        assert_eq!(git_mode(&Meta::new(Kind::Dir, attrs)), 0o040000);
+    }
 
     #[test]
     fn each_path_is_the_layouts_literal_text() {

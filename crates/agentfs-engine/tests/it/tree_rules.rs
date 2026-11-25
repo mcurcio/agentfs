@@ -9,8 +9,10 @@ use std::io::Write;
 use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
 use std::path::Path;
 
+use agentfs_contracts::TreeId;
 use agentfs_contracts::clients::FileOwner;
-use agentfs_engine::tree_actor::{Error, Kind, Meta, Perm, RenameMode, TreeActor, TreeId};
+use agentfs_contracts::meta::{Kind, Meta, Perm};
+use agentfs_engine::tree_actor::{Error, RenameMode, TreeActor};
 use trees::{ATTRS, new_actor, reopen, rowless_fork, writer};
 
 use crate::trees;

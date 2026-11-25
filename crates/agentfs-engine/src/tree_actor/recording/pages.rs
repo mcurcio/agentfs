@@ -30,7 +30,8 @@ use super::layout::Located;
 use super::{Call, FileMap, Handle};
 use crate::tree_actor::journal::PagePiece;
 use crate::tree_actor::journal::segment::{FramePos, Relocations};
-use crate::tree_actor::{Error, Result, TreeActor, TreeId};
+use crate::tree_actor::{Error, Result, TreeActor};
+use agentfs_contracts::TreeId;
 
 /// The bases' unit. Every kernel page size is a multiple of it, so a base map at
 /// this size is exact whatever the kernel's own page size is.

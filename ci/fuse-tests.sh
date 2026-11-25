@@ -47,6 +47,7 @@ step "creating as the caller, as root (crates/agentfs-fuse/src/creds.rs)"
 OUT=$(sudo "$unit" creds:: --nocapture 2>&1) || { echo "$OUT"; fail "creds tests failed"; }
 echo "$OUT"
 case "$OUT" in *"skipped: needs root"*) fail "the root test did not run as root" ;; esac
+case "$OUT" in *"ok. 0 passed"*) fail "no creds test ran" ;; esac
 
 step "tree views stacked over a stale mount, as root (crates/agentfs-fuse/src/tree_view.rs)"
 OUT=$(sudo "$unit" tree_view::tests::stale_view --ignored --test-threads=1 --nocapture 2>&1) ||

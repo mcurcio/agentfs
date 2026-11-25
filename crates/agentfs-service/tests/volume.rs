@@ -8,12 +8,12 @@ use std::path::Path;
 use agentfs_contracts::TreeId;
 use agentfs_contracts::caps::{LaunchCap, LaunchScope, Minter};
 use agentfs_contracts::clients::{Access, FileOwner};
+use agentfs_contracts::meta::{Attrs, Perm};
 use agentfs_contracts::name::{ClientLabel, ForkKey, LauncherId, VolumeName};
 use agentfs_contracts::pod::PodContext;
 use agentfs_contracts::trees::{ForkPhase, ForkSettings, Landing, TreeError};
 use agentfs_contracts::volume::{EnsureOutcome, StartPoint, VolumeError, VolumeSpec};
 use agentfs_engine::operator_settings::OperatorSettings;
-use agentfs_engine::tree_actor::{Attrs, Perm};
 use agentfs_service::{Domains, Launcher, ServiceError, Unstaged, end_fork, init};
 
 #[expect(

@@ -7,10 +7,11 @@ use std::fs::{self, OpenOptions};
 use std::io::{Seek, SeekFrom, Write};
 use std::os::unix::fs::FileExt;
 
+use agentfs_contracts::TreeId;
 use agentfs_contracts::name::WriterLabel;
 use agentfs_contracts::pod::PodContext;
 use agentfs_engine::tree_actor::{
-    Error, Gap, RecordNo, RenameMode, Saved, Took, TreeActor, TreeId, Upkeep,
+    Error, Gap, RecordNo, RenameMode, Saved, Took, TreeActor, Upkeep,
 };
 use trees::{ATTRS, checkout, fanned, new_actor, reopen, reopen_after_kill, rowless_fork, writer};
 

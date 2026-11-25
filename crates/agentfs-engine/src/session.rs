@@ -17,10 +17,12 @@ use agentfs_contracts::pod::WriterAt;
 use agentfs_contracts::ports::{SessionAuthority, SessionBinder};
 
 use crate::tree_actor::{
-    ActorGuard, Attrs, Closing, DirEntry, Error, FileMap, Node, OpenContent, PathStep, RecordNo,
-    Recording, RenameMode, SavePending, Saved, SetTime, Then, TreeActor, TreeId, UntrackedArea,
+    ActorGuard, Closing, DirEntry, Error, FileMap, Node, OpenContent, PathStep, RecordNo,
+    Recording, RenameMode, SavePending, Saved, SetTime, Then, TreeActor, UntrackedArea,
     WriteOpenStart,
 };
+use agentfs_contracts::TreeId;
+use agentfs_contracts::meta::Attrs;
 
 type Result<T> = std::result::Result<T, Error>;
 

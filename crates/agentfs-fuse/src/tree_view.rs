@@ -31,13 +31,16 @@ use std::thread::JoinHandle;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::stale::{self, MountState};
+use agentfs_contracts::TreeId;
 use agentfs_contracts::clients::{Access, Binding, FileOwner};
+use agentfs_contracts::meta::{Attrs, Kind, Meta, Perm};
+use agentfs_contracts::paths::parent_of;
 use agentfs_contracts::views::{MountOptions, MountPoint, ViewError, ViewId, Views};
 use agentfs_engine::session::{SessionGuard, Sessions, TreeSession};
 use agentfs_engine::tree_actor::stages as measured;
 use agentfs_engine::tree_actor::{
-    Attrs, Closing, Error, FileMap, Kind, Meta, Node, PathStep, Perm, Progress, Recording,
-    RenameMode, SavePending, Saved, SetTime, TreeId,
+    Closing, Error, FileMap, Node, PathStep, Progress, Recording, RenameMode, SavePending, Saved,
+    SetTime,
 };
 use agentfs_rules::{NewKind, PathFacts, Placement};
 use fuser::*;
@@ -711,11 +714,6 @@ fn child_path(dir: &str, name: &OsStr) -> Result<String> {
     })
 }
 
-/// The directory holding `path`: `""` for a top-level entry.
-fn parent_dir(path: &str) -> &str {
-    path.rsplit_once('/').map_or("", |(parent, _)| parent)
-}
-
 /// A time as the kernel takes it.
 fn time(ns: u64) -> SystemTime {
     UNIX_EPOCH + Duration::from_nanos(ns)
@@ -1237,7 +1235,7 @@ impl View {
         let up = if dir.is_empty() {
             INodeNo(1)
         } else {
-            let parent = parent_dir(&dir);
+            let parent = parent_of(&dir);
             match v.node(parent) {
                 Ok(node) => inode(&node)?,
                 Err(_) => self

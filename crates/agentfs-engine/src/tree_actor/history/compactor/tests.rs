@@ -29,7 +29,8 @@ use crate::tree_actor::rows::{Chain, RowEvent, RowWrite};
 use crate::tree_actor::test_support::{
     ATTRS, compact_now, never_due, new_actor_with, reopen_with, rowless_fork, same_pointers, writer,
 };
-use crate::tree_actor::{BUILT_LOG, History, JOURNAL, TreeActor, TreeId, Upkeep};
+use crate::tree_actor::{BUILT_LOG, History, JOURNAL, TreeActor, Upkeep};
+use agentfs_contracts::TreeId;
 
 const ROOT: TreeId = TreeId::Root;
 const BOUND: Duration = Duration::from_secs(10);

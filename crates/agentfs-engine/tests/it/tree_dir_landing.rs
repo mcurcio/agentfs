@@ -10,8 +10,10 @@ use crate::trees;
 use std::path::Path;
 use std::process::Command;
 
+use agentfs_contracts::TreeId;
 use agentfs_contracts::clients::FileOwner;
-use agentfs_engine::tree_actor::{Attrs, Kind, Meta, Perm, RenameMode, TreeActor, TreeId};
+use agentfs_contracts::meta::{Attrs, Kind, Meta, Perm};
+use agentfs_engine::tree_actor::{RenameMode, TreeActor};
 use trees::{ATTRS, fanned, new_actor, rowless_fork, writer};
 
 const ROOT: TreeId = TreeId::Root;

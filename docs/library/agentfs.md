@@ -36,7 +36,8 @@ no TLS, no SSH, no FUSE and no OpenTelemetry SDK or exporter:
 The crate's documentation carries one example, a doctest, on the consumer
 API's route alone: the composition root mints the launcher's capability, the
 service's `init` makes the volume and `Domains::stage` serves it, one client
-bound to the root writes a file through its session's guard, closes it and
+bound to the root writes a file through its session's guard (its permission
+bits and owner from `agentfs::contracts::meta`), closes it and
 reads it back, and `unstage` drains and releases the volume, every name
 reached through `agentfs::` alone. `cargo test --doc -p agentfs` runs it and
 is the crate's gate: nextest does not run doctests, so `cargo nextest run -p agentfs`
@@ -52,7 +53,7 @@ fails with exit status 4, "no tests to run".
 - **The leaves**: `agentfs-os`, `agentfs-git`, `agentfs-lines`,
   `agentfs-failpoints` and `agentfs-align`, mechanisms below the engines.
   A few of their types reach the engine's API: `agentfs_lines::Image` and
-  the engine's `From<agentfs_lines::Error>` (and, in a [test
+  the engine's `Error::Lines`, which carries an `agentfs_lines::Error` (and, in a [test
   build](engine.md#test-builds), `agentfs_os::file_lock::FileLock`). A
   consumer that names one depends on that leaf by name.
 
@@ -70,7 +71,12 @@ What it is meant to call:
 - The service: `service::init`, `service::end_fork`, `service::Domains::stage`
   and the calls of the `Domains` it answers, `unstage` among them.
 - The shared kernel's values, errors and events (`agentfs::contracts`), and
-  the domains' values they carry.
+  the domains' values they carry. Each item has one path, its own crate's: a
+  tree's identity is `contracts::TreeId` and an entry's metadata
+  `contracts::meta`, never re-exported by the engine. No crate the library
+  re-exports gives another crate's item a second path (`pub use` or `pub
+  type`), which `the_library_gives_each_item_one_path` in agentfs-repo
+  checks ([development](../development.md#build-settings)).
 - `operator_settings::OperatorSettings::read`, the one value `stage` takes.
 - `session::Sessions` and its `TreeSession`, a bound client's one route to
   its tree ([sessions](engine.md#sessions)), reached through

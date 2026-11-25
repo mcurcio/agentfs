@@ -108,6 +108,11 @@ pub fn is_dotgit(component: &str) -> bool {
     })
 }
 
+/// The directory holding `path`: `""` for a top-level entry.
+pub fn parent_of(path: &str) -> &str {
+    path.rsplit_once('/').map_or("", |(parent, _)| parent)
+}
+
 /// Code points HFS+ ignores when comparing names.
 fn is_hfs_ignorable(c: char) -> bool {
     matches!(

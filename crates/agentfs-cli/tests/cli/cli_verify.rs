@@ -90,8 +90,10 @@ fn verify_takes_the_state_flag_only() {
 #[cfg(feature = "failpoints")]
 #[test]
 fn verify_checks_a_flag_once_per_release() {
+    use agentfs_contracts::TreeId;
+    use agentfs_contracts::meta::{Attrs, Perm};
     use agentfs_contracts::pod::{PodContext, WriterAt};
-    use agentfs_engine::tree_actor::{Attrs, Perm, TreeActor, TreeId};
+    use agentfs_engine::tree_actor::TreeActor;
     let tmp = tempfile::tempdir().unwrap();
     let state = tmp.path().join("state");
     init(&state);

@@ -409,9 +409,10 @@ fn the_lifecycle_is_a_chain_of_events() {
 #[cfg(feature = "failpoints")]
 #[test]
 fn a_drain_goes_on_while_the_builder_fails() {
+    use agentfs_contracts::TreeId;
     use agentfs_contracts::ports::ForkStore;
     use agentfs_contracts::trees::{ForkSettings, Landing};
-    use agentfs_engine::tree_actor::{Progress, TreeId};
+    use agentfs_engine::tree_actor::Progress;
 
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().join("state");

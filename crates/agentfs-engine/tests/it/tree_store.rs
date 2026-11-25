@@ -15,6 +15,7 @@ use std::path::Path;
 use std::process::Command;
 use std::sync::Arc;
 
+use agentfs_contracts::TreeId;
 use agentfs_contracts::caps::{LaunchCap, LaunchScope, Minter};
 use agentfs_contracts::clients::{AttachedLookup, ClientSet};
 use agentfs_contracts::name::LauncherId;
@@ -23,7 +24,7 @@ use agentfs_contracts::ports::{Event, EventSink, ForkStore, QueueFacts, StoreErr
 use agentfs_contracts::tree::ForkId;
 use agentfs_contracts::trees::{ForkLookup, ForkPhase, ForkSettings, Landing, Trees};
 use agentfs_engine::store::TreeStore;
-use agentfs_engine::tree_actor::{Chain, Recording, RowDomain, TreeId};
+use agentfs_engine::tree_actor::{Chain, Recording, RowDomain};
 use agentfs_trees::TreesService;
 use trees::{ATTRS, identity, writer};
 

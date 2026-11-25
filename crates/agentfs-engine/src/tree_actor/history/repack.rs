@@ -852,9 +852,9 @@ pub(in crate::tree_actor) mod tests {
 
     use super::*;
     use crate::tree_actor::TreeActor;
-    use crate::tree_actor::TreeId;
     use crate::tree_actor::history::built::BuiltSnapshot;
     use crate::tree_actor::test_support::{ATTRS, new_actor, reopen, rowless_fork, writer};
+    use agentfs_contracts::TreeId;
 
     /// The program the task runs instead of git when the git directory holds it.
     pub(in crate::tree_actor) const WRAPPER: &str = "repack-git";

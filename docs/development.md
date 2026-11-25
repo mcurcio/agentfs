@@ -71,7 +71,10 @@ layer's and the binary's tests through their dev-dependencies, the binary's
 its dependency. A workspace-wide build therefore has it on: build the
 library alone, as a consumer does, with
 `cargo clippy -p agentfs-engine -p agentfs-service -p agentfs --lib` and
-`cargo test --doc -p agentfs`.
+`cargo test --doc -p agentfs`. That build refuses a call to the test-only
+surface from production code. Which `pub` items only tests call is not
+checked: an item goes behind the feature when a reading of its callers
+(`grep`) finds only tests.
 
 The container image:
 
@@ -115,7 +118,11 @@ AGENTFS_TEST_VOLUMES=full cargo nextest run -p agentfs-engine --test tree_batch_
 `cargo test --no-run` is still used where a script builds a test program
 and then runs it itself: `ci/fuse-tests.sh` runs it under sudo with
 libtest's flags, and `ci/model-digest.sh` and `ci/replay-seeds.sh` run one
-process per seed. Each says so in a comment.
+process per seed. Each says so in a comment. A name filter given to a
+libtest program run directly is not otherwise checked: libtest exits 0
+when it matches nothing. So each such run in `ci/fuse-tests.sh` reads its
+output and fails when it ran no test (`0 passed`) or not the count it
+expects.
 
 ### Test programs
 
@@ -233,8 +240,18 @@ library depends only on serde and serde_json. Its checks of the crates
 ranks it uses; only `agentfs-service`, the crate `agentfs` and the tests
 depend on the domains the service composes; every `failpoints` feature is
 forwarded; every cargo command the repository writes down names what the
-workspace has; every failpoint hit is listed; and the tree engine starts
-`git` only through `counted`. Measured on 2026-11-25 in a
+workspace has; every failpoint hit is listed; the tree engine starts
+`git` only through `counted`; and each item of the library has one path
+(`the_library_gives_each_item_one_path`): no source of a crate the crate
+`agentfs` re-exports holds a statement starting `pub use` or `pub type` that
+names a path of another crate, `agentfs_<name>::` or `::agentfs_<name>`,
+test modules included. Not read by that check: a private import
+re-exported through `self::` or `crate::` (`use agentfs_contracts::TreeId;
+pub use self::TreeId as T;`), a crate alias (`use agentfs_contracts as c;
+pub use c::TreeId;`), and a macro that expands to one. rustdoc's JSON
+output, which resolves items, would read them, but it is nightly-only. The
+leaves (`agentfs-lines`, `agentfs-git` and the rest) are not read: the
+crate `agentfs` does not re-export them. Measured on 2026-11-25 in a
 container with 4 CPUs and 15 GB:
 
 | Step | Time |

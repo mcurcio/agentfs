@@ -15,11 +15,12 @@ use super::format::{self, read_snapshot};
 use super::message;
 use super::refs;
 use crate::tree_actor::journal::{TAKE_CHUNK, TakeHead};
-use crate::tree_actor::meta::Meta;
 use crate::tree_actor::stages::{Timer, Which};
 use crate::tree_actor::tree::{EventNumber, Lines, MergeFileIdentity};
-use crate::tree_actor::{Error, Result, TreeId, queue, referee};
+use crate::tree_actor::{Error, Result, queue, referee};
 use crate::tree_git::{STREAMED_BLOB, TreeGit};
+use agentfs_contracts::TreeId;
+use agentfs_contracts::meta::Meta;
 use agentfs_lines::{FileImage, Image, Piece};
 
 /// A record's value in one commit, as [`LandedInto`] caches it: the commit, and the record (a

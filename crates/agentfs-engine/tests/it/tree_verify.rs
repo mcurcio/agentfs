@@ -23,9 +23,10 @@
 use std::path::Path;
 use std::process::Command;
 
+use agentfs_contracts::TreeId;
 use agentfs_contracts::pod::PodContext;
 use agentfs_engine::tree_actor::{
-    EVIDENCE_REF, Outcome, TreeActor, TreeId, UnverifiedCounts, VERIFY_REF, Verdict, verify_flagged,
+    EVIDENCE_REF, Outcome, TreeActor, UnverifiedCounts, VERIFY_REF, Verdict, verify_flagged,
 };
 use agentfs_engine::tree_git::{RefUpdate, TreeGit};
 use git2::Oid;

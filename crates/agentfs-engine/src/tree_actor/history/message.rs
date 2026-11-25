@@ -10,7 +10,8 @@ use super::verify::Flag;
 use crate::tree_actor::journal::RowRecord;
 use crate::tree_actor::rows::Chain;
 use crate::tree_actor::tree::EventNumber;
-use crate::tree_actor::{Error, Result, TreeId, referee};
+use crate::tree_actor::{Error, Result, referee};
+use agentfs_contracts::TreeId;
 
 const WRITER: &str = "Agentfs-Writer: ";
 const CAUSE: &str = "Agentfs-Cause: ";

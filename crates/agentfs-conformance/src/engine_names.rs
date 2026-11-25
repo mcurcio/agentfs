@@ -13,7 +13,7 @@
 //! events, and `Invariants` checks after each fork that git lists exactly the
 //! forks the trace made.
 
-use agentfs_engine::tree_actor::TreeId as EngineTree;
+use agentfs_contracts::TreeId as EngineTree;
 use agentfs_model::calls::{CallError, TreeId};
 
 /// The engine's tree for each tree of a trace.

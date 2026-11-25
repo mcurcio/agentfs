@@ -240,8 +240,8 @@ fn read_full(segment: &Segment, buf: &mut [u8], at: u64) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use crate::tree_actor::TreeId;
     use crate::tree_actor::test_support::{ATTRS, compact_now, never_due, new_actor_with, writer};
+    use agentfs_contracts::TreeId;
 
     /// The reader finds an open's calls in record order, with their bytes,
     /// across a segment roll and a compaction that carried them, and none of

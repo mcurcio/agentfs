@@ -15,9 +15,11 @@ use serde::{Deserialize, Serialize};
 
 use super::history::retired::Retired;
 use super::journal::{Change, SaveOutcome, TakeRecord, TreeLocals};
-use super::meta::{Attrs, Kind, Meta, Perm, Times};
+use super::meta::Times;
 use super::recording::FileMap;
 use super::{Error, Result, queue, referee};
+use agentfs_contracts::meta::{Attrs, Kind, Meta, Perm};
+use agentfs_contracts::paths::parent_of;
 use agentfs_lines::{Id, LineMap};
 
 /// A step's journal number. It numbers the step's name versions and line versions, and the object,
@@ -783,11 +785,6 @@ impl std::ops::Index<&u64> for Files {
 /// `S_ISGID`.
 const SET_GROUP_ID: u32 = 0o2000;
 
-/// The directory holding `path`: `""` for a top-level entry.
-pub(super) fn parent_of(path: &str) -> &str {
-    path.rsplit_once('/').map_or("", |(parent, _)| parent)
-}
-
 /// The prefix every path under directory `dir` starts with.
 fn under(dir: &str) -> String {
     if dir.is_empty() {
@@ -1203,6 +1200,18 @@ impl Shape {
     pub(super) fn keys(&self, object: u64) -> BTreeSet<queue::Key> {
         let mut keys = BTreeSet::new();
         self.keys_of(object, &mut keys);
+        keys
+    }
+
+    /// The keys a tree's write-opens hold (R9): each open object's identity and every path naming
+    /// it; an object no name reaches holds none.
+    pub(super) fn held(&self, open_objects: impl IntoIterator<Item = u64>) -> BTreeSet<queue::Key> {
+        let mut keys = BTreeSet::new();
+        for object in open_objects {
+            if self.is_named(object) {
+                self.keys_of(object, &mut keys);
+            }
+        }
         keys
     }
 
@@ -2041,6 +2050,28 @@ impl NameHistory {
 mod tests {
     use super::*;
     use crate::tree_actor::meta::SetTime;
+
+    #[test]
+    fn held_keys_are_an_open_objects_identity_and_names_and_none_unnamed() {
+        let key = |n| queue::Key::File(MergeFileIdentity(n));
+        let mut tree = Shape::default();
+        tree.name("a", 5, MergeFileIdentity(50));
+        tree.name("b", 5, MergeFileIdentity(50));
+        tree.name("c", 6, MergeFileIdentity(60));
+        tree.add_anonymous(7, super::super::meta::TEST_FILE, 0);
+        assert_eq!(
+            tree.held([7, 5]),
+            [
+                key(50),
+                queue::Key::Name("a".into()),
+                queue::Key::Name("b".into())
+            ]
+            .into_iter()
+            .collect()
+        );
+        assert!(tree.held([7]).is_empty());
+        assert!(tree.held([]).is_empty());
+    }
 
     #[test]
     fn identities_map_to_object_states_and_back() {

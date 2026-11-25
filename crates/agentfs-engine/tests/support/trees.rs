@@ -5,12 +5,14 @@
 
 use std::path::Path;
 
+use agentfs_contracts::TreeId;
 use agentfs_contracts::clients::FileOwner;
+use agentfs_contracts::meta::{Attrs, Perm};
 use agentfs_contracts::name::{VolumeName, WriterLabel};
 use agentfs_contracts::pod::{PodContext, WriterAt};
 use agentfs_contracts::volume::{VolumeId, VolumeIdentity};
 use agentfs_engine::tree_actor::{
-    Attrs, ChannelGate, Checkpointed, CompactGate, Gap, Perm, RecordNo, TreeActor, TreeId, Upkeep,
+    ChannelGate, Checkpointed, CompactGate, Gap, RecordNo, TreeActor, Upkeep,
 };
 
 /// What a test's create gives a file: mode 0644, owned by 1000:1000.

@@ -16,7 +16,9 @@
 //! rule that changes nothing for existing files is never silent.
 
 use super::untracked::UntrackedArea;
-use super::{Error, Kind, Result, TreeActor, TreeId};
+use super::{Error, Result, TreeActor};
+use agentfs_contracts::TreeId;
+use agentfs_contracts::meta::Kind;
 use rustix::fs::FileType;
 
 impl TreeActor {

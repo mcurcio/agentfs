@@ -12,7 +12,6 @@ use std::sync::Arc;
 use std::thread::JoinHandle;
 
 use super::built::{BuiltObjects, History};
-use crate::tree_actor::TreeId;
 use crate::tree_actor::journal::compaction::{
     Checkpoint, CompactionError, Gap, JournalCompaction, Sealed,
 };
@@ -21,6 +20,7 @@ use crate::tree_actor::journal::{DropStats, Folded, OpenRecord, Target};
 use crate::tree_actor::pointers::Pointers;
 use crate::tree_actor::stages::{Timer, Which};
 use crate::tree_actor::tree::Tree;
+use agentfs_contracts::TreeId;
 
 /// What the compactor reads of History at its built point B, in one hold of
 /// History's lock ([`History::at_built`]): every field a persistent map or an

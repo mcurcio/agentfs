@@ -59,11 +59,13 @@ use std::sync::Arc;
 use agentfs_contracts::pod::WriterAt;
 use serde::{Deserialize, Serialize};
 
-use super::meta::{Meta, SetTime, Times};
+use super::meta::{SetTime, Times};
 use super::recording::{Call, FileMap};
 use super::stages::{self, Timer, Which};
 use super::tree::{MergeFileIdentity, NameHistory};
 use super::{Error, Result, referee};
+use agentfs_contracts::TreeId;
+use agentfs_contracts::meta::Meta;
 use compaction::{Checkpoint, Live, Published};
 use durable::{Durability, RecordNo};
 #[cfg(test)]
@@ -350,8 +352,8 @@ impl Change {
     ///
     /// # Errors
     ///
-    /// [`Error::Format`] for a tree that is no [`super::TreeId`].
-    pub fn build_cost(&self) -> Result<Option<(super::TreeId, u64)>> {
+    /// [`Error::Format`] for a tree that is no [`TreeId`].
+    pub fn build_cost(&self) -> Result<Option<(TreeId, u64)>> {
         let (tree, bytes) = match self {
             Self::Rows | Self::Drop { .. } | Self::SetTimes { .. } => return Ok(None),
             Self::Create { tree, .. }
@@ -1709,9 +1711,10 @@ mod tests {
     #[cfg(feature = "failpoints")]
     #[test]
     fn a_layout_past_the_file_stops_the_builder() {
+        use crate::tree_actor::Saved;
         use crate::tree_actor::history::built::{BuildError, WaitError};
         use crate::tree_actor::test_support::{ATTRS, new_actor, writer};
-        use crate::tree_actor::{Saved, TreeId};
+        use agentfs_contracts::TreeId;
         let tmp = tempfile::tempdir().unwrap();
         let unbuilt = agentfs_failpoints::configure("tree.build_before_batch=error@*").unwrap();
         let mut v = new_actor(tmp.path());
@@ -1749,8 +1752,9 @@ mod tests {
     #[cfg(feature = "failpoints")]
     #[test]
     fn a_save_whose_pieces_name_no_run_is_flagged_and_keeps_its_bytes() {
+        use crate::tree_actor::UnverifiedCounts;
         use crate::tree_actor::test_support::{ATTRS, new_actor, writer};
-        use crate::tree_actor::{TreeId, UnverifiedCounts};
+        use agentfs_contracts::TreeId;
         let tmp = tempfile::tempdir().unwrap();
         let unbuilt = agentfs_failpoints::configure("tree.build_before_batch=error@*").unwrap();
         let mut v = new_actor(tmp.path());
@@ -1810,8 +1814,9 @@ mod tests {
     /// is no step.
     #[test]
     fn a_close_record_is_appended_without_an_fsync() {
+        use crate::tree_actor::JOURNAL;
         use crate::tree_actor::test_support::{ATTRS, never_due, new_actor_with, writer};
-        use crate::tree_actor::{JOURNAL, TreeId};
+        use agentfs_contracts::TreeId;
 
         let tmp = tempfile::tempdir().unwrap();
         let mut v = new_actor_with(tmp.path(), never_due());

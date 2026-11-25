@@ -12,7 +12,6 @@ use std::time::{Duration, Instant};
 
 use git2::Oid;
 
-use super::super::TreeId;
 use super::super::journal::durable::RecordNo;
 use super::retired::{DeferredDrops, Retired};
 use super::{Objects, refs};
@@ -23,6 +22,7 @@ use crate::tree_actor::recording::FileMap;
 use crate::tree_actor::stages::InnerLock;
 use crate::tree_actor::tree::{EventNumber, Tree};
 use crate::tree_git::TreeGit;
+use agentfs_contracts::TreeId;
 
 /// Each direct save's commit by its event, as built: the snapshot the
 /// builder hands History at each built event. Persistent, so the handover is
@@ -207,6 +207,7 @@ struct State {
     checkpointed_through: RecordNo,
     /// The generation of the last checkpoint whose compaction has ended
     /// ([`History::compaction_ended`]).
+    #[cfg(any(test, feature = "test-util"))]
     compacted: u64,
     /// The built point of the last built event the compactor is done with.
     compactor_through: RecordNo,
@@ -365,6 +366,7 @@ impl History {
                         built: opened.built(),
                     },
                     checkpointed_through: redo_through(opened.built(), opened.oldest_head()),
+                    #[cfg(any(test, feature = "test-util"))]
                     compacted: 0,
                     compactor_through: built,
                     compaction_stopped: false,
@@ -421,6 +423,7 @@ impl History {
     /// [`WaitError::Failed`] at a failed built event after the call, as
     /// [`History::wait_built`]. A compaction that failed and will be retried
     /// does not end the wait.
+    #[cfg(any(test, feature = "test-util"))]
     pub fn wait_checkpointed(&self, after: u64) -> Result<Checkpointed, WaitError> {
         let mut state = self.state();
         let ended = state.ends.ended;
@@ -440,7 +443,7 @@ impl History {
         }
     }
 
-    /// A compaction ended in `Stopped`: every [`History::wait_checkpointed`]
+    /// A compaction ended in `Stopped`: every `History::wait_checkpointed` (a test build's)
     /// ends, and the compactor thread with it.
     pub(in crate::tree_actor) fn compaction_stopped(&self) {
         self.state().compaction_stopped = true;
@@ -454,7 +457,10 @@ impl History {
     /// unlink. The compactor thread's alone.
     pub(in crate::tree_actor) fn compaction_ended(&self, through: RecordNo) {
         let mut state = self.state();
-        state.compacted = state.checkpointed.generation;
+        #[cfg(any(test, feature = "test-util"))]
+        {
+            state.compacted = state.checkpointed.generation;
+        }
         state.compactor_through = state.compactor_through.max(through);
         state.epoch += 1;
         drop(state);
@@ -476,6 +482,7 @@ impl History {
     ///
     /// [`WaitError::Stopped`] at shutdown, or once a compaction stopped the
     /// actor.
+    #[cfg(any(test, feature = "test-util"))]
     pub fn wait_compacted(&self, generation: u64) -> Result<(), WaitError> {
         let mut state = self.state();
         loop {
@@ -498,6 +505,7 @@ impl History {
     ///
     /// [`WaitError::Stopped`] at shutdown, or once a compaction stopped the
     /// actor.
+    #[cfg(any(test, feature = "test-util"))]
     pub fn wait_compactor(&self, through: RecordNo) -> Result<(), WaitError> {
         let mut state = self.state();
         loop {

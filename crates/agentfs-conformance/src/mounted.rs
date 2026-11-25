@@ -12,7 +12,7 @@
 use crate::compact_turns::{Turns, answer_fifos, end_fifos};
 use crate::engine_names::EngineNames;
 use crate::library::{fail, seed};
-use agentfs_engine::tree_actor::TreeId as EngineTree;
+use agentfs_contracts::TreeId as EngineTree;
 use agentfs_model::calls::{CallError, Caller, Kind, Meta, Took, TreeCalls, TreeId};
 use std::collections::{BTreeMap, VecDeque};
 use std::ffi::CString;

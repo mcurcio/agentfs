@@ -15,10 +15,10 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
-use super::meta::Meta;
 use super::queue;
 use super::tree::{EventNumber, LineVersion, Lines, MergeFileIdentity, NameHistory};
 use super::{Error, Result};
+use agentfs_contracts::meta::Meta;
 pub(super) use ancestry::Broken;
 pub(super) use entries::{Cause, Record, with_directories};
 pub(super) use undecided::{Landed, Undecided, ended_files, undecided};

@@ -18,7 +18,8 @@ use std::path::Path;
 use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use agentfs_engine::tree_actor::{AreaWrite, Meta, UntrackedArea};
+use agentfs_contracts::meta::Meta;
+use agentfs_engine::tree_actor::{AreaWrite, UntrackedArea};
 use fuser::{Errno, FileAttr, FileType, INodeNo, TimeOrNow};
 use rustix::fs::{AtFlags, Mode, OFlags, RenameFlags, Stat, Timespec, Timestamps};
 

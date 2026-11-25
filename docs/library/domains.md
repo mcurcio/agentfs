@@ -8,6 +8,12 @@ an adapter implements. None does I/O, and no domain depends on another. A
 consumer reaches them as `agentfs::contracts`, `agentfs::volume`,
 `agentfs::clients` and `agentfs::trees` ([the library](agentfs.md)).
 
+The kernel's values are each named from it alone, never through a crate
+that uses them: a tree's identity (`agentfs_contracts::TreeId`, with
+`NotATree`), and an entry's metadata as history records it
+(`agentfs_contracts::meta`: `Kind`, `Perm` with `NotAPerm`, `Attrs` and
+`Meta`), which the tree engine's calls take and the FUSE layer passes on.
+
 The tree engine implements the ports over a served volume: [the domains'
 store](engine.md#the-domains-store) says how a row is kept, and the
 [architecture](../architecture.md#agentfs-contracts) maps every module. What

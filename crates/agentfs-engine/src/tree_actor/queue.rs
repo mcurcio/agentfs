@@ -3,8 +3,8 @@
 
 use std::collections::BTreeSet;
 
-use super::TreeId;
-use super::tree::{MergeFileIdentity, Shape};
+use super::tree::MergeFileIdentity;
+use agentfs_contracts::TreeId;
 
 /// A file identity or a namespace slot involved in a change. Namespace slots
 /// are included because distinct files may compete for the same name.
@@ -42,25 +42,6 @@ pub(in crate::tree_actor) fn eligible(plans: &[Plan], open: &BTreeSet<Key>) -> O
         waiting_sources.insert(plan.source);
     }
     None
-}
-
-/// The keys a tree's write-opens hold (R9): each open object's identity and every path naming
-/// it; an object no name reaches holds none.
-pub(in crate::tree_actor) fn held(
-    tree: &Shape,
-    open_objects: impl IntoIterator<Item = u64>,
-) -> BTreeSet<Key> {
-    let mut keys = BTreeSet::new();
-    for object in open_objects {
-        if !tree.is_named(object) {
-            continue;
-        }
-        if let Some(id) = tree.identity_of(object) {
-            keys.insert(Key::File(id));
-        }
-        keys.extend(tree.paths_of(object).map(|path| Key::Name(path.to_owned())));
-    }
-    keys
 }
 
 /// The last upstream change a prefix sync takes (R9.3, R9.9, R3d). Its fields are private:
@@ -229,22 +210,5 @@ mod tests {
             }
         });
         assert!(matches!(result, Err(2)));
-    }
-
-    #[test]
-    fn held_keys_are_an_open_objects_identity_and_names_and_none_unnamed() {
-        let mut tree = Shape::default();
-        tree.name("a", 5, MergeFileIdentity(50));
-        tree.name("b", 5, MergeFileIdentity(50));
-        tree.name("c", 6, MergeFileIdentity(60));
-        tree.add_anonymous(7, crate::tree_actor::meta::TEST_FILE, 0);
-        assert_eq!(
-            held(&tree, [5, 7]),
-            [file(50), Key::Name("a".into()), Key::Name("b".into())]
-                .into_iter()
-                .collect()
-        );
-        assert!(held(&tree, [7]).is_empty());
-        assert!(held(&tree, []).is_empty());
     }
 }

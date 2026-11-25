@@ -17,6 +17,7 @@ use std::process::Command;
 use std::sync::Arc;
 
 use agentfs_clients::ClientsService;
+use agentfs_contracts::TreeId;
 use agentfs_contracts::caps::{LaunchCap, LaunchScope, Minter};
 use agentfs_contracts::clients::{
     Access, AttachedLookup, AttachmentEndReason, Binding, ClientError, ClientEvent, ClientId,
@@ -28,7 +29,7 @@ use agentfs_contracts::ports::{Event, EventSink};
 use agentfs_contracts::trees::{ForkSettings, Landing, Trees};
 use agentfs_engine::session::{Sessions, TreeSession};
 use agentfs_engine::store::TreeStore;
-use agentfs_engine::tree_actor::{Error, Recording, RenameMode, Saved, TreeId};
+use agentfs_engine::tree_actor::{Error, Recording, RenameMode, Saved};
 use agentfs_trees::TreesService;
 use trees::{ATTRS, identity};
 

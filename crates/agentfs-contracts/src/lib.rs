@@ -9,6 +9,7 @@ pub mod audit;
 pub mod caps;
 pub mod clients;
 pub mod host;
+pub mod meta;
 pub mod name;
 pub mod paths;
 pub mod pod;

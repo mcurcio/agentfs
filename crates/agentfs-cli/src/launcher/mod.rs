@@ -30,6 +30,7 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
+use agentfs_contracts::TreeId;
 use agentfs_contracts::caps::{LaunchCap, LaunchScope, Minter};
 use agentfs_contracts::clients::FileOwner;
 use agentfs_contracts::clients::{Access, Binding, ClientError, ClientId, ClientSet};
@@ -44,7 +45,7 @@ use agentfs_contracts::volume::{
 use agentfs_engine::operator_settings::OperatorSettings;
 use agentfs_engine::state_area::TreeStateArea;
 use agentfs_engine::telemetry;
-use agentfs_engine::tree_actor::{self, TreeId, Upkeep};
+use agentfs_engine::tree_actor::{self, Upkeep};
 use agentfs_service::{Domains, Launcher, ServiceError};
 use anyhow::{Context, Result, bail};
 use opentelemetry::metrics::Meter;

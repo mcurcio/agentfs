@@ -28,7 +28,8 @@ use super::journal::durable::{Durability, RecordNo};
 use super::recording::{CloseStart, CloseWork};
 use super::stages::{self, Held};
 use super::takes::{self, Lands};
-use super::{Error, Saved, Took, TreeActor, TreeId, Upkeep};
+use super::{Error, Saved, Took, TreeActor, Upkeep};
+use agentfs_contracts::TreeId;
 
 /// The actor, locked through the call path: [`TreeActor`] by `Deref`. Each
 /// hold, from the lock taken to its release, adds one run of
@@ -992,9 +993,10 @@ impl Recording {
 mod tests {
     use std::sync::mpsc::{self, sync_channel};
 
-    use super::super::meta::{Attrs, Perm, SetTime};
+    use super::super::meta::SetTime;
     use super::super::test_support::{ATTRS, new_actor, writer};
     use super::*;
+    use agentfs_contracts::meta::{Attrs, Perm};
 
     #[test]
     fn a_flush_waits_without_the_actor_lock() {
