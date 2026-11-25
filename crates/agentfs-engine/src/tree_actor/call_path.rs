@@ -513,6 +513,7 @@ impl Recording {
     /// # Errors
     ///
     /// As [`TreeActor::open`].
+    #[cfg(any(test, feature = "test-util"))]
     pub fn open(root: &Path, service: &PodContext) -> Result<Arc<Self>, Error> {
         Self::open_with(root, service, Upkeep::default())
     }
@@ -523,7 +524,8 @@ impl Recording {
     /// # Errors
     ///
     /// As [`TreeActor::open`].
-    pub fn open_with(
+    #[cfg_attr(feature = "test-util", visibility::make(pub))]
+    pub(crate) fn open_with(
         root: &Path,
         service: &PodContext,
         upkeep: Upkeep,

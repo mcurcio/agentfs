@@ -39,8 +39,10 @@ and an id). Its Root commit records the root directory with mode 0755 and
 `UID:GID`), or the creating process's effective uid and gid when `None`.
 A launcher passes it as `VolumeSpec.root_owner`; `ensure` uses it only when it
 creates the volume and never compares it, since a found volume's root owner is
-content. `TreeActor::open(root, service)` recovers one and never creates
-(`Error::NotCreated`, `Error::Format` for another format). `service` is the pod
+content. `TreeActor::open(root, service)` (a test build's too; a consumer
+stages through the service, whose state area opens with `Recording::open_with`)
+recovers one and never creates (`Error::NotCreated`, `Error::Format` for
+another format). `service` is the pod
 context of the process that serves it, which its own commits carry. It holds
 an exclusive lease on its state area (`Error::Busy` if another process holds
 it). `state_area::TreeStateArea` offers it to the Volume domain as its
@@ -496,11 +498,13 @@ library crate `agentfs` never turns it on, and `ci/check-deps.sh` fails when
 its build would (`ok   library features`). With it:
 
 - `pub` where the engine also calls them, `pub(crate)` without it:
-  `TreeActor::{create_with, fork_with, drop_fork}`, `Recording::create_with`,
-  `TreeGit::{open_with_lease, init_with_lease}`, and `tree_actor::CompactGate`.
-- Present only with it: `TreeActor::create`, `Recording::create`,
-  `TreeGit::{open, init}`, `Upkeep::gated`, and `tree_actor::COMPACT_GATE_VAR`,
-  `ChannelGate` and `Gap`.
+  `TreeActor::{create_with, open_with, fork_with, drop_fork}`,
+  `Recording::{create_with, open_with}`, `TreeGit::{open_with_lease,
+  init_with_lease}`, and `tree_actor::CompactGate`.
+- Present only with it: `TreeActor::{create, open}`, `Recording::{create,
+  open}`, `tree_actor::wait_for_lease`, `TreeGit::{open, init}`,
+  `Upkeep::gated`, and `tree_actor::COMPACT_GATE_VAR`, `ChannelGate` and
+  `Gap`.
 
 `TreeActor::record_rows` and `close_writer` are crate-private in every build.
 The engine's own tests reach these items through a dev-dependency on itself

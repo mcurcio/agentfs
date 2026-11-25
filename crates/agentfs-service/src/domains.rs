@@ -7,6 +7,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use agentfs_clients::ClientsService;
+use agentfs_contracts::TreeId;
 use agentfs_contracts::caps::{LaunchCap, Minter};
 use agentfs_contracts::clients::{
     Access, AttachedLookup as _, Binding, ClientError, ClientEvent, ClientId, ClientSet, Clients,
@@ -21,7 +22,7 @@ use agentfs_engine::operator_settings::OperatorSettings;
 use agentfs_engine::session::Sessions;
 use agentfs_engine::state_area::TreeStateArea;
 use agentfs_engine::store::TreeStore;
-use agentfs_engine::tree_actor::{Recording, TreeId};
+use agentfs_engine::tree_actor::Recording;
 use agentfs_trees::TreesService;
 use agentfs_volume::VolumeService;
 
@@ -84,7 +85,8 @@ impl Domains {
     ///
     /// [`ServiceError::Volume`]: the stage refused or failed (`Busy` while
     /// another holds the state area, `OtherFormat`, ...);
-    /// [`ServiceError::Settings`]: an overlay limit refused;
+    /// [`ServiceError::Settings`]: an overlay limit refused, before the
+    /// volume is staged;
     /// [`ServiceError::Forks`] or [`ServiceError::Clients`]: rows not read.
     pub fn stage(
         state: &Path,
@@ -99,9 +101,10 @@ impl Domains {
             clients.clone(),
             events.clone(),
         );
+        let overlay_limit = settings.overlay_limit()?;
         volume.stage(&at, &cap)?;
         let recording = served(volume.area());
-        recording.set_overlay_limit(settings.overlay_limit()?);
+        recording.set_overlay_limit(overlay_limit);
         Self::restore(recording, (minter, cap, at), events, clients, Some(volume))
     }
 
@@ -207,8 +210,8 @@ impl Domains {
     /// The Stop drain begins: Volume unstages (`Staged` → `Draining`). If
     /// that begins the drain: `views`, the caller's views' clients, are
     /// detached (their opens saved), this launcher's other clients ended,
-    /// and other launchers' attached clients logged (`tree DrainBlocked`),
-    /// unless the volume released at once; [`Unstaged::Draining`] is
+    /// and other launchers' attached clients logged (`tree DrainBlocked`);
+    /// a volume that released at once has none of these. [`Unstaged::Draining`] is
     /// answered and the caller closes every view it serves. A failure is
     /// logged (`tree UnstageFailed`) and the volume stays staged; the next
     /// stop asks again.
@@ -222,13 +225,11 @@ impl Domains {
         if !std::mem::take(&mut self.draining) {
             return Unstaged::Unchanged;
         }
-        if !self.released {
-            self.detach_all(views);
-            // Every client of this launcher ends, not only the views': the
-            // release is judged from the Clients index alone.
-            self.reconcile(&ClientSet::new());
-            self.log_foreign_clients();
-        }
+        self.detach_all(views);
+        // Every client of this launcher ends, not only the views': the
+        // release is judged from the Clients index alone.
+        self.reconcile(&ClientSet::new());
+        self.log_foreign_clients();
         Unstaged::Draining
     }
 

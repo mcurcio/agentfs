@@ -113,10 +113,14 @@ design was reviewed on 2026-10-12.
   `unstage` drains it until it is released. The binary's `init`, `mount`,
   `host` and `fork end` use the same crate, the only one that composes the
   domains (docs/library/service.md). `agentfs init` now prints a failed
-  recovery as `error: <reason>`.
+  recovery as `error: <reason>`, and a recovery that finds another format
+  with the same message as a create that finds one. `agentfs fork end`
+  prints a state area it cannot open in the Volume domain's words
+  (`opening tree state: no volume here: create it first ...`), exit status
+  unchanged.
 - **`agentfs-engine`'s `test-util` feature.** The engine's items only tests
-  call (creating a volume with a hand-made id, the compaction gate, opening
-  the git store directly) are behind it, off by default, and the library
+  call (creating a volume with a hand-made id, opening one around the
+  service, the compaction gate, opening the git store directly) are behind it, off by default, and the library
   crate `agentfs` never turns it on; the row writes and a client's end are
   crate-private (docs/library/engine.md, "Test builds").
 - **The library crate `agentfs`.** The one crate a consumer depends on: the

@@ -161,6 +161,7 @@ const LOCK: &str = "actor.lock";
 /// # Errors
 ///
 /// A failed open or lock of the lease file.
+#[cfg(any(test, feature = "test-util"))]
 pub fn wait_for_lease(root: &Path) -> io::Result<()> {
     let file = FileLock::open(&root.join(LOCK))?;
     drop(FileLock::wait(file, Mode::Exclusive)?);
@@ -793,6 +794,7 @@ impl TreeActor {
     /// or a pointer's objects are damaged (docs/runbooks/recording-failures.md),
     /// [`Error::History`] when history cannot be built, and any failure of a
     /// recovery close.
+    #[cfg(any(test, feature = "test-util"))]
     pub fn open(root: &Path, service: &PodContext) -> Result<Self> {
         Self::open_with(root, service, Upkeep::default())
     }
@@ -802,7 +804,8 @@ impl TreeActor {
     /// # Errors
     ///
     /// As [`TreeActor::open`].
-    pub fn open_with(root: &Path, service: &PodContext, upkeep: Upkeep) -> Result<Self> {
+    #[cfg_attr(feature = "test-util", visibility::make(pub))]
+    pub(crate) fn open_with(root: &Path, service: &PodContext, upkeep: Upkeep) -> Result<Self> {
         found_volume(root)?;
         agentfs_git::init();
         let root = root.canonicalize()?;

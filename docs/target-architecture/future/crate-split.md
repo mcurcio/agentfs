@@ -1,6 +1,6 @@
 # agentfs-core along domain lines: the crates, and the course to them
 
-**Design; rows A to E of section 3 are built, the rest is not. The owner's answers are in [OWNER-GUIDANCE.md](../../../OWNER-GUIDANCE.md) ("Performance",
+**Design; rows A to F of section 3 are built, the rest is not. The owner's answers are in [OWNER-GUIDANCE.md](../../../OWNER-GUIDANCE.md) ("Performance",
 2026-11-24); no question is open.** Layer: module (crate boundaries). Counts read at main 7efd868. **[read]**: in
 code. **[measured]**: timed in a 4-CPU container, or `docs/development.md` "Build settings". **[est]**: to be measured
 by the step that claims it.
@@ -17,7 +17,8 @@ hands consumers a working volume: "Q1 A"; cargo-nextest locally and in CI: "Q2 A
  LIBRARY      agentfs (front, rank `umbrella`: re-exports only; from M9 a `fuse` feature, the rank then using `filesystem`)
  FILESYSTEM   agentfs-cli (binary `agentfs`: composition root, the OpenTelemetry SDK)
                  └─ agentfs-fuse (tree views, stale mounts)
- LIBRARY      agentfs-service (one volume: the domains wired onto one store, event dispatch, drain)
+ LIBRARY      agentfs-service (one volume: the domains wired onto one store, event dispatch, drain;
+                 uses the domains below and agentfs-engine's adapters: state area, store, sessions)
         ┌────────────┬──────────────┬──────────────┬───────────────────────┐
    agentfs-volume agentfs-clients agentfs-trees agentfs-replication (M4)     pure domains over ports
         └────────────┴──────┬───────┴──────────────┘
@@ -84,8 +85,8 @@ are their own crates. What remains:
 | C (built) | agentfs-engine: `tree_actor/`, `tree_git`, `session`, `store`, `state_area`, `operator_settings`, their tests (`it/tree_*`, `tree_*.rs`, the tree half of `crash_points.rs`); its instruments registered on a `Meter` the binary makes; csi through the `StateArea` port; `docs/library/core.md`'s tree half becomes `engine.md`. The crate boundary replaces agentfs-repo's recording-module check; the engine keeps git2, so the ban on opening a remote stays clippy's (`clippy.toml`, the SSH transport's registration rests on it) | B | ci, image, phase-1 | a recording-engine edit builds and runs only the recording engine's tests (23 s and 20 s), a tree edit only the tree engine's (25 s and 64 s), against the 77 s nextest run of all of core [measured, 2026-11-25, development.md "Build settings"] |
 | D (built) | The CLI package renamed `agentfs-cli` (directory too), its binary still `agentfs` (`[[bin]] name`, which clap reads through `CARGO_BIN_NAME`); every `-p agentfs` rewritten; agentfs-repo refuses, in a file that runs, a package, feature, binary or test program selected through a variable and a `cargo build` of a package with no binary, and, in any tracked file, a path under `crates/` that names nothing | C | ci, image, docker, hermes | none; with no package named `agentfs`, a missed reference fails |
 | E (built) | The front `agentfs`, in a new rank `umbrella` that no rank uses (it uses `shared-kernel`, `domain` and `engine`; listed after `kubernetes`, so M9 only adds `filesystem` to its uses): re-exports of the engine, contracts and the domains; a doctest opens a tree volume through it; AGENTS.md principle 10's mapping updated; the domain invariants and the rows-and-events contract out of `engine.md` to a library page of the shared kernel and the domains, which `engine.md` links | D | ci, docs | the owner's one name |
-| F (built) | agentfs-service, in a rank of its own below `umbrella`, which `umbrella` and `filesystem` use: `launcher/domains.rs`, `shared.rs`, `domain_events.rs` and the drain, used by the binary; the front re-exports it; the launch's reads of core (the telemetry resource built from the binary's pod flags, not core's `identity::Context`, as contracts already holds the pod context; the telemetry scope and the export counter's name to the binary). Acceptance: the front's doctest goes through the one-call service, and docs/library/agentfs.md's consumer API names that route alone | E | ci, image | consumers compose a volume in one call |
-| G | agentfs-referee: its own error enum (`From` into the engine's); the line values (`tree.rs:27-205`) to lines; `MergeFileIdentity`, `NameHistory`, `Meta`, `queue::Key` public; `queue::held` (`queue.rs:50`, takes `&Shape`) up to its caller; ref naming for `Upstreams::merges` (`upstreams.rs:69`) resolved | C | ci, phase-1 | purity checked; rule tests in seconds |
+| F (built) | agentfs-service, in a rank of its own below `umbrella`, which `umbrella` and `filesystem` use: `launcher/domains.rs`, `shared.rs`, `domain_events.rs` and the drain, used by the binary; the front re-exports it; the launch's reads of core (the telemetry resource's identity a binary-local `otel::Identity` built from the pod flags, not core's `identity::Context`, which it replaces at M9: unlike contracts' `PodContext` it holds raw strings and the replica; the telemetry scope and the export counter's name to the binary). Acceptance: the front's doctest goes through the one-call service, and docs/library/agentfs.md's consumer API names that route alone | E | ci, image | consumers compose a volume in one call |
+| G | agentfs-referee: its own error enum (`From` into the engine's); the line values (`tree.rs:27-205`) to lines; `MergeFileIdentity`, `NameHistory`, `Meta`, `queue::Key` public; `queue::held` (`queue.rs:50`, takes `&Shape`) up to its caller; ref naming for `Upstreams::merges` (`upstreams.rs:69`) resolved. Also the engine's open items: whether `Error::Reconcile` keeps exposing `agentfs_lines::Error`; the engine's re-export of `TreeId` and `NotATree`; the compaction labels JC6 and JC8, cited and defined nowhere (`journal/compaction.rs`'s module doc; errata, E fix round); re-recording the trace of `finding-51-sync-fast-forward.patch` (errata, C fix round); and the engine's `pub` items whose only callers are tests, re-read against F2's rule (Traps) | C | ci, phase-1 | purity checked; rule tests in seconds |
 
 The waiting-marks PR lands in the engine after C, beside G (disjoint files); whether its `Waiters` gets a crate is its
 architect's call. **Later:** a journal or history crate only if a measurement shows the boundary pays; M4 adds
@@ -123,6 +124,16 @@ agentfs-repo reads the front's `src/lib.rs` and refuses anything but comments an
 requires one such module, named for its crate without `agentfs_`, for each library of the ranks the front's rank uses
 but agentfs-core (named as the one exception until M9), with its normal dependencies exactly those crates. Not read:
 what each re-exported crate makes `pub`.
+A second composition of a volume beside the service: agentfs-repo's `only_the_service_composes_the_domains` refuses a
+normal or build dependency on a domain the service composes from any crate but the `service`, `umbrella` and `tests`
+ranks. Not read: dev-dependencies and the `tests` rank, so agentfs-conformance composes Trees itself
+(`mounted.rs`), as a test may; and a consumer outside the workspace, which may wire the domains' services itself.
+The library turning on a test build: `ci/check-deps.sh`'s `library features` refuses `test-util` or `failpoints` of
+any agentfs crate in what `cargo tree -p agentfs` builds, and CI's lint job builds the libraries and the front's
+doctest without them. Not read: a consumer that depends on agentfs-engine by name with `test-util`; and which `pub`
+items only tests call. F2 narrowed a list read by hand, and no check finds an item a test-only caller still keeps
+`pub` (G re-reads it, row G). The clippy bans of `TreeGit::open` and `TreeGit::init` carry `allow-invalid = true`, as
+the paths resolve only under `test-util`: a rename or move of either drops its ban without a word. Not checked.
 
 ## 4. What this gives up
 
@@ -135,29 +146,22 @@ what each re-exported crate makes `pub`.
   keeps its own confined access beside `agentfs_os::confined` (B shares the resolution flags and `proc_path`); it is
   the recording engine's FUSE half, so M9's deletion ends the copy.
 - The front re-exports each crate whole (E), so the library's surface is the crates' `pub`, which also serves the
-  sibling crates (fuse, the binary, conformance). Outside the consumer API and unguarded for a consumer, whose build
-  never reads this workspace's `clippy.toml`: minting capabilities (`caps::Minter::new`), the store-only row writes
-  (`TreeActor::fork_with`, `record_rows`, `drop_fork`), `TreeActor::close_writer`, a volume made with a hand-made id
-  (`TreeActor::create`), `tree_git::TreeGit`'s opens, and the compaction gate (`COMPACT_GATE_VAR`, `ChannelGate`,
-  `CompactGate`). docs/library/agentfs.md lists them. Until F a consumer that serves a volume is its own composition
-  root, so `Minter::new` is its to call and is consumer API; the routes around the Volume and Clients domains are not:
-  the `StateArea` port's `create` called directly (around VO5 and VO6) and the actor guard's calls that name a tree and
-  a writer (around C1 and C5). E's doctest takes both, as no one-call route exists yet. F owns the fix: the service's
-  one-call volume is the consumer's route, and F decides what the front re-exports of the engine once it exists.
+  sibling crates (fuse, the binary, conformance), and a consumer's build never reads this workspace's `clippy.toml`.
   **F's decision:** the front keeps the engine whole, and the engine's items `pub` only for the workspace's tests
-  (the store-only row writes, `close_writer`, the hand-made-id `create`s, `TreeGit`'s opens, the compaction gate)
-  become `pub(crate)` or `pub` only under its `test-util` feature, which the library never enables
-  (`ci/check-deps.sh`). The alternative, a front of contracts, the domains and the service with the engine reached by
-  name, narrows nothing (naming the engine reaches all of it), needs a second dependency or re-exports for the engine
-  types the service's API carries, and drops the engine from principle 10's library. `Minter::new` stays consumer API:
-  a consumer's `main` is its composition root and hands the service its capabilities. What stays reachable and
-  outside the route: the `StateArea` port's `create`, the guard's calls that name a writer, and any consumer that
-  turns `test-util` on itself. The tree library (engine and service alike) reports failures it cannot hand back as
-  `tree <Name>` lines on stderr, not through OpenTelemetry; moving them to an alarm port is one change for both. F or
-  G decides whether the engine's `Error::Reconcile` keeps exposing a leaf's type (`agentfs_lines::Error`), which a
-  consumer can name only by depending on agentfs-lines. The engine's re-export of the shared
-  kernel's `TreeId` and `NotATree` (`tree_actor/mod.rs`) gives the library two paths to one value: G removes it, or
-  records why it stays.
+  (the store-only row writes, `close_writer`, the hand-made-id `create`s, the direct `open`s, `TreeGit`'s opens, the
+  compaction gate) are `pub(crate)` or `pub` only under its `test-util` feature, which the library never enables
+  (`ci/check-deps.sh`). The consumer's route is the service (docs/library/agentfs.md, "The consumer API"); a
+  consumer's `main` is its composition root, so `Minter::new` stays consumer API. The alternative, a front of
+  contracts, the domains and the service with the engine reached by name, narrows nothing (naming the engine reaches
+  all of it), needs a second dependency or re-exports for the engine types the service's API carries, and drops the
+  engine from principle 10's library. What stays reachable and outside the route, listed in docs/library/agentfs.md:
+  the domains' services, `TreeStateArea` and `TreeStore` wired by hand, the `StateArea` port's `create`, the guard's
+  calls that name a writer, and any consumer that turns `test-util` on itself. The tree library (engine and service
+  alike) reports failures it cannot hand back as `tree <Name>` lines on stderr, not through OpenTelemetry; moving them
+  to an alarm port is one change for both. G decides whether the engine's `Error::Reconcile` keeps exposing a leaf's
+  type (`agentfs_lines::Error`), which a consumer can name only by depending on agentfs-lines. The engine's re-export
+  of the shared kernel's `TreeId` and `NotATree` (`tree_actor/mod.rs`) gives the library two paths to one value: G
+  removes it, or records why it stays.
 - Without release `lto`, calls across the new boundaries are not inlined unless generic or `#[inline]`; C and G re-run
   the release figures.
 

@@ -5,6 +5,7 @@
 
 use std::path::Path;
 
+use agentfs_contracts::TreeId;
 use agentfs_contracts::caps::{LaunchCap, LaunchScope, Minter};
 use agentfs_contracts::clients::{Access, FileOwner};
 use agentfs_contracts::name::{ClientLabel, ForkKey, LauncherId, VolumeName};
@@ -12,7 +13,7 @@ use agentfs_contracts::pod::PodContext;
 use agentfs_contracts::trees::{ForkPhase, ForkSettings, Landing, TreeError};
 use agentfs_contracts::volume::{EnsureOutcome, StartPoint, VolumeError, VolumeSpec};
 use agentfs_engine::operator_settings::OperatorSettings;
-use agentfs_engine::tree_actor::{Attrs, Perm, TreeId};
+use agentfs_engine::tree_actor::{Attrs, Perm};
 use agentfs_service::{Domains, Launcher, ServiceError, Unstaged, end_fork, init};
 
 #[expect(
@@ -104,9 +105,38 @@ fn unstage_drains_and_releases() {
         )
         .unwrap();
     assert!(!domains.released());
-    assert_eq!(domains.unstage(&[binding.client]), Unstaged::Draining);
+    assert_eq!(
+        domains.unstage(std::slice::from_ref(&binding.client)),
+        Unstaged::Draining
+    );
     assert!(domains.released());
     assert!(!domains.stopped());
+    // The view's client was detached, not left to the reconcile that
+    // follows: its end is recorded as `Detached` on its tree's clients row.
+    domains.sessions().recording().settle().unwrap();
+    let ends = clients_row_subjects(dir.path(), TreeId::Root);
+    let detached = format!("AttachmentEnded {} Detached", binding.client);
+    assert!(ends.contains(&detached), "{ends:?}");
+}
+
+/// The subjects of `tree`'s clients row in the volume's history, newest
+/// first.
+fn clients_row_subjects(state: &Path, tree: TreeId) -> Vec<String> {
+    let output = std::process::Command::new("git")
+        .env("GIT_DIR", state.join("history.git"))
+        .args([
+            "log",
+            "--format=%s",
+            &format!("refs/agentfs/clients/{tree}"),
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .map(str::to_owned)
+        .collect()
 }
 
 #[test]

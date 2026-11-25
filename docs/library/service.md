@@ -12,7 +12,7 @@ checks that only it, the crate `agentfs` and the tests depend on the domains
 it composes (`only_the_service_composes_the_domains`).
 
 It mints nothing. Its caller's composition root mints the capabilities, as
-the binary's `main` does, and hands them in.
+the binary's launcher does, and hands them in.
 
 ## The launcher
 
@@ -42,8 +42,9 @@ LaunchScope::Root)`. Volume refuses a fork launcher (VO6).
   The fork drops now if nothing holds it, else at a later `stage`'s
   settle. It holds the state area's lock while it runs.
 - `Domains::stage(state, launcher, &settings)` stages the volume through
-  Volume. It recovers the volume and never creates one. It sets the
-  overlay limit from `settings` before any view opens, then restores Trees
+  Volume. It refuses a bad overlay limit in `settings` before it stages
+  anything. It recovers the volume and never creates one. It sets the
+  overlay limit before any view opens, then restores Trees
   and Clients on one store. It holds the state area's lock until the
   `Domains` is dropped. `settings` is `OperatorSettings::read(state)`, the
   one value that type has: read it once, check it, and stage with it.
@@ -118,7 +119,7 @@ consumers:
    serves.
 
 When Volume releases the volume at once, nothing was attached, so steps 1
-to 3 are skipped. A second `unstage`, or one that failed, answers
+to 3 find nothing to do. A second `unstage`, or one that failed, answers
 `Unstaged::Unchanged`. The answer is `#[must_use]`.
 
 ## Costs
@@ -126,4 +127,5 @@ to 3 are skipped. A second `unstage`, or one that failed, answers
 - One thread: a `Domains` is not `Send`.
 - `init` and then `stage` recover the volume twice. The second recovery
   replays nothing new.
-- `stage` reads no file: the caller reads the operator settings.
+- `stage` does not read the operator settings: the caller reads them once
+  and passes them in.

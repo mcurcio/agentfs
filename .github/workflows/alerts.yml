@@ -21,6 +21,7 @@ on:
       - crates/agentfs-engine/src/operator_settings.rs
       - crates/agentfs-cli/src/otel.rs
       - crates/agentfs-cli/src/launcher/**
+      - crates/agentfs-service/**
       - Cargo.lock
   pull_request:
     paths: *paths

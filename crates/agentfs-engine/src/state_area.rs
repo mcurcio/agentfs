@@ -86,7 +86,7 @@ impl StateArea for TreeStateArea {
             .map_err(|e| VolumeError::Unreadable(format!("{}: {e}", self.root.display())))
     }
 
-    /// [`Recording::create`] takes the state area's lock and inspects again
+    /// `Recording::create_with` takes the state area's lock and inspects again
     /// under it; a volume there by now (another launcher raced) is answered
     /// `Found`, with nothing written.
     fn create(

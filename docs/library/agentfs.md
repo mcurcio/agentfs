@@ -51,9 +51,10 @@ fails with exit status 4, "no tests to run".
   `agentfs` binary's ([filesystem](filesystem.md)).
 - **The leaves**: `agentfs-os`, `agentfs-git`, `agentfs-lines`,
   `agentfs-failpoints` and `agentfs-align`, mechanisms below the engines.
-  A few of their types reach the engine's API: `agentfs_lines::Image`, the
-  engine's `From<agentfs_lines::Error>`, and `agentfs_os::file_lock::FileLock`.
-  A consumer that names one depends on that leaf by name.
+  A few of their types reach the engine's API: `agentfs_lines::Image` and
+  the engine's `From<agentfs_lines::Error>` (and, in a [test
+  build](engine.md#test-builds), `agentfs_os::file_lock::FileLock`). A
+  consumer that names one depends on that leaf by name.
 
 ## The consumer API
 
@@ -75,17 +76,18 @@ What it is meant to call:
   its tree ([sessions](engine.md#sessions)), reached through
   `Domains::sessions`.
 
-The domains' services (`VolumeService`, `ClientsService`, `TreesService`),
-the engine's `state_area::TreeStateArea` and `store::TreeStore` stay public
-for the service and the tests: a consumer that wires them itself composes a
-volume a second way, outside the consumer API.
-
 ### Outside the consumer API
 
-Two calls are `pub` and reachable through `agentfs` but are not for a
-consumer. Nothing stops one from calling them: a consumer's build does not
-read this workspace's `clippy.toml`.
+These are `pub` and reachable through `agentfs` but are not for a consumer.
+Nothing stops one from calling them: a consumer's build does not read this
+workspace's `clippy.toml`.
 
+- The domains' services (`VolumeService`, `ClientsService`,
+  `TreesService`), and the engine's `state_area::TreeStateArea` (the one
+  default-build opener of a `tree_actor::Recording`) and `store::TreeStore`:
+  public for the service and the tests. A consumer that wires them itself
+  composes a volume a second way, around the service. Use
+  `service::Domains::stage`.
 - The `StateArea` port's `create`, called directly: a trait method the
   Volume domain calls. Use the service's `init`, which makes a volume
   through `VolumeService::ensure` after its launch-scope check (VO6) and its

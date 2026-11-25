@@ -79,15 +79,19 @@ Behaviour changes: the drain runs inside `unstage`, not at the loop's next turn;
 `Domains::stage` (today between stage and restore), so the boot window in which SIGTERM kills the process also spans
 the restore of the rows (csi reads that death as `Exit::Signal(15)`, as for the window today); `init`'s recovery
 failure prints `error: <e>` (not `recovering the volume: <e>`), exit 1 as before; no test reads the old words.
+[Erratum F: also `init`'s recovery that finds another format prints `other_format`'s message, and `fork end`'s open
+failure prints Volume's words (`opening tree state: <VolumeError>`), exit statuses unchanged.]
 **Binary.** main.rs keeps `Minter::new` and mints: `LaunchCap::mint(&minter, LauncherId::parse("cli")?` (or host's
-`--launcher`)`, LaunchScope::Root)`, then `Launcher::new(minter, cap, at).with_upkeep(upkeep())`. It loses `mod
+`--launcher`)`, LaunchScope::Root)`, then `Launcher::new(minter, cap, at).with_upkeep(upkeep())`. [Erratum F: main.rs
+makes only the `Minter`; the launcher's `root_launcher` and `host` mint the `LaunchCap` and build the `Launcher`, as
+host checks its control channel (exit 2) before it parses `--launcher`.] It loses `mod
 shared`, `mod domain_events`. `settings::at_boot` returns the `OperatorSettings` it read (logs, the include check and
 `overlay_limit()`'s early refusal on that one value; `BootSettings.overlay_limit` goes); stage gets that value.
 `Serving::stop` passes its views' clients to `unstage` and closes every view on `Draining` or a stopped actor; every
 `domains.unstage()` call goes through it. Sites: launcher/mod.rs (about 12), serving.rs (8), host.rs (3).
 agentfs-cli drops its normal dependencies on agentfs-{volume,clients,trees} and gains agentfs-service.
 **Check** (agentfs-repo, `crates.rs`): `only_the_service_composes_the_domains`: each `domain`-rank crate the
-`service`-rank crate depends on (derived, so M4's domains join it) is a normal dependency only of `service`,
+`service`-rank crate depends on (derived, so M4's domains join it) is a normal [erratum F: or build] dependency only of `service`,
 `umbrella` and `tests` crates; with a fixture test. agentfs-conformance stays its own root (tests rank): it places a
 keyed fork in a recording it already holds open, which `stage` would refuse as busy.
 **Front.** Doctest: `Minter::new`, `LaunchCap::mint`, `Launcher::new`, `init`, `OperatorSettings::read`,
@@ -132,6 +136,10 @@ caller in the engine, `#[cfg_attr(feature = "test-util", visibility::make(pub))]
 | `COMPACT_GATE_VAR`, `CompactGate`, `Gap` (re-export), `ChannelGate`, `Upkeep::gated` | test-util; `Upkeep.gate` `pub(crate)` |
 | the `StateArea` port's `create`; the guard's named-writer calls (19) | documented outside the route (below) |
 `Minter::new` is not in the list: a consumer's `main` is its composition root and mints (F1). The clippy bans stay.
+[Erratum F: `clippy.toml`'s bans of `TreeGit::{open, init}` gain `allow-invalid = true` (the paths resolve only under
+test-util); `Gap::ALL` is test-util and `Gap::name` test-util or failpoints, as nothing else calls them. The fix round
+added `TreeActor::open_with`, `Recording::open_with` (make-pub) and `TreeActor::open`, `Recording::open`,
+`tree_actor::wait_for_lease` (test-util), by this page's own rule.]
 **Consumers** (sites): engine `tests/` (about 55, self dev-dependency, no edit); agentfs-fuse dev-dep test-util
 (tree_view.rs tests, 1); agentfs-cli dev-dep test-util (cli_verify.rs, reference_tests.rs) and its `failpoints` adds
 `"agentfs-engine/test-util"` (`upkeep()`); agentfs-conformance's engine dependency `features = ["test-util"]` (14).
@@ -226,4 +234,6 @@ before the surface narrows to it. F2 edits launcher/mod.rs and host.rs after F1.
 minted it (minter, capability, pod context, upkeep). `init` (the service's): Volume's `ensure`, then recovery, then
 the includes under its lock; unlike `Volume::ensure` it recovers and writes settings. `end_fork`: `fork end` as one
 call. `Unstaged`: whether an unstage began the drain. `test-util`: the engine feature that makes the test-only
-surface `pub`.
+surface `pub`. `otel::Identity` (erratum F): the binary-local identity the telemetry resource is built from
+(namespace, pod, pod uid, node, replica as raw strings); unlike contracts' `PodContext` it carries the replica and
+is not parsed; it replaces core's `identity::Context` for telemetry until M9 deletes that.
