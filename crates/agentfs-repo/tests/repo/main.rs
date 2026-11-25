@@ -14,9 +14,10 @@
 //!   (pipefail turns its SIGPIPE into a failure); publishing an image
 //!   retries a failed push.
 //! - [`crates`]: every dependency follows the ranks, every `failpoints`
-//!   feature is forwarded, and every cargo command in the workflows,
-//!   scripts and docs names packages, features and binaries the workspace
-//!   has.
+//!   feature is forwarded, every cargo command in the workflows, scripts
+//!   and docs names packages, features and binaries the workspace has,
+//!   every failpoint call is in `agentfs_failpoints::POINTS`, and the tree
+//!   engine starts `git` only through `agentfs_git::git_cli::counted`.
 //!
 //! The configuration keys and operator attributes are checked by
 //! `agentfs-core`'s `tests/config_reference.rs`; the flags and environment

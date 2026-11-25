@@ -48,7 +48,7 @@ mod fold;
 pub(super) mod readback;
 pub(super) mod segment;
 
-use crate::fsutil::sync_dir;
+use agentfs_os::fsutil::sync_dir;
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
@@ -1121,9 +1121,9 @@ impl Journal {
         let segment = Arc::clone(&self.current);
         let at = segment.len();
         let written = (|| -> io::Result<()> {
-            crate::failpoints::hit("tree.wal_before_header")?;
+            agentfs_failpoints::hit("tree.wal_before_header")?;
             segment.file().write_all_at(&bytes, at)?;
-            crate::failpoints::hit("tree.wal_after_payload")
+            agentfs_failpoints::hit("tree.wal_after_payload")
         })();
         if let Err(e) = written {
             if segment.file().set_len(at).is_err() {
@@ -1713,7 +1713,7 @@ mod tests {
         use crate::tree_actor::test_support::{ATTRS, new_actor, writer};
         use crate::tree_actor::{Saved, TreeId};
         let tmp = tempfile::tempdir().unwrap();
-        let unbuilt = crate::failpoints::configure("tree.build_before_batch=error@*").unwrap();
+        let unbuilt = agentfs_failpoints::configure("tree.build_before_batch=error@*").unwrap();
         let mut v = new_actor(tmp.path());
         let h = v
             .write_open(TreeId::Root, "a", &writer("w"), Some(ATTRS))
@@ -1752,7 +1752,7 @@ mod tests {
         use crate::tree_actor::test_support::{ATTRS, new_actor, writer};
         use crate::tree_actor::{TreeId, UnverifiedCounts};
         let tmp = tempfile::tempdir().unwrap();
-        let unbuilt = crate::failpoints::configure("tree.build_before_batch=error@*").unwrap();
+        let unbuilt = agentfs_failpoints::configure("tree.build_before_batch=error@*").unwrap();
         let mut v = new_actor(tmp.path());
         let h = v
             .write_open(TreeId::Root, "a", &writer("w"), Some(ATTRS))

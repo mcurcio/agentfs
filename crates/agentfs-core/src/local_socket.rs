@@ -6,7 +6,7 @@
 //! socket's directory is `0700` and the socket `0600`, and a server accepts
 //! only peers whose `SO_PEERCRED` uid is root or its own effective uid
 //! ([`allowed`]). Each listens through a
-//! [`crate::listening_socket::Listener`].
+//! [`agentfs_os::listening_socket::Listener`].
 
 use std::fs::DirBuilder;
 use std::io;
@@ -17,7 +17,7 @@ use std::path::Path;
 
 use rustix::fs::{AtFlags, Mode, OFlags};
 
-use crate::listening_socket::Listener;
+use agentfs_os::listening_socket::Listener;
 
 /// Who is on the other end of a connection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

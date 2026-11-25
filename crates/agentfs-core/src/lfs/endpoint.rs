@@ -304,7 +304,7 @@ fn local_path(url: &str) -> PathBuf {
 /// The git directory of the repository at `path` (bare: `path` itself;
 /// with a working tree: its `.git`).
 fn git_dir_of(path: &Path) -> Result<PathBuf, git2::Error> {
-    crate::history::init_libgit2();
+    crate::history::init_git();
     let repo = git2::Repository::open_ext(
         path,
         git2::RepositoryOpenFlags::NO_SEARCH,

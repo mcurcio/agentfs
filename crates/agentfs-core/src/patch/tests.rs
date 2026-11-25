@@ -9,6 +9,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use agentfs_git::git_cli;
+use agentfs_os::confined::Dir;
 use git2::{Oid, Repository, Signature, Time};
 
 use super::accept::{AcceptanceRule, CleanMerge};
@@ -16,9 +18,7 @@ use super::integrate::{GitMergeTree, Integrated, Integrator, PatchBranch};
 use super::queue::{Queue, QueueContext, QueueReport};
 use super::status::{PatchState, read_status};
 use super::*;
-use crate::confined::Dir;
 use crate::events::{Event, Events, MemorySink};
-use crate::git_cli;
 use crate::identity::Context;
 use crate::lfs::Pointer;
 use crate::lfs::fetch::LfsObjects;

@@ -12,7 +12,7 @@ use std::io::Write as _;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
-use crate::fsutil::sync_dir;
+use agentfs_os::fsutil::sync_dir;
 
 /// The operator settings file's name in the state area.
 pub const FILE: &str = "config";

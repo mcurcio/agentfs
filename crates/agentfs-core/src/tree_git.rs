@@ -22,8 +22,7 @@ use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use crate::file_lock::FileLock;
-
+use agentfs_os::file_lock::FileLock;
 use git2::{ErrorCode, ObjectType, Oid, Repository};
 use thiserror::Error;
 
@@ -65,7 +64,7 @@ static OBJECT_WRITES: AtomicU64 = AtomicU64::new(0);
 static OBJECT_DIR_SYNCS: AtomicU64 = AtomicU64::new(0);
 
 /// Objects handed to a tree repository's store in this process, new or not.
-/// A measurement, like [`crate::git_cli::children`].
+/// A measurement, like [`agentfs_git::git_cli::children`].
 pub(crate) fn object_writes() -> u64 {
     OBJECT_WRITES.load(Ordering::Relaxed)
 }
@@ -227,7 +226,7 @@ impl TreeGit {
             Err(err) if err.kind() == io::ErrorKind::NotFound => {}
             Err(err) => return Err(err.into()),
         }
-        crate::failpoints::hit("tree.ref_rebuild_after_remove")?;
+        agentfs_failpoints::hit("tree.ref_rebuild_after_remove")?;
         self.ref_transaction(pointers)
     }
 
@@ -361,7 +360,7 @@ impl TreeGit {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        let mut child = crate::git_cli::counted(&mut cmd)?;
+        let mut child = agentfs_git::git_cli::counted(&mut cmd)?;
         let piped = || io::Error::other("git log's pipes were not set up");
         let stdin = child.stdin.take().ok_or_else(piped)?;
         let stdout = child.stdout.take().ok_or_else(piped)?;
@@ -454,7 +453,7 @@ impl TreeGit {
             attach_lease(&mut cmd, lease);
         }
         cmd.env_clear()
-            .env("PATH", crate::git_cli::GIT_PATH)
+            .env("PATH", agentfs_git::git_cli::GIT_PATH)
             .env("LC_ALL", "C")
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
@@ -492,7 +491,7 @@ impl TreeGit {
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
-        Ok(crate::git_cli::counted(&mut cmd)?)
+        Ok(agentfs_git::git_cli::counted(&mut cmd)?)
     }
 
     /// Makes objects stored by another writer since this handle last looked
@@ -572,7 +571,7 @@ impl TreeGit {
         let repo = match &mut *slot {
             Some(repo) => repo,
             empty => {
-                crate::history::init_libgit2();
+                agentfs_git::init();
                 empty.insert(Repository::open_bare(&self.path)?)
             }
         };
@@ -651,7 +650,7 @@ impl TreeGit {
             .stdin(Stdio::null())
             .stdout(Stdio::from(file.try_clone()?))
             .stderr(Stdio::piped());
-        let out = crate::git_cli::counted(&mut cmd)?.wait_with_output()?;
+        let out = agentfs_git::git_cli::counted(&mut cmd)?.wait_with_output()?;
         if !out.status.success() {
             return Err(classify(&out.stderr));
         }
@@ -972,7 +971,7 @@ fn output(mut cmd: Command) -> io::Result<Output> {
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    crate::git_cli::counted(&mut cmd)?.wait_with_output()
+    agentfs_git::git_cli::counted(&mut cmd)?.wait_with_output()
 }
 
 /// Where each record of `git log --format=%x01%H%n%B` starts.
@@ -1030,7 +1029,7 @@ fn run_command(mut cmd: Command, input: Option<&[u8]>) -> Result<Output> {
     } else {
         cmd.stdin(Stdio::null());
     }
-    let mut child = crate::git_cli::counted(&mut cmd)?;
+    let mut child = agentfs_git::git_cli::counted(&mut cmd)?;
     let (output, write_result) = std::thread::scope(|scope| {
         let writer = input.map(|bytes| {
             let mut stdin = child.stdin.take().expect("piped stdin");
@@ -1181,7 +1180,7 @@ mod classify_tests {
 #[allow(clippy::disallowed_methods, reason = "a test makes a store of its own")]
 mod tests {
     use super::*;
-    use crate::file_lock::Mode;
+    use agentfs_os::file_lock::Mode;
     use std::time::{Duration, Instant};
 
     // Invoked as a separate test process by the lifecycle test below.
@@ -1197,7 +1196,7 @@ mod tests {
         let mut command = Command::new("git");
         command
             .env_clear()
-            .env("PATH", crate::git_cli::GIT_PATH)
+            .env("PATH", agentfs_git::git_cli::GIT_PATH)
             .env("LC_ALL", "C")
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .env("GIT_CONFIG_GLOBAL", "/dev/null")

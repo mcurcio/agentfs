@@ -371,7 +371,7 @@ impl PendingFold {
             pages,
             reader,
         } = self;
-        crate::failpoints::hit("tree.pending_fold")?;
+        agentfs_failpoints::hit("tree.pending_fold")?;
         let (writes, mut through) = pages.unwrap_or_default();
         for (handle, call_count) in closes {
             let own = if call_count > 0 {
@@ -1819,7 +1819,7 @@ impl TreeActor {
                 return Ok(Saved::Unchanged);
             }
         }
-        crate::failpoints::hit("tree.replace_before_step")?;
+        agentfs_failpoints::hit("tree.replace_before_step")?;
         let pointers = self.publish(tree, seq);
         let (recorded, _, _) = self.record_with(
             by.clone(),

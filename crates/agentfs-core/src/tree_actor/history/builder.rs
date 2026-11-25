@@ -1491,7 +1491,7 @@ impl Builder {
     /// One batch: every durable record past the built point, built and
     /// installed, or nothing reachable changed.
     fn batch(&mut self) -> std::result::Result<(), BuildError> {
-        crate::failpoints::hit("tree.build_before_batch")?;
+        agentfs_failpoints::hit("tree.build_before_batch")?;
         #[cfg(test)]
         self.history.batch_read(None);
         let started = std::time::Instant::now();
@@ -1629,7 +1629,7 @@ impl Builder {
             write_evidence(&repo, commit, &pending);
             flagged.push((commit, pending));
         }
-        crate::failpoints::hit("tree.build_after_pack")?;
+        agentfs_failpoints::hit("tree.build_after_pack")?;
         let entry = BuiltEntry {
             through,
             values,
@@ -1765,7 +1765,7 @@ impl Builder {
         forked: bool,
     ) -> Result<Vec<TreeId>> {
         // The batch is built: from here a failure leaves only stale copies.
-        crate::failpoints::hit("tree.build_after_built_log")?;
+        agentfs_failpoints::hit("tree.build_after_built_log")?;
         let repo = self.history.repo().clone();
         repo.refresh()?;
         {
@@ -1788,7 +1788,7 @@ impl Builder {
             }
         }
         let old = std::mem::replace(&mut self.copied, built.clone());
-        crate::failpoints::hit("tree.build_after_ref_copy")?;
+        agentfs_failpoints::hit("tree.build_after_ref_copy")?;
         // A dropped fork's checkout goes after its refs.
         let branches = refs::branches(built)?;
         let dropped: Vec<TreeId> = self
@@ -1848,7 +1848,7 @@ pub(in crate::tree_actor) fn copy_all(
 ) -> Result<BTreeMap<TreeId, Oid>> {
     repo.write_config(&refs::head(), &upstreams.merges())?;
     repo.rebuild_refs(&pointers.creates())?;
-    crate::failpoints::hit("tree.after_ref_rebuild")?;
+    agentfs_failpoints::hit("tree.after_ref_rebuild")?;
     let branches = refs::branches(pointers)?;
     remove_stale_checkouts(root, &branches)?;
     let mut checked_out = BTreeMap::new();

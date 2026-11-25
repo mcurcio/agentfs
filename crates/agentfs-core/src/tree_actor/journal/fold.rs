@@ -788,7 +788,7 @@ mod tests {
     #[test]
     fn a_replay_serves_the_recorded_layout_not_the_calls() {
         let tmp = tempfile::tempdir().unwrap();
-        let _unbuilt = crate::failpoints::configure("tree.build_before_batch=error@*").unwrap();
+        let _unbuilt = agentfs_failpoints::configure("tree.build_before_batch=error@*").unwrap();
         let mut v = new_actor(tmp.path());
         let h = v
             .write_open(TreeId::Root, "a", &writer("w"), Some(ATTRS))
@@ -833,7 +833,7 @@ mod tests {
         drop(v.close_begin(h2).unwrap());
         drop(v);
         {
-            let _second_save = crate::failpoints::configure("tree.before_step=error@2").unwrap();
+            let _second_save = agentfs_failpoints::configure("tree.before_step=error@2").unwrap();
             assert!(TreeActor::open(tmp.path(), &PodContext::default()).is_err());
         }
         let frames = Journal::open(&tmp.path().join(JOURNAL), RecordNo::ZERO)
@@ -866,7 +866,7 @@ mod tests {
         let (h1, _) = two_opens(&mut v);
         let w = writer("w");
         {
-            let _append = crate::failpoints::configure("tree.wal_before_header=error").unwrap();
+            let _append = agentfs_failpoints::configure("tree.wal_before_header=error").unwrap();
             assert!(v.close_begin(h1).is_err());
         }
         let metrics = v.metrics();
@@ -874,7 +874,7 @@ mod tests {
         v.mkdir(TreeId::Root, "d", ATTRS, &w).unwrap();
         assert_eq!(v.read(TreeId::Root, "f").unwrap(), b"AAAA");
         {
-            let _append = crate::failpoints::configure("tree.wal_before_header=error").unwrap();
+            let _append = agentfs_failpoints::configure("tree.wal_before_header=error").unwrap();
             assert!(v.close_writer(TreeId::Root, &w.writer).is_err());
         }
         let metrics = v.metrics();
@@ -897,7 +897,7 @@ mod tests {
         let mut v = new_actor(tmp.path());
         let (h1, h2) = two_opens(&mut v);
         {
-            let _append = crate::failpoints::configure("tree.wal_before_header=error").unwrap();
+            let _append = agentfs_failpoints::configure("tree.wal_before_header=error").unwrap();
             assert!(v.close_begin(h1).is_err());
         }
         v.close(h2).unwrap();
@@ -951,7 +951,7 @@ mod tests {
         let mut v = new_actor(tmp.path());
         let (h1, h2) = two_opens(&mut v);
         {
-            let _append = crate::failpoints::configure("tree.wal_before_header=error@*").unwrap();
+            let _append = agentfs_failpoints::configure("tree.wal_before_header=error@*").unwrap();
             assert!(v.close_begin(h2).is_err());
             assert!(v.close_begin(h1).is_err());
         }

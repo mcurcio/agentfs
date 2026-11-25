@@ -19,8 +19,8 @@
 use std::io;
 use std::path::Path;
 
-use agentfs_core::mountinfo::{self, MountEntry};
 use agentfs_core::nested::View;
+use agentfs_os::mountinfo::{self, MountEntry};
 
 use crate::mount::{MountKind, MountSource};
 

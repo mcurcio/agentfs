@@ -10,9 +10,6 @@
 //! relative to an opened parent directory, by a single name. A symlink in
 //! any ancestor fails with `ELOOP`; a symlink as the last component is an
 //! object, never a direction. Needs Linux 5.6 or later.
-//!
-//! This duplicates the small part of `agentfs_fuse::backing` a restore
-//! needs; merging the two is a follow-up.
 
 // `stat` field types differ between architectures, so conversions written
 // to be portable are identities on some targets.
@@ -26,10 +23,9 @@ use std::path::{Path, PathBuf};
 
 use rustix::fs::{AtFlags, Mode, OFlags, ResolveFlags, Stat};
 
-use crate::lfs::{LfsOid, Pointer};
-use crate::paths::RepoPath;
-
-const RESOLVE: ResolveFlags = ResolveFlags::BENEATH
+/// How every path beneath a [`Dir`] is resolved: never out of the tree,
+/// never through a symlink or a magic link.
+pub const RESOLVE: ResolveFlags = ResolveFlags::BENEATH
     .union(ResolveFlags::NO_SYMLINKS)
     .union(ResolveFlags::NO_MAGICLINKS);
 
@@ -37,35 +33,6 @@ const S_IFMT: u32 = 0o170000;
 const S_IFREG: u32 = 0o100000;
 const S_IFDIR: u32 = 0o040000;
 const S_IFLNK: u32 = 0o120000;
-
-/// What is at a path in the tree.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Current {
-    Absent,
-    File(FileState),
-    Symlink {
-        target: Vec<u8>,
-    },
-    Dir,
-    /// A FIFO, socket or device.
-    Other,
-}
-
-/// A regular file as a restore sees it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FileState {
-    /// Its content's git blob id.
-    pub oid: git2::Oid,
-    /// Any execute bit is set (git's executable bit).
-    pub executable: bool,
-    /// Permission bits (`mode & 0o7777`).
-    pub mode: u32,
-    pub nlink: u64,
-    pub uid: u32,
-    pub gid: u32,
-    /// Its length in bytes.
-    pub size: u64,
-}
 
 /// The kind of an inode, without reading it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -152,36 +119,6 @@ impl Dir {
         })
     }
 
-    /// What is at `path`, with a regular file's content hashed as a git
-    /// blob.
-    pub fn current_entry(&self, path: &RepoPath) -> io::Result<Current> {
-        let Some((fd, st)) = self.stat_at(path.as_str())? else {
-            return Ok(Current::Absent);
-        };
-        Ok(match kind_of(&st) {
-            Kind::Absent => Current::Absent,
-            Kind::Dir => Current::Dir,
-            Kind::Other => Current::Other,
-            Kind::Symlink => Current::Symlink {
-                target: read_link_fd(&fd)?,
-            },
-            Kind::File => {
-                let mode = u32::from(st.st_mode);
-                let oid = git2::Oid::hash_file(git2::ObjectType::Blob, proc_path(&fd))
-                    .map_err(io::Error::other)?;
-                Current::File(FileState {
-                    oid,
-                    executable: mode & 0o111 != 0,
-                    mode: mode & 0o7777,
-                    nlink: st.st_nlink as u64,
-                    uid: st.st_uid,
-                    gid: st.st_gid,
-                    size: st.st_size as u64,
-                })
-            }
-        })
-    }
-
     /// Every regular file, symlink and other non-directory under the
     /// directory `rel`, as paths relative to the root.
     pub fn list_tree(&self, rel: &str) -> io::Result<Vec<String>> {
@@ -227,16 +164,6 @@ impl Dir {
         let fd = self.open_at(rel, OFlags::PATH, Mode::empty())?;
         let st = rustix::fs::fstat(&fd)?;
         Ok((st.st_uid, st.st_gid))
-    }
-
-    /// The SHA-256 and length of the regular file `rel` (an LFS object id), read without following a symlink.
-    pub fn sha256_at(&self, rel: &str) -> io::Result<(LfsOid, u64)> {
-        let fd = self.open_at(rel, OFlags::RDONLY, Mode::empty())?;
-        if kind_of(&rustix::fs::fstat(&fd)?) != Kind::File {
-            return Err(io::Error::other(format!("{rel} is not a regular file")));
-        }
-        let pointer = Pointer::of_reader(std::fs::File::from(fd))?;
-        Ok((pointer.oid, pointer.size))
     }
 
     /// Replaces the content of the regular file `rel` in place (keeping its
@@ -493,55 +420,9 @@ pub fn can_chown() -> bool {
 #[cfg(test)]
 mod tests {
     use std::fs;
-    use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
+    use std::os::unix::fs::{MetadataExt, symlink};
 
     use super::*;
-
-    fn p(s: &str) -> RepoPath {
-        RepoPath::new(s).unwrap()
-    }
-
-    #[test]
-    fn current_entries() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        fs::create_dir(root.join("d")).unwrap();
-        fs::write(root.join("d/f"), "hello").unwrap();
-        fs::set_permissions(root.join("d/f"), fs::Permissions::from_mode(0o750)).unwrap();
-        symlink("target", root.join("l")).unwrap();
-        let t = Dir::open(root).unwrap();
-        match t.current_entry(&p("d/f")).unwrap() {
-            Current::File(f) => {
-                assert_eq!(
-                    f.oid,
-                    git2::Oid::hash_object(git2::ObjectType::Blob, b"hello").unwrap()
-                );
-                assert!(f.executable);
-                assert_eq!(f.mode, 0o750);
-                assert_eq!(f.nlink, 1);
-            }
-            other => panic!("{other:?}"),
-        }
-        assert_eq!(
-            t.current_entry(&p("l")).unwrap(),
-            Current::Symlink {
-                target: b"target".to_vec()
-            }
-        );
-        assert_eq!(t.current_entry(&p("d")).unwrap(), Current::Dir);
-        assert_eq!(t.current_entry(&p("missing")).unwrap(), Current::Absent);
-        assert_eq!(t.current_entry(&p("d/missing/x")).unwrap(), Current::Absent);
-        // Through a file: ENOTDIR. Through a symlink: refused (ELOOP).
-        assert!(t.current_entry(&p("d/f/x")).is_err());
-        symlink("d", root.join("ld")).unwrap();
-        let e = t.current_entry(&p("ld/f")).unwrap_err();
-        assert_eq!(
-            e.raw_os_error(),
-            Some(rustix::io::Errno::LOOP.raw_os_error())
-        );
-        assert_eq!(t.list_tree("").unwrap(), ["d/f", "l", "ld"]);
-        assert_eq!(t.list_tree("d").unwrap(), ["d/f"]);
-    }
 
     #[test]
     fn writes_stay_beneath_the_root() {

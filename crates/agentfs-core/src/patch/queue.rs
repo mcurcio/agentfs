@@ -67,6 +67,7 @@
 
 use std::collections::BTreeMap;
 
+use agentfs_os::confined::Dir;
 use git2::{Oid, Repository};
 use opentelemetry::KeyValue;
 
@@ -81,7 +82,6 @@ use super::{
     BlockReason, Blocked, Ignored, PatchError, Verdict, WaitReason, applied_ref, held_prefix,
     held_ref, inbox_from_message, inbox_prefix, inbox_ref, seq_of_ref,
 };
-use crate::confined::Dir;
 use crate::events::{Event, Events};
 use crate::history::{History, InboxCommit};
 use crate::identity::Identity;
@@ -562,7 +562,7 @@ impl<'a> Queue<'a> {
                 match self.judge_and_land(n, patch, &aside) {
                     Judged::Landed(commit) => {
                         first_applied.entry(patch).or_insert(n);
-                        crate::failpoints::hit("patch.after_commit")?;
+                        agentfs_failpoints::hit("patch.after_commit")?;
                         applied.push((n, commit));
                         self.cx.recorder.events().emit(Event::PatchApplied {
                             inbox: n,
@@ -659,7 +659,7 @@ impl<'a> Queue<'a> {
         };
         let signature = committer.committer_signature()?;
         let status = write_status_ref(repo, &volume, &doc, &signature)?;
-        crate::failpoints::hit("queue.after_status")?;
+        agentfs_failpoints::hit("queue.after_status")?;
         state.version = STATUS_VERSION;
         state.last_applied = last_applied;
         state.last_applied_patch = last.map(|c| c.patch.to_string());
@@ -872,11 +872,11 @@ impl<'a> Queue<'a> {
         let result = restore::apply(&plan, repo, *objects, tree, &NotLive, false);
         match result {
             Ok(applied) => {
-                crate::failpoints::hit("patch.after_tree_write")?;
+                agentfs_failpoints::hit("patch.after_tree_write")?;
                 let recorded =
                     restore::record_applied(recorder, tree, &applied, *caller, RecordMode::Atomic);
                 guard.finish();
-                crate::failpoints::hit("patch.after_record")?;
+                agentfs_failpoints::hit("patch.after_record")?;
                 let committed = committer.commit_pending();
                 let head_now = history.head()?;
                 let done = head_now.as_ref().is_some_and(|c| {

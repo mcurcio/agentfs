@@ -40,9 +40,9 @@ use std::path::Path;
 use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
+use agentfs_os::confined;
 use rustix::fs::{Mode, OFlags};
 
-use crate::confined;
 use crate::paths::{RepoPath, is_dotgit};
 use crate::record::{Caller, Origin};
 

@@ -2,7 +2,7 @@
 //!
 //! Fronts freeze into one shared `pending/`, each in a slot of its own
 //! ([`crate::pending::SLOT_SHIFT`]). A front leases its slot with an
-//! exclusive `flock` on `meta/fronts/slot-N.lock` ([`crate::file_lock`])
+//! exclusive `flock` on `meta/fronts/slot-N.lock` ([`agentfs_os::file_lock`])
 //! for as long as it runs; the kernel releases it when the front exits,
 //! even after `kill -9`. The history service treats a leased slot's copies
 //! as the front's own and leaves them alone when it prunes `pending/`; an
@@ -17,7 +17,8 @@ use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::file_lock::{Attempt, FileLock, Mode};
+use agentfs_os::file_lock::{Attempt, FileLock, Mode};
+
 use crate::push::utc_basic;
 use crate::volume::StateDir;
 
@@ -195,7 +196,7 @@ mod tests {
     #[test]
     fn a_slot_let_go_is_free_while_children_spawn() {
         let (_dir, state) = state();
-        let (busy, takes) = crate::file_lock::takes_while_children_spawn(|| {
+        let (busy, takes) = agentfs_os::file_lock::takes_while_children_spawn(|| {
             let lease = FrontLease::acquire(&state, "pod=a").unwrap();
             let first = lease.slot() == 1;
             drop(lease);

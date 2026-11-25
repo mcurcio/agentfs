@@ -252,7 +252,7 @@ impl SaveToDecide {
                 }
             },
         };
-        let decided = crate::failpoints::hit("tree.close_decide")
+        let decided = agentfs_failpoints::hit("tree.close_decide")
             .map_err(Error::from)
             .and_then(|()| {
                 #[cfg(test)]
@@ -447,11 +447,11 @@ impl Recording {
         let history = actor.history().clone();
         let rules = Arc::clone(actor.rules());
         let gate = history.clone();
-        let owner = crate::failpoints::owner();
+        let owner = agentfs_failpoints::owner();
         let gate = std::thread::Builder::new()
             .name("tree-gate".into())
             .spawn(move || {
-                crate::failpoints::adopt(owner);
+                agentfs_failpoints::adopt(owner);
                 gate.serve_gate();
             })?;
         Ok(Arc::new(Self {
@@ -1238,7 +1238,7 @@ mod tests {
         let rec = Recording::serve(new_actor(tmp.path())).unwrap();
         rec.settle().unwrap();
         rec.history.set_lag_limits(Duration::ZERO, Duration::ZERO);
-        let failing = crate::failpoints::configure("tree.build_after_pack=error@*").unwrap();
+        let failing = agentfs_failpoints::configure("tree.build_after_pack=error@*").unwrap();
         // Hold the builder in the fsync it makes before its batch.
         let (entered, inside) = sync_channel::<()>(0);
         let (release, released) = mpsc::channel::<()>();
@@ -1926,7 +1926,7 @@ mod tests {
         let a = client(&rec, "a");
         let (first, second) = two_pending_saves(&a);
         {
-            let _fold = crate::failpoints::configure("tree.pending_fold=error").unwrap();
+            let _fold = agentfs_failpoints::configure("tree.pending_fold=error").unwrap();
             assert!(a.lock().unwrap().write_open("f", None).is_err());
         }
         let metrics = rec.actor().unwrap().metrics();
@@ -1965,8 +1965,9 @@ mod tests {
             let weak = Arc::downgrade(&rec);
             rec.on_unlocked_with(move || {
                 let Some(rec) = weak.upgrade() else { return };
-                let _append = append_fails
-                    .then(|| crate::failpoints::configure("tree.wal_before_header=error").unwrap());
+                let _append = append_fails.then(|| {
+                    agentfs_failpoints::configure("tree.wal_before_header=error").unwrap()
+                });
                 let ended = rec.actor().unwrap().close_writer(TreeId::Root, &by);
                 assert_eq!(ended.is_err(), append_fails, "{ended:?}");
             });
@@ -2012,7 +2013,7 @@ mod tests {
         let a = client(&rec, "a");
         let (first, second) = two_pending_saves(&a);
         {
-            let _decide = crate::failpoints::configure("tree.close_decide=error").unwrap();
+            let _decide = agentfs_failpoints::configure("tree.close_decide=error").unwrap();
             assert!(first.finish().is_err());
         }
         // Dropped unfinished: failed too.
@@ -2020,7 +2021,7 @@ mod tests {
         let metrics = rec.actor().unwrap().metrics();
         assert_eq!((metrics.failed_saves, metrics.pending_saves), (2, 2));
         {
-            let _fold = crate::failpoints::configure("tree.pending_fold=error@*").unwrap();
+            let _fold = agentfs_failpoints::configure("tree.pending_fold=error@*").unwrap();
             let truncated = a.lock().unwrap().truncate_path("f", 6).unwrap();
             assert!(matches!(truncated, PathStep::Done(())));
         }

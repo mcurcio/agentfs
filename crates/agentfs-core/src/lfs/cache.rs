@@ -11,7 +11,7 @@
 //!
 //! **Resumable downloads** ([`Partial`]) write into `incomplete/<oid>`
 //! (mode 0600) under an exclusive `flock` on that file
-//! ([`crate::file_lock`]), so one process and thread at a time downloads
+//! ([`agentfs_os::file_lock`]), so one process and thread at a time downloads
 //! an object; another waits, then finds it cached. A partial survives
 //! failures, commands and restarts: the next download hashes what is
 //! there and asks the server for the rest (HTTP `Range`). On completion
@@ -26,10 +26,11 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use agentfs_os::file_lock::{Attempt, FileLock, Mode};
+
 use super::LfsError;
 use super::pointer::{Hashing, LfsOid, Pointer};
 use crate::events::PushFailureKind;
-use crate::file_lock::{Attempt, FileLock, Mode};
 
 /// The object cache of one state area.
 #[derive(Debug)]
@@ -540,7 +541,7 @@ mod tests {
                 .unwrap(),
             size: 5,
         };
-        let (busy, takes) = crate::file_lock::takes_while_children_spawn(|| {
+        let (busy, takes) = agentfs_os::file_lock::takes_while_children_spawn(|| {
             drop(cache.partial(&pointer).unwrap().unwrap());
             cache.remove_free_partials().unwrap().0 == 1
         });

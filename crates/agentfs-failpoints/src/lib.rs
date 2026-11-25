@@ -1,8 +1,679 @@
 //! Failpoints: named places on the durable path where a test build can
-//! kill the process, fail with an I/O error, panic, stall, or park it until
-//! a test script answers. The one list of every point, so a test's spec that
-//! names no point fails instead of passing by never firing, and the gates a
+//! kill the process, fail with an I/O error, panic or stall, and the gates a
 //! test drives over FIFOs, which know no engine's types (docs/development.md
-//! explains crash injection; docs/configuration.md lists the variables). In
-//! a build without the `failpoints` feature, as in every release and image,
-//! a point is an inlined `Ok(())`.
+//! explains crash injection; docs/configuration.md lists the variables).
+//!
+//! Every step of record → commit → ref update → push that leaves
+//! something on disk calls [`hit`] with its name, listed in [`POINTS`]: the
+//! one list of every point, so a test's spec that names no point fails
+//! instead of passing by never firing.
+//! In a normal build (`failpoints` feature off, as in every release and
+//! image) [`hit`] is an inlined `Ok(())` and nothing else of this crate
+//! exists beyond the names. With the feature on, a point does what the
+//! [`ENV_VAR`] variable (read once, on the first hit) or
+//! `configure` (in-process tests) says:
+//!
+//! ```text
+//! AGENTFS_FAILPOINTS='journal.after_fsync=kill@3;push.after_remote_update=error'
+//! ```
+//!
+//! `name=action[@n]`, joined with `;`. The action is `kill` (SIGKILL to
+//! this process, as a crash or power cut of the daemon looks to the
+//! state area), `error` (the step returns an `io::Error`), `panic`, or
+//! `sleep(<ms>)`; `@n` fires on the `n`th hit of the point only (default
+//! 1). Before it acts, a point writes
+//! `agentfs failpoint <name> triggered (<action>)` to stderr, which the
+//! harnesses look for.
+//!
+//! An unknown name or bad syntax in the variable aborts the process with
+//! a message: a test that misspells a point must not pass by never firing.
+
+#[cfg(not(feature = "failpoints"))]
+use std::io;
+
+/// The environment variable a `failpoints` build reads its spec from.
+/// Release builds have no failpoints and ignore it.
+pub const ENV_VAR: &str = "AGENTFS_FAILPOINTS";
+
+/// Every failpoint, in the order a change passes them, grouped by engine.
+/// A test (`every_hit_is_listed`, in crates/agentfs-repo) keeps this list
+/// equal to the `hit` calls in the workspace's sources.
+pub const POINTS: &[&str] = &[
+    // The tree engine (agentfs_core::tree_actor, tree_git), and the tree
+    // view's FUSE layer.
+    //
+    // Tree actor recording and publication (target git-model §3, §12).
+    "tree.init_before_format",
+    "tree.ref_rebuild_after_remove",
+    "tree.after_ref_rebuild",
+    "tree.wal_before_header",
+    "tree.wal_after_payload",
+    "tree.wal_before_fsync",
+    "tree.segment_after_create",
+    "tree.wal_after_fsync",
+    "tree.before_step",
+    "tree.replace_before_step",
+    "tree.close_decide",
+    "tree.pending_fold",
+    "tree.untrack_after_place",
+    "tree.fork_copy_file",
+    "tree.fork_after_copy",
+    // The tree builder, behind the call path (docs/trees.md).
+    "tree.build_before_batch",
+    "tree.build_replay_skew",
+    "tree.build_after_pack",
+    "tree.build_after_built_log",
+    "tree.build_after_ref_copy",
+    // The recording engine, and its FUSE layer and daemon.
+    //
+    // The synchronous step.
+    "pending.after_freeze",
+    "journal.before_write",
+    "journal.before_fsync",
+    "journal.after_fsync",
+    "record.after_journal",
+    "service.after_record",
+    "front.after_reply",
+    "fuse.after_record",
+    "repairs.before_rename",
+    // Commits.
+    "lfs.after_cache_insert",
+    "commit.after_tree",
+    "commit.sync_objects",
+    "commit.after_object",
+    "commit.after_ref",
+    "commit.after_sync",
+    "journal.truncate.after_tmp",
+    "journal.truncate.after_rename",
+    "commit.before_pending_remove",
+    "pending.remove.between",
+    // Pushes.
+    "push.after_lfs_upload",
+    "push.after_remote_update",
+    "push.diverged.after_pending",
+    "push.diverged.after_ref",
+    "state.json.before_rename",
+    // The patch queue and repack.
+    "patch.after_tree_write",
+    "patch.after_record",
+    "patch.after_commit",
+    "queue.after_status",
+    "repack.running",
+    // Mounting.
+    "mount.before_overlay",
+];
+
+/// Passes failpoint `name`: `Ok(())` unless a test build was told to act
+/// here. A no-op in builds without the `failpoints` feature.
+#[cfg(not(feature = "failpoints"))]
+#[inline(always)]
+pub fn hit(_name: &'static str) -> io::Result<()> {
+    Ok(())
+}
+
+#[cfg(feature = "failpoints")]
+pub use imp::{FailpointError, Guard, adopt, configure, hit, hits, owner, trace};
+
+/// The thread a [`configure`]d spec acts on when hit here: a worker thread
+/// passes this to [`adopt`] so its points act for the thread that started it.
+/// `None` in builds without the `failpoints` feature.
+#[cfg(not(feature = "failpoints"))]
+pub fn owner() -> Option<std::thread::ThreadId> {
+    None
+}
+
+/// Makes this thread's points act as `owner`'s ([`owner`]). A no-op in builds
+/// without the `failpoints` feature.
+#[cfg(not(feature = "failpoints"))]
+pub fn adopt(_owner: Option<std::thread::ThreadId>) {}
+
+#[cfg(feature = "failpoints")]
+pub use take_gate::{TakeGate, take_gate};
+
+#[cfg(feature = "failpoints")]
+pub use fifo_gate::FifoGate;
+
+/// A process parked at named places by a test script.
+#[cfg(feature = "failpoints")]
+mod fifo_gate {
+    use std::fs::{File, OpenOptions};
+    use std::io::{self, BufRead, BufReader, Write};
+    use std::path::Path;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Mutex, PoisonError};
+
+    /// A process parked at named places by a test script: FIFOs `at` and
+    /// `go` in a directory, both opened read and write so neither end blocks
+    /// or sees end of file. At each place it writes the place's name and a
+    /// newline to `at`, then reads one line from `go`: `go` goes on, `fail`
+    /// returns an EIO error (the place's fault), and an empty line or end of
+    /// file ends the gate, after which every place passes without a line.
+    pub struct FifoGate {
+        at: Mutex<File>,
+        go: Mutex<BufReader<File>>,
+        ended: AtomicBool,
+    }
+
+    impl FifoGate {
+        /// The gate on the FIFOs in `dir`.
+        ///
+        /// # Errors
+        ///
+        /// Either FIFO could not be opened.
+        pub fn open(dir: &Path) -> io::Result<Self> {
+            let open = |name: &str| {
+                OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(dir.join(name))
+            };
+            Ok(Self {
+                at: Mutex::new(open("at")?),
+                go: Mutex::new(BufReader::new(open("go")?)),
+                ended: AtomicBool::new(false),
+            })
+        }
+
+        /// Parks at `place`: writes its name to `at` and waits for the
+        /// script's line on `go`.
+        ///
+        /// # Errors
+        ///
+        /// `fail` from the script (EIO), or either FIFO failing.
+        pub fn park(&self, place: &str) -> io::Result<()> {
+            if self.ended.load(Ordering::Acquire) {
+                return Ok(());
+            }
+            writeln!(
+                self.at.lock().unwrap_or_else(PoisonError::into_inner),
+                "{place}"
+            )?;
+            let mut line = String::new();
+            self.go
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .read_line(&mut line)?;
+            match line.trim_end() {
+                "go" => Ok(()),
+                "fail" => Err(io::Error::from_raw_os_error(libc::EIO)),
+                _ => {
+                    self.ended.store(true, Ordering::Release);
+                    Ok(())
+                }
+            }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// Each line a script answers: `go` passes the place, `fail` fails it
+        /// with EIO, and an empty line ends the gate, which then writes and
+        /// reads nothing.
+        #[test]
+        fn a_script_passes_fails_and_ends_the_gate() {
+            let dir = tempfile::tempdir().unwrap();
+            for name in ["at", "go"] {
+                rustix::fs::mknodat(
+                    rustix::fs::CWD,
+                    dir.path().join(name),
+                    rustix::fs::FileType::Fifo,
+                    rustix::fs::Mode::from_raw_mode(0o600),
+                    0,
+                )
+                .unwrap();
+            }
+            let gate = FifoGate::open(dir.path()).unwrap();
+            let both = |name: &str| {
+                let mut options = OpenOptions::new();
+                options.read(true).write(true);
+                options.open(dir.path().join(name)).unwrap()
+            };
+            both("go").write_all(b"go\nfail\n\n").unwrap();
+            gate.park("one").unwrap();
+            let failed = gate.park("two").unwrap_err();
+            assert_eq!(failed.raw_os_error(), Some(libc::EIO));
+            gate.park("three").unwrap();
+            gate.park("four").unwrap();
+            let mut reached = BufReader::new(both("at")).lines();
+            for place in ["one", "two", "three"] {
+                assert_eq!(reached.next().unwrap().unwrap(), place);
+            }
+            // Nothing after the gate ended: a line written now is the next.
+            writeln!(both("at"), "end").unwrap();
+            assert_eq!(reached.next().unwrap().unwrap(), "end");
+        }
+    }
+}
+
+/// Takes at a test's points, not the queue worker's (git-model §18's replay).
+#[cfg(feature = "failpoints")]
+mod take_gate {
+    use std::fs::{File, OpenOptions};
+    use std::io::{self, BufRead, BufReader, Write};
+    use std::path::Path;
+
+    /// The variable naming the gate's directory.
+    const VAR: &str = "AGENTFS_TAKE_GATE";
+
+    /// `AGENTFS_TAKE_GATE=<dir>` with fifos `go` and `took`: the worker takes
+    /// nothing by itself; a line `tree` on `go` runs one `take_next(tree)` and
+    /// answers taken|waiting|empty on `took`, or `error ...`; a line `settle`
+    /// waits until history is built through every record so far and answers
+    /// `settled`. An empty line ends
+    /// the gate: the worker then takes as it does without one, so a stop
+    /// drain can empty the queues and the mount exit. The actor stays unlocked
+    /// while it waits.
+    pub struct TakeGate {
+        go: BufReader<File>,
+        took: File,
+    }
+
+    impl TakeGate {
+        /// The next tree to take in; none when the gate ends.
+        pub fn next_tree(&mut self) -> io::Result<Option<String>> {
+            let mut line = String::new();
+            if self.go.read_line(&mut line)? == 0 {
+                return Ok(None);
+            }
+            let tree = line.trim_end();
+            Ok((!tree.is_empty()).then(|| tree.to_owned()))
+        }
+
+        /// Answers the last tree.
+        pub fn answer(&mut self, answer: &str) -> io::Result<()> {
+            writeln!(self.took, "{answer}")
+        }
+    }
+
+    /// The gate, in a build with failpoints and the variable set. A gate that
+    /// cannot open aborts, as a misspelt failpoint does: a test must not pass
+    /// with the worker taking by itself.
+    pub fn take_gate() -> Option<TakeGate> {
+        let dir = std::env::var_os(VAR)?;
+        // Read and write: neither end ever sees end of file, nor blocks opening.
+        let open = |name: &str| {
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(Path::new(&dir).join(name))
+        };
+        match (open("go"), open("took")) {
+            (Ok(go), Ok(took)) => Some(TakeGate {
+                go: BufReader::new(go),
+                took,
+            }),
+            (Err(e), _) | (_, Err(e)) => {
+                eprintln!("{VAR}: {e}");
+                std::process::abort();
+            }
+        }
+    }
+}
+
+#[cfg(feature = "failpoints")]
+mod imp {
+    use std::collections::HashMap;
+    use std::io::{self, Write as _};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Mutex, MutexGuard, Once, PoisonError};
+    use std::time::Duration;
+
+    use super::{ENV_VAR, POINTS};
+
+    /// A spec that cannot be used.
+    #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+    pub enum FailpointError {
+        #[error("unknown failpoint {0:?} (see agentfs_failpoints::POINTS)")]
+        UnknownPoint(String),
+        #[error("bad failpoint spec {0:?}: expected name=kill|error|panic|sleep(ms)[@n|@*]")]
+        BadSpec(String),
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Action {
+        Kill,
+        Error,
+        Panic,
+        Sleep(u64),
+    }
+
+    impl Action {
+        fn label(self) -> String {
+            match self {
+                Self::Kill => "kill".into(),
+                Self::Error => "error".into(),
+                Self::Panic => "panic".into(),
+                Self::Sleep(ms) => format!("sleep({ms})"),
+            }
+        }
+    }
+
+    #[derive(Default)]
+    struct State {
+        /// Only this thread's hits count and act, for a spec set by
+        /// [`configure`]: in-process tests run in parallel. `None` (the
+        /// environment's spec): every thread.
+        thread: Option<std::thread::ThreadId>,
+        /// Point → (action, the hit it fires on).
+        actions: HashMap<&'static str, (Action, u64)>,
+        hits: HashMap<&'static str, u64>,
+        trace: Vec<&'static str>,
+    }
+
+    /// Whether any spec is in force: the fast path of [`hit`] is this
+    /// one relaxed load.
+    static ACTIVE: AtomicBool = AtomicBool::new(false);
+
+    thread_local! {
+        /// The thread whose configured spec this thread's points act on.
+        static OWNER: std::cell::Cell<Option<std::thread::ThreadId>> =
+            const { std::cell::Cell::new(None) };
+    }
+
+    /// The thread a [`configure`]d spec acts on when hit here: the adopted
+    /// owner, or this thread.
+    pub fn owner() -> Option<std::thread::ThreadId> {
+        Some(OWNER.get().unwrap_or_else(|| std::thread::current().id()))
+    }
+
+    /// Makes this thread's points act as `owner`'s: a worker started for a
+    /// test (the tree builder) fails where that test configured.
+    pub fn adopt(owner: Option<std::thread::ThreadId>) {
+        OWNER.set(owner);
+    }
+    static STATE: Mutex<Option<State>> = Mutex::new(None);
+    static ENV: Once = Once::new();
+    /// Serialises in-process tests that configure failpoints.
+    static TESTS: Mutex<()> = Mutex::new(());
+
+    fn state() -> MutexGuard<'static, Option<State>> {
+        STATE.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn parse(spec: &str) -> Result<HashMap<&'static str, (Action, u64)>, FailpointError> {
+        let mut actions = HashMap::new();
+        for part in spec.split(';').map(str::trim).filter(|p| !p.is_empty()) {
+            let bad = || FailpointError::BadSpec(part.to_owned());
+            let (name, rest) = part.split_once('=').ok_or_else(bad)?;
+            let name = name.trim();
+            let point = POINTS
+                .iter()
+                .copied()
+                .find(|p| *p == name)
+                .ok_or_else(|| FailpointError::UnknownPoint(name.to_owned()))?;
+            // `@*` acts at every hit (stored as 0); `@n` at the nth only.
+            let (action, nth) = match rest.trim().rsplit_once('@') {
+                Some((a, "*")) => (a, 0),
+                Some((a, n)) => (a, n.parse::<u64>().ok().filter(|n| *n > 0).ok_or_else(bad)?),
+                None => (rest.trim(), 1),
+            };
+            let action = match action {
+                "kill" => Action::Kill,
+                "error" => Action::Error,
+                "panic" => Action::Panic,
+                other => {
+                    let ms = other
+                        .strip_prefix("sleep(")
+                        .and_then(|s| s.strip_suffix(')'))
+                        .and_then(|ms| ms.parse().ok())
+                        .ok_or_else(bad)?;
+                    Action::Sleep(ms)
+                }
+            };
+            actions.insert(point, (action, nth));
+        }
+        Ok(actions)
+    }
+
+    fn load_env() {
+        ENV.call_once(|| {
+            let Some(spec) = std::env::var_os(ENV_VAR) else {
+                return;
+            };
+            let spec = spec.to_string_lossy();
+            match parse(&spec) {
+                Ok(actions) => {
+                    *state() = Some(State {
+                        actions,
+                        ..State::default()
+                    });
+                    ACTIVE.store(true, Ordering::Release);
+                }
+                Err(e) => {
+                    eprintln!("agentfs: {ENV_VAR}: {e}");
+                    std::process::abort();
+                }
+            }
+        });
+    }
+
+    /// Passes failpoint `name`, doing what the spec in force says when
+    /// this is the hit it names.
+    pub fn hit(name: &'static str) -> io::Result<()> {
+        load_env();
+        if !ACTIVE.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        let action = {
+            let mut guard = state();
+            let Some(st) = guard.as_mut() else {
+                return Ok(());
+            };
+            if st.thread.is_some_and(|t| Some(t) != owner()) {
+                return Ok(());
+            }
+            let count = st.hits.entry(name).or_default();
+            *count += 1;
+            let count = *count;
+            st.trace.push(name);
+            match st.actions.get(name) {
+                Some((action, nth)) if *nth == count || *nth == 0 => *action,
+                _ => return Ok(()),
+            }
+        };
+        let mut stderr = io::stderr().lock();
+        let _ = writeln!(
+            stderr,
+            "agentfs failpoint {name} triggered ({})",
+            action.label()
+        );
+        let _ = stderr.flush();
+        drop(stderr);
+        match action {
+            Action::Kill => {
+                let me = rustix::process::getpid();
+                let _ = rustix::process::kill_process(me, rustix::process::Signal::KILL);
+                // SIGKILL cannot be caught; in case delivery lags.
+                loop {
+                    std::thread::sleep(Duration::from_secs(1));
+                }
+            }
+            Action::Error => Err(io::Error::other(format!("failpoint {name}"))),
+            Action::Panic => panic!("failpoint {name}"),
+            Action::Sleep(ms) => {
+                std::thread::sleep(Duration::from_millis(ms));
+                Ok(())
+            }
+        }
+    }
+
+    /// How many times `name` was hit since the spec in force was set.
+    /// Hits are counted only while a spec is in force (from [`ENV_VAR`] or
+    /// [`configure`], even an empty one).
+    pub fn hits(name: &str) -> u64 {
+        load_env();
+        state()
+            .as_ref()
+            .and_then(|st| st.hits.iter().find(|(k, _)| **k == name).map(|(_, v)| *v))
+            .unwrap_or(0)
+    }
+
+    /// Every point hit since the spec in force was set, in order.
+    pub fn trace() -> Vec<&'static str> {
+        load_env();
+        state()
+            .as_ref()
+            .map(|st| st.trace.clone())
+            .unwrap_or_default()
+    }
+
+    /// Sets `spec` (the [`ENV_VAR`] syntax; empty counts hits only) for
+    /// the calling thread until the guard drops: hits on other threads
+    /// neither count nor act, so in-process tests can run in parallel.
+    /// Guards serialise: a second `configure` waits for the first guard
+    /// to drop. A spec from [`ENV_VAR`] applies to every thread.
+    pub fn configure(spec: &str) -> Result<Guard, FailpointError> {
+        let actions = parse(spec)?;
+        let lock = TESTS.lock().unwrap_or_else(PoisonError::into_inner);
+        load_env();
+        *state() = Some(State {
+            actions,
+            thread: Some(std::thread::current().id()),
+            ..State::default()
+        });
+        ACTIVE.store(true, Ordering::Release);
+        Ok(Guard { _lock: lock })
+    }
+
+    /// Keeps a [`configure`]d spec in force; dropping it turns every
+    /// failpoint off.
+    pub struct Guard {
+        _lock: MutexGuard<'static, ()>,
+    }
+
+    impl Guard {
+        /// Puts `spec` in force in place of the guard's own, for the same
+        /// thread, with the hits counted from here. One step: no hit falls
+        /// between the two specs with none in force, as one would between
+        /// a dropped guard and the next [`configure`].
+        ///
+        /// # Errors
+        ///
+        /// [`FailpointError`] for a spec that cannot be used; the guard's
+        /// own stays in force.
+        pub fn set(&self, spec: &str) -> Result<(), FailpointError> {
+            let actions = parse(spec)?;
+            let mut state = state();
+            let thread = state.as_ref().and_then(|st| st.thread);
+            *state = Some(State {
+                actions,
+                thread,
+                ..State::default()
+            });
+            Ok(())
+        }
+    }
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            ACTIVE.store(false, Ordering::Release);
+            *state() = None;
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn specs_parse() {
+            let a = parse("journal.after_fsync=kill@3; push.after_remote_update=error").unwrap();
+            assert_eq!(a["journal.after_fsync"], (Action::Kill, 3));
+            assert_eq!(a["push.after_remote_update"], (Action::Error, 1));
+            let a = parse("commit.after_ref=sleep(25)@2;").unwrap();
+            assert_eq!(a["commit.after_ref"], (Action::Sleep(25), 2));
+            assert!(parse("").unwrap().is_empty());
+        }
+
+        #[test]
+        fn bad_specs_are_refused() {
+            assert_eq!(
+                parse("no.such.point=kill"),
+                Err(FailpointError::UnknownPoint("no.such.point".into()))
+            );
+            for bad in [
+                "journal.after_fsync",
+                "journal.after_fsync=explode",
+                "journal.after_fsync=kill@0",
+                "journal.after_fsync=kill@x",
+                "journal.after_fsync=sleep(x)",
+            ] {
+                assert!(
+                    matches!(parse(bad), Err(FailpointError::BadSpec(_))),
+                    "{bad}"
+                );
+            }
+        }
+
+        #[test]
+        fn the_nth_hit_fires_once_and_errors() {
+            let _guard = configure("journal.before_write=error@2").unwrap();
+            assert!(hit("journal.before_write").is_ok());
+            let e = hit("journal.before_write").unwrap_err();
+            assert_eq!(e.to_string(), "failpoint journal.before_write");
+            assert!(hit("journal.before_write").is_ok());
+            assert_eq!(hits("journal.before_write"), 3);
+            assert!(hit("commit.after_ref").is_ok());
+            assert_eq!(
+                trace(),
+                [
+                    "journal.before_write",
+                    "journal.before_write",
+                    "journal.before_write",
+                    "commit.after_ref"
+                ]
+            );
+        }
+
+        #[test]
+        fn a_guard_changes_its_spec_in_one_step() {
+            let guard = configure("commit.after_ref=error@*").unwrap();
+            assert!(hit("commit.after_ref").is_err());
+            assert!(guard.set("nope=error").is_err());
+            assert!(hit("commit.after_ref").is_err(), "the old spec stands");
+            guard.set("journal.after_fsync=error@2").unwrap();
+            assert!(hit("commit.after_ref").is_ok());
+            assert_eq!(hits("commit.after_ref"), 1, "counted from the change");
+            assert!(hit("journal.after_fsync").is_ok());
+            assert!(hit("journal.after_fsync").is_err());
+            // Still this thread's alone.
+            std::thread::spawn(|| assert!(hit("journal.after_fsync").is_ok()))
+                .join()
+                .unwrap();
+            assert_eq!(hits("journal.after_fsync"), 2);
+        }
+
+        #[test]
+        fn a_dropped_guard_turns_everything_off() {
+            {
+                let _guard = configure("commit.after_tree=error").unwrap();
+                assert!(hit("commit.after_tree").is_err());
+            }
+            // Hold the test lock so no parallel test configures a spec
+            // between the drop and these checks.
+            let _lock = TESTS.lock().unwrap_or_else(PoisonError::into_inner);
+            assert!(hit("commit.after_tree").is_ok());
+            assert_eq!(hits("commit.after_tree"), 0);
+        }
+
+        #[test]
+        fn sleep_and_panic() {
+            let _guard = configure("commit.after_tree=sleep(1);commit.after_ref=panic").unwrap();
+            assert!(hit("commit.after_tree").is_ok());
+            let panicked = std::panic::catch_unwind(|| hit("commit.after_ref"));
+            assert!(panicked.is_err());
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hit_is_a_no_op_without_a_spec() {
+        assert!(hit("commit.after_ref").is_ok());
+    }
+}

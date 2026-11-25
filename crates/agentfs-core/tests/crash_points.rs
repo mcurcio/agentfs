@@ -49,13 +49,13 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use agentfs_core::events::NullSink;
-use agentfs_core::failpoints::POINTS;
 use agentfs_core::identity::Context;
 use agentfs_core::paths::RepoPath;
 use agentfs_core::push::{PushOutcome, RemotePusher};
 use agentfs_core::record::{Caller, Trigger};
 use agentfs_core::telemetry::Telemetry;
 use agentfs_core::volume::{self, Committer, Input, MoveOutcome, Recorder, StateDir};
+use agentfs_failpoints::POINTS;
 use git2::{Oid, Repository, Signature};
 
 use crash_oracle::{Mode, Model, PromiseLog};
@@ -400,9 +400,9 @@ fn run_workload(env: &Env) {
         }
     }
     for point in POINTS {
-        eprintln!("HITS {point} {}", agentfs_core::failpoints::hits(point));
+        eprintln!("HITS {point} {}", agentfs_failpoints::hits(point));
     }
-    eprintln!("TRACE {}", agentfs_core::failpoints::trace().join(","));
+    eprintln!("TRACE {}", agentfs_failpoints::trace().join(","));
 }
 
 /// The child: runs the workload in `CRASH_CHILD` when set; a no-op in a
@@ -426,7 +426,7 @@ fn run_child(dir: &Path, spec: &str) -> Result<ChildRun, String> {
     let mut child = Command::new(std::env::current_exe().unwrap())
         .args(["--exact", "crash_child", "--nocapture", "--test-threads=1"])
         .env("CRASH_CHILD", dir)
-        .env(agentfs_core::failpoints::ENV_VAR, spec)
+        .env(agentfs_failpoints::ENV_VAR, spec)
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .stdout(Stdio::null())
@@ -775,10 +775,7 @@ fn a_kill_after_a_write_returned_keeps_it() {
             "--test-threads=1",
         ])
         .env("TREE_CRASH_CHILD", &dir)
-        .env(
-            agentfs_core::failpoints::ENV_VAR,
-            "tree.wal_after_payload=kill@2",
-        )
+        .env(agentfs_failpoints::ENV_VAR, "tree.wal_after_payload=kill@2")
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .stdout(Stdio::null())

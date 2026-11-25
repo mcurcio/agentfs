@@ -423,7 +423,7 @@ impl Untracked {
         let writing = self.area.writing();
         let (parent, name) = match writing.parent(path) {
             Ok(found) => found,
-            Err(e) if if_any && agentfs_core::confined::is_gone(&e) => return Ok(()),
+            Err(e) if if_any && agentfs_os::confined::is_gone(&e) => return Ok(()),
             Err(e) => return Err(io(e)),
         };
         match rustix::fs::unlinkat(&parent, name.as_str(), AtFlags::REMOVEDIR) {

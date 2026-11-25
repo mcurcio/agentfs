@@ -24,12 +24,12 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use agentfs_os::confined;
 use opentelemetry::KeyValue;
 
 use crate::checks::{Checks, Limits, Refusal};
 use crate::claims::PathClaims;
 use crate::config::{ConfigError, validate_name};
-use crate::confined;
 use crate::events::{CheckStage, Event, Events};
 use crate::fork::identity::{
     self as fork_identity, ForkIdentity, ForkLink, PushTarget, StartPoint,
@@ -614,7 +614,7 @@ fn existing_identity(git: &Path) -> Result<Option<(String, String)>, VolumeError
     if !path.exists() {
         return Ok(None);
     }
-    crate::history::init_libgit2();
+    crate::history::init_git();
     let config = git2::Config::open(&path).map_err(HistoryError::from)?;
     let get =
         |key: &str| crate::config::string(&config, key).map_err(|e| VolumeError::History(e.into()));
@@ -1321,7 +1321,7 @@ impl Recorder {
             match &self.backend {
                 Backend::Local { journal, .. } => {
                     let seq = journal.record(draft)?;
-                    crate::failpoints::hit("record.after_journal")?;
+                    agentfs_failpoints::hit("record.after_journal")?;
                     Ok(Recorded {
                         seq: Some(seq),
                         ..Recorded::default()
@@ -2713,7 +2713,7 @@ impl Committer {
         if let Some(seq) = report.last_seq {
             self.journal.truncate_through(seq)?;
             self.duties.committed_through(seq);
-            crate::failpoints::hit("commit.before_pending_remove")?;
+            agentfs_failpoints::hit("commit.before_pending_remove")?;
             let done = records
                 .iter()
                 .take_while(|r| r.seq <= seq)

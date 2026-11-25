@@ -147,7 +147,7 @@ impl PendingStore {
             }
         };
         fs::rename(&tmp, self.path(id))?;
-        crate::failpoints::hit("pending.after_freeze")?;
+        agentfs_failpoints::hit("pending.after_freeze")?;
         Ok((id, method))
     }
 
@@ -162,7 +162,7 @@ impl PendingStore {
                 Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
                 _ => {}
             }
-            crate::failpoints::hit("pending.remove.between")?;
+            agentfs_failpoints::hit("pending.remove.between")?;
         }
         Ok(())
     }
@@ -238,7 +238,7 @@ pub(crate) fn copy_into(src: &Path, dst: &Path) -> io::Result<FreezeMethod> {
         .create_new(true)
         .mode(0o600)
         .open(dst)?;
-    let method = if crate::fsutil::clone_or_copy(&from, &to)? {
+    let method = if agentfs_os::fsutil::clone_or_copy(&from, &to)? {
         FreezeMethod::Reflink
     } else {
         FreezeMethod::Copy

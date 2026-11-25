@@ -331,7 +331,7 @@ impl Durability {
     /// segment is new, then each segment in order; `fdatasync` covers the
     /// length a read needs.
     fn fsync(&self, dir: Option<&File>, files: &[Arc<Segment>]) -> io::Result<()> {
-        crate::failpoints::hit("tree.wal_before_fsync")?;
+        agentfs_failpoints::hit("tree.wal_before_fsync")?;
         #[cfg(test)]
         if let Some(hook) = &*self.in_fsync.lock().unwrap_or_else(PoisonError::into_inner) {
             hook();
@@ -339,14 +339,14 @@ impl Durability {
         {
             let _timer = Timer::start(Which::JournalFsync);
             if let Some(dir) = dir {
-                crate::failpoints::hit("tree.segment_after_create")?;
+                agentfs_failpoints::hit("tree.segment_after_create")?;
                 dir.sync_all()?;
             }
             for segment in files {
                 segment.sync()?;
             }
         }
-        crate::failpoints::hit("tree.wal_after_fsync")
+        agentfs_failpoints::hit("tree.wal_after_fsync")
     }
 
     /// [`Durability::make_durable`] through [`Durability::appended`]: FSYNCDIR,

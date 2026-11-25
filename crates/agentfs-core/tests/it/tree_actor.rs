@@ -1494,7 +1494,7 @@ fn a_record_in_a_segment_whose_entry_is_not_fsynced_is_never_marked_durable() {
         .unwrap()
         .parse()
         .unwrap();
-    let guard = agentfs_core::failpoints::configure("tree.segment_after_create=error").unwrap();
+    let guard = agentfs_failpoints::configure("tree.segment_after_create=error").unwrap();
     assert!(v.durability().make_all_durable().is_err());
     drop(guard);
     assert!(v.durability().mark().get() < first);
@@ -1502,9 +1502,9 @@ fn a_record_in_a_segment_whose_entry_is_not_fsynced_is_never_marked_durable() {
     drop(v);
     // The reopen finds the segment whose entry no fsync covered: its first
     // fsync syncs the directory before the mark covers any record.
-    let counted = agentfs_core::failpoints::configure("").unwrap();
+    let counted = agentfs_failpoints::configure("").unwrap();
     let v = reopen(tmp.path());
-    assert!(agentfs_core::failpoints::hits("tree.segment_after_create") >= 1);
+    assert!(agentfs_failpoints::hits("tree.segment_after_create") >= 1);
     drop(counted);
     assert_eq!(v.read(ROOT, "big").unwrap().len(), 66 << 20);
 }
@@ -1517,7 +1517,7 @@ fn run_killed_worker(worker: &str, root: &std::path::Path, spec: &str) -> u64 {
     let output = Command::new(std::env::current_exe().unwrap())
         .args(["--exact", test_name!(worker).as_str(), "--nocapture"])
         .env("AGENTFS_TREE_STEP_WORKER", root)
-        .env(agentfs_core::failpoints::ENV_VAR, spec)
+        .env(agentfs_failpoints::ENV_VAR, spec)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output()
@@ -1839,7 +1839,7 @@ fn open_serves_from_the_journal_while_every_build_fails() {
     let mut v = new_actor(tmp.path());
     put(&mut v, ROOT, "a", b"built");
     v.settle().unwrap();
-    let held = agentfs_core::failpoints::configure("tree.build_before_batch=error@*").unwrap();
+    let held = agentfs_failpoints::configure("tree.build_before_batch=error@*").unwrap();
     put(&mut v, ROOT, "a", b"unbuilt");
     drop(v);
     let mut v = reopen(tmp.path());
@@ -1868,7 +1868,7 @@ fn open_serves_from_the_journal_while_every_build_fails() {
 fn a_file_linked_while_held_open_reopens_before_its_link_is_built() {
     let tmp = tempfile::tempdir().unwrap();
     let mut v = new_actor(tmp.path());
-    let held = agentfs_core::failpoints::configure("tree.build_before_batch=error@*").unwrap();
+    let held = agentfs_failpoints::configure("tree.build_before_batch=error@*").unwrap();
     let h = v.anonymous_open(ROOT, &writer("w"), ATTRS).unwrap();
     v.write(h, 0, b"linked", false).unwrap();
     let object = v.open_object(h).unwrap();
@@ -1984,7 +1984,7 @@ fn a_failed_compaction_fsync_stops_the_actor() {
 #[test]
 fn a_cut_first_init_starts_over() {
     let tmp = tempfile::tempdir().unwrap();
-    let guard = agentfs_core::failpoints::configure("tree.init_before_format=error").unwrap();
+    let guard = agentfs_failpoints::configure("tree.init_before_format=error").unwrap();
     assert!(
         TreeActor::create(tmp.path(), &trees::identity(), None, &PodContext::default()).is_err()
     );
@@ -2008,7 +2008,7 @@ fn a_failed_save_keeps_serving_and_saves_at_the_next_step() {
     v.write(h, 0, b"+returned", true).unwrap();
     let head = v.head(ROOT).unwrap();
     let point = "tree.before_step";
-    let guard = agentfs_core::failpoints::configure(&format!("{point}=error")).unwrap();
+    let guard = agentfs_failpoints::configure(&format!("{point}=error")).unwrap();
     assert!(v.close(h).is_err(), "{point}");
     drop(guard);
     assert!(!v.is_stopped(), "{point}");
@@ -2025,7 +2025,7 @@ fn a_failed_save_keeps_serving_and_saves_at_the_next_step() {
     // A failed save a restart finds saves there, once.
     let h = v.write_open(ROOT, "a", &writer("writer"), None).unwrap();
     v.write(h, 0, b"+again", true).unwrap();
-    let guard = agentfs_core::failpoints::configure("tree.before_step=error").unwrap();
+    let guard = agentfs_failpoints::configure("tree.before_step=error").unwrap();
     assert!(v.close(h).is_err());
     drop(guard);
     drop(v);
@@ -2124,7 +2124,7 @@ fn a_failed_truncate_at_open_leaves_no_open_behind() {
     let fork = rowless_fork(&mut v);
     put(&mut v, fork, "a", b"sandbox");
     // The open's record is the first append, the truncate's the second.
-    let guard = agentfs_core::failpoints::configure("tree.wal_before_header=error@2").unwrap();
+    let guard = agentfs_failpoints::configure("tree.wal_before_header=error@2").unwrap();
     assert!(
         v.write_open_truncating(ROOT, "a", &writer("w"), None)
             .is_err()
@@ -2140,7 +2140,7 @@ fn a_failed_take_stays_queued_for_the_next_event() {
     let mut v = new_actor(tmp.path());
     let fork = rowless_fork(&mut v);
     put(&mut v, fork, "a", b"sandbox");
-    let guard = agentfs_core::failpoints::configure("tree.before_step=error").unwrap();
+    let guard = agentfs_failpoints::configure("tree.before_step=error").unwrap();
     assert!(!v.progress().unwrap());
     drop(guard);
     assert!(!v.is_stopped());
@@ -2162,7 +2162,7 @@ fn a_failed_write_changes_nothing_and_keeps_serving() {
     let path = trees::current_segment(tmp.path());
     let journal = fs::read(&path).unwrap();
     for point in ["tree.wal_before_header", "tree.wal_after_payload"] {
-        let guard = agentfs_core::failpoints::configure(&format!("{point}=error")).unwrap();
+        let guard = agentfs_failpoints::configure(&format!("{point}=error")).unwrap();
         assert!(v.write(h, 3, b"lost", false).is_err(), "{point}");
         drop(guard);
         assert!(!v.is_stopped(), "{point}");
@@ -2181,7 +2181,7 @@ fn a_failed_fsync_stops_the_actor() {
     let mut v = new_actor(tmp.path());
     // The builder makes its batch durable first; held (its batches fail
     // before that), it leaves the records for this fsync.
-    let guard = agentfs_core::failpoints::configure(
+    let guard = agentfs_failpoints::configure(
         "tree.build_before_batch=error@*;tree.wal_before_fsync=error",
     )
     .unwrap();
@@ -2216,7 +2216,7 @@ fn branch_and_queue_recover_together_after_the_commit_point() {
     volume.settle().unwrap();
     let repo = repo(tmp.path());
     let before = repo.list_refs("refs/queue/root/").unwrap().len();
-    let guard = agentfs_core::failpoints::configure("tree.build_after_built_log=error").unwrap();
+    let guard = agentfs_failpoints::configure("tree.build_after_built_log=error").unwrap();
     assert!(matches!(volume.close(h).unwrap(), Saved::Commit(_)));
     volume.settle().unwrap();
     drop(guard);
@@ -2252,7 +2252,7 @@ fn recovery_enqueues_once_after_failure_before_the_commit_point() {
     let before_head = volume.head(fork).unwrap();
     let repo = repo(tmp.path());
     let before = repo.list_refs("refs/queue/root/").unwrap();
-    let guard = agentfs_core::failpoints::configure("tree.before_step=error").unwrap();
+    let guard = agentfs_failpoints::configure("tree.before_step=error").unwrap();
     assert!(volume.close(h).is_err());
     volume.settle().unwrap();
     drop(guard);

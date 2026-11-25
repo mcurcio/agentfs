@@ -18,7 +18,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use super::*;
 use crate::config::RemoteSettings;
 use crate::events::PushFailureKind;
-use crate::history::init_libgit2;
+use crate::history::init_git;
 use crate::push::classify;
 use crate::remote_auth::RemoteAuth;
 
@@ -324,7 +324,7 @@ struct Fixture {
 
 impl Fixture {
     fn new() -> Self {
-        init_libgit2();
+        init_git();
         let dir = tempfile::tempdir().unwrap();
         let repo = Repository::init_bare(dir.path().join("local.git")).unwrap();
         let blob = repo.blob(b"hello\n").unwrap();
@@ -880,7 +880,7 @@ impl TestAgent {
         let _ = fs::remove_file(&socket);
         let connections = {
             let _guard = runtime.enter();
-            crate::listening_socket::Listener::bind(&socket)
+            agentfs_os::listening_socket::Listener::bind(&socket)
                 .unwrap()
                 .into_async()
                 .unwrap()

@@ -127,11 +127,11 @@ impl Compactor {
         journal: JournalCompaction,
         compact_from: u64,
     ) -> std::io::Result<Self> {
-        let owner = crate::failpoints::owner();
+        let owner = agentfs_failpoints::owner();
         let thread = std::thread::Builder::new()
             .name("tree-compactor".into())
             .spawn(move || {
-                crate::failpoints::adopt(owner);
+                agentfs_failpoints::adopt(owner);
                 run(&history, &journal, compact_from);
             })?;
         Ok(Self {

@@ -32,7 +32,6 @@ use std::time::Duration;
 use anyhow::{Context as _, Result};
 
 use agentfs_core::config::Settings;
-use agentfs_core::confined::Dir;
 use agentfs_core::history::{History, seq_from_message};
 use agentfs_core::history_service::{Fronts, FrontsError};
 use agentfs_core::lfs::ObjectCache;
@@ -44,6 +43,7 @@ use agentfs_core::restore::{
     self, Liveness, NotLive, Pathspec, Plan, RecordMode, Request, RestoreError,
 };
 use agentfs_core::volume::{Recorder, StateDir};
+use agentfs_os::confined::Dir;
 
 use crate::control::{self, ClientError, Op, Outcome, Reply};
 use crate::{EXIT_LOCKED, Pod, Session, current_gid, current_uid};

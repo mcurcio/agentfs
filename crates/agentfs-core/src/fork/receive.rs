@@ -188,7 +188,7 @@ pub fn receive_fork_change(
     fork: &ForkIdentity,
     from: &StateDir,
 ) -> Result<Oid, ReceiveError> {
-    crate::history::init_libgit2();
+    crate::history::init_git();
     let source_git = source.git();
     if !source_git.join("config").is_file() {
         return Err(ReceiveError::SourceRemoved);

@@ -2,7 +2,7 @@
 //!
 //! Every command that opens a volume for writing (`mount`, `run`, `record`,
 //! `flush`, `push`) takes [`StateLock`] first: an exclusive `flock` on
-//! `<state>/meta/lock` taken through [`crate::file_lock`], which unlocks it
+//! `<state>/meta/lock` taken through [`agentfs_os::file_lock`], which unlocks it
 //! when it is dropped. The kernel releases it when the holder exits, even
 //! after `kill -9`, so a crash never leaves a stale lock. The file holds a
 //! one-line description of the holder (`pid=… command=… since=…`) for
@@ -11,7 +11,7 @@
 //! lock.
 //!
 //! The state area must be on a filesystem whose locks exclude other nodes
-//! too ([`crate::shared_fs`]): [`StateLock::acquire`] refuses NFS below
+//! too ([`agentfs_os::shared_fs`]): [`StateLock::acquire`] refuses NFS below
 //! 4.1 and NFS with local locks.
 //!
 //! [`StateLock::holder`] probes with a shared lock that it drops at once,
@@ -24,7 +24,8 @@ use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use crate::file_lock::{Attempt, FileLock, Mode};
+use agentfs_os::file_lock::{Attempt, FileLock, Mode};
+
 use crate::push::utc_basic;
 use crate::volume::StateDir;
 
@@ -47,7 +48,7 @@ pub enum LockError {
     UnsafeFilesystem {
         state: PathBuf,
         #[source]
-        source: crate::shared_fs::CheckError,
+        source: agentfs_os::shared_fs::CheckError,
     },
 }
 
@@ -72,7 +73,7 @@ impl StateLock {
         };
         fs::create_dir_all(state.meta()).map_err(io_err)?;
         // Only a lock the server enforces keeps another node out.
-        crate::shared_fs::require_safe_locks(&state.meta()).map_err(|source| {
+        agentfs_os::shared_fs::require_safe_locks(&state.meta()).map_err(|source| {
             LockError::UnsafeFilesystem {
                 state: state.root().to_path_buf(),
                 source,
@@ -184,7 +185,7 @@ mod tests {
     #[test]
     fn a_lock_let_go_is_free_while_children_spawn() {
         let (_dir, state) = state();
-        let (busy, takes) = crate::file_lock::takes_while_children_spawn(|| {
+        let (busy, takes) = agentfs_os::file_lock::takes_while_children_spawn(|| {
             drop(StateLock::acquire(&state, "run", Duration::ZERO).unwrap());
             StateLock::holder(&state).unwrap().is_none()
         });

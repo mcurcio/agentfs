@@ -15,6 +15,10 @@ agentfs-align = { version = "0.1.0", path = "../agentfs-align" }
 # The shared kernel: values (the tree identity among them), capabilities and the
 # ports agentfs-core's adapters implement.
 agentfs-contracts = { version = "0.1.0", path = "../agentfs-contracts" }
+# The leaves both engines share: failpoints, the operating system, git.
+agentfs-failpoints = { version = "0.1.0", path = "../agentfs-failpoints" }
+agentfs-git = { version = "0.1.0", path = "../agentfs-git" }
+agentfs-os = { version = "0.1.0", path = "../agentfs-os" }
 # The Rules domain: where each new name of a tree lives (tree_actor's untracked areas).
 agentfs-rules = { version = "0.1.0", path = "../agentfs-rules" }
 # known_hosts key blobs and hashed host names, and OpenSSH private key
@@ -28,7 +32,6 @@ gix-ignore = "0.24.0"
 # Only for its `parallel` feature, which backs gix-attributes' names with
 # `Arc` instead of `Rc`, so the rules engine is `Send + Sync`.
 gix-parallel = { version = "0.50.0", features = ["parallel"] }
-libgit2-sys = { version = "0.18.8", default-features = false }
 # Persistent (structurally shared) ordered maps: a tree view's state crosses
 # from the builder to History and the actor as a snapshot whose clone is
 # O(1), and a large file map's pieces (docs/trees.md, "File maps").
@@ -74,6 +77,8 @@ protox = "0.10.0"
 tonic-prost-build = { version = "0.14.6", default-features = false }
 
 [dev-dependencies]
+# The lock tests' shared helper (file_lock::takes_while_children_spawn).
+agentfs-os = { version = "0.1.0", path = "../agentfs-os", features = ["test-util"] }
 # The markdown reader of the documentation tests (tests/config_reference.rs).
 agentfs-repo = { version = "0.0.0", path = "../agentfs-repo" }
 # The Volume domain over the real state area (tests/it/state_area.rs).
@@ -108,7 +113,7 @@ https = ["git2/https", "ureq/native-tls"]
 # it an ssh remote is reported as misconfigured.
 ssh = ["dep:russh"]
 # Test builds only: failpoints on the durable path (`failpoints`). Never in a release or image.
-failpoints = []
+failpoints = ["agentfs-failpoints/failpoints"]
 
 # The synchronous step's cost: a plain binary,
 # no harness or new dependencies; docs/performance.md describes it.

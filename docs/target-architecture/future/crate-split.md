@@ -48,8 +48,8 @@ agentfs-conformance on the engine only. The front re-exports neither agentfs-cor
 
 ## 2. What today's code does that the end state does not [read]
 
-- The tree engine reaches into the recording engine four times: `history::init_libgit2` (`tree_actor/mod.rs:688`,
-  `:803`, `tree_git.rs:575`, `history/verify.rs:686`), `repack::PACK_CONFIG` (`tree_actor/history/repack.rs:98`),
+- The tree engine reaches into the recording engine four times: the libgit2 setup in `history` (`tree_actor/mod.rs:688`,
+  `:803`, `tree_git.rs:575`, `history/verify.rs:686`), the pack settings in `repack` (`tree_actor/history/repack.rs:98`),
   `config::parse_size` (`operator_settings.rs:184`), `paths::RepoPath` (`tree_actor/recording/mod.rs:39`).
 - Shared modules reach into the tree engine: `telemetry.rs` (`:48`, `:684`, `:801`; tests `:1886`, `:1947`),
   `failpoints.rs:141` (`impl CompactGate for FifoGate`); `confined.rs:29` mixes LFS into confinement.

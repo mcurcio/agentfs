@@ -17,7 +17,7 @@ use std::process::{Child, Command, Output, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use agentfs_core::listening_socket::Listener;
+use agentfs_os::listening_socket::Listener;
 use git2::{Oid, Repository};
 
 const BRANCH: &str = "refs/heads/agentfs/demo";

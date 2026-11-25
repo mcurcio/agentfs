@@ -50,6 +50,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
+use agentfs_git::{SERVER_CONNECT_TIMEOUT_MS, SERVER_IO_TIMEOUT_MS};
 use git2::transport::{Service, SmartSubtransport, SmartSubtransportStream, Transport};
 use git2::{Error as GitError, ErrorClass, ErrorCode};
 use russh::client::{self, Handle};
@@ -63,7 +64,6 @@ use russh::{Channel, ChannelMsg, Disconnect, Preferred};
 use tokio::runtime::Runtime;
 
 use crate::credentials::DEFAULT_SSH_USERNAME;
-use crate::history::{SERVER_CONNECT_TIMEOUT_MS, SERVER_IO_TIMEOUT_MS};
 use crate::known_hosts::{HostCertificate, fingerprint, lookup_name};
 use crate::remote_auth::{AuthState, SshRemote};
 use crate::remote_url::{self, Endpoint};
@@ -120,11 +120,21 @@ impl Drop for Scope {
 }
 
 /// Registers the transport with libgit2. Called once, from
-/// [`crate::history::init_libgit2`], before any remote is used.
+/// [`crate::history::init_git`], before any remote is used.
 pub(crate) fn register() {
     for scheme in SCHEMES {
-        // SAFETY: called once, inside init_libgit2's `Once`, before this
-        // process creates any transport.
+        // SAFETY: git2 requires that `transport::register` not run while
+        // this process creates a transport. It runs once, inside
+        // `init_git`'s `Once`, which every recording-engine path that opens
+        // a remote calls first, so no call returns before the registration
+        // has finished. Nothing else opens a remote: the tree engine is
+        // refused one (agentfs-repo's
+        // `the_tree_engine_names_no_recording_engine_module`), and
+        // agentfs-fuse, agentfs and agentfs-csi name no git2 remote API.
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "the one registration of a transport"
+        )]
         let result = unsafe { git2::transport::register(scheme, factory) };
         assert!(
             result.is_ok(),

@@ -11,7 +11,7 @@
 //! on an anonymous remote, never forced. Remote configuration such as
 //! `remote.<name>.push` is therefore never consulted, and the system,
 //! global and XDG git config are not read at all
-//! (see `history::init_libgit2`).
+//! (see `history::init_git`).
 //!
 //! Outcomes:
 //!
@@ -69,6 +69,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use agentfs_os::file_lock::{FileLock, Mode};
 #[cfg(test)]
 use git2::CredentialType;
 use git2::{Error as GitError, Repository};
@@ -78,8 +79,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::{RemoteSettings, Settings};
 use crate::events::{Event, Events, PushFailureKind, PushStage};
-use crate::file_lock::{FileLock, Mode};
-use crate::history::init_libgit2;
+use crate::history::init_git;
 use crate::lfs::upload::objects_to_upload;
 use crate::lfs::{Direction, LfsError, ObjectCache, Transfer, UploadReport, transfer_for};
 use crate::push_size::Step;
@@ -233,7 +233,7 @@ impl PushState {
 
     /// Writes atomically: temporary file, fsync, rename, fsync directory.
     pub fn save(&self, path: &Path) -> io::Result<()> {
-        crate::fsutil::write_json_atomic(path, self)
+        agentfs_os::fsutil::write_json_atomic(path, self)
     }
 }
 
@@ -496,7 +496,7 @@ impl RemotePusher {
         events: Events,
         telemetry: &Telemetry,
     ) -> Result<Self, PushError> {
-        init_libgit2();
+        init_git();
         let repo = Repository::open_bare(state.git())?;
         fs::create_dir_all(state.push_dir())?;
         let state_path = state.push_state(&remote.name);
@@ -862,7 +862,7 @@ impl RemotePusher {
             Ok(report) => *lfs_out = report,
             Err(e) => return self.failed_at(e.kind, e.message, Some(head), PushStage::Lfs),
         }
-        if let Err(e) = crate::failpoints::hit("push.after_lfs_upload") {
+        if let Err(e) = agentfs_failpoints::hit("push.after_lfs_upload") {
             return self.failed_at(
                 PushFailureKind::Local,
                 e.to_string(),
@@ -1868,7 +1868,7 @@ impl RemotePusher {
         self.state.consecutive_failures = 0;
         self.state.last_error = None;
         self.state.diverged = None;
-        if let Err(e) = crate::failpoints::hit("push.after_remote_update")
+        if let Err(e) = agentfs_failpoints::hit("push.after_remote_update")
             .and_then(|()| self.state.save(&self.state_path))
         {
             let message = format!(
@@ -1949,7 +1949,7 @@ impl RemotePusher {
             match self
                 .state
                 .save(&self.state_path)
-                .and_then(|()| crate::failpoints::hit("push.diverged.after_pending"))
+                .and_then(|()| agentfs_failpoints::hit("push.diverged.after_pending"))
             {
                 Err(e) => {
                     // Without a durable name, pushing could save the head
@@ -1961,7 +1961,7 @@ impl RemotePusher {
                 }
                 Ok(()) => match self.save_head(&name, head) {
                     Saved::Held => {
-                        if let Err(e) = crate::failpoints::hit("push.diverged.after_ref") {
+                        if let Err(e) = agentfs_failpoints::hit("push.diverged.after_ref") {
                             message = format!("{message}; {e}");
                         }
                         self.events.emit(Event::Diverged {
@@ -2229,7 +2229,7 @@ pub struct RemoteStatus {
 
 /// Every remote's state, read without taking the push locks.
 pub fn status(state: &StateDir, settings: &Settings) -> Result<Vec<RemoteStatus>, PushError> {
-    init_libgit2();
+    init_git();
     let repo = Repository::open_bare(state.git())?;
     settings
         .remotes
@@ -2266,7 +2266,7 @@ pub struct RemoteBacklog {
 /// taking the push locks. Opens its own repository handle, so it can run on
 /// any thread.
 pub fn backlog(state: &StateDir, settings: &Settings) -> Result<Vec<RemoteBacklog>, PushError> {
-    init_libgit2();
+    init_git();
     let repo = Repository::open_bare(state.git())?;
     settings
         .remotes

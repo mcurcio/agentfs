@@ -980,7 +980,7 @@ fn restoring_a_path_never_prunes_its_parent() {
 
 #[test]
 fn new_files_and_directories_take_the_parents_owner() {
-    if !crate::confined::can_chown() {
+    if !agentfs_os::confined::can_chown() {
         eprintln!("skipped: needs CAP_CHOWN");
         return;
     }
@@ -1452,4 +1452,50 @@ fn reverting_one_member_reverts_its_whole_group() {
         fx.read_tree(),
         tree_of(&[("d/s.db", File("v1")), ("d/s.db-wal", File("w1"))])
     );
+}
+
+#[test]
+fn current_entries() {
+    let p = |s: &str| RepoPath::new(s).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    fs::create_dir(root.join("d")).unwrap();
+    fs::write(root.join("d/f"), "hello").unwrap();
+    fs::set_permissions(root.join("d/f"), fs::Permissions::from_mode(0o750)).unwrap();
+    symlink("target", root.join("l")).unwrap();
+    let t = Dir::open(root).unwrap();
+    match current_entry(&t, &p("d/f")).unwrap() {
+        Current::File(f) => {
+            assert_eq!(
+                f.oid,
+                git2::Oid::hash_object(git2::ObjectType::Blob, b"hello").unwrap()
+            );
+            assert!(f.executable);
+            assert_eq!(f.mode, 0o750);
+            assert_eq!(f.nlink, 1);
+        }
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(
+        current_entry(&t, &p("l")).unwrap(),
+        Current::Symlink {
+            target: b"target".to_vec()
+        }
+    );
+    assert_eq!(current_entry(&t, &p("d")).unwrap(), Current::Dir);
+    assert_eq!(current_entry(&t, &p("missing")).unwrap(), Current::Absent);
+    assert_eq!(
+        current_entry(&t, &p("d/missing/x")).unwrap(),
+        Current::Absent
+    );
+    // Through a file: ENOTDIR. Through a symlink: refused (ELOOP).
+    assert!(current_entry(&t, &p("d/f/x")).is_err());
+    symlink("d", root.join("ld")).unwrap();
+    let e = current_entry(&t, &p("ld/f")).unwrap_err();
+    assert_eq!(
+        e.raw_os_error(),
+        Some(rustix::io::Errno::LOOP.raw_os_error())
+    );
+    assert_eq!(t.list_tree("").unwrap(), ["d/f", "l", "ld"]);
+    assert_eq!(t.list_tree("d").unwrap(), ["d/f"]);
 }

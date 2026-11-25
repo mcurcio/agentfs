@@ -1234,7 +1234,7 @@ fn update_mark(state: &StateDir, change: impl FnOnce(&mut ForkMark)) -> Result<(
     let mut mark = read_mark(state)?.unwrap_or_else(ForkMark::empty);
     change(&mut mark);
     mark.version = MARK_VERSION;
-    crate::fsutil::write_json_atomic(&state.fork_mark(), &mark).map_err(StatusError::Mark)
+    agentfs_os::fsutil::write_json_atomic(&state.fork_mark(), &mark).map_err(StatusError::Mark)
 }
 
 /// [`FinishError::Abandoned`] once the operator has abandoned `fork`.
@@ -1310,7 +1310,7 @@ fn now_ms() -> u64 {
 /// ([`crate::config::declares_fork`]), so a volume that is not one is
 /// `Ok(None)` even when its settings cannot be loaded.
 pub fn status(state: &StateDir) -> Result<Option<ForkStatus>, StatusError> {
-    crate::history::init_libgit2();
+    crate::history::init_git();
     if !crate::config::declares_fork(&state.git()).map_err(HistoryError::from)? {
         return Ok(None);
     }

@@ -342,7 +342,7 @@ impl HistoryClient {
             |mut grpc, request| async move { grpc.record(request).await },
             request,
         )?;
-        if let Err(e) = crate::failpoints::hit("front.after_reply") {
+        if let Err(e) = agentfs_failpoints::hit("front.after_reply") {
             return Err(ClientError::Lost {
                 address: self.address.clone(),
                 sent: true,

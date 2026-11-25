@@ -104,7 +104,7 @@ fn save_twice(v: &mut TreeActor, name: &str) {
 /// commit.
 #[cfg(feature = "failpoints")]
 fn flagged_volume(root: &Path) -> Oid {
-    let skew = agentfs_core::failpoints::configure("tree.build_replay_skew=error@*").unwrap();
+    let skew = agentfs_failpoints::configure("tree.build_replay_skew=error@*").unwrap();
     let mut v = new_actor(root);
     save_twice(&mut v, "a");
     v.settle().unwrap();
@@ -123,7 +123,7 @@ fn flagged_volume(root: &Path) -> Oid {
 #[test]
 fn a_save_the_builder_cannot_reproduce_keeps_the_saved_bytes() {
     let tmp = tempfile::tempdir().unwrap();
-    let skew = agentfs_core::failpoints::configure("tree.build_replay_skew=error@*").unwrap();
+    let skew = agentfs_failpoints::configure("tree.build_replay_skew=error@*").unwrap();
     let mut v = new_actor(tmp.path());
     save_twice(&mut v, "a");
     v.settle().unwrap();
@@ -170,7 +170,7 @@ fn a_save_the_builder_cannot_reproduce_keeps_the_saved_bytes() {
 fn a_batch_built_again_writes_evidence_once() {
     let tmp = tempfile::tempdir().unwrap();
     // Nothing built until the save is recorded: one batch holds it.
-    let points = agentfs_core::failpoints::configure("tree.build_before_batch=error@*").unwrap();
+    let points = agentfs_failpoints::configure("tree.build_before_batch=error@*").unwrap();
     let mut v = new_actor(tmp.path());
     save_twice(&mut v, "a");
     // In one step: the close asked for a build, and an attempt that started
@@ -183,7 +183,7 @@ fn a_batch_built_again_writes_evidence_once() {
         v.settle().unwrap();
     }
     assert!(
-        agentfs_core::failpoints::hits("tree.build_after_pack") >= 2,
+        agentfs_failpoints::hits("tree.build_after_pack") >= 2,
         "the batch was built twice"
     );
     let dir = tmp.path().join("history.git");
@@ -214,7 +214,7 @@ fn a_later_release_checks_a_flag_again() {
     let store = repo(tmp.path());
     assert_eq!(store.note_tip(VERIFY_REF).unwrap(), None, "nothing written");
     {
-        let _skew = agentfs_core::failpoints::configure("tree.build_replay_skew=error@*").unwrap();
+        let _skew = agentfs_failpoints::configure("tree.build_replay_skew=error@*").unwrap();
         let report = verify_flagged(tmp.path(), &pod, Some("agentfs 0.0.0 build later-1")).unwrap();
         assert_eq!(
             report.checked[0].outcome,
@@ -314,7 +314,7 @@ fn a_start_under_another_release_checks_a_flag() {
             "1",
         ])
         .env("TREE_VERIFY_CHILD", &root)
-        .env_remove(agentfs_core::failpoints::ENV_VAR)
+        .env_remove(agentfs_failpoints::ENV_VAR)
         .output()
         .unwrap();
     assert!(out.status.success(), "{out:?}");
@@ -452,8 +452,7 @@ fn a_ref_rebuild_cut_short_keeps_the_notes_refs() {
     let (repo, tip, note) = noted_store(&path);
     git(&path, &["pack-refs", "--all"]);
     {
-        let _cut =
-            agentfs_core::failpoints::configure("tree.ref_rebuild_after_remove=error").unwrap();
+        let _cut = agentfs_failpoints::configure("tree.ref_rebuild_after_remove=error").unwrap();
         assert!(repo.rebuild_refs(&pointers(tip)).is_err());
     }
     assert_eq!(repo.note_tip(VERIFY_REF).unwrap(), Some(note));

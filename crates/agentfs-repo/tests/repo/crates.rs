@@ -1,8 +1,10 @@
 //! The workspace's crates: their dependencies against the ranks
 //! (docs/architecture.md, "Ranks"), the `failpoints` feature forwarded to
-//! every dependency that has it, and every cargo command the repository
-//! writes down naming what the workspace has. Each check is a pure function
-//! over a [`Workspace`] or a line, with a fixture test beside it.
+//! every dependency that has it, every cargo command the repository
+//! writes down naming what the workspace has, every failpoint call listed,
+//! and the tree engine's `git` children all counted. Each check is a pure
+//! function over a [`Workspace`], a line or a source, with a fixture test
+//! beside it.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -756,4 +758,205 @@ fn cargo_commands_are_refused_where_the_workspace_lacks_their_names() {
         &renamed,
         "cargo nextest run -p $pkg --features failpoints"
     ));
+}
+
+/// Every `.rs` file under the `src` of each member, but `except`'s, with its
+/// path from the root and its text.
+fn member_sources(workspace: &Workspace, except: &str) -> Vec<(String, String)> {
+    let root = root();
+    let mut sources = Vec::new();
+    for member in workspace.members.iter().filter(|m| m.name != except) {
+        let src = root.join(&member.dir).join("src");
+        if !src.is_dir() {
+            continue;
+        }
+        let mut files = Vec::new();
+        files_under(&src, &mut files);
+        files.sort();
+        for path in files
+            .into_iter()
+            .filter(|p| p.extension().is_some_and(|e| e == "rs"))
+        {
+            let text = std::fs::read_to_string(&path).unwrap();
+            let shown = path
+                .strip_prefix(&root)
+                .unwrap_or(&path)
+                .display()
+                .to_string();
+            sources.push((shown, text));
+        }
+    }
+    sources
+}
+
+/// Where the failpoint calls in `sources` break the registry's rules: a
+/// call to `hit` with a literal name not written `agentfs_failpoints::hit(`
+/// (so the scan cannot miss one imported or renamed), a name `points` does
+/// not list, a listed point no source hits, and a point listed twice.
+fn hit_problems(sources: &[(String, String)], points: &[&str]) -> Vec<String> {
+    const CALL: &str = "hit(\"";
+    const PATH: &str = "agentfs_failpoints::";
+    let mut problems = Vec::new();
+    let mut found = BTreeSet::new();
+    for (shown, text) in sources {
+        for (at, _) in text.match_indices(CALL) {
+            let before = &text[..at];
+            // Another function or a method ending in `hit`.
+            if before
+                .chars()
+                .next_back()
+                .is_some_and(|c| c.is_alphanumeric() || c == '_' || c == '.')
+            {
+                continue;
+            }
+            let line = before.matches('\n').count() + 1;
+            if !before.ends_with(PATH) {
+                problems.push(format!(
+                    "{shown}:{line}: a failpoint is passed as `hit(`: write `{PATH}hit(`"
+                ));
+            }
+            let rest = &text[at + CALL.len()..];
+            let name = &rest[..rest.find('"').unwrap_or(rest.len())];
+            if !points.contains(&name) {
+                problems.push(format!(
+                    "{shown}:{line}: failpoint {name:?} is not in agentfs_failpoints::POINTS"
+                ));
+            }
+            found.insert(name.to_owned());
+        }
+    }
+    let mut listed = BTreeSet::new();
+    for point in points {
+        if !listed.insert(*point) {
+            problems.push(format!("failpoint {point:?} is listed twice in POINTS"));
+        }
+        if !found.contains(*point) {
+            problems.push(format!(
+                "failpoint {point:?} is listed in POINTS but never hit"
+            ));
+        }
+    }
+    problems
+}
+
+/// `agentfs_failpoints::POINTS` is exactly the set of failpoint calls in
+/// the workspace's sources, each written `agentfs_failpoints::hit("name")`,
+/// so a renamed, removed or unlisted point fails here.
+#[test]
+fn every_hit_is_listed() {
+    let workspace = Workspace::load();
+    let sources = member_sources(&workspace, "agentfs-failpoints");
+    assert!(
+        sources
+            .iter()
+            .any(|(_, text)| text.contains("agentfs_failpoints::hit(\"")),
+        "no failpoint call found: is the scan broken?"
+    );
+    let problems = hit_problems(&sources, agentfs_failpoints::POINTS);
+    assert!(problems.is_empty(), "{}", problems.join("\n"));
+}
+
+#[test]
+fn a_failpoint_off_the_list_is_found() {
+    let source = |text: &str| vec![("a.rs".to_owned(), text.to_owned())];
+    let listed =
+        source("agentfs_failpoints::hit(\"tree.a\")?; cache.hit(\"x\"); cache_hit(\"y\");");
+    assert!(hit_problems(&listed, &["tree.a"]).is_empty());
+    assert_eq!(
+        hit_problems(&source("agentfs_failpoints::hit(\"os.x\")?;"), &["tree.a"]),
+        [
+            "a.rs:1: failpoint \"os.x\" is not in agentfs_failpoints::POINTS",
+            "failpoint \"tree.a\" is listed in POINTS but never hit",
+        ]
+    );
+    assert_eq!(
+        hit_problems(
+            &source("use agentfs_failpoints::hit;\nhit(\"tree.a\")?;"),
+            &["tree.a"]
+        ),
+        ["a.rs:2: a failpoint is passed as `hit(`: write `agentfs_failpoints::hit(`"]
+    );
+    assert_eq!(
+        hit_problems(&source("crate::failpoints::hit(\"tree.a\")?;"), &["tree.a"]),
+        ["a.rs:1: a failpoint is passed as `hit(`: write `agentfs_failpoints::hit(`"]
+    );
+    assert_eq!(
+        hit_problems(&listed, &["tree.a", "tree.a"]),
+        ["failpoint \"tree.a\" is listed twice in POINTS"]
+    );
+}
+
+/// A source's production text: up to its first test module.
+fn production(source: &str) -> &str {
+    let end = source.find("#[cfg(test)]").unwrap_or(source.len());
+    let end = source[..end].find("#[cfg(all(test").unwrap_or(end);
+    &source[..end]
+}
+
+/// The ways a source starts a process: `Command`'s methods take no
+/// argument (a thread scope's `spawn` takes one), and the same methods
+/// passed as functions.
+const STARTS: [&str; 6] = [
+    ".spawn()",
+    ".output()",
+    ".status()",
+    "Command::spawn",
+    "Command::output",
+    "Command::status",
+];
+
+/// How `source`'s production text starts a process itself.
+fn starts_in(source: &str) -> Vec<&'static str> {
+    let text = production(source);
+    STARTS.into_iter().filter(|s| text.contains(s)).collect()
+}
+
+/// The tree engine starts each `git` child through
+/// `agentfs_git::git_cli::counted`, the one site that counts it: none of
+/// its production sources starts a process itself, but the history's repack
+/// task, whose `git repack` is not on the actor's path and stays uncounted,
+/// so each operation's count of Git children stays exact. `counted` is
+/// git_cli's one `.spawn()`.
+#[test]
+fn the_tree_engine_starts_git_only_through_counted() {
+    let workspace = Workspace::load();
+    let root = root();
+    let dir = |name: &str| root.join(&workspace.member(name).unwrap().dir);
+    let src = dir("agentfs-core").join("src");
+    let mut files = vec![src.join("tree_git.rs"), src.join("tree_reconcile.rs")];
+    files_under(&src.join("tree_actor"), &mut files);
+    let repack = src.join("tree_actor/history/repack.rs");
+    let mut problems = Vec::new();
+    for file in files.iter().filter(|f| **f != repack) {
+        let source = std::fs::read_to_string(file).unwrap();
+        for start in starts_in(&source) {
+            problems.push(format!(
+                "{} starts a process with `{start}` outside git_cli::counted",
+                file.strip_prefix(&root).unwrap_or(file).display()
+            ));
+        }
+    }
+    assert!(
+        files.len() > 20,
+        "only {} files read: is the scan broken?",
+        files.len()
+    );
+    assert!(problems.is_empty(), "{}", problems.join("\n"));
+    let git_cli = std::fs::read_to_string(dir("agentfs-git").join("src/git_cli.rs")).unwrap();
+    assert_eq!(
+        production(&git_cli).matches(".spawn()").count(),
+        1,
+        "git_cli::counted is the one site"
+    );
+}
+
+#[test]
+fn a_process_started_outside_counted_is_found() {
+    assert!(starts_in("agentfs_git::git_cli::counted(&mut cmd)?; s.spawn(|| ());").is_empty());
+    assert_eq!(starts_in("cmd.output()?;"), [".output()"]);
+    assert_eq!(
+        starts_in("let child = std::process::Command::spawn(&mut cmd)?;"),
+        ["Command::spawn"]
+    );
+    assert!(starts_in("#[cfg(test)]\nmod tests { fn f() { cmd.status(); } }").is_empty());
 }

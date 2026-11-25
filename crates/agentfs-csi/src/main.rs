@@ -64,7 +64,7 @@ struct Cli {
 
 fn main() -> ExitCode {
     // Before tokio's threads start: arenas made before it stay.
-    agentfs_core::allocator::limit_arenas();
+    agentfs_os::allocator::limit_arenas();
     let cli = Cli::parse();
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -104,7 +104,7 @@ async fn run(cli: Cli) -> Result<(), String> {
     std::fs::create_dir_all(&cli.base_path)
         .map_err(|e| agentfs_csi::volume::chain(&e))
         .and_then(|()| {
-            agentfs_core::shared_fs::network_filesystem(&cli.base_path)
+            agentfs_os::shared_fs::network_filesystem(&cli.base_path)
                 .map_err(|e| agentfs_csi::volume::chain(&e))
         })
         .and_then(|network| match network {

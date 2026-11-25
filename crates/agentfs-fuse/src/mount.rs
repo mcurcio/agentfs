@@ -971,7 +971,7 @@ impl Mount {
         gate: agentfs_core::visibility::Gate,
         tmp: Arc<TmpLayer>,
     ) -> Result<(), MountError> {
-        agentfs_core::failpoints::hit("mount.before_overlay")?;
+        agentfs_failpoints::hit("mount.before_overlay")?;
         let telemetry = self.ops.boundary().recorder().telemetry().clone();
         let refused: crate::overlay::RefusalCounter =
             Arc::new(move |reason| telemetry.overlay_refused(reason));

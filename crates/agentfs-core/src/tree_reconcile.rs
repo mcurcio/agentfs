@@ -1171,7 +1171,7 @@ pub fn histogram(old: &[u8], new: &[u8]) -> Result<Vec<Hunk>, Error> {
     Ok(agentfs_align::histogram_with(
         old,
         new,
-        crate::git_cli::counted,
+        agentfs_git::git_cli::counted,
     )?)
 }
 
@@ -1186,7 +1186,7 @@ pub fn histogram_files(old: &Path, new: &Path) -> Result<Vec<Hunk>, Error> {
     Ok(agentfs_align::histogram_files(
         old,
         new,
-        crate::git_cli::counted,
+        agentfs_git::git_cli::counted,
     )?)
 }
 

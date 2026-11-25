@@ -36,11 +36,11 @@ impl SaveWorker {
     /// A failed thread spawn.
     pub(super) fn start(tree: TreeId) -> io::Result<Self> {
         let (queue, jobs) = mpsc::channel::<SaveJob>();
-        let owner = agentfs_core::failpoints::owner();
+        let owner = agentfs_failpoints::owner();
         let thread = std::thread::Builder::new()
             .name("tree-saves".into())
             .spawn(move || {
-                agentfs_core::failpoints::adopt(owner);
+                agentfs_failpoints::adopt(owner);
                 for job in jobs {
                     if catch_unwind(AssertUnwindSafe(job)).is_err() {
                         eprintln!(

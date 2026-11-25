@@ -486,7 +486,8 @@ fn identity(volume: &str, pod: &PodArgs) -> Identity {
 pub(crate) fn upkeep() -> Upkeep {
     #[cfg(feature = "failpoints")]
     {
-        use agentfs_core::failpoints::{COMPACT_GATE_VAR, FifoGate};
+        use agentfs_core::tree_actor::COMPACT_GATE_VAR;
+        use agentfs_failpoints::FifoGate;
         if let Some(dir) = std::env::var_os(COMPACT_GATE_VAR) {
             match FifoGate::open(Path::new(&dir)) {
                 Ok(gate) => return Upkeep::gated(std::sync::Arc::new(gate)),

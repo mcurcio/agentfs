@@ -10,21 +10,15 @@
 //! [`events::Event`]s, and [`telemetry::Telemetry`] turns them, with the
 //! engine's own measurements and spans, into OpenTelemetry signals.
 
-pub mod allocator;
 pub mod checkpoint;
 pub mod checks;
 pub mod claims;
 pub mod command;
 pub mod config;
-pub mod confined;
 pub mod credentials;
 pub mod events;
-pub mod failpoints;
-pub mod file_lock;
 pub mod fork;
-pub mod fsutil;
 pub mod fsync_class;
-pub mod git_cli;
 pub mod gitmodules;
 pub mod history;
 pub mod history_service;
@@ -32,10 +26,8 @@ pub mod identity;
 pub mod journal;
 pub mod known_hosts;
 pub mod lfs;
-pub mod listening_socket;
 pub mod local_socket;
 pub mod lock;
-pub mod mountinfo;
 pub mod nested;
 pub mod non_empty;
 pub mod operations;
@@ -57,7 +49,6 @@ pub mod restore;
 pub mod rules;
 pub mod service;
 pub mod session;
-pub mod shared_fs;
 #[cfg(feature = "ssh")]
 pub(crate) mod ssh_transport;
 pub mod stamps;

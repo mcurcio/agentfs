@@ -24,10 +24,10 @@ use agentfs_contracts::pod::PodContext;
 use agentfs_contracts::ports::ForkStore as _;
 use agentfs_contracts::tree::TreeId;
 use agentfs_contracts::trees::{ForkSettings, Landing};
-use agentfs_core::file_lock::{FileLock, Mode};
 use agentfs_core::store::TreeStore;
 use agentfs_core::tree_actor::Recording;
 use agentfs_fuse::stale::{MountState, mount_state};
+use agentfs_os::file_lock::{FileLock, Mode};
 
 struct Volume {
     dir: tempfile::TempDir,

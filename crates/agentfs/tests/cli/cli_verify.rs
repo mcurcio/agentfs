@@ -96,7 +96,7 @@ fn verify_checks_a_flag_once_per_release() {
     let state = tmp.path().join("state");
     init(&state);
     let head = {
-        let _skew = agentfs_core::failpoints::configure("tree.build_replay_skew=error@*").unwrap();
+        let _skew = agentfs_failpoints::configure("tree.build_replay_skew=error@*").unwrap();
         let mut v = TreeActor::open(&state, &PodContext::default()).unwrap();
         let writer = WriterAt {
             writer: agentfs_contracts::name::WriterLabel::parse("w").unwrap(),
@@ -118,7 +118,7 @@ fn verify_checks_a_flag_once_per_release() {
     let skewed = agentfs(&binary(), &state)
         .arg("verify")
         .env(
-            agentfs_core::failpoints::ENV_VAR,
+            agentfs_failpoints::ENV_VAR,
             "tree.build_replay_skew=error@*",
         )
         .output()

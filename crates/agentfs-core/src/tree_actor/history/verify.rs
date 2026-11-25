@@ -683,7 +683,7 @@ fn flagged_in(repo: &TreeGit, pointers: &Pointers) -> Result<Vec<Unverified>> {
 /// [`Error::NotCreated`] for a store with no root branch; a store read or a
 /// verdict's write.
 pub fn verify_flagged(root: &Path, by: &PodContext, release: Option<&str>) -> Result<VerifyReport> {
-    crate::history::init_libgit2();
+    agentfs_git::init();
     let root = root.canonicalize()?;
     let lock = crate::tree_actor::lock_area(&root)?;
     let repo = super::open_store(&root.join("history.git"), lock)?;

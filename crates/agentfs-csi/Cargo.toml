@@ -14,9 +14,11 @@ rank = "kubernetes"
 # The view host's control messages, names and pod contexts.
 agentfs-contracts = { version = "0.1.0", path = "../agentfs-contracts" }
 # Only what reads a state area without serving it (tree_actor::inspect),
-# installs the operator's rule files, and the shared helpers (atomic JSON,
-# the network filesystem check, the listening socket).
+# and installs the operator's rule files.
 agentfs-core = { version = "0.1.0", path = "../agentfs-core" }
+# The allocator, atomic JSON, the network filesystem check and the
+# listening socket.
+agentfs-os = { version = "0.1.0", path = "../agentfs-os" }
 # Only mount_state (live or stale FUSE mounts) and MountState; the FUSE
 # session itself runs in `agentfs host` children.
 agentfs-fuse = { version = "0.1.0", path = "../agentfs-fuse" }

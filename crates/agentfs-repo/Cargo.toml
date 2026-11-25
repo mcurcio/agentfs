@@ -18,5 +18,7 @@ serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 
 [dev-dependencies]
+# Its POINTS, against every failpoint call (tests/repo/crates.rs).
+agentfs-failpoints = { version = "0.1.0", path = "../agentfs-failpoints" }
 # The stand-in `docker` of the image-publishing test (tests/repo/ci.rs).
 tempfile = "3.27.0"

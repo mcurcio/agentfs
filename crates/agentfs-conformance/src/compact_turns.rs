@@ -115,7 +115,7 @@ pub fn answer_fifos(
 }
 
 /// Ends the mount's gate and [`answer_fifos`]' thread: the turns end, an
-/// empty line on `go` ends the mount's gate (`failpoints::FifoGate`), and
+/// empty line on `go` ends the mount's gate (`agentfs_failpoints::FifoGate`), and
 /// the end line on `at` ends the thread.
 ///
 /// # Errors

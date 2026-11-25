@@ -439,7 +439,7 @@ fn take_worker(
     // Once a test's gate ends, takes go on as the worker's: a stop drain
     // releases only with every queue empty.
     #[cfg(feature = "failpoints")]
-    if let Some(gate) = agentfs_core::failpoints::take_gate() {
+    if let Some(gate) = agentfs_failpoints::take_gate() {
         run_take_gate(gate, recording, views)?;
     }
     let mut epoch = 0;
@@ -485,7 +485,7 @@ fn metrics_worker(recording: &Recording, output: &Path, stop: &AtomicBool) -> io
 /// `TakeGate`), the actor locked only for that take.
 #[cfg(feature = "failpoints")]
 fn run_take_gate(
-    mut gate: agentfs_core::failpoints::TakeGate,
+    mut gate: agentfs_failpoints::TakeGate,
     actor: &Recording,
     views: &OpenViews,
 ) -> io::Result<()> {

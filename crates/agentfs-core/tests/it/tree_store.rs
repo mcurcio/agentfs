@@ -121,7 +121,7 @@ fn run_killed(worker: &str, dir: &Path, spec: &str) {
     let output = Command::new(std::env::current_exe().unwrap())
         .args(["--exact", test_name!(worker).as_str(), "--nocapture"])
         .env(WORKER, dir)
-        .env(agentfs_core::failpoints::ENV_VAR, spec)
+        .env(agentfs_failpoints::ENV_VAR, spec)
         .output()
         .unwrap();
     assert_eq!(
@@ -187,7 +187,7 @@ fn a_fork_and_its_row_are_one_record() {
 #[test]
 fn an_event_is_durable_before_create_returns() {
     let tmp = tempfile::tempdir().unwrap();
-    let held = agentfs_core::failpoints::configure("tree.build_before_batch=error@*").unwrap();
+    let held = agentfs_failpoints::configure("tree.build_before_batch=error@*").unwrap();
     let recording = serve(tmp.path());
     let mut trees = service(&recording);
     create(&mut trees);
@@ -261,7 +261,7 @@ fn a_row_chain_is_a_commit_chain_of_events() {
 #[test]
 fn a_failed_builder_stops_no_event() {
     let tmp = tempfile::tempdir().unwrap();
-    let held = agentfs_core::failpoints::configure("tree.build_before_batch=error@*").unwrap();
+    let held = agentfs_failpoints::configure("tree.build_before_batch=error@*").unwrap();
     let recording = serve(tmp.path());
     let mut trees = service(&recording);
     let fork = create(&mut trees);
@@ -312,7 +312,7 @@ fn a_restart_builds_the_rows_it_had_not_built() {
 #[test]
 fn queue_facts_come_from_the_journal() {
     let tmp = tempfile::tempdir().unwrap();
-    let held = agentfs_core::failpoints::configure("tree.build_before_batch=error@*").unwrap();
+    let held = agentfs_failpoints::configure("tree.build_before_batch=error@*").unwrap();
     let recording = serve(tmp.path());
     let fork = create(&mut service(&recording));
     let store = TreeStore::new(Arc::clone(&recording));
@@ -569,7 +569,7 @@ fn a_drop_and_its_row_are_one_record() {
 fn a_dropped_fork_recovers_dropped() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path();
-    let held = agentfs_core::failpoints::configure("tree.build_before_batch=error@*").unwrap();
+    let held = agentfs_failpoints::configure("tree.build_before_batch=error@*").unwrap();
     let recording = serve(dir);
     let mut trees = service(&recording);
     let fork = create(&mut trees);

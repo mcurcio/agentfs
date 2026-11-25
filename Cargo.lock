@@ -47,7 +47,10 @@ dependencies = [
  "agentfs-contracts",
  "agentfs-core",
  "agentfs-csi",
+ "agentfs-failpoints",
  "agentfs-fuse",
+ "agentfs-git",
+ "agentfs-os",
  "agentfs-repo",
  "agentfs-rules",
  "agentfs-trees",
@@ -124,6 +127,9 @@ dependencies = [
  "agentfs-align",
  "agentfs-clients",
  "agentfs-contracts",
+ "agentfs-failpoints",
+ "agentfs-git",
+ "agentfs-os",
  "agentfs-repo",
  "agentfs-rules",
  "agentfs-trees",
@@ -140,7 +146,6 @@ dependencies = [
  "hyper-util",
  "imbl",
  "libc",
- "libgit2-sys",
  "opentelemetry",
  "opentelemetry_sdk",
  "prost",
@@ -172,6 +177,7 @@ dependencies = [
  "agentfs-contracts",
  "agentfs-core",
  "agentfs-fuse",
+ "agentfs-os",
  "agentfs-repo",
  "clap",
  "hyper-util",
@@ -195,6 +201,12 @@ dependencies = [
 [[package]]
 name = "agentfs-failpoints"
 version = "0.1.0"
+dependencies = [
+ "libc",
+ "rustix",
+ "tempfile",
+ "thiserror",
+]
 
 [[package]]
 name = "agentfs-fuse"
@@ -202,6 +214,8 @@ version = "0.1.0"
 dependencies = [
  "agentfs-contracts",
  "agentfs-core",
+ "agentfs-failpoints",
+ "agentfs-os",
  "agentfs-rules",
  "fuser",
  "git2",
@@ -216,6 +230,12 @@ dependencies = [
 [[package]]
 name = "agentfs-git"
 version = "0.1.0"
+dependencies = [
+ "agentfs-align",
+ "git2",
+ "libgit2-sys",
+ "tempfile",
+]
 
 [[package]]
 name = "agentfs-lines"
@@ -231,11 +251,23 @@ dependencies = [
 [[package]]
 name = "agentfs-os"
 version = "0.1.0"
+dependencies = [
+ "agentfs-failpoints",
+ "libc",
+ "rustix",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tokio-stream",
+]
 
 [[package]]
 name = "agentfs-repo"
 version = "0.0.0"
 dependencies = [
+ "agentfs-failpoints",
  "serde",
  "serde_json",
  "tempfile",
