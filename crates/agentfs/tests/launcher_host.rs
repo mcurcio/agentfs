@@ -121,7 +121,7 @@ impl Volume {
             log: Some(log),
             next: 1,
             lease: self.lease_path(),
-            held: false,
+            ended: false,
         }
     }
 
@@ -130,9 +130,12 @@ impl Volume {
         self.p("state/actor.lock")
     }
 
-    /// The volume's lease, taken once whoever holds it lets go.
+    /// The volume's lease, taken once whoever holds it lets go. End every
+    /// host that may hold it before taking this guard: a host's end waits
+    /// for the lease ([`Host::wait`]), which never comes while the guard
+    /// lives.
     fn lease(&self) -> FileLock {
-        lease(&self.lease_path())
+        lease(&self.lease_path()).unwrap()
     }
 
     /// SIGKILL to `host`, which leaves its views stale, and the lease free:
@@ -197,12 +200,13 @@ struct Host {
     next: u64,
     /// The volume's lease file.
     lease: PathBuf,
-    /// Whether this host held the lease: it wrote its hello, which a host
-    /// writes only once it holds the lease. Its end waits for the lease
-    /// ([`Host::release`]); a host that never held it skips the wait, which
-    /// would never end while another holder keeps the lease.
-    held: bool,
+    /// Whether [`Host::wait`] has reaped the host.
+    ended: bool,
 }
+
+/// The exit status of a host that found the volume held by another process
+/// (docs/library/filesystem.md, "Exit status"): it never took the lease.
+const BUSY: i32 = 75;
 
 impl Host {
     /// The next line, or `None` at EOF.
@@ -216,14 +220,9 @@ impl Host {
     /// test with its exit status and what it logged.
     fn hello(&mut self) -> Hello {
         let Some(line) = self.line() else {
-            let status = self.child.wait().unwrap();
-            let log = self.log.take().map(|log| log.join().unwrap());
-            panic!(
-                "the host wrote no hello: {status}: {}",
-                log.unwrap_or_default()
-            );
+            let (status, log) = self.wait();
+            panic!("the host wrote no hello: {status}: {log}");
         };
-        self.held = true;
         serde_json::from_str(&line).unwrap()
     }
 
@@ -266,54 +265,67 @@ impl Host {
 
     /// Shuts this test's end for writing (EOF; the reader is a clone of
     /// the same socket): the host drains and exits. Returns once its lease
-    /// is free ([`Host::release`]).
+    /// is free ([`Host::wait`]).
     fn eof(&mut self) -> (ExitStatus, String) {
         if let Some(control) = self.control.take() {
             control.shutdown(std::net::Shutdown::Write).unwrap();
         }
-        let status = self.child.wait().unwrap();
-        self.release();
-        (status, self.log.take().unwrap().join().unwrap())
+        self.wait()
     }
 
     /// SIGKILL: the host's views are left stale. Returns once its lease is
-    /// free ([`Host::release`]).
+    /// free ([`Host::wait`]).
     fn kill(&mut self) {
         self.child.kill().unwrap();
-        self.child.wait().unwrap();
-        self.release();
+        self.wait();
     }
 
-    /// Waits, after the host has exited, until the lease it held is free:
-    /// taken and let go at once. The lease is shared with the host's tree
-    /// Git children, which keep it until each has exited, and the host's
-    /// exit does not wait for them when it does not drain (exit 3, a
-    /// kill): a host started before then exits 75, as the launcher's
-    /// contract says. Only a host that held the lease waits.
-    fn release(&mut self) {
-        if std::mem::take(&mut self.held) {
-            drop(lease(&self.lease));
+    /// Reaps the host, waits until the lease it may have held is free
+    /// (taken and let go at once), and returns its exit status and what it
+    /// logged. Every end of a host in this harness comes here.
+    ///
+    /// The lease is shared with the host's tree Git children, which keep it
+    /// until each has exited, and the host's exit does not wait for them
+    /// when it does not drain (exit 3, exit 2 with a view open, a kill): a
+    /// host started before then exits 75, as the launcher's contract says.
+    /// The host takes the lease before its hello, so a host may hold it
+    /// without having written one; only one that exited 75 ([`BUSY`]) never
+    /// took it, and it skips the wait, which would never end while the
+    /// other holder keeps the lease.
+    fn wait(&mut self) -> (ExitStatus, String) {
+        let status = self.child.wait().unwrap();
+        self.ended = true;
+        if status.code() != Some(BUSY) {
+            drop(lease(&self.lease).unwrap());
         }
+        (status, self.log.take().unwrap().join().unwrap())
     }
 }
 
 impl Drop for Host {
+    /// Kills a host the test did not end and waits for its lease, as
+    /// [`Host::wait`] does, so its Git children are gone before the volume's
+    /// directory is. No panic in a drop: a lease that cannot be opened is
+    /// not waited for. While the test panics the wait is skipped, so a lease
+    /// guard the failing test still holds cannot hang it.
     fn drop(&mut self) {
+        if self.ended {
+            return;
+        }
         let _ = self.child.kill();
-        let _ = self.child.wait();
-        // No panic in a drop: a lease that cannot be opened is not waited for.
-        if std::mem::take(&mut self.held)
-            && let Ok(file) = FileLock::open(&self.lease)
-        {
-            let _ = FileLock::wait(file, Mode::Exclusive);
+        let busy = self
+            .child
+            .wait()
+            .is_ok_and(|status| status.code() == Some(BUSY));
+        if !busy && !std::thread::panicking() {
+            let _ = lease(&self.lease);
         }
     }
 }
 
 /// The lease file at `path`, taken once whoever holds it lets go.
-fn lease(path: &Path) -> FileLock {
-    let file = FileLock::open(path).unwrap();
-    FileLock::wait(file, Mode::Exclusive).unwrap()
+fn lease(path: &Path) -> std::io::Result<FileLock> {
+    FileLock::wait(FileLock::open(path)?, Mode::Exclusive)
 }
 
 fn text(bytes: &[u8]) -> String {
@@ -892,14 +904,17 @@ fn a_stopped_hosts_lease_is_free_when_its_end_returns() {
             std::fs::write(a.join(format!("f{i}")), &data).unwrap();
         }
         let (status, log) = host.eof();
+        let free = FileLock::try_take(&v.lease_path(), Mode::Exclusive)
+            .unwrap()
+            .is_some();
+        // Detached before any assertion, so a red round leaves no mount.
+        let detached = agentfs_fuse::stale::detach_stale_layers(&a, 1);
         assert_eq!(status.code(), Some(3), "round {round}: {log}");
         assert!(
-            FileLock::try_take(&v.lease_path(), Mode::Exclusive)
-                .unwrap()
-                .is_some(),
+            free,
             "round {round}: the lease is held after the host's end returned"
         );
-        assert_eq!(agentfs_fuse::stale::detach_stale_layers(&a, 1).unwrap(), 1);
+        assert_eq!(detached.unwrap(), 1, "round {round}");
     }
 }
 
@@ -1065,9 +1080,8 @@ fn a_duplicate_id_in_flight_is_malformed() {
     host.send_as(5, &close(&a));
     host.send_as(5, &Request::Reconcile);
     assert_eq!(host.line(), None, "no reply: the host stopped");
-    let status = host.child.wait().unwrap();
+    let (status, log) = host.wait();
     drop(held);
-    let log = host.log.take().unwrap().join().unwrap();
     assert_eq!(status.code(), Some(2), "{log}");
     assert!(log.contains("id 5 is already in flight"), "{log}");
     agentfs_fuse::stale::detach_stale_layers(&a, 4).unwrap();
@@ -1098,9 +1112,8 @@ fn a_duplicate_of_a_waiting_id_is_malformed() {
     host.send_as(6, &open(TreeRef::Root, &a, "a2", PodContext::default()));
     host.send_as(6, &Request::Reconcile);
     assert_eq!(host.line(), None, "no reply: the host stopped");
-    let status = host.child.wait().unwrap();
+    let (status, log) = host.wait();
     drop(held);
-    let log = host.log.take().unwrap().join().unwrap();
     assert_eq!(status.code(), Some(2), "{log}");
     assert!(log.contains("id 6 is already in flight"), "{log}");
     agentfs_fuse::stale::detach_stale_layers(&a, 4).unwrap();
