@@ -11,7 +11,6 @@ description = "Recording, journal and history engine for agentfs"
 rank = "engine"
 
 [dependencies]
-agentfs-align = { version = "0.1.0", path = "../agentfs-align" }
 # The shared kernel: values (the tree identity among them), capabilities and the
 # ports agentfs-core's adapters implement.
 agentfs-contracts = { version = "0.1.0", path = "../agentfs-contracts" }
@@ -19,6 +18,8 @@ agentfs-contracts = { version = "0.1.0", path = "../agentfs-contracts" }
 agentfs-failpoints = { version = "0.1.0", path = "../agentfs-failpoints" }
 agentfs-git = { version = "0.1.0", path = "../agentfs-git" }
 agentfs-os = { version = "0.1.0", path = "../agentfs-os" }
+# Line maps: which version wrote each line of a tree's files (tree_actor).
+agentfs-lines = { version = "0.1.0", path = "../agentfs-lines" }
 # The Rules domain: where each new name of a tree lives (tree_actor's untracked areas).
 agentfs-rules = { version = "0.1.0", path = "../agentfs-rules" }
 # known_hosts key blobs and hashed host names, and OpenSSH private key

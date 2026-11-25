@@ -36,9 +36,9 @@ use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
+use agentfs_contracts::paths::PathError;
 use agentfs_core::fsync_class::GroupMembers;
 use agentfs_core::nested;
-use agentfs_core::paths::PathError;
 use agentfs_core::record::{Caller, Origin, SavedRepairs, Trigger, read_repairs, repairs_tmp};
 use agentfs_core::volume::{Input, MoveOutcome, Recorded, Recorder, VolumeError};
 

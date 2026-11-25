@@ -16,8 +16,10 @@
 //! - [`crates`]: every dependency follows the ranks, every `failpoints`
 //!   feature is forwarded, every cargo command in the workflows, scripts
 //!   and docs names packages, features and binaries the workspace has,
-//!   every failpoint call is in `agentfs_failpoints::POINTS`, and the tree
-//!   engine starts `git` only through `agentfs_git::git_cli::counted`.
+//!   every failpoint call is in `agentfs_failpoints::POINTS`, the tree
+//!   engine starts `git` only through `agentfs_git::git_cli::counted`, and
+//!   the tree engine's modules in agentfs-core name no recording-engine
+//!   module and open no remote.
 //!
 //! The configuration keys and operator attributes are checked by
 //! `agentfs-core`'s `tests/config_reference.rs`; the flags and environment

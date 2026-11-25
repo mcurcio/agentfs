@@ -2441,9 +2441,9 @@ mod tests {
     use crate::credentials::Credential;
     use crate::events::{MemorySink, NullSink};
     use crate::identity::Context;
-    use crate::paths::RepoPath;
     use crate::record::{Caller, Trigger};
     use crate::volume::{self, Committer, Input, Recorder};
+    use agentfs_contracts::paths::RepoPath;
 
     const CALLER: Caller = Caller {
         uid: 1,

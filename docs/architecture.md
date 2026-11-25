@@ -20,7 +20,7 @@ is. The libraries behind it, and why each was chosen, are under
 | `agentfs-os` | library | The operating-system leaves used outside the recording engine too: advisory file locks, atomic files, confined access to a directory tree, the mount table, the shared-filesystem check, listening Unix sockets, the allocator's arenas. Knows nothing of git, volumes or trees |
 | `agentfs-git` | library | Git below both engines: the `git` program in an environment of its own and the count of the children it starts, every repack's memory bounds, and the process's one libgit2 setup. Knows no volume or tree layout |
 | `agentfs-lines` | library | Line maps: which version wrote each line of a file, aligned across saves by `agentfs-align`'s histogram diff. It reads the images it is given and starts no process: the diff's `git` child comes from the spawner its caller passes |
-| `agentfs-contracts` | library | The shared kernel of the domains around the git model ([the system](target-architecture/system.md)): values (the tree and volume identities, names, the pod context), capabilities and their minter, each domain's trait, errors and events, and the ports adapters implement. No I/O; depends on no other agentfs crate |
+| `agentfs-contracts` | library | The shared kernel of the domains around the git model ([the system](target-architecture/system.md)): values (the tree and volume identities, names, repository paths, the pod context, durations and sizes), capabilities and their minter, each domain's trait, errors and events, and the ports adapters implement. No I/O; depends on no other agentfs crate |
 | `agentfs-volume` | library | The Volume domain, pure over its ports: `ensure`, the lifecycle and the release verdict |
 | `agentfs-clients` | library | The Clients domain, pure over its ports: attachments, grants and each fork's one writer |
 | `agentfs-trees` | library | The Trees domain, pure over its ports: each fork's lifecycle |
@@ -73,10 +73,12 @@ row names a module that no longer exists; `tests.rs` files are not listed.
 | `clients.rs` | The Clients domain's contract: client ids, grants, bindings, errors, events and the `Clients` trait |
 | `host.rs` | The view host's control messages, one JSON object per line on `agentfs host`'s standard input and back: the hello, requests (open, close, reconcile, fork create, fork end), replies and refusal kinds |
 | `name.rs` | Validated names and labels (volume, pod field, writer, client, launcher, fork key) and the one safe-name rule |
+| `paths.rs` | Repository-relative paths (`RepoPath`) and the names git refuses to store |
 | `pod.rs` | The pod context a writer ran in, and a writer with it (`WriterAt`), as commits name them |
 | `ports.rs` | The ports adapters implement: the state area, each domain's rows as journal steps, queue facts, sessions and the event sink |
 | `tree.rs` | A tree's identity, `root` or `fork/<n>`, and a fork's number: the text history, refs and checkouts name a tree by |
 | `trees.rs` | The Trees domain's contract: fork settings, facts, phases, errors, events and the `Trees` trait |
+| `units.rs` | The units settings and flags are written in: `parse_duration`, `parse_size` (git's `k`, `m`, `g`), and `duration_arg`, the binaries' one value parser for a duration flag |
 | `views.rs` | The Views domain's contract: mount points, mount options, errors and the `Views` trait |
 | `volume.rs` | The Volume domain's contract: identity, spec, lifecycle, the release verdict's facts and blockers, errors, events and the `Volume` trait |
 
@@ -125,7 +127,7 @@ row names a module that no longer exists; `tests.rs` files are not listed.
 
 | Module | Role |
 |---|---|
-| `lib.rs` | Crate root: the line maps' overview |
+| `lib.rs` | The line-map library: line identities as runs, never bytes; histogram alignment streamed over images, its `git` child started by the caller's spawner (the `_with` calls); a merged file's pieces of its sources. Generic over the caller's numbered version (`Id`) |
 
 ### `agentfs-volume`
 
@@ -205,7 +207,6 @@ row names a module that no longer exists; `tests.rs` files are not listed.
 | `tree_actor/untrack.rs` | Untrack at open: each tracked file or link the operator's `info/attributes` now marks `-agentfs` is placed in its tree's untracked area, then its unlink is recorded as writer `agentfs`; a crash between the two places it again at the next open |
 | `tree_actor/untracked.rs` | Each tree's untracked area (`UntrackedArea`): its files the rules leave out, under `<state>/untracked/<tree>/`, reached only beneath it through `confined::Dir`; containers for tracked directories, atomic placement, a new fork's copy of its upstream's area taken while the upstream's untracked changes are held, and the sweep at open of copies no fork owns |
 | `tree_actor/tree.rs` | A tree's shared types: the event number a step is given, the line versions (`<event>:<index>`, ordered as their text) and line maps it writes; a tree's shape (names, directories, objects, identities, metadata and times) with its one transition per step (`Shape::apply`, POSIX's errors checked before a record), the actor's saved state (`SavedTree`) and the builder's (`Tree`, with line maps and name histories) |
-| `tree_reconcile.rs` | The line-map library: line identities as runs, never bytes; histogram alignment streamed over images; a merged file's pieces of its sources. Generic over the caller's numbered version (`Id`) |
 | `tree_git.rs` | The tree actor's Git store: durable objects, the rebuildable copy of the pointer refs in files format (the rebuild leaves `refs/notes/`, which is not a copy, as it is), git notes read and written in git's layout with a compare-and-swap of the notes ref, and the private checkouts through libgit2 in process (each file written to a temporary name and renamed into place); `config` and `HEAD`; the history walks and `init` as Git children, which retain the actor lease. It knows no ref layout and no trailer |
 | `journal.rs` | The durable change log: framed, checksummed records with group-commit `fsync` |
 | `pending.rs` | Frozen copies in `pending/`: `FICLONE` reflink, else copy plus `fsync`; slot-numbered ids for fronts |
@@ -218,7 +219,6 @@ row names a module that no longer exists; `tests.rs` files are not listed.
 | `nested.rs` | Detects nested git repositories, including ones being created |
 | `non_empty.rs` | A list with at least one element by construction (`config::Remotes::Pushed`) |
 | `probe.rs` | Bounded, non-blocking reads of small workload files (`.gitignore`, `.git` files) during the synchronous step |
-| `paths.rs` | Repository-relative paths and the names git refuses to store |
 | `checks.rs` | git fsck rules and remote limits, checked at record time and again at commit |
 | `gitmodules.rs` | A port of git fsck's `.gitmodules` rules |
 | `fsync_class.rs` | The `fsync` class for databases: membership and groups |

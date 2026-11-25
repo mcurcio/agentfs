@@ -17,7 +17,7 @@ use std::collections::BTreeMap;
 use std::ops::Bound;
 use std::sync::{Condvar, Mutex, MutexGuard};
 
-use crate::paths::RepoPath;
+use agentfs_contracts::paths::RepoPath;
 
 /// The paths claimed by in-flight records. Safe to share across threads.
 #[derive(Debug, Default)]

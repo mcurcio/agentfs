@@ -49,7 +49,7 @@ use crate::tree_actor::tree::{
 };
 use crate::tree_actor::{Error, Result, TreeId};
 use crate::tree_git::{RefUpdate, TreeGit};
-use crate::tree_reconcile::{Window, histogram_files};
+use agentfs_lines::{Window, histogram_files_with};
 
 /// The most steps one batch builds: a batch's built event wakes the lag gate,
 /// so a long backlog is built in slices that each end in one.
@@ -1426,7 +1426,7 @@ fn align(
                 let mut file = std::fs::File::create(path)?;
                 std::io::copy(&mut map.reader(), &mut file)?;
             }
-            histogram_files(&a, &b)
+            histogram_files_with(&a, &b, agentfs_git::git_cli::counted)
         })();
         let _ = std::fs::remove_file(&a);
         let _ = std::fs::remove_file(&b);

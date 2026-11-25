@@ -13,11 +13,11 @@ use std::time::{Duration, Instant};
 #[path = "../../../agentfs-core/tests/support/queue_patch.rs"]
 mod queue_patch;
 
+use agentfs_contracts::paths::RepoPath;
 use agentfs_core::events::NullSink;
 use agentfs_core::history_service::{
     Address, ClientConfig, FrontHooks, FrontInfo, FrontLease, HistoryClient, ListenerHandle,
 };
-use agentfs_core::paths::RepoPath;
 use agentfs_core::record::Origin;
 use agentfs_core::telemetry::Telemetry;
 use agentfs_core::volume::StateDir;

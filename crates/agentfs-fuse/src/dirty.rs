@@ -30,7 +30,7 @@
 use std::fs::File;
 use std::sync::Arc;
 
-use agentfs_core::paths::RepoPath;
+use agentfs_contracts::paths::RepoPath;
 use agentfs_core::pending::PendingId;
 use agentfs_core::record::Caller;
 use rustix::fs::Stat;

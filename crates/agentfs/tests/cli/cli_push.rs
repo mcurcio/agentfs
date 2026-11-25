@@ -447,7 +447,7 @@ fn journal(v: &Volume, name: &str) {
             pid: 1,
         },
         vec![agentfs_core::volume::Input::Write {
-            path: agentfs_core::paths::RepoPath::new(name).unwrap(),
+            path: agentfs_contracts::paths::RepoPath::new(name).unwrap(),
             backing: v.tree().join(name),
             executable: false,
         }],

@@ -1002,11 +1002,11 @@ mod tests {
     use super::*;
     use crate::events::{Event, MemorySink, NullSink, PushFailureKind};
     use crate::identity::Context;
-    use crate::paths::RepoPath;
     use crate::push;
     use crate::record::{Caller, Trigger};
     use crate::telemetry::Telemetry;
     use crate::volume::{self, Input, Recorder, StateDir};
+    use agentfs_contracts::paths::RepoPath;
     use agentfs_os::file_lock::{FileLock, Mode};
 
     const CALLER: Caller = Caller {

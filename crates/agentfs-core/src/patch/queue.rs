@@ -86,11 +86,11 @@ use crate::events::{Event, Events};
 use crate::history::{History, InboxCommit};
 use crate::identity::Identity;
 use crate::lfs::fetch::LfsObjects;
-use crate::paths::RepoPath;
 use crate::record::{Caller, Operation, OperationKind, PatchAuthor};
 use crate::restore::{self, Applied, NotLive, Plan, RecordMode, RestoreError, Step};
 use crate::telemetry::{ActiveSpan, Telemetry, spans};
 use crate::volume::{Committer, OperationSpec, Recorder, StateDir};
+use agentfs_contracts::paths::RepoPath;
 
 /// Inputs per record when a partial write is recorded.
 const PARTIAL_RECORD_CHUNK: usize = 4096;

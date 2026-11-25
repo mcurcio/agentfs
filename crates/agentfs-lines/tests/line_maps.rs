@@ -1,4 +1,9 @@
-use agentfs_core::tree_reconcile::{Id, LineMap, pieces, render};
+//! The line maps through their public calls: identity kept across saves,
+//! bytes rendered exactly, and the empty-image answer equal to git's.
+
+use std::process::Command;
+
+use agentfs_lines::{Id, LineMap, pieces, render};
 use serde::{Deserialize, Serialize};
 
 /// A version: its writer and its place among the writer's versions.
@@ -25,7 +30,7 @@ impl Id for V {
 
 fn save(base: &LineMap<V>, old: &[u8], new: &[u8], writer: u64) -> LineMap<V> {
     let mut last = 0;
-    base.align_bytes(old, new, |n| {
+    base.align_bytes_with(old, new, Command::spawn, |n| {
         let first = V(writer, last + 1);
         last += n;
         first
@@ -76,7 +81,7 @@ fn an_empty_old_image_aligns_as_git_does() {
         b"repeat\nrepeat\nrepeat\n",
     ];
     for new in inputs {
-        let ours = agentfs_core::tree_reconcile::histogram(b"", new).unwrap();
+        let ours = agentfs_lines::histogram_with(b"", new, Command::spawn).unwrap();
         let git = agentfs_align::histogram(b"", new).unwrap();
         assert_eq!(ours, git, "{new:?}");
         let map = save(&LineMap::default(), b"", new, 1);

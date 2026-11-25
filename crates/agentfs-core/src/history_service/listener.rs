@@ -24,7 +24,7 @@ use tokio::sync::Notify;
 use super::client::Listening;
 use super::wire::pb;
 use super::{Answer, Call, HistoryClient};
-use crate::paths::RepoPath;
+use agentfs_contracts::paths::RepoPath;
 
 /// The first wait before reconnecting.
 pub const RECONNECT_MIN: Duration = Duration::from_millis(100);

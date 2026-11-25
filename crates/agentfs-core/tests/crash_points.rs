@@ -48,9 +48,9 @@ use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use agentfs_contracts::paths::RepoPath;
 use agentfs_core::events::NullSink;
 use agentfs_core::identity::Context;
-use agentfs_core::paths::RepoPath;
 use agentfs_core::push::{PushOutcome, RemotePusher};
 use agentfs_core::record::{Caller, Trigger};
 use agentfs_core::telemetry::Telemetry;

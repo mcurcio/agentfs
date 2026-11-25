@@ -1,6 +1,6 @@
 Removes the fix of pieces-shorter-run-306.trace and pieces-shorter-run-414.trace:
 `pieces` placing each line of a take from a source whose run holds it (in
-tree_reconcile.rs). Without it, `pieces` merged every source's runs into one
+agentfs-lines' lib.rs). Without it, `pieces` merged every source's runs into one
 list and looked only in the last run starting at or before a line, so a shorter
 run of the same versions from a later source hid the head's whole run.
 Base: the commit that adds this file; this hunk set is the reverse of its fix.
@@ -23,8 +23,8 @@ mount namespace (agentfs_align::GIT_PATH is fixed). The seed 306 recording equal
 one made independently on main 9045165 byte for byte (cmp).
 `git apply` skips these lines.
 
---- a/crates/agentfs-core/src/tree_reconcile.rs
-+++ b/crates/agentfs-core/src/tree_reconcile.rs
+--- a/crates/agentfs-lines/src/lib.rs
++++ b/crates/agentfs-lines/src/lib.rs
 @@ -15,7 +15,6 @@
  //! ancestors retained; a line's identity is independent of a filesystem object's
  //! identity.

@@ -36,7 +36,7 @@ use super::queue::Key;
 use super::stages::{Hold, section};
 use super::tree::{DirState, EventNumber, SavedTree};
 use super::{Error, Result, SavePending, Saved, TreeActor, TreeId};
-use crate::paths::RepoPath;
+use agentfs_contracts::paths::RepoPath;
 pub use file_map::FileMap;
 use layout::{Layout, Positions};
 use pages::CloseCalls;

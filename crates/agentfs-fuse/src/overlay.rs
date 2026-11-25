@@ -47,7 +47,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, PoisonError};
 
-use agentfs_core::paths::RepoPath;
+use agentfs_contracts::paths::RepoPath;
 use agentfs_core::record::Caller;
 use agentfs_core::telemetry::OverlayRefusal;
 use agentfs_core::visibility::{

@@ -31,13 +31,13 @@ use std::time::Duration;
 
 use anyhow::{Context as _, Result};
 
+use agentfs_contracts::paths::RepoPath;
 use agentfs_core::config::Settings;
 use agentfs_core::history::{History, seq_from_message};
 use agentfs_core::history_service::{Fronts, FrontsError};
 use agentfs_core::lfs::ObjectCache;
 use agentfs_core::lfs::fetch::{CacheProbe, Fetcher, LfsObjects};
 use agentfs_core::lock::{LockError, StateLock};
-use agentfs_core::paths::RepoPath;
 use agentfs_core::record::Caller;
 use agentfs_core::restore::{
     self, Liveness, NotLive, Pathspec, Plan, RecordMode, Request, RestoreError,

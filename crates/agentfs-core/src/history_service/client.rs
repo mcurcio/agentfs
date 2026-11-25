@@ -46,11 +46,11 @@ use super::wire::pb::history_client::HistoryClient as Grpc;
 use super::{Address, FrontInfo, MAX_MESSAGE, PROTOCOL_VERSION, PathStamp, SERVICE_NAME};
 use crate::events::{Event, Events};
 use crate::local_socket;
-use crate::paths::RepoPath;
 use crate::pending::PendingId;
 use crate::record::Draft;
 use crate::telemetry::Telemetry;
 use crate::volume::{Recorded, Skipped};
+use agentfs_contracts::paths::RepoPath;
 
 /// How to reach the service.
 #[derive(Debug, Clone)]

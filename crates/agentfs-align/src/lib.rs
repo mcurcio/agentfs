@@ -140,14 +140,14 @@ pub fn histogram_with(
     let (a, b) = (dir.0.join("old"), dir.0.join("new"));
     std::fs::write(&a, old)?;
     std::fs::write(&b, new)?;
-    histogram_files(&a, &b, spawn)
+    histogram_files_with(&a, &b, spawn)
 }
 
 /// Git's text-mode histogram diff of the files `old` and `new`, which differ,
 /// run in `old`'s directory. Its output is read as it streams and only the hunk
 /// headers are kept, so neither file's lines are held: the call for images too
 /// large to hold. `git diff` itself reads both files whole.
-pub fn histogram_files(
+pub fn histogram_files_with(
     old: &Path,
     new: &Path,
     spawn: impl FnOnce(&mut Command) -> io::Result<Child>,
@@ -280,7 +280,7 @@ mod tests {
         std::fs::write(&a, b"a\nb\nc\n").unwrap();
         std::fs::write(&b, b"a\nB\nc\nd\n").unwrap();
         assert_eq!(
-            histogram_files(&a, &b, Command::spawn).unwrap(),
+            histogram_files_with(&a, &b, Command::spawn).unwrap(),
             histogram(b"a\nb\nc\n", b"a\nB\nc\nd\n").unwrap()
         );
     }

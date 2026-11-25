@@ -22,9 +22,9 @@ use crate::events::CheckStage;
 use crate::fork::finish::FinishRecord;
 use crate::identity::{Context, IdentityError, IdentityRenderer};
 use crate::lfs::{ObjectCache, Store, attributes};
-use crate::paths::{RepoPath, SpecialFile};
 use crate::pending::PendingStore;
 use crate::record::{Change, Operation, OperationKind, PatchAuthor, Record};
+use agentfs_contracts::paths::{RepoPath, SpecialFile};
 
 pub const SEQ_TRAILER: &str = "Agentfs-Seq";
 /// The inbox number of the patch a commit applies.

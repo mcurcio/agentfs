@@ -407,8 +407,8 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
-    use crate::paths::RepoPath;
     use crate::record::{Caller, Change, Trigger};
+    use agentfs_contracts::paths::RepoPath;
 
     fn draft(path: &str) -> Draft {
         Draft {

@@ -23,8 +23,8 @@
 use serde::{Deserialize, Serialize};
 
 use super::attributes::pattern_for;
-use crate::paths::{RepoPath, special_file};
 use crate::rules::{AttrState, Attributes};
+use agentfs_contracts::paths::{RepoPath, special_file};
 
 /// `agentfs.store`: `blob` or `lfs`, operator attributes only.
 pub const STORE_ATTR: &str = "agentfs.store";

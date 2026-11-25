@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
 
-use agentfs_core::config::validate_name;
+use agentfs_contracts::name::is_safe_name;
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum LayoutError {
@@ -82,12 +82,20 @@ impl Layout {
 
 /// A volume handle is a directory name and an agentfs name component.
 pub fn validate_handle(handle: &str) -> Result<(), LayoutError> {
-    validate_name("volume id", handle).map_err(|_| LayoutError::BadHandle(handle.to_owned()))
+    if is_safe_name(handle) {
+        Ok(())
+    } else {
+        Err(LayoutError::BadHandle(handle.to_owned()))
+    }
 }
 
 /// A node id names a topology segment.
 pub fn validate_node(node: &str) -> Result<(), LayoutError> {
-    validate_name("node id", node).map_err(|_| LayoutError::BadNode(node.to_owned()))
+    if is_safe_name(node) {
+        Ok(())
+    } else {
+        Err(LayoutError::BadNode(node.to_owned()))
+    }
 }
 
 /// The first 16 hex digits of the SHA-256 of `target`: a short, stable

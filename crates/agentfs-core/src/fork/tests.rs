@@ -22,11 +22,11 @@ use super::identity::{ForkIdentity, ForkLink, PushTarget, change_ref, finish_ref
 use crate::events::{Event, Events, NullSink, PushFailureKind};
 use crate::identity::Context;
 use crate::lock::StateLock;
-use crate::paths::RepoPath;
 use crate::record::{Caller, OperationKind, Origin, Trigger};
 use crate::restore::{self, Applied, RecordMode};
 use crate::telemetry::Telemetry;
 use crate::volume::{self, StateDir};
+use agentfs_contracts::paths::RepoPath;
 
 const CALLER: Caller = Caller {
     uid: 10000,

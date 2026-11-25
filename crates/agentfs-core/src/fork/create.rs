@@ -32,9 +32,9 @@ use crate::config::{ConfigError, ForkRemote, Settings, validate_name};
 use crate::history::HistoryError;
 use crate::lfs::fetch::LfsObjects;
 use crate::lfs::{LfsError, ObjectCache, Pointer, Store};
-use crate::paths::RepoPath;
 use crate::restore::{self, NotLive, Pathspec, RecordPolicy, Request, RestoreError};
 use crate::volume::{self, StateDir, VolumeError};
+use agentfs_contracts::paths::RepoPath;
 
 use super::identity::{ForkIdentity, ForkLink, PushTarget};
 

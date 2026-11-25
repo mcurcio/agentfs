@@ -161,7 +161,7 @@ impl From<LinkArg> for ForkLink {
 pub struct FinishArgs {
     /// Stop publishing after this long and exit 1 (default: until
     /// published).
-    #[arg(long, value_parser = crate::parse_grace, value_name = "DURATION")]
+    #[arg(long, value_parser = agentfs_contracts::units::duration_arg, value_name = "DURATION")]
     pub timeout: Option<Duration>,
     /// Clear a refused publish and try again.
     #[arg(long)]
@@ -220,7 +220,7 @@ pub struct DeliverArgs {
     #[arg(long, value_name = "FILE")]
     pub credential_file: Option<PathBuf>,
     /// command and webhook: how long the receiver may take.
-    #[arg(long, default_value = "60s", value_parser = crate::parse_grace)]
+    #[arg(long, default_value = "60s", value_parser = agentfs_contracts::units::duration_arg)]
     pub timeout: Duration,
     /// The receiver's git repository, whose git and credentials are used.
     #[arg(long, default_value = ".")]

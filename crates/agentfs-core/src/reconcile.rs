@@ -43,8 +43,8 @@ use std::time::{Duration, Instant};
 use agentfs_os::confined;
 use rustix::fs::{Mode, OFlags};
 
-use crate::paths::{RepoPath, is_dotgit};
 use crate::record::{Caller, Origin};
+use agentfs_contracts::paths::{RepoPath, is_dotgit};
 
 /// How far before a move a file's change makes reconciliation compare
 /// its stamp with the last one journaled: well past any request timeout

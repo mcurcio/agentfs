@@ -415,7 +415,7 @@ pub struct FileMap<L: Located = FramePos> {
 
 /// A map read as an image: how a save's alignment reads both versions of a
 /// file without holding either.
-impl crate::tree_reconcile::Image for FileMap {
+impl agentfs_lines::Image for FileMap {
     fn len(&self) -> u64 {
         self.len
     }

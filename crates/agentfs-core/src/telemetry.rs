@@ -1630,7 +1630,7 @@ mod tests {
     use super::*;
     use crate::checks::Refusal;
     use crate::events::{CheckStage, MemorySink, PushFailureKind, PushStage};
-    use crate::paths::RepoPath;
+    use agentfs_contracts::paths::RepoPath;
 
     fn alarms() -> Vec<Event> {
         let failed = |remote: &str, kind, stage| Event::PushFailed {

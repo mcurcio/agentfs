@@ -29,8 +29,8 @@ recorded; [guarantees](../guarantees.md) says what the engine promises.
 | OpenTelemetry signals | `telemetry` | `Telemetry`, `Telemetry::sink` |
 | Exclusive use of a state area | `lock`, and `agentfs_os::file_lock` | `StateLock`, `FileLock` |
 | A binary's malloc arenas | `agentfs_os::allocator` | `limit_arenas` (glibc's `M_ARENA_MAX` to `ARENAS`, 2): a binary calls it first in `main`, before any thread; the library never does |
-| Settings from the git config | `config` | `Settings`, `Settings::load`, `KEYS` |
-| Path rules and checks | `rules`, `checks`, `paths` | `Rules`, `Checks`, `RepoPath` |
+| Settings from the git config | `config`, and `agentfs_contracts::units` | `Settings`, `Settings::load`, `KEYS`; `parse_duration`, `parse_size`, `duration_arg` (a duration flag's value parser) |
+| Path rules and checks | `rules`, `checks`, and `agentfs_contracts::paths` | `Rules`, `Checks`, `RepoPath` |
 | Restore and revert | `restore`, `operations` | `plan`, `check`, `apply`, `record_applied` |
 | Patch queue | `patch` | `Queue`, `Verdict`, `PatchBranch`, `submit` |
 | Forks and start points | `fork` | `create`, `Finisher`, `start_from`, `delivery` |
@@ -39,7 +39,7 @@ recorded; [guarantees](../guarantees.md) says what the engine promises.
 | Large files | `lfs` | `ObjectCache`, `Store`, `fetch`, `prune` |
 | Git-backed tree views | `tree_actor`, `state_area` | `TreeActor`, `TreeId` (a tree's identity, `root` or `fork/<n>`), `inspect`, `TreeStateArea` (the Volume domain's `StateArea` port) |
 | The domains' rows over a tree volume | `store`, `tree_actor` | `TreeStore` (the `VolumeStore`, `ForkStore`, `ClientStore` and `QueueFacts` ports), `Chain`, `RowDomain`, `RowWrite`, `RowEvent` |
-| Line identity across saves | `tree_reconcile` | `LineMap` (runs of lines, never bytes), `LineMap::align` (git's histogram diff over two `Image`s, read a line at a time), `LineMap::append`, `LineMap::expand` (line by line, for the landing rules), `pieces` (where a merged file's lines are in its sources): the line-map library, generic over the caller's numbered version (`Id`) |
+| Line identity across saves | `agentfs_lines` | `LineMap` (runs of lines, never bytes), `LineMap::align` (git's histogram diff over two `Image`s, read a line at a time), `LineMap::align_bytes_with`, `histogram_with` and `histogram_files_with` (the diff's `git` child started by the spawner passed: the tree engine passes `agentfs_git::git_cli::counted`), `LineMap::append`, `LineMap::expand` (line by line, for the landing rules), `pieces` (where a merged file's lines are in its sources): the line-map library, generic over the caller's numbered version (`Id`) |
 
 ## The state area
 
@@ -79,7 +79,7 @@ recorder, the committer and what recovery found:
 use std::sync::Arc;
 use agentfs_core::events::NullSink;
 use agentfs_core::identity::Context;
-use agentfs_core::paths::RepoPath;
+use agentfs_contracts::paths::RepoPath;
 use agentfs_core::record::{Caller, Trigger};
 use agentfs_core::telemetry::Telemetry;
 use agentfs_core::volume::{self, Input, StateDir};

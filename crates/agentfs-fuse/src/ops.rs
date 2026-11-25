@@ -694,7 +694,7 @@ impl Ops {
             .filter_map(|m| {
                 std::str::from_utf8(m)
                     .ok()
-                    .and_then(|m| agentfs_core::paths::RepoPath::new(m).ok())
+                    .and_then(|m| agentfs_contracts::paths::RepoPath::new(m).ok())
             })
             .collect();
         let error = io::Error::new(

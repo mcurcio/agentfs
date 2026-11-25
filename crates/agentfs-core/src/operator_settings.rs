@@ -165,7 +165,7 @@ impl OperatorSettings {
     }
 
     /// `agentfs.overlayLimit`, the last value set (git's rule): a positive
-    /// size (`k`, `m`, `g`: powers of 1024, `config::parse_size`), or the
+    /// size (`k`, `m`, `g`: powers of 1024, `agentfs_contracts::units::parse_size`), or the
     /// lag gate's default when unset. Tree volumes build it: [`classify`]
     /// answers `None` for it.
     ///
@@ -181,7 +181,7 @@ impl OperatorSettings {
         else {
             return Ok(DEFAULT_OVERLAY_LIMIT);
         };
-        crate::config::parse_size(value).ok_or_else(|| SettingsError::BadValue {
+        agentfs_contracts::units::parse_size(value).ok_or_else(|| SettingsError::BadValue {
             key: key.clone(),
             value: value.clone(),
             expected: "a positive size, such as 32m (k, m and g are powers of 1024)",

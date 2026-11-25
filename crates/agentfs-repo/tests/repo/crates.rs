@@ -2,7 +2,8 @@
 //! (docs/architecture.md, "Ranks"), the `failpoints` feature forwarded to
 //! every dependency that has it, every cargo command the repository
 //! writes down naming what the workspace has, every failpoint call listed,
-//! and the tree engine's `git` children all counted. Each check is a pure
+//! the tree engine's `git` children all counted, and the tree engine naming
+//! no module of the recording engine. Each check is a pure
 //! function over a [`Workspace`], a line or a source, with a fixture test
 //! beside it.
 
@@ -886,23 +887,45 @@ fn a_failpoint_off_the_list_is_found() {
     );
 }
 
-/// A source's production text: up to its first test module.
+/// A source's production text: up to its first test module, a `mod`
+/// under `#[cfg(test)]` or `#[cfg(all(test, ...))]` (other attributes may
+/// come between). A test-only item that is not a module is read: the scan
+/// stops at the module, not at the first test attribute.
 fn production(source: &str) -> &str {
-    let end = source.find("#[cfg(test)]").unwrap_or(source.len());
-    let end = source[..end].find("#[cfg(all(test").unwrap_or(end);
+    let mut end = source.len();
+    for marker in ["#[cfg(test)]", "#[cfg(all(test"] {
+        for (at, _) in source.match_indices(marker) {
+            let item = source[at..]
+                .lines()
+                .skip(1)
+                .map(str::trim_start)
+                .find(|line| !line.is_empty() && !line.starts_with("#["));
+            let item = item.map(|line| {
+                line.strip_prefix("pub(crate) ")
+                    .or_else(|| line.strip_prefix("pub "))
+                    .unwrap_or(line)
+            });
+            if item.is_some_and(|line| line.starts_with("mod ")) {
+                end = end.min(at);
+                break;
+            }
+        }
+    }
     &source[..end]
 }
 
 /// The ways a source starts a process: `Command`'s methods take no
-/// argument (a thread scope's `spawn` takes one), and the same methods
-/// passed as functions.
-const STARTS: [&str; 6] = [
+/// argument (a thread scope's `spawn` takes one), the same methods passed
+/// as functions (a spawner handed to `agentfs_lines`' `_with` calls), and
+/// `agentfs_align`'s diff that starts its own `git`.
+const STARTS: [&str; 7] = [
     ".spawn()",
     ".output()",
     ".status()",
     "Command::spawn",
     "Command::output",
     "Command::status",
+    "agentfs_align::histogram(",
 ];
 
 /// How `source`'s production text starts a process itself.
@@ -913,18 +936,20 @@ fn starts_in(source: &str) -> Vec<&'static str> {
 
 /// The tree engine starts each `git` child through
 /// `agentfs_git::git_cli::counted`, the one site that counts it: none of
-/// its production sources starts a process itself, but the history's repack
-/// task, whose `git repack` is not on the actor's path and stays uncounted,
-/// so each operation's count of Git children stays exact. `counted` is
-/// git_cli's one `.spawn()`.
+/// its production sources, nor the line maps' (`agentfs-lines`, which take
+/// the spawner from their caller), starts a process itself, but the
+/// history's repack task, whose `git repack` is not on the actor's path and
+/// stays uncounted, so each operation's count of Git children stays exact.
+/// `counted` is git_cli's one `.spawn()`.
 #[test]
 fn the_tree_engine_starts_git_only_through_counted() {
     let workspace = Workspace::load();
     let root = root();
     let dir = |name: &str| root.join(&workspace.member(name).unwrap().dir);
     let src = dir("agentfs-core").join("src");
-    let mut files = vec![src.join("tree_git.rs"), src.join("tree_reconcile.rs")];
+    let mut files = vec![src.join("tree_git.rs")];
     files_under(&src.join("tree_actor"), &mut files);
+    files_under(&dir("agentfs-lines").join("src"), &mut files);
     let repack = src.join("tree_actor/history/repack.rs");
     let mut problems = Vec::new();
     for file in files.iter().filter(|f| **f != repack) {
@@ -958,5 +983,183 @@ fn a_process_started_outside_counted_is_found() {
         starts_in("let child = std::process::Command::spawn(&mut cmd)?;"),
         ["Command::spawn"]
     );
+    assert_eq!(
+        starts_in("histogram_files_with(&a, &b, Command::spawn)"),
+        ["Command::spawn"]
+    );
+    assert_eq!(
+        starts_in("agentfs_align::histogram(old, new)?"),
+        ["agentfs_align::histogram("]
+    );
+    assert!(starts_in("agentfs_align::histogram_with(old, new, spawn)?").is_empty());
     assert!(starts_in("#[cfg(test)]\nmod tests { fn f() { cmd.status(); } }").is_empty());
+    assert!(
+        starts_in("#[cfg(all(test, feature = \"x\"))]\n#[allow(x)]\nmod t { s.output() }")
+            .is_empty()
+    );
+    assert_eq!(
+        starts_in("#[cfg(test)]\nconst X: u8 = 0;\nfn f() { cmd.output(); }"),
+        [".output()"]
+    );
+}
+
+/// The tree engine's modules in agentfs-core, the ones its own crate takes
+/// whole: each names only the others through `crate::`.
+const TREE_ENGINE: [&str; 6] = [
+    "tree_actor",
+    "tree_git",
+    "session",
+    "store",
+    "state_area",
+    "operator_settings",
+];
+
+/// Calls that would reach a remote through libgit2, whose transports the
+/// recording engine's `init_git` registers after `agentfs_git::init`: the
+/// tree engine opens no remote.
+const REMOTE_CALLS: [&str; 5] = [
+    "find_remote",
+    "remote_anonymous",
+    "remote_with_fetch",
+    "git2::Remote",
+    "git2::transport",
+];
+
+/// The first module of each `crate::` path in `text`, with the line it is
+/// on: `crate::a::b` names `a`, and `crate::{a, b::c}` names `a` and `b`.
+fn crate_paths(text: &str) -> Vec<(usize, String)> {
+    const PATH: &str = "crate::";
+    let ident = |s: &str| -> String {
+        s.trim_start()
+            .chars()
+            .take_while(|c| c.is_alphanumeric() || *c == '_')
+            .collect()
+    };
+    let mut out = Vec::new();
+    for (at, _) in text.match_indices(PATH) {
+        // `agentfs_crate::` or `$crate::` is another path.
+        if text[..at]
+            .chars()
+            .next_back()
+            .is_some_and(|c| c.is_alphanumeric() || c == '_' || c == '$')
+        {
+            continue;
+        }
+        let line = text[..at].matches('\n').count() + 1;
+        let rest = &text[at + PATH.len()..];
+        let Some(group) = rest.strip_prefix('{') else {
+            out.push((line, ident(rest)));
+            continue;
+        };
+        // The group's items at its own depth, each to its first `::`.
+        let (mut depth, mut item) = (0usize, String::new());
+        for c in group.chars() {
+            match c {
+                '{' => depth += 1,
+                '}' if depth == 0 => break,
+                '}' => depth -= 1,
+                ',' if depth == 0 => {
+                    out.push((line, ident(&item)));
+                    item.clear();
+                    continue;
+                }
+                _ => {}
+            }
+            if depth == 0 {
+                item.push(c);
+            }
+        }
+        if !item.trim().is_empty() {
+            out.push((line, ident(&item)));
+        }
+    }
+    out
+}
+
+/// Where `source`'s production text reaches past the tree engine: a
+/// `crate::` path to a module not in [`TREE_ENGINE`], or a remote call.
+fn recording_engine_uses(source: &str) -> Vec<String> {
+    let text = production(source);
+    let mut problems: Vec<String> = crate_paths(text)
+        .into_iter()
+        .filter(|(_, module)| !TREE_ENGINE.contains(&module.as_str()))
+        .map(|(line, module)| format!("{line}: names `crate::{module}`"))
+        .collect();
+    for call in REMOTE_CALLS {
+        for (at, _) in text.match_indices(call) {
+            let line = text[..at].matches('\n').count() + 1;
+            problems.push(format!("{line}: names `{call}`"));
+        }
+    }
+    problems
+}
+
+/// The tree engine's modules in agentfs-core name no recording-engine
+/// module and open no remote, so they move to their own crate whole and
+/// the recording engine's transports (registered after libgit2's setup)
+/// are never used by them. `super::` chains that reach the crate root are
+/// not read; there are none. The crate boundary replaces this check.
+#[test]
+fn the_tree_engine_names_no_recording_engine_module() {
+    let workspace = Workspace::load();
+    let root = root();
+    let src = root
+        .join(&workspace.member("agentfs-core").unwrap().dir)
+        .join("src");
+    let mut files: Vec<PathBuf> = TREE_ENGINE[1..]
+        .iter()
+        .map(|m| src.join(format!("{m}.rs")))
+        .collect();
+    files_under(&src.join(TREE_ENGINE[0]), &mut files);
+    files.sort();
+    let mut problems = Vec::new();
+    let mut paths = 0;
+    for file in &files {
+        let source = std::fs::read_to_string(file).unwrap();
+        paths += crate_paths(production(&source)).len();
+        let shown = file.strip_prefix(&root).unwrap_or(file).display();
+        for problem in recording_engine_uses(&source) {
+            problems.push(format!("{shown}:{problem}"));
+        }
+    }
+    assert!(
+        files.len() > 20 && paths > 100,
+        "only {} files and {paths} paths read: is the scan broken?",
+        files.len()
+    );
+    assert!(problems.is_empty(), "{}", problems.join("\n"));
+}
+
+#[test]
+fn a_tree_engine_use_of_the_recording_engine_is_found() {
+    assert_eq!(
+        crate_paths(
+            "use crate::tree_actor::Error;\nuse crate::{session::{A, B}, store, history::x};"
+        ),
+        [
+            (1, "tree_actor".to_owned()),
+            (2, "session".to_owned()),
+            (2, "store".to_owned()),
+            (2, "history".to_owned()),
+        ]
+    );
+    assert!(
+        recording_engine_uses(
+            "use crate::{tree_git::TreeGit, session};\nfn f() { agentfs_crate::x(); $crate::y(); }"
+        )
+        .is_empty()
+    );
+    assert_eq!(
+        recording_engine_uses("fn f() {\n    crate::history::init_git();\n}"),
+        ["2: names `crate::history`"]
+    );
+    assert_eq!(
+        recording_engine_uses("use crate::{store, paths::RepoPath};"),
+        ["1: names `crate::paths`"]
+    );
+    assert_eq!(
+        recording_engine_uses("let r = repo.find_remote(\"origin\")?;"),
+        ["1: names `find_remote`"]
+    );
+    assert!(recording_engine_uses("#[cfg(test)]\nmod tests { use crate::config; }").is_empty());
 }

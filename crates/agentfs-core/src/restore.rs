@@ -64,9 +64,9 @@ use git2::{ObjectType, Oid, Repository, TreeWalkMode, TreeWalkResult};
 use crate::checks::Refusal;
 use crate::lfs::fetch::LfsObjects;
 use crate::lfs::{Pointer, Store, attributes};
-use crate::paths::{PathError, RepoPath};
 use crate::record::OperationKind;
 use crate::rules::SkipReason;
+use agentfs_contracts::paths::{PathError, RepoPath};
 
 const MODE_EXECUTABLE: i32 = 0o100755;
 const MODE_SYMLINK: i32 = 0o120000;

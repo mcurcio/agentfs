@@ -22,11 +22,11 @@ use crate::events::{Event, Events, MemorySink};
 use crate::identity::Context;
 use crate::lfs::Pointer;
 use crate::lfs::fetch::LfsObjects;
-use crate::paths::RepoPath;
 use crate::record::{Caller, OperationKind};
 use crate::restore::{self, Applied, NotLive, RecordMode};
 use crate::telemetry::Telemetry;
 use crate::volume::{self, Committer, OperationSpec, Recorder, StateDir};
+use agentfs_contracts::paths::RepoPath;
 
 const CALLER: Caller = Caller {
     uid: 10000,

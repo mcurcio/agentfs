@@ -124,11 +124,11 @@ dependencies = [
 name = "agentfs-core"
 version = "0.1.0"
 dependencies = [
- "agentfs-align",
  "agentfs-clients",
  "agentfs-contracts",
  "agentfs-failpoints",
  "agentfs-git",
+ "agentfs-lines",
  "agentfs-os",
  "agentfs-repo",
  "agentfs-rules",
@@ -240,6 +240,12 @@ dependencies = [
 [[package]]
 name = "agentfs-lines"
 version = "0.1.0"
+dependencies = [
+ "agentfs-align",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
 
 [[package]]
 name = "agentfs-model"

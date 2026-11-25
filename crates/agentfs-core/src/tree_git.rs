@@ -560,8 +560,8 @@ impl TreeGit {
     }
 
     /// libgit2's handle on the repository, opened at first use with the
-    /// process's libgit2 setup ([`crate::history`]): no configuration but the
-    /// repository's own, and objects and refs fsynced.
+    /// process's libgit2 setup ([`agentfs_git::init`]): no configuration but
+    /// the repository's own, and objects and refs fsynced.
     fn with_repo<R>(&self, f: impl FnOnce(&Repository) -> Result<R>) -> Result<R> {
         let mut slot = self
             .store

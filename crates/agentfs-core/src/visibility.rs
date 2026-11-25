@@ -42,8 +42,8 @@
 use std::sync::Arc;
 
 use crate::fsync_class;
-use crate::paths::RepoPath;
 use crate::rules::{Decision, Rules, RulesError};
+use agentfs_contracts::paths::RepoPath;
 
 /// What an existing entry is, as a lookup or a listing sees it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

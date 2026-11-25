@@ -15,8 +15,8 @@
 use std::collections::BTreeMap;
 use std::sync::RwLock;
 
-use crate::paths::RepoPath;
 use crate::record::Change;
+use agentfs_contracts::paths::RepoPath;
 
 /// Tracked file and symlink paths. Safe to share across threads.
 #[derive(Debug, Default)]

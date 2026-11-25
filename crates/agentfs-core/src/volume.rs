@@ -42,7 +42,6 @@ use crate::journal::{Journal, OpenReport};
 use crate::lfs::{ObjectCache, Store, StorePolicy};
 use crate::nested;
 use crate::operations::{ActorBusy, OperationGuard, Operations};
-use crate::paths::{PathError, RepoPath};
 use crate::pending::{PendingId, PendingStore};
 use crate::reconcile::{self, Duties, Duty};
 use crate::record::{
@@ -52,6 +51,7 @@ use crate::rules::{Decision, Rules, RulesError, SkipReason};
 use crate::stamps::{FreezeStamp, LastWrites, StampBook, Verdict};
 use crate::telemetry::{Telemetry, spans};
 use crate::tracked::Tracked;
+use agentfs_contracts::paths::{PathError, RepoPath};
 
 /// The control socket's name in `meta/control`.
 pub const CONTROL_SOCKET: &str = "agentfs.sock";
@@ -3322,7 +3322,7 @@ mod tests {
             .unwrap();
         assert_eq!(recorded.seq, Some(0));
         let refusal = Refusal::SymlinkedSpecialFile {
-            file: crate::paths::SpecialFile::Gitmodules,
+            file: agentfs_contracts::paths::SpecialFile::Gitmodules,
         };
         assert_eq!(
             recorded.skipped,
@@ -3717,7 +3717,7 @@ mod tests {
             [skipped(
                 ".gitattributes/x",
                 SkipReason::Refused(Refusal::SpecialFileNotBlob {
-                    file: crate::paths::SpecialFile::Gitattributes,
+                    file: agentfs_contracts::paths::SpecialFile::Gitattributes,
                 })
             )]
         );

@@ -70,7 +70,7 @@ impl<'de> serde::Deserialize<'de> for Version {
     }
 }
 
-impl agentfs_core::tree_reconcile::Id for Version {
+impl agentfs_lines::Id for Version {
     fn at(writer: u64, index: u64) -> Self {
         Self(writer, index)
     }
@@ -82,7 +82,7 @@ impl agentfs_core::tree_reconcile::Id for Version {
     }
 }
 
-type LineMap = agentfs_core::tree_reconcile::LineMap<Version>;
+type LineMap = agentfs_lines::LineMap<Version>;
 
 /// A file's line map in a commit, with its identity: `lines/<aa>/<bb>/<name>`
 /// holds `[identity, line map, meta]`.
@@ -761,7 +761,7 @@ fn saved_line_map_and_bytes_share_a_commit_without_a_reserved_name() {
     let blob = at_path(&repo, head, &format!("files/{}", fanned("metadata.json")));
     assert_eq!(blob, b"first\npartial tail\nnext\n");
     let lines = line_map(&repo, head, "metadata.json").1;
-    let index = agentfs_core::tree_reconcile::LineIndex::of(&blob).unwrap();
+    let index = agentfs_lines::LineIndex::of(&blob).unwrap();
     lines.check(&blob, &index).unwrap();
     // One map per save, each a run: the file's lines, never its bytes.
     assert!(lines.encode().unwrap().len() < 300);

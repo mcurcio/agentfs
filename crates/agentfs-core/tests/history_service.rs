@@ -10,6 +10,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use agentfs_contracts::paths::RepoPath;
 use agentfs_core::events::{Event, Events, MemorySink, NullSink};
 use agentfs_core::history_service::wire::pb;
 use agentfs_core::history_service::{
@@ -18,7 +19,6 @@ use agentfs_core::history_service::{
 };
 use agentfs_core::identity::Context;
 use agentfs_core::lfs::Store;
-use agentfs_core::paths::RepoPath;
 use agentfs_core::pending::PendingId;
 use agentfs_core::record::{Caller, Change, Draft, Origin, Trigger};
 use agentfs_core::rules::SkipReason;

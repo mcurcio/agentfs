@@ -16,7 +16,7 @@
 //!   empty, `.` or `..` component. These are not recorded and raise
 //!   `PathRefused` ([`agentfs_core::volume::Recorder::refuse_invalid`]).
 
-use agentfs_core::paths::{PathError, RepoPath};
+use agentfs_contracts::paths::{PathError, RepoPath};
 
 /// How a path is treated when recording.
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -20,7 +20,7 @@ use crate::tree_actor::stages::{Timer, Which};
 use crate::tree_actor::tree::{EventNumber, Lines, MergeFileIdentity};
 use crate::tree_actor::{Error, Result, TreeId, queue, referee};
 use crate::tree_git::{STREAMED_BLOB, TreeGit};
-use crate::tree_reconcile::{self, FileImage, Image, Piece};
+use agentfs_lines::{FileImage, Image, Piece};
 
 /// A record's value in one commit, as [`LandedInto`] caches it: the commit, and the record (a
 /// file's identity, or none and a directory's path).
@@ -257,7 +257,7 @@ pub(in crate::tree_actor) fn take_bytes(
             .iter()
             .map(|(lines, at)| (lines, &*images[*at] as &dyn Image))
             .collect();
-        let pieces = tree_reconcile::pieces(&file.lines, &sources)?;
+        let pieces = agentfs_lines::pieces(&file.lines, &sources)?;
         out.push(
             pieces
                 .into_iter()

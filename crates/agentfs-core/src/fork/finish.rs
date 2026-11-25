@@ -61,13 +61,13 @@ use crate::identity::Context;
 use crate::lock::StateLock;
 use crate::patch::submit::{DEFAULT_ATTEMPTS, listed_as, next_seq};
 use crate::patch::{applied_prefix, inbox_prefix, inbox_ref, seq_of_ref};
-use crate::paths::RepoPath;
 use crate::push::{
     CreateOnlyOutcome, CreateOnlyRef, PUSH_BACKOFF_CAP, PushOutcome, RemotePusher, backoff,
 };
 use crate::record::{Caller, Trigger, read_repairs};
 use crate::telemetry::{Telemetry, spans};
 use crate::volume::{self, Committer, Input, Recorder, StateDir, VolumeError};
+use agentfs_contracts::paths::RepoPath;
 
 use super::identity::{ForkIdentity, ForkLink, change_ref, finish_ref};
 use super::receive::{ReceiveError, Receiver, ReceiverError, SOURCE_HISTORY, UnderLock};

@@ -13,7 +13,8 @@ use std::time::Duration;
 
 use clap::Parser;
 
-use agentfs_core::config::parse_duration;
+use agentfs_contracts::units::duration_arg;
+
 use agentfs_csi::controller::ControllerService;
 use agentfs_csi::identity::IdentityService;
 use agentfs_csi::launcher::{AgentfsLauncher, PluginIdentity};
@@ -22,10 +23,6 @@ use agentfs_csi::mounter::KernelMounter;
 use agentfs_csi::node::NodeService;
 use agentfs_csi::server;
 use agentfs_csi::supervisor::{Backoff, NodeConfig, Supervisor};
-
-fn duration(value: &str) -> Result<Duration, String> {
-    parse_duration(value).ok_or_else(|| format!("{value:?} is not a duration (use e.g. 500ms, 5s)"))
-}
 
 /// The agentfs CSI driver.
 #[derive(Debug, Parser)]
@@ -52,7 +49,7 @@ struct Cli {
     #[arg(long, default_value = "/usr/local/bin/agentfs")]
     agentfs_bin: PathBuf,
     /// The longest delay between restarts of a crashed host.
-    #[arg(long, default_value = "30s", value_parser = duration)]
+    #[arg(long, default_value = "30s", value_parser = duration_arg)]
     backoff_max: Duration,
     /// The plugin pod's name, for its children's identity.
     #[arg(long, env = "AGENTFS_CSI_POD", default_value = "")]

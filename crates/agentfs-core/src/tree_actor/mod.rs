@@ -175,7 +175,7 @@ pub enum Error {
     #[error(transparent)]
     Json(#[from] serde_json::Error),
     #[error(transparent)]
-    Reconcile(#[from] crate::tree_reconcile::Error),
+    Reconcile(#[from] agentfs_lines::Error),
     #[error("tree volume is busy")]
     Busy,
     #[error("not a tree state area (or unsupported format)")]
@@ -271,9 +271,7 @@ impl Error {
             Self::TreeGit(crate::tree_git::Error::NoSpace(_)) => libc::ENOSPC,
             Self::Io(e)
             | Self::TreeGit(crate::tree_git::Error::Io(e))
-            | Self::Reconcile(crate::tree_reconcile::Error::Io(e)) => {
-                e.raw_os_error().unwrap_or(libc::EIO)
-            }
+            | Self::Reconcile(agentfs_lines::Error::Io(e)) => e.raw_os_error().unwrap_or(libc::EIO),
             _ => libc::EIO,
         }
     }

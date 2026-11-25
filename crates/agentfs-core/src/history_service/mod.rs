@@ -38,9 +38,9 @@ pub use listener::{FrontHooks, ListenerHandle, NoHooks, RECONNECT_MAX, RECONNECT
 pub use server::{HistoryServer, MAX_CONNECTIONS};
 
 use crate::nested::View;
-use crate::paths::RepoPath;
 use crate::record::Origin;
 use crate::stamps::FreezeStamp;
+use agentfs_contracts::paths::RepoPath;
 
 /// 2 = gRPC, package `agentfs.history.v2`; 1 was length-prefixed JSON
 /// frames.

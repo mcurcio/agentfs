@@ -21,7 +21,7 @@ use git2::{Delta, DiffOptions, Oid, Repository};
 use super::LfsError;
 use super::attributes::{self, ROOT_GITATTRIBUTES};
 use super::pointer::{LfsOid, MAX_POINTER_SIZE, Pointer};
-use crate::paths::RepoPath;
+use agentfs_contracts::paths::RepoPath;
 
 /// The objects the commits in `head ^ hide` add or modify (all of
 /// `head`'s history when `hide` is `None` or unknown here), each with one
