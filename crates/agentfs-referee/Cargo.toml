@@ -1,0 +1,11 @@
+[package]
+name = "agentfs-referee"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "The landing rules of agentfs's tree views, pure: how a fork's changes land in its upstream and what a sync shows"
+
+[package.metadata.agentfs]
+rank = "domain"

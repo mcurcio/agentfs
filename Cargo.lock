@@ -46,6 +46,7 @@ dependencies = [
  "agentfs-clients",
  "agentfs-contracts",
  "agentfs-engine",
+ "agentfs-referee",
  "agentfs-rules",
  "agentfs-service",
  "agentfs-trees",
@@ -308,6 +309,10 @@ dependencies = [
  "tokio",
  "tokio-stream",
 ]
+
+[[package]]
+name = "agentfs-referee"
+version = "0.1.0"
 
 [[package]]
 name = "agentfs-repo"

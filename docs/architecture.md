@@ -18,6 +18,7 @@ is. The libraries behind it, and why each was chosen, are under
 | `agentfs-cli` | binary | The `agentfs` command, the package's one binary (every subcommand is listed in [configuration](configuration.md#commands)); OpenTelemetry export |
 | `agentfs-csi` | library and binary | The CSI driver: `agentfs-csi`, one per node beside csi-provisioner, which makes each claim's tree volume with `agentfs init` and supervises one `agentfs host` per volume in use on the node, each pod's view opened on it at the kubelet's target ([csi](csi.md)) |
 | `agentfs-rules` | library | The Rules domain of the tree views, pure: where each new name of a tree lives, recorded or in its untracked area, from the operator's `info/exclude` and `info/attributes` ([trees](trees.md#rules-and-the-untracked-area)). Depends on `gix-ignore` and `gix-attributes` only; both engines and `agentfs-fuse` depend on it |
+| `agentfs-referee` | library | The tree views' landing rules, pure and `no_std` outside its tests: every line, name, metadata and directory rule of a fork and its upstream as a plan (`land`, `sync`, `touches`), the queue's order and locks, each fork's upstream, and the values they read. It reads history only through its `Landed` port |
 | `agentfs-align` | library | Git's histogram diff, called one way, for line identity (git-model §7), and the `git` program's isolated environment (`isolated`, with the `PATH` every `git` child gets). It is the lowest crate with no git2, so the model and the line maps run `git` as the engines do. The engines and `agentfs-model` all reach the diff through it, so line identity does not depend on how `git` is called |
 | `agentfs-failpoints` | library | The one registry of failpoints, named places on the durable path where a test build can kill, fail, stall or park the process, and the gates a test drives over FIFOs. In a release build each point is an inlined `Ok(())` |
 | `agentfs-os` | library | The operating-system leaves used outside the recording engine too: advisory file locks, atomic files, confined access to a directory tree, the mount table, the shared-filesystem check, listening Unix sockets, the allocator's arenas. Knows nothing of git, volumes or trees |
@@ -58,7 +59,7 @@ and this table against the workspace manifest.
 | `line-identity` | `line-identity` | the library | The alignment and the line maps: which version wrote each line of a file |
 | `leaf` | `line-identity`, `leaf` | the library | Mechanisms over the operating system, git and the test build's failpoints, which know no domain value and are used outside the recording engine too, so it can be deleted whole |
 | `shared-kernel` | none | the library | The shared kernel of the domains: values, capabilities, traits, events and ports, with no I/O |
-| `domain` | `shared-kernel` | the library | The pure domains over the shared kernel's ports, and the tree views' rules; no domain depends on another |
+| `domain` | `line-identity`, `shared-kernel` | the library | The pure domains over the shared kernel's ports, and the tree views' rules: where a new name lives and how a fork's changes land; no domain depends on another |
 | `engine` | `line-identity`, `leaf`, `shared-kernel`, `domain` | the library | What implements the ports and owns the state on disk; no engine depends on another |
 | `service` | `shared-kernel`, `domain`, `engine` | the library | One volume composed: the domains wired onto the engine's store, the one place a volume is composed, which the binary and the crate `agentfs` both use |
 | `filesystem` | `leaf`, `shared-kernel`, `domain`, `engine`, `service`, `filesystem` | the filesystem | The FUSE layer and `agentfs-cli`, whose binary `agentfs` is the composition root |
@@ -99,6 +100,12 @@ row names a module that no longer exists; `tests.rs` files are not listed.
 | `lib.rs` | Crate root: the Rules domain's overview |
 | `operator.rs` | `OperatorRules`: `info/exclude` and `info/attributes` parsed from buffers with `gix-ignore` and `gix-attributes`, case-sensitive, never a system, global or tree file |
 | `set.rs` | `RuleSet`: one volume's rules, built once at open, refusing rules tree volumes do not build (`RulesError`); `place` judges a new name `Tracked` or `Untracked` with its reason, built-ins first |
+
+### `agentfs-referee`
+
+| Module | Role |
+|---|---|
+| `lib.rs` | Crate root: the landing rules' overview, `no_std` outside its tests |
 
 ### `agentfs-align`
 

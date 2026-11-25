@@ -183,7 +183,7 @@ fn ranks() -> Vec<Rank> {
         ("line-identity", &["line-identity"][..]),
         ("leaf", &["line-identity", "leaf"]),
         ("shared-kernel", &[]),
-        ("domain", &["shared-kernel"]),
+        ("domain", &["line-identity", "shared-kernel"]),
         (
             "engine",
             &["line-identity", "leaf", "shared-kernel", "domain"],

@@ -6,7 +6,8 @@
 //! (`agentfs-engine`), [`contracts`] the shared kernel of its domains
 //! (`agentfs-contracts`), [`volume`], [`clients`] and [`trees`] the Volume,
 //! Clients and Trees domains (`agentfs-volume`, `agentfs-clients`,
-//! `agentfs-trees`), [`rules`] the Rules domain (`agentfs-rules`), and
+//! `agentfs-trees`), [`rules`] the Rules domain (`agentfs-rules`),
+//! [`referee`] the tree views' landing rules (`agentfs-referee`), and
 //! [`service`] one volume composed: its domains wired onto one store
 //! (`agentfs-service`).
 //!
@@ -64,6 +65,7 @@
 pub use agentfs_clients as clients;
 pub use agentfs_contracts as contracts;
 pub use agentfs_engine as engine;
+pub use agentfs_referee as referee;
 pub use agentfs_rules as rules;
 pub use agentfs_service as service;
 pub use agentfs_trees as trees;
