@@ -23,13 +23,14 @@ ranks = [
     { name = "line-identity", uses = ["line-identity"] },
     { name = "leaf", uses = ["line-identity", "leaf"] },
     { name = "shared-kernel", uses = [] },
-    { name = "domain", uses = ["line-identity", "shared-kernel"] },
-    { name = "engine", uses = ["line-identity", "leaf", "shared-kernel", "domain"] },
+    { name = "domain", uses = ["shared-kernel"] },
+    { name = "landing-rules", uses = ["line-identity", "shared-kernel"] },
+    { name = "engine", uses = ["line-identity", "leaf", "shared-kernel", "domain", "landing-rules"] },
     { name = "service", uses = ["shared-kernel", "domain", "engine"] },
     { name = "filesystem", uses = ["leaf", "shared-kernel", "domain", "engine", "service", "filesystem"] },
     { name = "kubernetes", uses = ["leaf", "shared-kernel", "engine", "filesystem"] },
     { name = "umbrella", uses = ["shared-kernel", "domain", "engine", "service"] },
-    { name = "tests", uses = ["line-identity", "leaf", "shared-kernel", "domain", "engine", "service", "filesystem", "kubernetes", "tests"] },
+    { name = "tests", uses = ["line-identity", "leaf", "shared-kernel", "domain", "landing-rules", "engine", "service", "filesystem", "kubernetes", "tests"] },
 ]
 
 [patch.crates-io]

@@ -1,115 +1,111 @@
-# Crate split, PR G: frozen pages
+# Crate split, PR G: frozen pages (revision 2, after the design review)
 
-Design: `docs/target-architecture/future/crate-split.md` (section 3 row G, as the skeleton rewrote it; section 1;
-section 4's items routed to G). Branch `claude/bold-hopper-72ixu2`, PR #47, base of this run 0aea0f8. Two slices,
-G1 then G2, in order: G2 builds on the line values G1 moves into agentfs-lines and on G1's two cuts, and both edit
-the engine. Owner's words (OWNER-GUIDANCE.md "Performance", general guidance): "Just two? Can we break it down more
-along domain lines?" (2026-11-24); carrying D to G on PR #47: "Yes" (2026-11-25). Counts are `git grep` at 0aea0f8.
-A to F idioms hold: ranks, agentfs-repo's checks, no shims or second paths, docs in the same commit, commits naming
-their paths. No design review ran in this step (the skill: the code architect self-checks; Decisions, "Self-check").
-**The skeleton** (this file's commit): `crates/agentfs-referee/{Cargo.toml,src/lib.rs}` (rank `domain`, no
-dependencies, module doc and `#![cfg_attr(not(test), no_std)]` only); the member; the rank `domain`'s uses gain
-`line-identity` (manifest, agentfs-repo's `ranks()` fixture, architecture.md's Ranks table); the front's `pub use
-agentfs_referee as referee;`, its dependency and its doc sentence; `Cargo.lock`; the Dockerfile's stubs;
-architecture.md's Crates row and module-map section; crate-split.md row G and section 4 (the decisions below).
+Design: `docs/target-architecture/future/crate-split.md` (section 3 row G, as this revision's skeleton rewrote it;
+section 1; section 4). Branch `claude/bold-hopper-72ixu2`, PR #47, base of this run 0aea0f8. Two slices, G1 then G2,
+in order: G2's referee names the metadata values G1 moves to the shared kernel and uses G1's `Shape::held` cut, and
+both edit the engine. Owner's words (OWNER-GUIDANCE.md "Performance", general guidance): "Just two? Can we break it
+down more along domain lines?" (2026-11-24); carrying D to G on PR #47: "Yes" (2026-11-25). Counts are `grep` at
+0aea0f8. A to F idioms hold: ranks, agentfs-repo's checks, no shims or second paths, docs in the same commit, commits
+naming their paths. The design review's twelve findings and their outcome are under Decisions, "Review".
+**The skeleton** (this revision's commit): `crates/agentfs-referee/{Cargo.toml,src/lib.rs}` in a new rank
+`landing-rules` (uses `line-identity`, `shared-kernel`; `engine` and `tests` use it), no dependencies, module doc and
+`#![cfg_attr(not(test), no_std)]` only; `domain` back to `uses = ["shared-kernel"]`; the front's re-export of the
+referee, its dependency and its doc sentence removed (the front is 0aea0f8's again); the manifest, agentfs-repo's
+`ranks()` fixture, architecture.md's Crates row, Ranks table and module-map section; the Dockerfile's stubs;
+`Cargo.lock`; crate-split.md row G, section 1 and section 4.
 
 ## Page G1
 
-**Title.** The line values live in agentfs-lines; the referee's two upward edges are cut; the library gives each
-item one path (checked); the engine's open items closed.
-**Line values** (tree.rs:22-205 → `crates/agentfs-lines/src/version.rs`, private module; lib.rs gains `pub use
-version::{EventNumber, LineVersion, Lines, NotALineVersion, Versions};`). Bodies move unchanged; visibility widens
-from `pub(super)` to `pub` because the engine and G2's referee both name them.
+**Title.** Entry metadata and `parent_of` go to the shared kernel; the engine gives each item one path (checked);
+`queue::held` becomes `Shape::held`; the engine's open items close.
+**Metadata** (meta.rs:12-103 → `crates/agentfs-contracts/src/meta.rs`, `pub mod meta;`, doc: an entry's metadata as
+history records it, docs/trees.md "What a commit holds"). Bodies move; `Perm`'s parse error becomes its own:
 ```rust
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)] #[serde(transparent)]
-pub struct EventNumber(u64);
-impl EventNumber { #[inline] pub const fn new(seq: u64) -> Self; #[inline] pub const fn get(self) -> u64;
-                   #[inline] pub const fn object(self) -> u64; }          // + Display, as today
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)] #[serde(into = "String", try_from = "String")]
-pub struct LineVersion { event: EventNumber, index: u64 }                 // fields stay private
-impl LineVersion { #[inline] pub const fn event(self) -> EventNumber; }
-// Id (at, writer, index), Ord and PartialOrd (the texts' byte order), Display, From<LineVersion> for String:
-// as today, each method #[inline], and the private `text` and `digits` #[inline].
-impl FromStr for LineVersion { type Err = NotALineVersion; }  impl TryFrom<String> for LineVersion { type Error = NotALineVersion; }
+pub enum Kind { File, Symlink, Dir }                       // derives and serde as today
+pub struct Perm(u32);                                      // private field; serde into/try_from String
+impl Perm { pub const fn from_mode(mode: u32) -> Self; pub const fn bits(self) -> u32; }
+impl TryFrom<String> for Perm { type Error = NotAPerm; }   // Display, From<Perm> for String as today
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[error("{0:?} is not a line version: `<event>:<index>`, decimal, no sign or leading zero, index from 1")]
-pub struct NotALineVersion(pub String);
-pub struct Versions { event: EventNumber, last: u64 }
-impl Versions { #[inline] pub const fn of(event: EventNumber) -> Self; #[inline] pub fn take(&mut self, n: u64) -> LineVersion;
-                #[cfg(test)] pub fn next(&mut self) -> LineVersion; }
-pub type Lines = LineMap<LineVersion>;
+#[error("{0:?} is not a permission: four octal digits")]
+pub struct NotAPerm(pub String);
+pub struct Attrs { pub perm: Perm, pub owner: crate::clients::FileOwner }
+pub struct Meta { pub kind: Kind, pub mode: Perm, pub uid: u32, pub gid: u32 }
+impl Meta { pub const fn new(kind: Kind, attrs: Attrs) -> Self; pub const fn attrs(&self) -> Attrs; }
 ```
-`NotALineVersion` replaces the engine's `Error::Format` here; it is read only through serde (a `serde_json::Error`, so
-the engine's `Error::Json` as before) and by tests. **Performance:** the values cross a crate boundary without release
-`lto`, and `LineVersion`'s `Ord` is hot (the builder's and the referee's maps of versions): hence the `#[inline]`s;
-image.yml's release figures for the final SHA are read against 0aea0f8's (AGENTS.md: a miss but `create`'s warns).
-**Cuts.** (1) `queue::held` (queue.rs:50) → `impl Shape { pub(super) fn held(&self, open_objects: impl
-IntoIterator<Item = u64>) -> BTreeSet<queue::Key> }` in tree.rs, beside `keys_of`, whose body it repeats (each
-named open object's `keys_of`); takes.rs:278 calls `t.held(..)`; queue.rs no longer imports `Shape`. (2)
-`Upstreams::merges` (upstreams.rs:66) → refs.rs, the ref layout's home: `pub(in crate::tree_actor) fn
-merges(upstreams: &Upstreams) -> BTreeMap<String, String>`, over a new `pub(in crate::tree_actor) fn pairs(&self) ->
-impl Iterator<Item = (TreeId, TreeId)> + '_` (each fork and its upstream, by fork); builder.rs's two calls (1774,
-1849); upstreams.rs no longer imports `refs`.
-**One path.** tree_actor/mod.rs:45 `pub use agentfs_contracts::{NotATree, TreeId};` becomes a private `use`; every
-import of either through the engine names `agentfs_contracts::{TreeId, NotATree}` (the front's doctest's form):
-engine src about 30 lines in 25 files (`super::TreeId`, `crate::tree_actor::{.., TreeId}`), engine tests 19 files,
-agentfs-cli 3 (launcher/host.rs, launcher/mod.rs, tests/cli/cli_verify.rs), agentfs-conformance 3 (engine_names.rs,
-mounted.rs, library.rs), agentfs-fuse 2 (tree_view.rs, save_worker.rs), docs/library/engine.md:186. New check
-(agentfs-repo `crates.rs`): `the_library_gives_each_item_one_path`: no production source (`production`, the spawn
-check's helper) of a crate the front re-exports (its normal dependencies) has a line matching `^\s*pub use
-(::)?agentfs_`; `fn reexport_problems(name: &str, source: &str) -> Vec<String>` with a fixture test
-`a_second_path_is_found` (`pub use agentfs_contracts::TreeId;` found; `pub(crate) use` and one inside `#[cfg(test)]
-mod t` not). Not read: an alias of a crate (`use agentfs_contracts as c; pub use c::TreeId;`) and the leaves
-(`agentfs_lines` re-exports align's `Hunk`, `agentfs_git` `GIT_PATH`, by design).
-**Engine items.** `Error::Reconcile(#[from] agentfs_lines::Error)` → `Error::Lines(#[from] agentfs_lines::Error)`,
-errno arm as before (mod.rs:183, :279). JC6 and JC8 join `journal/compaction.rs`'s module doc, from their citations
-and latency-upkeep.md's C6 and C8 (git show 1e45703^): **JC6.** an unlinked segment a holder still reads stays
-readable through its `Arc` and counts in `Durability::len` until the last holder lets go, never in `len()` here;
-**JC8.** every field of the checkpoint has one named source at `built` (the table on `Checkpoint`): History's state
-read in one hold, and the fold of the records at or below it. Test-only `pub` items, by F2's rule (no production
-caller: `#[cfg(any(test, feature = "test-util"))] pub`): `History::wait_compacted` (and the field `compacted`, its init
-and its write, which only it reads), `History::wait_compactor`, `stages::holds_on_this_thread`. Found by a scan of every
-`pub` item of the engine's production text whose name no other production text names; a `pub` method sharing its name
-with a production item elsewhere is not separated by the scan (stated in engine.md, "Test builds").
-**Tests.** tree.rs's `line_versions_order_as_their_text`, `only_canonical_text_parses`, `versions_count_from_one` and
-`v()` → version.rs; queue.rs's `held_keys_are_an_open_objects_identity_and_names_and_none_unnamed` → tree.rs's tests
-(calls `shape.held`); upstreams.rs's `merges` assertion → refs.rs's `merges_names_each_forks_upstream_branch`.
-**Docs.** architecture.md: lines' `version.rs` row; engine rows `tree.rs`, `queue.rs`, `history/refs.rs`,
-`history/upstreams.rs`. engine.md: example's `TreeId`, the compaction table's `wait_compacted` and "Test builds".
-agentfs.md "Not re-exported": `Error::Lines`. development.md: the new check in agentfs-repo's list. module-cut.md row 5.1's
-`tree.rs` path. CHANGELOG.
-**Acceptance.** `git grep -nE '(struct|type) (EventNumber|LineVersion|Versions|Lines)\b' -- crates/agentfs-engine` and
-`git grep -n 'Reconcile(' -- crates/agentfs-engine` are empty; `git grep -nE 'fn (held|merges)' --
-crates/agentfs-engine/src/tree_actor/queue.rs crates/agentfs-engine/src/tree_actor/history/upstreams.rs` is empty;
-`git grep -nE '^\s*pub use agentfs_contracts' -- crates/agentfs-engine` is empty. Gates: fmt; clippy `--all-targets -D
-warnings` and nextest of -lines, -engine (also `--features failpoints`), -fuse, -cli (also failpoints), -conformance,
--service, -repo; CI's two library steps (`cargo clippy --locked -p agentfs-engine -p agentfs-service -p agentfs --lib --
--D warnings`, `cargo test --doc --locked -p agentfs`); `cargo build -p agentfs-conformance --bin phase1-replay`.
-**Probes.** (1) LineVersion's `Ord` derived (numeric) → `line_versions_order_as_their_text`. (2) the engine's `pub
-use agentfs_contracts::TreeId;` restored → `the_library_gives_each_item_one_path`. (3) `Shape::held` keeps only its
-first object → the moved held test. (4) `refs::merges` maps to `refs::head()` → the moved merges test. (5)
-`holds_on_this_thread()` called in agentfs-service's `src` → CI's library clippy step (E0425).
-**Files.** `crates/agentfs-lines/src/{lib.rs,version.rs}`; `crates/agentfs-engine/**`; the import lines named in
--cli, -conformance, -fuse; `crates/agentfs-repo/tests/repo/crates.rs`; the docs named.
+`Meta::git_mode` stays in the engine as `pub(in crate::tree_actor) const fn git_mode(meta: &Meta) -> u32` in
+`history/format.rs`, its one caller (format.rs:165): git's storage mode is the history writer's. The engine's meta.rs
+keeps `Times`, `SetTime` and `#[cfg(test)] TEST_FILE` (now `Meta { kind: Kind::File, mode: Perm::from_mode(0o644),
+uid: 1000, gid: 1000 }`); `pub use meta::{SetTime, Times};`.
+**`parent_of`** (tree.rs:786-789) → `agentfs_contracts::paths::parent_of(path: &str) -> &str`, beside `is_dotgit`;
+fuse's identical `parent_dir` (tree_view.rs:714-717) is deleted and its caller (:1240) uses it.
+**One path.** mod.rs:45 `pub use agentfs_contracts::{NotATree, TreeId};` becomes a private `use`; `Attrs, Kind,
+Meta, Perm` leave mod.rs's `pub use meta::..`. Every import names `agentfs_contracts::{TreeId, NotATree}` or
+`agentfs_contracts::meta::{..}`: engine src about 30 lines in 25 files (TreeId) and 14 files (metadata); engine tests
+19 files; agentfs-cli 3 (launcher/host.rs, launcher/mod.rs, tests/cli/cli_verify.rs); agentfs-conformance 3
+(engine_names.rs, mounted.rs, library.rs); agentfs-fuse 3 (tree_view.rs, save_worker.rs, untracked.rs);
+agentfs-service tests/volume.rs; the front's doctest (`agentfs::contracts::meta::{Attrs, Perm}`); engine.md:25, :186.
+New check (agentfs-repo `crates.rs`) `the_library_gives_each_item_one_path`: in every source of a crate the front
+re-exports (its normal dependencies), whole text, no statement (up to its `;`) that starts `pub use` or `pub type`
+(not `pub(..)`) names a path `agentfs_<name>::` or `::agentfs_`; `fn reexport_problems(source: &str) -> Vec<String>`,
+fixture test `a_second_path_is_found`: `pub use agentfs_contracts::TreeId;`, `pub use {agentfs_contracts::TreeId};`,
+`pub type T = agentfs_contracts::TreeId;` and one inside `mod tests` found; `pub(crate) use ..`, `use ..` and
+`agentfs_layers` (a name, fuse lib.rs:52) not. **Not read** (development.md, beside the check): a private import
+re-exported through `self::`/`crate::` (`use agentfs_contracts::TreeId; pub use self::TreeId as T;`), a crate alias
+(`use agentfs_contracts as c; pub use c::TreeId;`), a macro that expands to one; rustdoc JSON, which resolves items,
+is nightly-only. The leaves are out of scope by design (lines' `Hunk`, git's `GIT_PATH`).
+**Cut.** `queue::held` (queue.rs:50) → `impl Shape { pub(super) fn held(&self, open_objects: impl IntoIterator<Item =
+u64>) -> BTreeSet<queue::Key> }` in tree.rs, beside `keys_of` (tree.rs:1210), whose body it repeats; takes.rs:278
+calls it; queue.rs no longer imports `Shape`. `Upstreams` and its `merges` do not move (Decisions 3).
+**Engine items.** `Error::Reconcile(#[from] agentfs_lines::Error)` → `Error::Lines(..)`, errno arm as before (mod.rs:183,
+:279). JC6 and JC8 join compaction.rs's invariant list (cited at :68, :987, built.rs:732, compactor.rs:190,
+mod.rs:2613; text from latency-upkeep.md's C6, C8 at 1e45703^): **JC6.** an unlinked segment a holder still reads stays
+readable through its `Arc` and counts in `Durability::len` until the last holder lets go; **JC8.** every field of the
+checkpoint has one named source at `built`: History's state read in one hold, and the fold of the records at or below
+it. Test-only `pub` (F2's rule, `#[cfg(any(test, feature = "test-util"))]`; every caller is a test, read with grep):
+`History::wait_checkpointed` (built.rs:424; callers mod.rs:1962 in `test_support`, :2609, compactor/tests.rs:478, :611,
+it/tree_actor.rs:1396, support/trees.rs:115, tree_stages.rs:393), `wait_compacted` with the field `compacted` and its
+write, `wait_compactor`, `stages::holds_on_this_thread` with `HOLDS_HERE` and its increment in `Held::start`
+(stages.rs:596, :611). engine.md's two compaction rows move under "Test builds".
+**CI.** `ci/fuse-tests.sh:47`'s `creds::` run gains `case "$OUT" in *"ok. 0 passed"*) fail "no creds test ran" ;; esac`
+(the one direct libtest run with a name filter and no count guard; :52 has one); development.md says a filter given to
+a libtest binary run directly is not otherwise checked: libtest exits 0 when it matches nothing.
+**Docs.** architecture.md: contracts' `meta.rs` row, `paths.rs` row; engine's `meta.rs`, `tree.rs`, `queue.rs`,
+`history/format.rs` rows. domains.md: the metadata values. engine.md, agentfs.md (doctest route, "Not re-exported":
+`Error::Lines`). development.md: the new check and its Not read. module-cut.md row 5.1's `tree.rs` path. CHANGELOG.
+**Acceptance.** `grep -rnE 'pub use agentfs_contracts|struct (Perm|Attrs|Meta)\b|enum Kind\b|fn parent_(of|dir)\b'
+crates/agentfs-engine/src crates/agentfs-fuse/src` and `grep -rn 'Reconcile(' crates/agentfs-engine` are empty; `grep -n
+'fn held' crates/agentfs-engine/src/tree_actor/queue.rs` is empty. Gates: fmt; clippy `--all-targets -D warnings` and
+nextest of -contracts, -engine (also `--features failpoints`), -fuse, -cli (also failpoints), -conformance, -service,
+-repo; `cargo test --doc -p agentfs`; CI's two library steps (`cargo clippy --locked -p agentfs-engine -p
+agentfs-service -p agentfs --lib -- -D warnings`, `cargo test --doc --locked -p agentfs`); `cargo build -p
+agentfs-conformance --bin phase1-replay`; `bash ci/check-deps.sh`.
+**Probes.** (1) `pub use agentfs_contracts::TreeId;` restored in mod.rs → `the_library_gives_each_item_one_path`. (2)
+`Shape::held` keeps only its first object → the moved held test. (3) `holds_on_this_thread()` called in
+agentfs-service's `src` → CI's library clippy step (E0425). (4) `Perm::try_from("644")` accepted → contracts'
+`only_four_octal_digits_parse_as_a_mode`. (5) `creds::` renamed `cred::` in the script → its new guard (on a runner).
+**Tests.** meta.rs's `meta_is_its_stored_json_..` splits: JSON and `attrs` half → contracts, git modes half →
+format.rs's `git_modes_follow_the_owners_execute_bit`; `only_four_octal_digits_..` → contracts; `a_save_keeps_the_atime`
+stays. queue.rs's `held_keys_are_an_open_objects_identity_and_names_and_none_unnamed` → tree.rs's tests.
+**Files.** `crates/agentfs-contracts/src/{lib.rs,meta.rs,paths.rs}`; `crates/agentfs-engine/**`; the import lines named
+in -cli, -conformance, -fuse, -service; `crates/agentfs/src/lib.rs`; `crates/agentfs-repo/tests/repo/crates.rs`; `ci/fuse-tests.sh`; the docs.
 
 ## Page G2
 
-**Title.** agentfs-referee holds the landing rules, the queue, the fork shape and their values, `no_std` outside its
-tests; its purity is checked three ways; the crate split's page keeps only what remains.
-**The crate** (`crates/agentfs-referee`, rank `domain`). Deps: agentfs-contracts (`TreeId`, `FileOwner`), agentfs-lines
-(the line maps and values), `serde` (derive), `thiserror`; dev `serde_json`. No dev-dependency on agentfs-git: the
-tests' spawner is `std::process::Command::spawn` (tests have std). lib.rs: `#![cfg_attr(not(test), no_std)]`, `extern
-crate alloc;`, private modules, `pub mod queue;`, the rest re-exported at the root (the engine's idiom: one path each).
+**Title.** agentfs-referee holds the landing rules, the queue and their values, `no_std` outside its tests; purity is
+read from the ranks and checked at compile time; the crate split's page keeps only what remains.
+**The crate** (`crates/agentfs-referee`, rank `landing-rules`). Deps: agentfs-contracts (`TreeId`, `meta::Meta`),
+`agentfs-lines = { .., default-features = false }`, `serde` (derive), `thiserror`; dev: `serde_json`, `agentfs-lines`
+with `features = ["io"]` (the tests' `align_bytes_with(.., Command::spawn, ..)`). lib.rs: the skeleton's lines, `extern
+crate alloc;`, private modules, `pub mod queue;`, the rest re-exported at the root (one path each).
 ```rust
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("the history the landing rules read is malformed")] Format,   // every `Error::Format` of referee/ today
     #[error(transparent)] Ancestry(#[from] Broken),                       // Broken: Cycle | Missing, as today
-    #[error(transparent)] Lines(#[from] agentfs_lines::Error),            // Lines::from_expanded and the maps
+    #[error(transparent)] Lines(#[from] agentfs_lines::Error),
 }
 pub type Result<T, E = Error> = core::result::Result<T, E>;
-/// History's answers; its own failure arrives as the caller's error, the rules' converted into it.
-pub trait Landed { type Error: From<Error>;
+pub trait Landed { type Error: From<Error>;                               // the caller's failure crosses intact
     fn landed(&mut self, save: EventNumber) -> Result<bool, Self::Error>;
     fn record_landed(&mut self, record: Record<'_>) -> Result<bool, Self::Error>; }
 pub fn undecided<L: Landed + ?Sized>(fork: &Snapshot, upstream: &Snapshot, landed: &mut L) -> Result<Undecided, L::Error>;
@@ -120,113 +116,130 @@ pub fn touches(before: &Snapshot, after: &Snapshot) -> BTreeSet<queue::Key>;
 pub fn consulted(base: &Snapshot, incoming: &Snapshot) -> Result<BTreeSet<queue::Key>>;
 pub fn ended_files(upstream: &Snapshot, undecided: &Undecided) -> Result<BTreeSet<MergeFileIdentity>>;
 pub fn with_directories(keys: impl IntoIterator<Item = queue::Key>) -> BTreeSet<queue::Key>;
-pub fn parent_of(path: &str) -> &str;      // tree.rs:787; tree.rs imports it
 ```
-`pub` at the root, shapes unchanged (fields `pub` as today): `Snapshot<L = Lines>`, `File<L = Lines>`, `Decision<L =
-Lines>`, `Version`, `CollisionKind`, `Collision`, `PriorDecisions`, `Synced`, `Cause`, `Record<'a>`, `Undecided`, `Broken`;
-`MergeFileIdentity(pub u64)`, `NameHistory { pub head, pub versions }`, `NameVersions`, `NameVersion { pub path, pub
-over, pub replaced_by }` and their methods (`pub`, the small accessors `#[inline]`); `Kind`, `Perm`, `Attrs`, `Meta`
-(as meta.rs today; `Perm: TryFrom<String, Error = NotAPerm>`, `pub struct NotAPerm(pub String)`, `#[error("{0:?} is not
-a permission: four octal digits")]`); `Upstreams` (its methods `pub`, with G1's `pairs`). `queue`: `Key`, `Plan`,
-`eligible`, `Cut` and its methods, `cut`, `pub`. Crate-private: `ByLine`, `Expanded`, `by_line`, `stored`, `Verdict`,
-`ancestry`'s `Graph`, `Ancestors`, `descends`, `union`; `test_bytes` and `TEST_FILE` under `#[cfg(test)]`.
-**Engine.** `impl From<agentfs_referee::Error> for Error`: `Format | Ancestry(_)` → `Format`, `Lines(e)` → `Lines(e)`
-(today's mapping); `From<referee::Broken>` goes; `impl Landed for LandedInto { type Error = Error; }`; unit test
-`referee_errors_map_to_the_engines` (mod.rs). `mod referee; mod queue;` and `history/upstreams.rs` go; meta.rs keeps
-`Times`, `SetTime` and its own `#[cfg(test)] TEST_FILE` (`Perm::from_mode(0o644)`); `pub use meta::{SetTime, Times};`.
-**Move map.** `tree_actor/referee/mod.rs` → `src/lib.rs`; `referee/{ancestry,entries,names,placing,undecided,verdicts,
-whole}.rs` → `src/`; `tree_actor/queue.rs` → `src/queue.rs`; `history/upstreams.rs` → `src/upstreams.rs`; meta.rs's
-`Kind`, `Perm`, `Attrs`, `Meta` → `src/meta.rs`; tree.rs's `MergeFileIdentity`, `NameHistory`, `NameVersions`,
-`NameVersion`, `parent_of` → `src/values.rs`. Each test module with its code; tree.rs's `name_versions_keep_event_order`,
-`the_stored_text_is_unchanged`, `combine_keeps_..`, `a_name_is_ended_..` and meta.rs's `meta_is_its_stored_json_..`,
-`only_four_octal_digits_..` move; `a_save_keeps_the_atime` stays.
-**Consumers.** engine src: `referee::X` → `agentfs_referee::X` (about 55 lines), `use super::queue` →
-`agentfs_referee::queue` (6 files), the meta values (about 20 lines in 18 files), the values from tree.rs (14 files);
-engine tests 9 files; agentfs-fuse `tree_view.rs`, `untracked.rs` (+ normal dep); agentfs-conformance `library.rs` (+ dep);
-agentfs-cli `tests/cli/cli_verify.rs`, agentfs-service `tests/volume.rs` (+ dev-deps); the front's doctest
-`agentfs::referee::{Attrs, Perm}`; docs/library/engine.md:186.
-**Checks.** (1) `no_std`: production code naming `std` fails to compile. (2) agentfs-repo `crates.rs`:
-`the_pure_crates_are_no_std` over `const PURE: &[&str] = &["agentfs-referee"]`: its `src/lib.rs` holds
-`#![cfg_attr(not(test), no_std)]` and no source's production text says `extern crate std`; `fn purity_problems(name:
-&str, lib_rs: &str, sources: &[(String, String)]) -> Vec<String>`, fixture test `a_pure_crate_that_reaches_std_is_found`.
-(3) the spawn check reads `agentfs-referee/src` too (a spawner closure handed to lines compiles under `no_std`). (4)
-`ci/check-deps.sh`: `ok   referee`, failing when `cargo tree --locked -p agentfs-referee -e normal` has `git2`,
-`libgit2-sys`, `libc`, `rustix` or `opentelemetry`; header comment says so. Not read: I/O through a dependency's API
-other than a spawn (lines' `FileImage::open` with an inferred `&Path`).
-**Docs.** New `docs/library/referee.md` (what it decides, its calls, the `Landed` port, errors, purity and its checks,
-tests in seconds) in SUMMARY.md and docs/README.md; agentfs.md's module row and "Not re-exported" (the line values in
-the referee's API); architecture.md: the referee's map (lib, ancestry, entries, meta, names, placing, queue, undecided,
-upstreams, values, verdicts, whole), the engine loses those rows, `meta.rs` and `tree.rs` rows; AGENTS.md Layout row;
-development.md: the checks, `ok   referee`, and "Build settings" `cargo nextest run -p agentfs-referee` cold and warm
-[measured]; CHANGELOG. crate-split.md keeps only what remains (Decision 8): section 1, M4, M9, "Later", what is not
-delivered; the Traps' "not read" lines move to development.md beside each check; references at check-deps.sh:10,
-crates.rs:438, the front's Cargo.toml:15 and target-architecture/README.md:61 follow.
-**Acceptance.** `crates/agentfs-engine/src/tree_actor/{referee,queue.rs,history/upstreams.rs}` gone; `git grep -n
-'git2\|agentfs-git' -- crates/agentfs-referee/Cargo.toml` empty; the Traps prose grep, every hit read. Gates: fmt;
-clippy `--all-targets -D warnings` and nextest of -referee, -lines, -engine (also failpoints), -fuse, -cli (also
-failpoints), -conformance, -service, -repo; CI's two library steps; `bash ci/check-deps.sh`; phase1-replay builds.
-**Probes.** (1) `let _ = std::fs::read("x");` in a referee function → `cargo build -p agentfs-referee` E0433. (2) the
-`no_std` line deleted → `the_pure_crates_are_no_std`. (3) `git2 = { version = "0.21.0", default-features = false }` in its
-dependencies → check-deps `referee links git2 ..`. (4) `agentfs_lines::histogram_with(a, b, |c| c.spawn())` in a
-referee function → the spawn check. (5) the engine's From maps `Lines(_)` to `Format` → `referee_errors_map_to_the_engines`.
-**Files.** `crates/agentfs-referee/**`; `crates/agentfs-engine/**`; Cargo.toml of -fuse, -conformance, -cli, -service;
-the consumer files named; `crates/agentfs/src/lib.rs`; `crates/agentfs-repo/tests/repo/crates.rs`; `ci/check-deps.sh`;
-`Cargo.lock`; the docs named.
+**Values** (tree.rs:22-205, `src/version.rs`): `EventNumber` (`new`, `get`, `object` `#[inline] pub const`; Display),
+`LineVersion` (fields private; `event`; `Id`, `Ord`/`PartialOrd` as its text, Display, `FromStr`/`TryFrom<String>` with
+`type Err = NotALineVersion`, each `#[inline]`), `pub struct NotALineVersion(pub String)` (`#[error("{0:?} is not a
+line version: `<event>:<index>`, decimal, no sign or leading zero, index from 1")]`), `Versions` (`of`, `take`;
+`#[cfg(test)] next`), `pub type Lines = agentfs_lines::LineMap<LineVersion>`. tree.rs's `MergeFileIdentity(pub u64)`,
+`NameHistory { pub head, pub versions }`, `NameVersions`, `NameVersion { pub path, pub over, pub replaced_by }` →
+`src/values.rs`. The engine's `UNSEALED` (tree.rs:303) becomes `EventNumber::new(u64::MAX)`.
+`pub` at the root, shapes unchanged: `Snapshot<L = Lines>`, `File<L>`, `Decision<L>`, `Version`, `CollisionKind`,
+`Collision`, `PriorDecisions`, `Synced`, `Cause`, `Record<'a>`, `Undecided`, `Broken`. `queue`: `Key`, `Plan`,
+`eligible`, `Cut` and its methods, `cut`. Crate-private: `ByLine`, `Expanded`, `by_line`, `stored`, `Verdict`,
+ancestry's `Graph`, `Ancestors`, `descends`, `union`; `#[cfg(test)]` `test_bytes`, `TEST_FILE` (Decisions 6).
+**Engine.** `impl From<agentfs_referee::Error> for Error`: `Format | Ancestry(_)` → `Format`, `Lines(e)` → `Lines(e)`;
+`From<referee::Broken>` goes; `impl Landed for LandedInto { type Error = Error; }`; unit test
+`referee_errors_map_to_the_engines`. `mod referee; mod queue;` go. Consumers: engine src `referee::X` → `agentfs_referee::X`
+(about 55 lines), `queue` (6 files), the values (17 files name `EventNumber`); engine tests 9 files. No crate outside
+the engine names the referee.
+**agentfs-lines `io` feature** (`default = ["io"]`): `FileImage` and its impls, `LineMap::align_bytes_with`,
+`histogram_with`, `histogram_files_with` and their `std::fs`/`os`/`path`/`process` imports under `#[cfg(feature =
+"io")]`; the engine, its only other user, keeps the default. Verified (scratch workspace, resolver 3): a dev-dependency's
+feature is not on in `cargo check -p <crate> --lib`, so a referee call to `FileImage::open` fails there (E0425).
+**Purity, checked.** (1) `no_std`: production code naming `std` fails to compile (verified with thiserror and serde
+derives). (2) From the ranks: `[workspace.metadata.agentfs] ranks` gains `no_std = true` on `domain` and
+`landing-rules`; `Rank` gains `pub no_std: bool` (`#[serde(default)]`); architecture.md's Ranks table gains a `no_std`
+column, read by `ranks_table_problems`. `the_pure_ranks_are_no_std` (crates.rs): each library of such a rank has
+`#![cfg_attr(not(test), no_std)]` in `src/lib.rs` and no `extern crate std` anywhere in `src` (whole text, tests
+included: they have std already); `fn purity_problems(name: &str, lib_rs: &str, sources: &[(String, String)]) ->
+Vec<String>`, fixture `a_pure_crate_that_reaches_std_is_found`. agentfs-volume, -clients, -trees and -rules become
+`no_std` (a trial compile: about 45 sites in 10 files, `String`/`Vec`/`format!` from `alloc`, `std::` → `core::`).
+`shared-kernel` is not marked: contracts' host.rs and views.rs carry std's `PathBuf` (stated in the table). (3) The
+spawn check reads `agentfs-referee/src` too. (4) `ci/check-deps.sh`: `cargo check --locked -p agentfs-referee --lib`
+(alone, so lines' `io` is off) → `ok   referee alone`; `cargo tree --locked -p agentfs-referee -e normal,features`
+refusing `git2`, `libgit2-sys`, `libc`, `rustix`, `opentelemetry*` and `agentfs-lines feature "io"` → `ok   referee`.
+**Not read** (development.md): I/O through a dependency's API other than lines' `io` half; an `extern crate` of another
+std-linked crate's re-export of std (none in the graph today). Concern for the implementer: a local `cargo clippy -p
+agentfs-referee --all-targets` turns `io` on through the dev-dependency; only check-deps' `--lib` build refuses its use.
+**Docs.** New `docs/library/referee.md` (what it decides, its calls, `Landed`, errors, purity and its checks, tests in
+seconds) in SUMMARY.md and docs/README.md; architecture.md: the referee's map (lib, ancestry, entries, names, placing,
+queue, undecided, values, verdicts, version, whole), the engine loses those rows; AGENTS.md Layout row; development.md:
+the checks, both `ok` lines, "Build settings" `cargo nextest run -p agentfs-referee` cold and warm [measured]; VERIFYING.md's
+finding-51 paragraph (Decisions 7); CHANGELOG. crate-split.md keeps only what remains (Decisions 8): section 1, M4,
+M9, "Later", what is not delivered; the Traps' "not read" lines move to development.md beside each check; references
+at check-deps.sh:10, crates.rs:438, the front's Cargo.toml:15 and target-architecture/README.md:61 follow.
+**Acceptance.** `crates/agentfs-engine/src/tree_actor/{referee,queue.rs}` gone; `grep -n 'git2\|agentfs-git'
+crates/agentfs-referee/Cargo.toml` empty; the Traps prose grep, every hit read. Gates: fmt; clippy `--all-targets -D
+warnings` and nextest of -referee, -lines, -volume, -clients, -trees, -rules, -engine (also failpoints), -fuse, -cli
+(also failpoints), -conformance, -service, -repo; CI's two library steps; `bash ci/check-deps.sh`; phase1-replay builds.
+Then, on the final pushed SHA: ci and image green; **phase-1.yml green with 0 mismatched traces** (no `MISMATCH` in its
+log); image.yml's release figures read against 0aea0f8's (a miss on any bar but `create` is a warning, reported).
+**Probes.** (1) `let _ = std::fs::read("x");` in a referee function → E0433. (2) the `no_std` line deleted from
+agentfs-trees → `the_pure_ranks_are_no_std`. (3) `agentfs_lines::FileImage::open("x".as_ref())` in a referee function
+→ check-deps `referee alone` (E0425). (4) `features = ["io"]` on its normal dependency → `ok   referee` fails. (5)
+`git2 = { version = "0.21.0", default-features = false }` in its dependencies → `referee links git2`. (6) `|c|
+c.spawn()` in a referee function → the spawn check. (7) the engine's From maps `Lines(_)` to `Format` →
+`referee_errors_map_to_the_engines`.
+**Files.** `crates/agentfs-referee/**`; `crates/agentfs-lines/src/lib.rs`; `crates/agentfs-{volume,clients,trees,rules}/src/**`;
+`crates/agentfs-engine/**`; `Cargo.toml`; `crates/agentfs-repo/{src/workspace.rs,tests/repo/crates.rs,tests/repo/docs.rs}`;
+`ci/check-deps.sh`; `Cargo.lock`; `crates/agentfs-model/VERIFYING.md`; the docs named.
 
 ## Decisions
 
-**Slice order.** G1 first, package-depth first: agentfs-lines gains the values the referee's signatures carry, and the
-engine's two upward edges are cut while the code is still in one crate, so G2 is moves and imports. Neither slice can
-fan out: both edit the engine.
+**Slice order.** G1 first: the metadata values go down to the shared kernel and the engine's one-path change rewrites
+the same import lines, while the referee's code is still in the engine; G2 then moves the referee onto them. Neither
+slice can fan out: both edit the engine and `crates.rs`.
 
 **Design choices.**
-1. **Rank `domain`**, whose uses gain `line-identity`. The domain rank already holds "the tree views' rules"
-   (agentfs-rules); the referee needs contracts (`TreeId`, `FileOwner`) and lines, and the front must re-export it,
-   since the engine's calls take `Attrs`, `Kind`, `Meta`, `Perm`. A rank of its own was weighed: one more row, and
-   `umbrella` would use it anyway. Cost: `only_the_service_composes_the_domains` derives its domains from the
-   service's dependencies, so the service may never depend on the referee or rules without that check refusing the
-   engine's and fuse's edges (stated in development.md beside the check).
-2. **Deviation from row G: `no_std`, not a `clippy.toml`.** Verified on this toolchain (clippy 0.1.100, scratch
-   workspace): a crate's own `clippy.toml` replaces the workspace's (the root's 66 bans, `Minter::new` among them, stop
-   applying), and clippy bans no module ("expected a type, found a module"), so "std::fs banned" would be some 40
-   entries that a new std function slips past, plus a copy of the root's that drifts. `#![cfg_attr(not(test),
-   no_std)]` is compile-time and covers fs, process, net, env, io and threads at once; tests keep std. Verified: a
-   `no_std` crate depends on std crates (lines), and `std::fs::read` in it fails E0433. Its one hole, a spawner closure
-   handed to lines, is the spawn check's.
-3. **What moves.** Row G's values plus what they need: the queue (owner's 2026-11-08 cut keeps "queue and locks" its
-   own module: `pub mod queue`), `Upstreams` (the earlier course put it with the queue; it decides which queue a
-   landing joins), `Kind`, `Perm`, `Attrs` with `Meta` (`Meta::new` takes `Attrs`), `NameVersions`, `NameVersion` with
-   `NameHistory`, `parent_of` (two sites, tree.rs and entries.rs). `Times` and `SetTime` stay: each tree's own times,
-   never in history.
-4. **`held` goes into `Shape`**, not takes.rs: up out of the queue as row G says, beside `keys_of`, which it repeated.
-   **`merges` goes up into refs.rs**, the ref layout's one home; ref naming does not move down (the referee knows no
-   git refs).
-5. **Errors.** The referee's own enum; the engine's `From` keeps today's mapping exactly. `Landed` has an associated
-   error (serde's `Serializer::Error` idiom), so the engine's git failures cross the port intact, no boxing.
-   `Error::Reconcile` keeps `agentfs_lines::Error`, renamed `Lines` for its crate: E's policy holds (a leaf's types
-   that reach the API are named by depending on the leaf, agentfs.md), and the referee's API now carries lines' values
-   anyway; re-exporting the leaves from the front would make `umbrella` use `line-identity` and re-export align too.
-   `NotALineVersion` and `NotAPerm` follow contracts' `NotATree` idiom.
-6. **One path, checked.** The re-export goes and agentfs-repo refuses its class in every crate the front re-exports.
-7. **finding-51's trace: closed, not re-recorded.** VERIFYING.md re-records "when an unrelated engine change makes the
-   second test fail"; it passes, and G does not touch take.rs's guard. Recording needs the pinned git through
-   `ci/model-docker.sh`; this container has no Docker daemon and the rails forbid starting one in the background. The
-   open question (the re-cut hunk ran past 750 s) has its home in the patch's header, which says so.
+1. **Rank `landing-rules` of its own** (uses `line-identity`, `shared-kernel`; used by `engine` and `tests`). With the
+   metadata values in the shared kernel, nothing outside the engine names the referee: fuse, the binary, the service
+   and consumers do not. So `umbrella` does not use the rank, the front does not re-export it (agentfs-repo's front
+   check requires exactly the libraries of the ranks `umbrella` uses), and its `pub` is engine-facing, not consumer API.
+   `domain` stays `uses = ["shared-kernel"]`, so the pure domains still cannot depend on align or lines.
+2. **`no_std`, not a crate `clippy.toml`** (deviation from row G's first text, kept from revision 1): on clippy 0.1.100 a
+   crate's own `clippy.toml` replaces the workspace's 66 bans, and clippy bans no module.
+3. **What moves.** Row G's values; the queue (owner's 2026-11-08 cut keeps "queue and locks" its own module: `pub mod
+   queue`); `NameVersions`, `NameVersion` with `NameHistory`; the line values. Not: `Upstreams` (no rule or queue reads
+   it; its readers are fold.rs, builder.rs, mod.rs), so `merges` keeps its `refs` import inside the engine and no ref
+   naming moves; the metadata values and `parent_of` (shared kernel, G1); `Times`, `SetTime` (each tree's own times).
+4. **`held` goes into `Shape`**, beside `keys_of`, which it repeated.
+5. **Errors.** The referee's own enum; the engine's `From` keeps today's mapping. `Landed` has an associated error
+   (serde's `Serializer::Error` idiom). `Error::Reconcile` keeps `agentfs_lines::Error`, renamed `Lines` (E's policy:
+   a leaf's types that reach the API are named by depending on the leaf). `NotAPerm`, `NotALineVersion` follow
+   `NotATree`.
+6. **Two `TEST_FILE`s** (the engine's tests, the referee's): a one-line fixture; one home would need a `test-util`
+   feature on the shared kernel or the referee for a constant.
+7. **finding-51.** Not re-recorded in G: it needs Docker (`ci/model-docker.sh`), and this container has no daemon. G2
+   writes into VERIFYING.md's finding-51 paragraph, present tense, that the patch's hunk was re-cut against
+   `shows_the_same` and is not yet re-recorded, so that it still reproduces the regression on today's engine is
+   unverified, and that the re-record is that page's "Re-record" step. The orchestrator should open a bead for it
+   (this agent's tracker access is read-only).
 8. **crate-split.md after G**: kept, shrunk to what remains (M4's two crates, M9's deletion and the front's `fuse`,
-   "Later", what is not delivered), because M4 and M9 build on its end state; the built behaviour (the Traps) moves to
-   development.md beside the checks.
-9. Pages G1 and G2 run to about 80 lines each, past the 60 asked: their signatures and move maps are the pages.
+   "Later", what is not delivered), because M4 and M9 build on its end state.
+9. Pages run to about 75 (G1) and 85 (G2) lines, past the 60 asked: their signatures and move maps are the pages.
 
-**Errata C to F, each disposed.** C: finding-51 (Decision 7); the dev-edge rule and domain docs (built in C, E); a
-test-name filter is unchecked: closed, a stale filter in a script fails when run (nextest exits 4, "no tests to run"),
-one in markdown is the unchecked class development.md names. D: built in D; the prose grep runs in G2's acceptance. E:
-the rank, doctest and front (built in E, F); JC6 and JC8 (G1). F: (a), (b), (d), (e), (f) built; (c) the
-`allow-invalid` bans stay unchecked, now said in development.md (G2); F2's hand-read list (G1's scan).
+**Review (revision 2): one line per finding.**
+1. P1 metadata in the referee: **applied.** `Kind`, `Perm`, `Attrs`, `Meta` go to `agentfs_contracts::meta` (G1);
+   `git_mode` stays in format.rs; the front does not re-export the referee.
+2. P1 `domain` widened: **applied.** Rank `landing-rules` of its own; `domain` reverted (skeleton).
+3. P1 `Upstreams` moved: **applied.** It stays in the engine with `merges`; G1's second cut and `pairs` are gone.
+4. P2 hand-kept `PURE`: **applied.** `no_std = true` on the ranks, the four domains made `no_std`, whole-text
+   `extern crate std` scan; lines' I/O half behind `io`, refused by check-deps' alone build (G2). The shared kernel is
+   unmarked, with its reason.
+5. P2 line values' home: **applied.** They go to the referee (G2), as section 1 already drew.
+6. P2 `wait_checkpointed`, `HOLDS_HERE`: **applied** (G1, with every caller listed). No scan is described in engine.md:
+   which `pub` items only tests call stays unchecked, said in development.md.
+7. P2 libtest filters: **applied.** Not closed: G1 adds a `0 passed` refusal after `ci/fuse-tests.sh`'s `creds::` run
+   (the one direct run with a name filter not guarded; :52 has its count), and development.md states that a filter
+   given to a libtest binary run directly is not checked, since libtest exits 0 when it matches nothing.
+8. P2 finding-51 orphan: **applied** (Decisions 7): VERIFYING.md owns it; a bead is asked of the orchestrator.
+9. P2 gate missing from acceptance: **applied** (G2's acceptance: phase-1 0 mismatched, ci, image, release figures).
+10. P2 one-path regex holes: **applied.** Whole text, statements, `pub type` and braces read; the rest listed as Not
+   read; rustdoc JSON rejected (nightly-only).
+11. nit `parent_of` twice: **applied.** `agentfs_contracts::paths::parent_of`; fuse's copy deleted (G1).
+12. nit `TEST_FILE`, `git_mode`: **applied** for `git_mode` (format.rs); two `TEST_FILE`s accepted (Decisions 6).
 
-**Self-check (goal-oriented).** Row G's ends and the slice that delivers each: purity checked (G2 checks 1-4); rule
-tests in seconds (G2's measured row); error enum with `From` (G2); line values (G1); values public (G2); `held` (G1);
-merges (G1); `Error::Reconcile` (G1, Decision 5); `TreeId` path (G1); JC6, JC8 (G1); finding-51 (Decision 7); test-only
-`pub` items (G1); release figures (G1's `#[inline]`s, read in image.yml); crate-split.md (G2). No goal is unowned.
+**Errata C to F, each disposed.** C: finding-51 (Decisions 7); the dev-edge rule and domain docs (built in C, E); the
+test-name filter (Review 7). D: built in D; the prose grep runs in G2's acceptance. E: the rank, doctest and front
+(built in E, F); JC6 and JC8 (G1). F: (a), (b), (d), (e), (f) built; (c) the `allow-invalid` bans stay unchecked, said
+in development.md (G2); F2's hand-read list (G1 adds `wait_checkpointed` and the counter; still unchecked).
 
-**New terms.** `pure crate`: one in agentfs-repo's `PURE`, `no_std` outside its tests. `Landed::Error`: the port's own
-failure type. `NotALineVersion`, `NotAPerm`: text that is not one, as `NotATree` is for trees.
+**Self-check (goal-oriented).** Row G's ends and the slice for each: purity checked (G2 1-4); rule tests in seconds
+(G2's measured row); error enum with `From` (G2); line values (G2); values public (G2); `held` (G1); merges resolved
+(stays, Decisions 3); `Error::Reconcile` (G1); `TreeId` path (G1, checked); JC6, JC8 (G1); finding-51 (Decisions 7);
+test-only `pub` (G1); release figures and phase-1 (G2's acceptance); crate-split.md (G2). No goal is unowned.
+
+**New terms.** `landing-rules`: the rank of the referee. `no_std` rank: one the manifest marks `no_std = true`, whose
+libraries are `no_std` outside their tests. `io` (agentfs-lines): the feature holding its file and process calls.
+`Landed::Error`: the port's own failure type. `NotALineVersion`, `NotAPerm`: text that is not one, as `NotATree`.

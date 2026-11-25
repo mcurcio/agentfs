@@ -46,7 +46,6 @@ dependencies = [
  "agentfs-clients",
  "agentfs-contracts",
  "agentfs-engine",
- "agentfs-referee",
  "agentfs-rules",
  "agentfs-service",
  "agentfs-trees",
