@@ -187,15 +187,26 @@ fn ranks() -> Vec<Rank> {
             "engine",
             &["line-identity", "leaf", "shared-kernel", "domain"],
         ),
+        ("service", &["shared-kernel", "domain", "engine"]),
         (
             "filesystem",
-            &["leaf", "shared-kernel", "domain", "engine", "filesystem"],
+            &[
+                "leaf",
+                "shared-kernel",
+                "domain",
+                "engine",
+                "service",
+                "filesystem",
+            ],
         ),
         (
             "kubernetes",
             &["leaf", "shared-kernel", "engine", "filesystem"],
         ),
-        ("umbrella", &["shared-kernel", "domain", "engine"]),
+        (
+            "umbrella",
+            &["shared-kernel", "domain", "engine", "service"],
+        ),
         (
             "tests",
             &[
@@ -204,6 +215,7 @@ fn ranks() -> Vec<Rank> {
                 "shared-kernel",
                 "domain",
                 "engine",
+                "service",
                 "filesystem",
                 "kubernetes",
                 "tests",

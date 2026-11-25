@@ -47,6 +47,7 @@ dependencies = [
  "agentfs-contracts",
  "agentfs-engine",
  "agentfs-rules",
+ "agentfs-service",
  "agentfs-trees",
  "agentfs-volume",
  "tempfile",
@@ -330,6 +331,10 @@ dependencies = [
  "tempfile",
  "thiserror",
 ]
+
+[[package]]
+name = "agentfs-service"
+version = "0.1.0"
 
 [[package]]
 name = "agentfs-test-metrics"

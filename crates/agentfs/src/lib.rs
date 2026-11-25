@@ -6,7 +6,9 @@
 //! (`agentfs-engine`), [`contracts`] the shared kernel of its domains
 //! (`agentfs-contracts`), [`volume`], [`clients`] and [`trees`] the Volume,
 //! Clients and Trees domains (`agentfs-volume`, `agentfs-clients`,
-//! `agentfs-trees`), and [`rules`] the Rules domain (`agentfs-rules`).
+//! `agentfs-trees`), [`rules`] the Rules domain (`agentfs-rules`), and
+//! [`service`] one volume composed: its domains wired onto one store
+//! (`agentfs-service`).
 //!
 //! See docs/library/agentfs.md for the consumer API and what is not
 //! re-exported.
@@ -45,5 +47,6 @@ pub use agentfs_clients as clients;
 pub use agentfs_contracts as contracts;
 pub use agentfs_engine as engine;
 pub use agentfs_rules as rules;
+pub use agentfs_service as service;
 pub use agentfs_trees as trees;
 pub use agentfs_volume as volume;

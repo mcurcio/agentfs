@@ -1,0 +1,11 @@
+[package]
+name = "agentfs-service"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "One agentfs tree volume composed: its domains wired onto one store, their events dispatched, its drain"
+
+[package.metadata.agentfs]
+rank = "service"

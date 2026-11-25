@@ -12,6 +12,7 @@ is. The libraries behind it, and why each was chosen, are under
 |---|---|---|
 | `agentfs-core` | library | The recording engine: path rules, the journal, frozen copies, commits, pushes, restores, the patch queue, the history service, LFS, telemetry. No FUSE and no CLI |
 | `agentfs-engine` | library | The tree engine, the recording engine's sibling: the tree views' one actor per volume over its journal, history and rows (`tree_actor`), its git store (`tree_git`), sessions, the domains' store adapters, the state area, the operator's settings and its OpenTelemetry instruments ([library](library/engine.md)). No FUSE, no CLI and no remote |
+| `agentfs-service` | library | One tree volume composed: the Volume, Trees and Clients domains wired onto the engine's store as one launcher, the one queue that dispatches their events, and the drain at a stop. The `agentfs` binary serves its views on it; it decides nothing |
 | `agentfs` | library | The library under one name, the one crate a consumer depends on: re-exports only, the tree engine, the shared kernel and the domains each as a module, whole ([library](library/agentfs.md)). No crate of the workspace depends on it |
 | `agentfs-fuse` | library | The FUSE layer: a passthrough filesystem over the backing tree that calls the engine at every change boundary |
 | `agentfs-cli` | binary | The `agentfs` command, the package's one binary (every subcommand is listed in [configuration](configuration.md#commands)); OpenTelemetry export |
@@ -59,10 +60,11 @@ and this table against the workspace manifest.
 | `shared-kernel` | none | the library | The shared kernel of the domains: values, capabilities, traits, events and ports, with no I/O |
 | `domain` | `shared-kernel` | the library | The pure domains over the shared kernel's ports, and the tree views' rules; no domain depends on another |
 | `engine` | `line-identity`, `leaf`, `shared-kernel`, `domain` | the library | What implements the ports and owns the state on disk; no engine depends on another |
-| `filesystem` | `leaf`, `shared-kernel`, `domain`, `engine`, `filesystem` | the filesystem | The FUSE layer and `agentfs-cli`, whose binary `agentfs` is the composition root |
+| `service` | `shared-kernel`, `domain`, `engine` | the library | One volume composed: the domains wired onto the engine's store, the one place a volume is composed, which the binary and the crate `agentfs` both use |
+| `filesystem` | `leaf`, `shared-kernel`, `domain`, `engine`, `service`, `filesystem` | the filesystem | The FUSE layer and `agentfs-cli`, whose binary `agentfs` is the composition root |
 | `kubernetes` | `leaf`, `shared-kernel`, `engine`, `filesystem` | the kubernetes adapter | The CSI driver |
-| `umbrella` | `shared-kernel`, `domain`, `engine` | the library | The crate `agentfs`, consumers' one name for the library: re-exports only, one module for each library of the ranks it uses but the recording engine `agentfs-core`, which `crates/agentfs-repo` checks. No rank uses it, so no package of the workspace depends on it: a workspace crate names each item by the crate that holds it |
-| `tests` | `line-identity`, `leaf`, `shared-kernel`, `domain`, `engine`, `filesystem`, `kubernetes`, `tests` | none | Packages that exist only for tests: the model, the conformance replay, the metric reader, the repository checks. No other rank uses it |
+| `umbrella` | `shared-kernel`, `domain`, `engine`, `service` | the library | The crate `agentfs`, consumers' one name for the library: re-exports only, one module for each library of the ranks it uses but the recording engine `agentfs-core`, which `crates/agentfs-repo` checks. No rank uses it, so no package of the workspace depends on it: a workspace crate names each item by the crate that holds it |
+| `tests` | `line-identity`, `leaf`, `shared-kernel`, `domain`, `engine`, `service`, `filesystem`, `kubernetes`, `tests` | none | Packages that exist only for tests: the model, the conformance replay, the metric reader, the repository checks. No other rank uses it |
 
 ## Module map
 
@@ -304,6 +306,12 @@ row names a module that no longer exists; `tests.rs` files are not listed.
 | `patch/notify.rs` | Telling the integrator of every verdict change: the `patch-notify` hook and the notify webhook, with the delivered cursor in `meta/notify.json` |
 | `patch/queue.rs` | Applying the queue at mount, before the workload sees the tree; judging it read only while a daemon holds the volume |
 | `patch/status.rs` | The status ref iac reads, and the local cache in `meta/patch.json` |
+
+### `agentfs-service`
+
+| Module | Role |
+|---|---|
+| `lib.rs` | The crate's documentation: one tree volume composed on one store as one launcher |
 
 ### `agentfs`
 

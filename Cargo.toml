@@ -1,7 +1,7 @@
 [workspace]
 resolver = "3"
 exclude = ["vendor/fuser"]
-members = ["crates/agentfs-align", "crates/agentfs-lines", "crates/agentfs-failpoints", "crates/agentfs-os", "crates/agentfs-git", "crates/agentfs-rules", "crates/agentfs-contracts", "crates/agentfs-volume", "crates/agentfs-clients", "crates/agentfs-trees", "crates/agentfs-engine", "crates/agentfs-core", "crates/agentfs", "crates/agentfs-fuse", "crates/agentfs-cli", "crates/agentfs-csi", "crates/agentfs-model", "crates/agentfs-conformance", "crates/agentfs-test-metrics", "crates/agentfs-repo"]
+members = ["crates/agentfs-align", "crates/agentfs-lines", "crates/agentfs-failpoints", "crates/agentfs-os", "crates/agentfs-git", "crates/agentfs-rules", "crates/agentfs-contracts", "crates/agentfs-volume", "crates/agentfs-clients", "crates/agentfs-trees", "crates/agentfs-engine", "crates/agentfs-core", "crates/agentfs-service", "crates/agentfs", "crates/agentfs-fuse", "crates/agentfs-cli", "crates/agentfs-csi", "crates/agentfs-model", "crates/agentfs-conformance", "crates/agentfs-test-metrics", "crates/agentfs-repo"]
 
 [workspace.package]
 # The product's one version, which every published package takes: it is
@@ -25,10 +25,11 @@ ranks = [
     { name = "shared-kernel", uses = [] },
     { name = "domain", uses = ["shared-kernel"] },
     { name = "engine", uses = ["line-identity", "leaf", "shared-kernel", "domain"] },
-    { name = "filesystem", uses = ["leaf", "shared-kernel", "domain", "engine", "filesystem"] },
+    { name = "service", uses = ["shared-kernel", "domain", "engine"] },
+    { name = "filesystem", uses = ["leaf", "shared-kernel", "domain", "engine", "service", "filesystem"] },
     { name = "kubernetes", uses = ["leaf", "shared-kernel", "engine", "filesystem"] },
-    { name = "umbrella", uses = ["shared-kernel", "domain", "engine"] },
-    { name = "tests", uses = ["line-identity", "leaf", "shared-kernel", "domain", "engine", "filesystem", "kubernetes", "tests"] },
+    { name = "umbrella", uses = ["shared-kernel", "domain", "engine", "service"] },
+    { name = "tests", uses = ["line-identity", "leaf", "shared-kernel", "domain", "engine", "service", "filesystem", "kubernetes", "tests"] },
 ]
 
 [patch.crates-io]

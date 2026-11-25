@@ -18,6 +18,7 @@ agentfs-clients = { version = "0.1.0", path = "../agentfs-clients" }
 agentfs-contracts = { version = "0.1.0", path = "../agentfs-contracts" }
 agentfs-engine = { version = "0.1.0", path = "../agentfs-engine" }
 agentfs-rules = { version = "0.1.0", path = "../agentfs-rules" }
+agentfs-service = { version = "0.1.0", path = "../agentfs-service" }
 agentfs-trees = { version = "0.1.0", path = "../agentfs-trees" }
 agentfs-volume = { version = "0.1.0", path = "../agentfs-volume" }
 
