@@ -3,8 +3,11 @@
 //! system, global or tree file is ever read, and matching is always
 //! case-sensitive (docs/trees.md, "Rules and the untracked area").
 
-use std::collections::BTreeMap;
-use std::fmt;
+use alloc::borrow::ToOwned;
+use alloc::collections::BTreeMap;
+use alloc::string::{String, ToString};
+use alloc::vec::Vec;
+use core::fmt;
 
 use bstr::ByteSlice;
 use gix_attributes::StateRef;

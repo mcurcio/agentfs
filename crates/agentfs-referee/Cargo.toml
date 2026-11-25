@@ -9,3 +9,19 @@ description = "The landing rules of agentfs's tree views, pure: how a fork's cha
 
 [package.metadata.agentfs]
 rank = "landing-rules"
+
+[dependencies]
+# Tree ids (the queue's sources) and an entry's metadata.
+agentfs-contracts = { version = "0.1.0", path = "../agentfs-contracts" }
+# Line maps without their I/O half (`io`): the rules read maps, never a
+# file or a process (ci/check-deps.sh builds this crate alone to hold it).
+agentfs-lines = { version = "0.1.0", path = "../agentfs-lines", default-features = false }
+# History and the journal hold the rules' values as JSON; derives only.
+serde = { version = "1.0.229", features = ["derive"] }
+thiserror = "2.0.21"
+
+[dev-dependencies]
+# The tests save bytes into maps through the diff's spawner calls.
+agentfs-lines = { version = "0.1.0", path = "../agentfs-lines", features = ["io"] }
+# The stored forms' text.
+serde_json = "1.0.154"

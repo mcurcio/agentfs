@@ -20,9 +20,10 @@ use crate::tree_actor::journal::compaction::Published;
 use crate::tree_actor::pointers::Pointers;
 use crate::tree_actor::recording::FileMap;
 use crate::tree_actor::stages::InnerLock;
-use crate::tree_actor::tree::{EventNumber, Tree};
+use crate::tree_actor::tree::Tree;
 use crate::tree_git::TreeGit;
 use agentfs_contracts::TreeId;
+use agentfs_referee::EventNumber;
 
 /// Each direct save's commit by its event, as built: the snapshot the
 /// builder hands History at each built event. Persistent, so the handover is

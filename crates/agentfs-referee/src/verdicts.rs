@@ -1,12 +1,13 @@
 //! Rule 3 for one change, for names and lines alike: each changed version of the change against
 //! the upstream's, and its loss so far (docs/target-architecture/git-model.md §7).
 
-use std::collections::{BTreeMap, BTreeSet};
+use alloc::collections::{BTreeMap, BTreeSet};
+use alloc::vec::Vec;
 
 use super::ancestry::{self, Broken, Graph, descends};
 use super::{ByLine as Snapshot, CollisionKind, PriorDecisions, Verdict, Version};
-use crate::tree_actor::tree::{LineVersion, MergeFileIdentity, NameHistory};
-use crate::tree_actor::{Error, Result};
+use crate::{Error, Result};
+use crate::{LineVersion, MergeFileIdentity, NameHistory};
 use agentfs_lines::Line;
 
 /// A version as rule 3 reads it: which one, and whether it is live (a line's bytes, a file's
@@ -23,7 +24,7 @@ pub(super) fn verdict<G: Graph + ?Sized>(
     g: &G,
     upstream: Option<Held<G::Version>>,
     incoming: Held<G::Version>,
-) -> std::result::Result<Verdict<G::Version>, Broken> {
+) -> core::result::Result<Verdict<G::Version>, Broken> {
     let Some(upstream) = upstream else {
         return Ok(Verdict::Apply);
     };
@@ -81,7 +82,7 @@ pub(super) struct Verdicts {
     pub files: BTreeMap<MergeFileIdentity, BTreeMap<LineVersion, Verdict<LineVersion>>>,
 }
 
-fn held_name(name: &NameHistory) -> Result<Held<crate::tree_actor::tree::EventNumber>> {
+fn held_name(name: &NameHistory) -> Result<Held<crate::EventNumber>> {
     Ok(Held {
         version: name.head,
         live: !name.is_ended()?,
@@ -307,7 +308,7 @@ pub(super) fn verdicts(
 mod tests {
     use super::super::{Expanded as Lines, test_bytes};
     use super::*;
-    use crate::tree_actor::tree::EventNumber;
+    use crate::EventNumber;
 
     fn save(base: &Lines, bytes: &[u8], event: u64) -> Lines {
         test_bytes::save_lines(base, bytes, event)

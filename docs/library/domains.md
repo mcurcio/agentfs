@@ -4,7 +4,10 @@ The tree views' records are kept by three domains, each a crate that is pure
 over ports: Volume (`agentfs-volume`), Clients (`agentfs-clients`) and
 Trees (`agentfs-trees`). They share one kernel, `agentfs-contracts`: the
 values, capabilities, each domain's trait, errors and events, and the ports
-an adapter implements. None does I/O, and no domain depends on another. A
+an adapter implements. None does I/O, and no domain depends on another.
+Each domain, the Rules domain (`agentfs-rules`) among them, is `no_std`
+outside its tests, so the compiler refuses its code naming the file system,
+a process or the network ([ranks](../architecture.md#ranks)). A
 consumer reaches them as `agentfs::contracts`, `agentfs::volume`,
 `agentfs::clients` and `agentfs::trees` ([the library](agentfs.md)).
 

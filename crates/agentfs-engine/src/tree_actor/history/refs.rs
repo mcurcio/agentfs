@@ -7,10 +7,10 @@ use git2::Oid;
 
 use crate::tree_actor::pointers::Pointers;
 use crate::tree_actor::rows::Chain;
-use crate::tree_actor::tree::EventNumber;
 use crate::tree_actor::{Error, Result};
 use agentfs_contracts::TreeId;
 use agentfs_contracts::tree::ForkId;
+use agentfs_referee::EventNumber;
 
 /// Every pointer: what `check_objects` names when a lost object is no one pointer's.
 pub(in crate::tree_actor) const ALL: &str = "refs/";

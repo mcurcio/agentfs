@@ -17,3 +17,12 @@ agentfs-align = { version = "0.1.0", path = "../agentfs-align" }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 thiserror = "2.0.21"
+
+[features]
+# The line maps' I/O: a file read as an image (`FileImage`) and the diff's
+# calls that take a spawner for their `git` child (`align_bytes_with`,
+# `histogram_with`, `histogram_files_with`). The landing rules
+# (agentfs-referee) build without it, so they reach no file or process
+# through this crate (ci/check-deps.sh).
+default = ["io"]
+io = []

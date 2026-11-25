@@ -16,18 +16,19 @@ use super::message;
 use super::refs;
 use crate::tree_actor::journal::{TAKE_CHUNK, TakeHead};
 use crate::tree_actor::stages::{Timer, Which};
-use crate::tree_actor::tree::{EventNumber, Lines, MergeFileIdentity};
-use crate::tree_actor::{Error, Result, queue, referee};
+use crate::tree_actor::{Error, Result};
 use crate::tree_git::{STREAMED_BLOB, TreeGit};
 use agentfs_contracts::TreeId;
 use agentfs_contracts::meta::Meta;
 use agentfs_lines::{FileImage, Image, Piece};
+use agentfs_referee::queue;
+use agentfs_referee::{EventNumber, Lines, MergeFileIdentity};
 
 /// A record's value in one commit, as [`LandedInto`] caches it: the commit, and the record (a
 /// file's identity, or none and a directory's path).
 type RecordAt = (Oid, Option<MergeFileIdentity>, String);
 
-/// The actor's [`referee::Landed`]: whether a save's commit is in `upstream`'s history. That
+/// The actor's [`agentfs_referee::Landed`]: whether a save's commit is in `upstream`'s history. That
 /// never changes, and every line one save wrote has that save's commit: ask Git once per commit,
 /// not once per line (an 8 MiB file is 8,000 lines). A record's writing commit is found from the
 /// fork's head as the model finds it: back through each parent holding the same value.
@@ -51,10 +52,10 @@ impl LandedInto<'_> {
         Ok(answer)
     }
 
-    fn value(&mut self, commit: Oid, record: referee::Record<'_>) -> Result<Option<Meta>> {
+    fn value(&mut self, commit: Oid, record: agentfs_referee::Record<'_>) -> Result<Option<Meta>> {
         let key = match record {
-            referee::Record::Meta(id) => (commit, Some(id), String::new()),
-            referee::Record::Dir(path) => (commit, None, path.to_owned()),
+            agentfs_referee::Record::Meta(id) => (commit, Some(id), String::new()),
+            agentfs_referee::Record::Dir(path) => (commit, None, path.to_owned()),
         };
         if let Some(known) = self.values.get(&key) {
             return Ok(*known);
@@ -65,7 +66,9 @@ impl LandedInto<'_> {
     }
 }
 
-impl referee::Landed for LandedInto<'_> {
+impl agentfs_referee::Landed for LandedInto<'_> {
+    type Error = Error;
+
     fn landed(&mut self, save: EventNumber) -> Result<bool> {
         let owner = *self.owners.get(&save).ok_or(Error::Format)?;
         self.reaches(owner)
@@ -73,7 +76,7 @@ impl referee::Landed for LandedInto<'_> {
 
     /// The walk stops at the first commit in the upstream's history: the writing commit is that
     /// one or older, so it is in it too. Only the fork's undecided commits are walked.
-    fn record_landed(&mut self, record: referee::Record<'_>) -> Result<bool> {
+    fn record_landed(&mut self, record: agentfs_referee::Record<'_>) -> Result<bool> {
         let mine = self.value(self.fork_head, record)?;
         let mut at = self.fork_head;
         loop {
@@ -99,10 +102,10 @@ impl referee::Landed for LandedInto<'_> {
 /// older commits whose files hold lines it keeps (finding 44's last lines).
 pub(in crate::tree_actor) struct SyncStep {
     pub(in crate::tree_actor) commit: Oid,
-    pub(in crate::tree_actor) snapshot: referee::Snapshot,
+    pub(in crate::tree_actor) snapshot: agentfs_referee::Snapshot,
     pub(in crate::tree_actor) older: Vec<Oid>,
     /// An entry the snapshot leaves out because the rules do not decide it
-    /// (`referee::Synced::unruled`): this step may not be the one shown.
+    /// (`agentfs_referee::Synced::unruled`): this step may not be the one shown.
     pub(in crate::tree_actor) unruled: Option<String>,
 }
 
@@ -112,8 +115,8 @@ pub(in crate::tree_actor) struct SyncStep {
 /// beside those it writes (a landing's directories, rule 14).
 pub(in crate::tree_actor) struct Decided {
     pub head: TakeHead,
-    pub snapshot: Option<referee::Snapshot>,
-    pub collisions: Vec<referee::Collision>,
+    pub snapshot: Option<agentfs_referee::Snapshot>,
+    pub collisions: Vec<agentfs_referee::Collision>,
     pub entry_done: bool,
     pub sources: Vec<Oid>,
     pub reads: BTreeSet<queue::Key>,
@@ -224,7 +227,7 @@ fn unlinked_file(dir: &std::path::Path) -> io::Result<std::fs::File> {
 pub(in crate::tree_actor) fn take_bytes(
     snapshot: &BuiltSnapshot,
     tree: TreeId,
-    files: &[(MergeFileIdentity, Option<referee::File>)],
+    files: &[(MergeFileIdentity, Option<agentfs_referee::File>)],
     sources: &[Oid],
 ) -> Result<TakeBytes> {
     let repo = snapshot.repo();
@@ -276,7 +279,7 @@ pub(in crate::tree_actor) fn take_bytes(
 /// versions in the same order and the same metadata, the same name versions and
 /// the same directories. The versions each line version was written over may
 /// differ.
-fn shows_the_same(a: &referee::Snapshot, b: &referee::Snapshot) -> bool {
+fn shows_the_same(a: &agentfs_referee::Snapshot, b: &agentfs_referee::Snapshot) -> bool {
     a.files.len() == b.files.len()
         && a.names.len() == b.names.len()
         && a.dirs == b.dirs
@@ -292,7 +295,7 @@ fn shows_the_same(a: &referee::Snapshot, b: &referee::Snapshot) -> bool {
         })
 }
 
-fn prior_decisions(repo: &TreeGit, mut head: Oid) -> Result<referee::PriorDecisions> {
+fn prior_decisions(repo: &TreeGit, mut head: Oid) -> Result<agentfs_referee::PriorDecisions> {
     let _timer = Timer::start(Which::PriorDecisions);
     let mut result = BTreeMap::new();
     loop {
@@ -318,7 +321,7 @@ pub(in crate::tree_actor) fn plan_landing(
     let base = *commit.parents.first().ok_or(Error::Format)?;
     let source = message::tree_of(&commit.message)?.ok_or(Error::Format)?;
     let objects = snapshot.objects(source);
-    let files = referee::touches(
+    let files = agentfs_referee::touches(
         &read_snapshot(repo, base, objects)?,
         &read_snapshot(repo, incoming, objects)?,
     );
@@ -329,7 +332,7 @@ pub(in crate::tree_actor) fn plan_landing(
 pub(in crate::tree_actor) fn decide_landing(
     snapshot: &BuiltSnapshot,
     tree: TreeId,
-    mine: &referee::Snapshot,
+    mine: &agentfs_referee::Snapshot,
     incoming: Oid,
 ) -> Result<Decided> {
     let repo = snapshot.repo();
@@ -346,14 +349,14 @@ pub(in crate::tree_actor) fn decide_landing(
     let prior = prior_decisions(repo, current)?;
     let decision = {
         let _timer = Timer::start(Which::Judge);
-        referee::land(mine, &base, &theirs, &prior)?
+        agentfs_referee::land(mine, &base, &theirs, &prior)?
     };
-    let reads = referee::consulted(&base, &theirs)?;
+    let reads = agentfs_referee::consulted(&base, &theirs)?;
     let head = if base_commit == current {
         // Made on the parent's current version: every line replaces the
         // parent's, so nothing collides, and the save itself is the head.
         if !decision.collisions.is_empty()
-            || !referee::touches(&decision.snapshot, &theirs).is_empty()
+            || !agentfs_referee::touches(&decision.snapshot, &theirs).is_empty()
         {
             return Err(Error::Format);
         }
@@ -376,12 +379,12 @@ pub(in crate::tree_actor) fn decide_landing(
 }
 
 /// [`queue::cut`] over the upstream commits the fork lacks, oldest first: each is synced
-/// and diffed against the last taken (or the fork's own snapshot) with `referee::touches`.
+/// and diffed against the last taken (or the fork's own snapshot) with `agentfs_referee::touches`.
 pub(in crate::tree_actor) fn plan_sync(
     snapshot: &BuiltSnapshot,
     tree: TreeId,
     upstream: TreeId,
-    fork_snapshot: &referee::Snapshot,
+    fork_snapshot: &agentfs_referee::Snapshot,
     open: &BTreeSet<queue::Key>,
 ) -> Result<queue::Cut<SyncStep>> {
     let repo = snapshot.repo();
@@ -401,7 +404,7 @@ pub(in crate::tree_actor) fn plan_sync(
     let mut values = BTreeMap::new();
     queue::cut(todo, open, |last: Option<&SyncStep>, oid| {
         let parent = read_snapshot(repo, oid, objects)?;
-        let undecided = referee::undecided(
+        let undecided = agentfs_referee::undecided(
             fork_snapshot,
             &parent,
             &mut LandedInto {
@@ -416,10 +419,10 @@ pub(in crate::tree_actor) fn plan_sync(
         let (last_lines, older) = last_lines(repo, &parent, oid, &undecided)?;
         let next = {
             let _timer = Timer::start(Which::SyncMerge);
-            referee::sync(&parent, fork_snapshot, &undecided, &last_lines)?
+            agentfs_referee::sync(&parent, fork_snapshot, &undecided, &last_lines)?
         };
         let current = last.map_or(fork_snapshot, |step| &step.snapshot);
-        let keys = referee::touches(current, &next.snapshot);
+        let keys = agentfs_referee::touches(current, &next.snapshot);
         Ok((
             SyncStep {
                 commit: oid,
@@ -438,11 +441,11 @@ pub(in crate::tree_actor) fn plan_sync(
 /// them from (finding 44).
 fn last_lines(
     repo: &TreeGit,
-    parent: &referee::Snapshot,
+    parent: &agentfs_referee::Snapshot,
     at: Oid,
-    undecided: &referee::Undecided,
+    undecided: &agentfs_referee::Undecided,
 ) -> Result<(BTreeMap<MergeFileIdentity, Lines>, Vec<Oid>)> {
-    let mut wanted = referee::ended_files(parent, undecided)?;
+    let mut wanted = agentfs_referee::ended_files(parent, undecided)?;
     let mut lines = BTreeMap::new();
     let mut older = Vec::new();
     let mut cursor = at;

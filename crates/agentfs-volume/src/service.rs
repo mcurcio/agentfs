@@ -12,6 +12,7 @@ use agentfs_contracts::volume::{
     Blocker, Disposition, Drain, EnsureOutcome, Ensured, ReleaseFacts, ReleaseVerdict, Settlement,
     Volume, VolumeError, VolumeEvent, VolumeSpec, VolumeState,
 };
+use alloc::vec;
 
 use crate::ensure::{EnsureStep, decide_ensure};
 use crate::release::{decide, verdict};

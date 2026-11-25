@@ -22,6 +22,8 @@ agentfs-os = { version = "0.1.0", path = "../agentfs-os" }
 agentfs-align = { version = "0.1.0", path = "../agentfs-align" }
 # Line maps: which version wrote each line of a tree's files (tree_actor).
 agentfs-lines = { version = "0.1.0", path = "../agentfs-lines" }
+# The landing rules, the queue and the values they read (tree_actor's takes).
+agentfs-referee = { version = "0.1.0", path = "../agentfs-referee" }
 # The Rules domain: where each new name of a tree lives (tree_actor's untracked areas).
 agentfs-rules = { version = "0.1.0", path = "../agentfs-rules" }
 crc32fast = "1.5.2"

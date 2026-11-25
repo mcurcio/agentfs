@@ -6,8 +6,12 @@
 # brings OpenSSL. The library: no recording engine, no FUSE, no
 # OpenTelemetry SDK or exporter, no TLS and no libssh2, and no crate of the
 # workspace with a test build's feature (test-util, failpoints) turned on.
+# The landing rules (agentfs-referee): built alone, so agentfs-lines' I/O
+# half (its `io` feature) is off and a call into it does not compile; and
+# what they link holds no git, no operating-system binding, no
+# OpenTelemetry and never that feature.
 # The recording engine is refused here, not by the ranks: its rank is the
-# tree engine's (docs/target-architecture/future/crate-split.md, "Traps").
+# tree engine's, until M9 deletes it (docs/development.md, "Build settings").
 # The ranks refuse the FUSE layer.
 set -euo pipefail
 
@@ -53,3 +57,12 @@ features=$(cargo tree --locked -p agentfs -e normal,features --prefix none --for
 found=$(grep -E '^agentfs-[a-z-]+ feature "(test-util|failpoints)"' <<<"$features" | sort -u || true)
 [ -z "$found" ] || fail "library turns on $(echo "$found" | tr '\n' ' ')"
 echo "ok   library features"
+
+cargo check --locked --quiet -p agentfs-referee --lib || fail "referee alone does not build"
+echo "ok   referee alone"
+
+referee=$(cargo tree --locked -p agentfs-referee -e normal,features --prefix none --format '{p}')
+found=$(grep -E '^(git2|libgit2-sys|libc|rustix|opentelemetry[a-z_-]*) |^agentfs-lines feature "io"' <<<"$referee" |
+  sed 's/ (\*)$//' | sort -u || true)
+[ -z "$found" ] || fail "referee links $(echo "$found" | tr '\n' ' ')"
+echo "ok   referee"

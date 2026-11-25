@@ -2,11 +2,12 @@
 //! (R3e.1) with its joins (R10.4, R10.8), and a sync's undecided lines kept over the upstream's
 //! (R3d, R10.6, R10.9) (docs/target-architecture/git-model.md §7, §8).
 
-use std::collections::{BTreeMap, BTreeSet};
+use alloc::collections::{BTreeMap, BTreeSet};
+use alloc::vec::Vec;
 
 use super::{ByLine as Snapshot, Expanded as Lines, Verdict, ancestry};
-use crate::tree_actor::tree::{LineVersion, MergeFileIdentity};
-use crate::tree_actor::{Error, Result};
+use crate::{Error, Result};
+use crate::{LineVersion, MergeFileIdentity};
 use agentfs_lines::Line;
 
 /// One file's lines placed, and the joins that lose: each as the losing version and the
@@ -223,7 +224,7 @@ pub(super) fn sync_files(
 mod tests {
     use super::super::{CollisionKind, File, Version, land, test_bytes};
     use super::*;
-    use crate::tree_actor::tree::{EventNumber, NameHistory};
+    use crate::{EventNumber, NameHistory};
 
     const FILE: MergeFileIdentity = MergeFileIdentity(100);
 
@@ -238,7 +239,7 @@ mod tests {
                 File {
                     object: 100,
                     lines: super::super::Lines::from_expanded(lines).unwrap(),
-                    meta: crate::tree_actor::meta::TEST_FILE,
+                    meta: crate::TEST_FILE,
                 },
             )]
             .into_iter()

@@ -29,7 +29,7 @@ use git2::Oid;
 use super::pointers::Pointers;
 use super::stages::{Timer, Which};
 use super::tree::{FileBytes, Shape, Tree};
-use super::{Error, Result, referee};
+use super::{Error, Result};
 use crate::tree_git::TreeGit;
 use agentfs_contracts::TreeId;
 
@@ -361,7 +361,7 @@ pub(in crate::tree_actor) fn tree_snapshot(
     pointers: &Pointers,
     objects: &Objects,
     tree: TreeId,
-) -> Result<referee::Snapshot> {
+) -> Result<agentfs_referee::Snapshot> {
     let head = pointers.get(&refs::branch(tree)).ok_or(Error::NotFound)?;
     let snapshot = format::read_snapshot(repo, head, objects)?;
     if snapshot.files.keys().any(|id| !objects.contains_key(&id.0)) {

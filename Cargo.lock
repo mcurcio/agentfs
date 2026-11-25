@@ -218,6 +218,7 @@ dependencies = [
  "agentfs-git",
  "agentfs-lines",
  "agentfs-os",
+ "agentfs-referee",
  "agentfs-rules",
  "agentfs-test-metrics",
  "agentfs-trees",
@@ -312,6 +313,13 @@ dependencies = [
 [[package]]
 name = "agentfs-referee"
 version = "0.1.0"
+dependencies = [
+ "agentfs-contracts",
+ "agentfs-lines",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
 
 [[package]]
 name = "agentfs-repo"

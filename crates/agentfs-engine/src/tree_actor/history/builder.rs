@@ -39,18 +39,17 @@ use crate::tree_actor::journal::{
     chunk_map, frame_at, link_map, runs_from_frame, take_chunks,
 };
 use crate::tree_actor::pointers::Pointers;
-use crate::tree_actor::queue::Key;
 use crate::tree_actor::recording::file_map::BaseFile;
 use crate::tree_actor::recording::layout::{Layout, Positions};
 use crate::tree_actor::recording::{Call, FileMap, pages};
 use crate::tree_actor::stages::{Timer, Which};
-use crate::tree_actor::tree::{
-    EventNumber, FileBytes, Lines, MergeFileIdentity, NameHistory, Tree, Versions,
-};
+use crate::tree_actor::tree::{FileBytes, Tree};
 use crate::tree_actor::{Error, Result};
 use crate::tree_git::{RefUpdate, TreeGit};
 use agentfs_contracts::TreeId;
 use agentfs_lines::{Window, histogram_files_with};
+use agentfs_referee::queue::Key;
+use agentfs_referee::{EventNumber, Lines, MergeFileIdentity, NameHistory, Versions};
 
 /// The most steps one batch builds: a batch's built event wakes the lag gate,
 /// so a long backlog is built in slices that each end in one.

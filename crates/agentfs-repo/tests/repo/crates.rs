@@ -7,8 +7,9 @@
 //! `failpoints` feature forwarded to
 //! every dependency that has it, every cargo command the repository
 //! writes down naming what the workspace has, every failpoint call listed,
-//! the tree engine's `git` children all counted, and the tree engine naming
-//! no module of the recording engine. Each check is a pure
+//! the tree engine's `git` children all counted, the tree engine naming
+//! no module of the recording engine, and each library of a pure rank
+//! `no_std` outside its tests. Each check is a pure
 //! function over a [`Workspace`], a line or a source, with a fixture test
 //! beside it.
 
@@ -237,6 +238,7 @@ fn ranks() -> Vec<Rank> {
     .map(|(name, uses)| Rank {
         name: name.to_owned(),
         uses: uses.iter().map(|u| (*u).to_owned()).collect(),
+        no_std: matches!(name, "domain" | "landing-rules"),
     })
     .collect()
 }
@@ -1702,30 +1704,38 @@ fn cargo_calls_written_as_python_lists_are_read() {
 /// Every `.rs` file under the `src` of each member, but `except`'s, with its
 /// path from the root and its text.
 fn member_sources(workspace: &Workspace, except: &str) -> Vec<(String, String)> {
+    workspace
+        .members
+        .iter()
+        .filter(|m| m.name != except)
+        .flat_map(sources_of)
+        .collect()
+}
+
+/// Every `.rs` file under `member`'s `src`, with its path from the root and
+/// its text.
+fn sources_of(member: &Member) -> Vec<(String, String)> {
     let root = root();
-    let mut sources = Vec::new();
-    for member in workspace.members.iter().filter(|m| m.name != except) {
-        let src = root.join(&member.dir).join("src");
-        if !src.is_dir() {
-            continue;
-        }
-        let mut files = Vec::new();
-        files_under(&src, &mut files);
-        files.sort();
-        for path in files
-            .into_iter()
-            .filter(|p| p.extension().is_some_and(|e| e == "rs"))
-        {
+    let src = root.join(&member.dir).join("src");
+    if !src.is_dir() {
+        return Vec::new();
+    }
+    let mut files = Vec::new();
+    files_under(&src, &mut files);
+    files.sort();
+    files
+        .into_iter()
+        .filter(|p| p.extension().is_some_and(|e| e == "rs"))
+        .map(|path| {
             let text = std::fs::read_to_string(&path).unwrap();
             let shown = path
                 .strip_prefix(&root)
                 .unwrap_or(&path)
                 .display()
                 .to_string();
-            sources.push((shown, text));
-        }
-    }
-    sources
+            (shown, text)
+        })
+        .collect()
 }
 
 /// Where the failpoint calls in `sources` break the registry's rules: a
@@ -1875,7 +1885,8 @@ fn starts_in(source: &str) -> Vec<&'static str> {
 /// The tree engine starts each `git` child through
 /// `agentfs_git::git_cli::counted`, the one site that counts it: none of
 /// its production sources (agentfs-engine's `src`), nor the line maps'
-/// (`agentfs-lines`, which take the spawner from their caller), starts a
+/// (`agentfs-lines`, which take the spawner from their caller), nor the
+/// landing rules' (`agentfs-referee`, which start none), starts a
 /// process itself, but the history's repack task, whose `git repack` is not
 /// on the actor's path and stays uncounted, so each operation's count of
 /// Git children stays exact. `counted` is git_cli's one `.spawn()`.
@@ -1888,6 +1899,7 @@ fn the_tree_engine_starts_git_only_through_counted() {
     let mut files = Vec::new();
     files_under(&src, &mut files);
     files_under(&dir("agentfs-lines").join("src"), &mut files);
+    files_under(&dir("agentfs-referee").join("src"), &mut files);
     let repack = src.join("tree_actor/history/repack.rs");
     let mut problems = Vec::new();
     for file in files.iter().filter(|f| **f != repack) {
@@ -1934,4 +1946,103 @@ fn a_process_started_outside_counted_is_found() {
         starts_in("#[cfg(test)]\nconst X: u8 = 0;\nfn f() { cmd.output(); }"),
         [".output()"]
     );
+}
+
+/// The line that makes a library `no_std` outside its tests, which each
+/// library of a rank marked `no_std = true` holds in its `src/lib.rs`.
+const NO_STD: &str = "#![cfg_attr(not(test), no_std)]";
+
+/// Where `name`, a library of a pure rank (`no_std = true`), can reach std
+/// outside its tests: its `src/lib.rs`, `lib_rs`, has no line [`NO_STD`]
+/// (a comment does not count), or a file of its `src` (`sources`, each path
+/// and text) declares `extern crate std`. The whole text is read, tests
+/// included, as they have std already; whitespace between the words is
+/// read as one space.
+fn purity_problems(name: &str, lib_rs: &str, sources: &[(String, String)]) -> Vec<String> {
+    let mut problems = Vec::new();
+    if !lib_rs.lines().any(|line| line.trim() == NO_STD) {
+        problems.push(format!(
+            "{name}'s src/lib.rs lacks `{NO_STD}`: its rank is pure (no_std = true)"
+        ));
+    }
+    for (shown, text) in sources {
+        let words = text.split_whitespace().collect::<Vec<_>>().join(" ");
+        let declares = words.match_indices("extern crate std").any(|(at, found)| {
+            !words[at + found.len()..]
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_alphanumeric() || c == '_')
+        });
+        if declares {
+            problems.push(format!(
+                "{shown} declares `extern crate std`: {name}'s rank is pure (no_std = true)"
+            ));
+        }
+    }
+    problems
+}
+
+/// Each library of a rank the workspace manifest marks `no_std = true` (the
+/// pure domains, the landing rules) is `no_std` outside its tests, so the
+/// compiler refuses its code naming the file system, a process or the
+/// network (docs/architecture.md, "Ranks").
+#[test]
+fn the_pure_ranks_are_no_std() {
+    let workspace = Workspace::load();
+    let root = root();
+    let pure: Vec<&Member> = workspace
+        .members
+        .iter()
+        .filter(|m| {
+            m.rank
+                .as_deref()
+                .and_then(|r| workspace.rank(r))
+                .is_some_and(|r| r.no_std)
+                && m.targets.iter().any(|t| t.kinds.iter().any(|k| k == "lib"))
+        })
+        .collect();
+    assert!(
+        pure.iter().any(|m| m.name == "agentfs-referee")
+            && pure.iter().any(|m| m.name == "agentfs-trees"),
+        "the pure libraries read: {:?}: is the scan broken?",
+        pure.iter().map(|m| &m.name).collect::<Vec<_>>()
+    );
+    let mut problems = Vec::new();
+    for member in pure {
+        let lib_rs = std::fs::read_to_string(root.join(&member.dir).join("src/lib.rs")).unwrap();
+        problems.extend(purity_problems(&member.name, &lib_rs, &sources_of(member)));
+    }
+    assert!(problems.is_empty(), "{}", problems.join("\n"));
+}
+
+#[test]
+fn a_pure_crate_that_reaches_std_is_found() {
+    let lib = "//! A domain.\n#![cfg_attr(not(test), no_std)]\n\nextern crate alloc;\n";
+    let source = |text: &str| vec![("crates/x/src/a.rs".to_owned(), text.to_owned())];
+    assert!(purity_problems("x", lib, &source("use alloc::vec::Vec;")).is_empty());
+    assert!(
+        purity_problems("x", lib, &source("extern crate stdx;\nextern crate alloc;")).is_empty()
+    );
+    assert_eq!(
+        purity_problems("x", "//! A domain.\n", &[]),
+        [
+            "x's src/lib.rs lacks `#![cfg_attr(not(test), no_std)]`: its rank is pure (no_std = true)"
+        ]
+    );
+    assert_eq!(
+        purity_problems("x", "// #![cfg_attr(not(test), no_std)]\n#![no_std]\n", &[]).len(),
+        1,
+        "a comment, or no_std in tests too, is not the line"
+    );
+    for declared in [
+        "extern crate std;",
+        "extern  crate\n  std as other;",
+        "#[cfg(test)]\nmod tests { extern crate std; }",
+    ] {
+        assert_eq!(
+            purity_problems("x", lib, &source(declared)),
+            ["crates/x/src/a.rs declares `extern crate std`: x's rank is pure (no_std = true)"],
+            "{declared}"
+        );
+    }
 }

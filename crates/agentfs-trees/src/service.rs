@@ -2,7 +2,8 @@
 //! end by key and the settle that ends and drops forks (slice S5)
 //! (docs/trees.md, "Forks: keys, end and the drop").
 
-use std::collections::BTreeMap;
+use alloc::collections::BTreeMap;
+use alloc::vec::Vec;
 
 use agentfs_contracts::audit::Principal;
 use agentfs_contracts::caps::{LaunchCap, LaunchScope};

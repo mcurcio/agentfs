@@ -25,6 +25,7 @@ module; [trees](../trees.md) says what a tree view does and promises.
 | Git-backed tree views | `tree_actor`, `state_area` | `TreeActor`, `TreeStateArea` (the Volume domain's `StateArea` port; its `inspect` reads what a state area holds) |
 | The domains' rows over a tree volume | `store`, `tree_actor` | `TreeStore` (the `VolumeStore`, `ForkStore`, `ClientStore` and `QueueFacts` ports), `Chain`, `RowDomain`, `RowWrite`, `RowEvent` |
 | Line identity across saves | `agentfs_lines`, a leaf the library crate does not re-export: depend on `agentfs-lines` by name | `LineMap` (runs of lines, never bytes), `LineMap::align` (git's histogram diff over two `Image`s, read a line at a time), `LineMap::align_bytes_with`, `histogram_with` and `histogram_files_with` (the diff's `git` child started by the spawner passed: the tree engine passes `agentfs_git::git_cli::counted`), `LineMap::append`, `LineMap::expand` (line by line, for the landing rules), `pieces` (where a merged file's lines are in its sources): the line-map library, generic over the caller's numbered version (`Id`) |
+| The landing rules the engine's takes carry out | `agentfs_referee`, which the library crate does not re-export: the engine is its one user ([page](referee.md)) | `land`, `sync`, `undecided` through the `Landed` port, `touches`, the queue's `eligible` and `cut`, and the values they read (`EventNumber`, `LineVersion`, `MergeFileIdentity`, `NameHistory`) |
 | OpenTelemetry instruments | `telemetry` | `observe_process`, `observe_unverified`, on a `Meter` the caller makes |
 
 ## Git-backed tree views
@@ -235,7 +236,8 @@ for entry in v.children(TreeId::Root, "", 0, 100)? { /* name, number, kind */ }
 
 A fork's change lands in its upstream, and a sync brings the upstream's
 decisions to the fork, by the same rules as lines and names (rules 13 to 15 of
-the model, `crates/agentfs-model/MODEL.md`). The referee judges them with the
+the model, `crates/agentfs-model/MODEL.md`). The landing rules
+([`agentfs-referee`](referee.md)) judge them with the
 change's first parent (what its writer saw), the change, and the upstream's
 head:
 

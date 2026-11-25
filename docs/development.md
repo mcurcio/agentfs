@@ -241,7 +241,11 @@ ranks it uses; only `agentfs-service`, the crate `agentfs` and the tests
 depend on the domains the service composes; every `failpoints` feature is
 forwarded; every cargo command the repository writes down names what the
 workspace has; every failpoint hit is listed; the tree engine starts
-`git` only through `counted`; and each item of the library has one path
+`git` only through `counted`, and neither the line maps nor the landing
+rules start a process; each library of a rank marked `no_std = true` is
+`no_std` outside its tests (`the_pure_ranks_are_no_std`): its `src/lib.rs`
+holds `#![cfg_attr(not(test), no_std)]` and no file of its `src` declares
+`extern crate std`; and each item of the library has one path
 (`the_library_gives_each_item_one_path`): no source of a crate the crate
 `agentfs` re-exports holds a statement starting `pub use` or `pub type` that
 names a path of another crate, `agentfs_<name>::` or `::agentfs_<name>`,
@@ -261,6 +265,69 @@ container with 4 CPUs and 15 GB:
 | After an edit to a page under `docs/` | 1.0 s |
 | Of which the run, its 29 tests | 0.6 s |
 
+What the checks of the crates, `ci/check-deps.sh` and clippy's bans do not
+read, beside each:
+
+- **Purity** (`the_pure_ranks_are_no_std`, the compiler, and
+  `ci/check-deps.sh`'s `ok   referee alone` and `ok   referee`). A `no_std`
+  crate still calls what its dependencies make `pub`: I/O through a
+  dependency's API is not read, but for `agentfs-lines`' I/O half, its `io`
+  feature, which `check-deps.sh` refuses in what the landing rules link and
+  whose use fails their build alone (`cargo check -p agentfs-referee
+  --lib`). Also not read: an `extern crate` of another std-linked crate's
+  re-export of std (none in the graph today). A local `cargo clippy -p
+  agentfs-referee --all-targets` turns `io` on through the crate's
+  dev-dependency, so only that build alone refuses a call into it.
+- **Cargo commands** (`cargo_commands_name_what_the_workspace_has`). A
+  stale `cargo test` or `cargo nextest run -p agentfs`, meant for the
+  binary, is in form a right use of the library crate, and so is one in
+  markdown: not refused. Prose naming a package ("`agentfs` is a binary
+  only") is read by no check: a rename's own work greps for it.
+- **Paths under `crates/`** (`crate_paths_name_what_exists`). Every tracked
+  file is read but the records of past work (`vendor/`, `.claude/handoff/`,
+  the errata, `CHANGELOG.md`, `OWNER-GUIDANCE.md`, the patches). In Rust it
+  reads whole-line comments only: a comment after code, a `/* */` comment
+  and string literals are left to the compiler and the tests that open
+  them.
+- **The front** (`the_front_only_reexports_the_ranks_it_uses`, which
+  refuses anything in its `src/lib.rs` but comments and `pub use <crate> as
+  <module>;` and requires one module for each library of the ranks its rank
+  uses but `agentfs-core`). Not read: what each re-exported crate makes
+  `pub`.
+- **Composition** (`only_the_service_composes_the_domains`). Not read:
+  dev-dependencies and the `tests` rank, so `agentfs-conformance` composes
+  Trees itself (`mounted.rs`), as a test may; and a consumer outside the
+  workspace.
+- **What the library links** (`check-deps.sh`'s `ok   library` and `ok
+  library features`). It refuses the recording engine, which shares the
+  rank `engine` with the tree engine, so the ranks cannot. Not read: a
+  consumer that depends on `agentfs-engine` by name with `test-util`, and
+  which `pub` items only tests call (an item goes behind `test-util` when a
+  reading of its callers finds only tests).
+- **A library making its own `Meter`.** clippy bans
+  `opentelemetry::global::meter*`, `MeterProvider::{meter,
+  meter_with_scope}` and `Meter::new` but in the binary's `otel::meter_of`
+  and agentfs-test-metrics. Not checked: a library building an SDK
+  provider.
+- **clippy's bans of `TreeGit::open` and `TreeGit::init`** carry
+  `allow-invalid = true`, as the paths resolve only under `test-util`: a
+  rename or move of either drops its ban without a word. Not checked.
+- **One crate's documentation per name.** agentfs-cli's binary has `doc =
+  false`, so `cargo doc --workspace` does not write the binary's pages over
+  the library crate's (both are `agentfs`). Not checked: no gate runs
+  `cargo doc --workspace`.
+
+The landing rules are a crate of their own, `agentfs-referee`, whose tests
+build and run without the engine. Measured on 2026-11-25 in a container
+with 4 CPUs and 15 GB, at cargo's default jobs:
+
+| Step | Time |
+|---|---|
+| `cargo nextest run -p agentfs-referee`, from an empty target directory | 14 s |
+| The same again, nothing changed | 2.7 s |
+| After touching one of its files | 2.4 s |
+| Of which the run, its 43 tests | 1.4 s to 2.3 s |
+
 ## CI
 
 Every push runs [`.github/workflows/ci.yml`](../.github/workflows/ci.yml):
@@ -269,7 +336,9 @@ Every push runs [`.github/workflows/ci.yml`](../.github/workflows/ci.yml):
   [`ci/check-deps.sh`](../ci/check-deps.sh): what C and crypto each feature
   set of the binary links, and that the library crate `agentfs` links no
   recording engine, FUSE, OpenTelemetry SDK, TLS or SSH and turns on no
-  `test-util` or `failpoints` feature. Then the library as a consumer builds
+  `test-util` or `failpoints` feature; and that the landing rules
+  (`agentfs-referee`) build alone, without `agentfs-lines`' `io` feature,
+  and link no git, libc, rustix or OpenTelemetry. Then the library as a consumer builds
   it, without `test-util`: clippy of `agentfs-engine`, `agentfs-service`
   and `agentfs`'s libraries, and `agentfs`'s doctest.
 - **test:** the workspace tests under nextest's `ci` profile, then the

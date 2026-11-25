@@ -12,6 +12,16 @@ design was reviewed on 2026-10-12.
 
 ### Changed
 
+- **The landing rules are a crate of their own, `agentfs-referee`.** `land`,
+  `sync`, `touches`, the queue's order and locks, and the values they read
+  (`EventNumber`, `LineVersion`, `MergeFileIdentity`, `NameHistory`) moved
+  out of the tree engine, with their own error (`agentfs_referee::Error`,
+  mapped into the engine's as before) and their tests, which run in seconds.
+  The crate and the four domains are `no_std` outside their tests, from the
+  ranks the workspace manifest marks `no_std = true`, which agentfs-repo
+  checks; `agentfs-lines`' file and process half is its default feature `io`,
+  which the landing rules build without (`ci/check-deps.sh`)
+  (docs/library/referee.md).
 - **Each library item has one path.** An entry's metadata (`Kind`, `Perm`,
   `Attrs`, `Meta`) is the shared kernel's, `agentfs::contracts::meta`, and a
   tree's identity is `agentfs::contracts::TreeId` only: the engine no longer

@@ -9,9 +9,9 @@ use agentfs_contracts::volume::VolumeIdentity;
 use super::verify::Flag;
 use crate::tree_actor::journal::RowRecord;
 use crate::tree_actor::rows::Chain;
-use crate::tree_actor::tree::EventNumber;
-use crate::tree_actor::{Error, Result, referee};
+use crate::tree_actor::{Error, Result};
 use agentfs_contracts::TreeId;
+use agentfs_referee::EventNumber;
 
 const WRITER: &str = "Agentfs-Writer: ";
 const CAUSE: &str = "Agentfs-Cause: ";
@@ -88,7 +88,7 @@ pub(in crate::tree_actor) enum Message<'a> {
         landed: &'a WriterAt,
         tree: TreeId,
         event: EventNumber,
-        collisions: &'a [referee::Collision],
+        collisions: &'a [agentfs_referee::Collision],
     },
     /// Writer `agentfs` with the history service's pod context.
     Sync {
@@ -344,14 +344,16 @@ pub(in crate::tree_actor) fn open_of(message: &[u8]) -> Option<u64> {
 /// # Errors
 ///
 /// A line whose JSON is no list of collisions.
-pub(in crate::tree_actor) fn collisions(message: &[u8]) -> Result<Vec<referee::Collision>> {
+pub(in crate::tree_actor) fn collisions(message: &[u8]) -> Result<Vec<agentfs_referee::Collision>> {
     let mut all = Vec::new();
     for json in lines(message)
         .into_iter()
         .flatten()
         .filter_map(|line| line.strip_prefix(COLLISIONS))
     {
-        all.extend(serde_json::from_str::<Vec<referee::Collision>>(json)?);
+        all.extend(serde_json::from_str::<Vec<agentfs_referee::Collision>>(
+            json,
+        )?);
     }
     Ok(all)
 }
@@ -367,8 +369,8 @@ mod tests {
     use agentfs_contracts::volume::VolumeId;
 
     use super::*;
-    use crate::tree_actor::referee::{Collision, CollisionKind, Version};
-    use crate::tree_actor::tree::MergeFileIdentity;
+    use agentfs_referee::MergeFileIdentity;
+    use agentfs_referee::{Collision, CollisionKind, Version};
 
     const VOLUME_TEXT: &str =
         "Agentfs-Volume: t\nAgentfs-Volume-Id: 00000000-0000-0000-0000-00000000002a\n";

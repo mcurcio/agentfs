@@ -39,6 +39,7 @@ are under [Future designs](#future-designs).
 | [The library: `agentfs-service`](library/service.md) | One tree volume composed: its domains wired onto one store from the capabilities its caller mints, their events dispatched, the drain at a stop |
 | [The library: `agentfs-core`](library/core.md) | The recording engine: recording, history, pushing, restore, patches, forks and the history service, for building another front end or tooling |
 | [The library: `agentfs-engine`](library/engine.md) | The tree engine: git-backed tree views, their sessions, the domains' rows and the state area, for building another front end over tree views or tooling |
+| [The library: `agentfs-referee`](library/referee.md) | The tree views' landing rules, pure: how a fork's change lands in its upstream and what a sync shows, the queue's order and locks, and how their purity is checked |
 | [The filesystem: `agentfs-fuse` and `agentfs-cli`](library/filesystem.md) | The FUSE operations, the `agentfs` binary's commands, exit codes and control socket |
 | [The Kubernetes adapter: `agentfs-csi`](library/kubernetes.md) | The CSI driver as the adapter layer, and how to build on it |
 

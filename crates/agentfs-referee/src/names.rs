@@ -2,12 +2,15 @@
 //! the upstream's with the fork's undecided ones kept (docs/target-architecture/git-model.md §7,
 //! §8).
 
-use std::collections::{BTreeMap, BTreeSet};
+use alloc::borrow::ToOwned;
+use alloc::collections::{BTreeMap, BTreeSet};
+use alloc::string::String;
+use alloc::vec::Vec;
 
 use super::verdicts::Candidate;
 use super::{ByLine as Snapshot, CollisionKind, Version};
-use crate::tree_actor::tree::{EventNumber, MergeFileIdentity, NameHistory};
-use crate::tree_actor::{Error, Result};
+use crate::{Error, Result};
+use crate::{EventNumber, MergeFileIdentity, NameHistory};
 
 /// R11.2 at a landing: an applied name onto a path a live upstream file holds loses to that
 /// file's name, unless this change ended that file by a rename-over onto this name (its own

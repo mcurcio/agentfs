@@ -3,6 +3,7 @@
 
 use super::verdicts::Candidate;
 use super::{ByLine, Collision, CollisionKind, Decision, Expanded};
+use alloc::vec::Vec;
 
 /// Sorts `candidates` by their order. A loss anywhere: every candidate is a collision, its own loss
 /// or `Whole` to the first loss's winner, and the snapshot is the upstream's. Else the snapshot is
@@ -46,7 +47,7 @@ mod tests {
     use super::super::Version;
     use super::super::verdicts::{Of, Order};
     use super::*;
-    use crate::tree_actor::tree::{EventNumber, LineVersion, MergeFileIdentity};
+    use crate::{EventNumber, LineVersion, MergeFileIdentity};
 
     fn line(file: u64, version: &str) -> Version {
         Version::Line {
@@ -109,7 +110,7 @@ mod tests {
         let mut applied = ByLine::default();
         applied.names.insert(
             MergeFileIdentity(1),
-            crate::tree_actor::tree::NameHistory::created(EventNumber::new(1), "a".into()),
+            crate::NameHistory::created(EventNumber::new(1), "a".into()),
         );
         let decision = whole(
             &ByLine::default(),

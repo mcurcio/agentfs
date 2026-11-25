@@ -15,9 +15,7 @@ mod history;
 mod journal;
 mod meta;
 mod pointers;
-mod queue;
 mod recording;
-mod referee;
 mod rows;
 pub mod stages;
 mod takes;
@@ -46,6 +44,7 @@ use agentfs_contracts::meta::{Kind, Meta, Perm};
 use agentfs_contracts::{NotATree, TreeId};
 use agentfs_os::file_lock::{FileLock, Mode};
 use agentfs_os::fsutil::sync_dir;
+use agentfs_referee::EventNumber;
 pub(crate) use call_path::ActorGuard;
 pub use call_path::{Closing, PathStep, Progress, Recording, SavePending, SaveToDecide, Then};
 use history::builder::{BuildState, Builder, JournalReader, copy_all};
@@ -84,7 +83,7 @@ pub(crate) use recording::{OpenContent, WriteOpenStart};
 use rows::SavedRows;
 pub use rows::{Chain, RowDomain, RowEvent, RowWrite};
 use stages::Stages;
-use tree::{EventNumber, SavedTree};
+use tree::SavedTree;
 pub use untracked::{AreaWrite, UntrackedArea};
 
 const FORMAT: &str = "agentfs-trees-15\n";
@@ -249,10 +248,14 @@ impl From<NotATree> for Error {
     }
 }
 
-impl From<referee::Broken> for Error {
-    /// A broken ancestry is damaged history.
-    fn from(_: referee::Broken) -> Self {
-        Self::Format
+impl From<agentfs_referee::Error> for Error {
+    /// The landing rules' failures: malformed history or a broken ancestry is damaged state, a
+    /// line map's error stays the line map's.
+    fn from(e: agentfs_referee::Error) -> Self {
+        match e {
+            agentfs_referee::Error::Format | agentfs_referee::Error::Ancestry(_) => Self::Format,
+            agentfs_referee::Error::Lines(e) => Self::Lines(e),
+        }
     }
 }
 
@@ -2066,6 +2069,28 @@ mod tests {
     use super::*;
 
     const ROOT: TreeId = TreeId::Root;
+
+    /// The landing rules' errors cross into the engine's as before the crate split: malformed
+    /// history and a broken ancestry are damaged state, a line map's error stays its own (an
+    /// I/O error in one keeps its errno).
+    #[test]
+    fn referee_errors_map_to_the_engines() {
+        use agentfs_referee::{Broken, Error as Rules};
+        assert!(matches!(Error::from(Rules::Format), Error::Format));
+        assert!(matches!(
+            Error::from(Rules::Ancestry(Broken::Cycle)),
+            Error::Format
+        ));
+        assert!(matches!(
+            Error::from(Rules::Ancestry(Broken::Missing)),
+            Error::Format
+        ));
+        let lines = Error::from(Rules::Lines(agentfs_lines::Error::Io(
+            io::Error::from_raw_os_error(libc::ENOSPC),
+        )));
+        assert!(matches!(lines, Error::Lines(agentfs_lines::Error::Io(_))));
+        assert_eq!(lines.errno(), libc::ENOSPC);
+    }
 
     fn frames_of(root: &Path) -> Vec<Frame> {
         Journal::open(&root.join(JOURNAL), RecordNo::ZERO)

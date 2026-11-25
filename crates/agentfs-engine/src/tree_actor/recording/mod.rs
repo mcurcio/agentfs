@@ -32,13 +32,14 @@ use super::journal::{
     chunk_map,
 };
 use super::meta::{SetTime, Times};
-use super::queue::Key;
 use super::stages::{Hold, section};
-use super::tree::{DirState, EventNumber, SavedTree};
+use super::tree::{DirState, SavedTree};
 use super::{Error, Result, SavePending, Saved, TreeActor};
 use agentfs_contracts::TreeId;
 use agentfs_contracts::meta::{Attrs, Kind, Meta, Perm};
 use agentfs_contracts::paths::RepoPath;
+use agentfs_referee::EventNumber;
+use agentfs_referee::queue::Key;
 pub use file_map::FileMap;
 use layout::{Layout, Positions};
 use pages::CloseCalls;

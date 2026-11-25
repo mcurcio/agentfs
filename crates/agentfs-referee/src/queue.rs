@@ -1,15 +1,16 @@
 //! Queue and locks (target git-model §6): P1 eligibility, the keys open files hold, and the
 //! `Cut` a prefix sync takes to.
 
-use std::collections::BTreeSet;
+use alloc::collections::BTreeSet;
+use alloc::string::String;
 
-use super::tree::MergeFileIdentity;
+use crate::MergeFileIdentity;
 use agentfs_contracts::TreeId;
 
 /// A file identity or a namespace slot involved in a change. Namespace slots
 /// are included because distinct files may compete for the same name.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub(in crate::tree_actor) enum Key {
+pub enum Key {
     /// A merge-file identity.
     File(MergeFileIdentity),
     /// A name slot which may be claimed by another file.
@@ -18,7 +19,7 @@ pub(in crate::tree_actor) enum Key {
 
 /// Files and source of a queue entry, in arrival order.
 #[derive(Clone, Debug)]
-pub(in crate::tree_actor) struct Plan {
+pub struct Plan {
     /// The tree whose head the entry moves here: the upstream for a sync, a
     /// fork for a landing.
     pub source: TreeId,
@@ -28,7 +29,7 @@ pub(in crate::tree_actor) struct Plan {
 
 /// Return the first entry that can take, respecting transitive dependencies
 /// on earlier entries blocked by a writer (P1).
-pub(in crate::tree_actor) fn eligible(plans: &[Plan], open: &BTreeSet<Key>) -> Option<usize> {
+pub fn eligible(plans: &[Plan], open: &BTreeSet<Key>) -> Option<usize> {
     let mut waiting_files = BTreeSet::new();
     let mut waiting_sources = BTreeSet::new();
     for (index, plan) in plans.iter().enumerate() {
@@ -46,7 +47,7 @@ pub(in crate::tree_actor) fn eligible(plans: &[Plan], open: &BTreeSet<Key>) -> O
 
 /// The last upstream change a prefix sync takes (R9.3, R9.9, R3d). Its fields are private:
 /// only [`cut`] makes one, and a sync is built only from a `Cut`.
-pub(in crate::tree_actor) struct Cut<T> {
+pub struct Cut<T> {
     taken: Option<T>,
     remaining: bool,
     keys: BTreeSet<Key>,
@@ -55,24 +56,24 @@ pub(in crate::tree_actor) struct Cut<T> {
 
 impl<T> Cut<T> {
     /// The last change taken, if any.
-    pub(in crate::tree_actor) fn into_taken(self) -> Option<T> {
+    pub fn into_taken(self) -> Option<T> {
         self.taken
     }
 
     /// Whether a change after the cut waits for an open file: the queue entry stays.
-    pub(in crate::tree_actor) fn remaining(&self) -> bool {
+    pub fn remaining(&self) -> bool {
         self.remaining
     }
 
     /// What the take locks: the taken changes' keys; when the first change waits, that
     /// change's keys.
-    pub(in crate::tree_actor) fn keys(&self) -> &BTreeSet<Key> {
+    pub fn keys(&self) -> &BTreeSet<Key> {
         &self.keys
     }
 
     /// The held keys that cut it: those of the first change it did not take that open files
     /// hold. A take decided on this cut read them (`takes::Decision::reads`).
-    pub(in crate::tree_actor) fn held(&self) -> &BTreeSet<Key> {
+    pub fn held(&self) -> &BTreeSet<Key> {
         &self.held
     }
 }
@@ -84,7 +85,7 @@ impl<T> Cut<T> {
 /// # Errors
 ///
 /// The first error of `step`.
-pub(in crate::tree_actor) fn cut<C, T, E>(
+pub fn cut<C, T, E>(
     changes: impl IntoIterator<Item = C>,
     open: &BTreeSet<Key>,
     mut step: impl FnMut(Option<&T>, C) -> Result<(T, BTreeSet<Key>), E>,

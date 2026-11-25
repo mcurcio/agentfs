@@ -31,11 +31,12 @@ use git2::Oid;
 use super::Objects;
 use super::feed::Edit;
 use super::message;
-use crate::tree_actor::queue::Key;
 use crate::tree_actor::stages::{Timer, Which};
-use crate::tree_actor::tree::{FileBytes, Lines, MergeFileIdentity, NameHistory, Tree};
-use crate::tree_actor::{Error, Result, referee};
+use crate::tree_actor::tree::{FileBytes, Tree};
+use crate::tree_actor::{Error, Result};
 use crate::tree_git::{TreeEntry, TreeGit};
+use agentfs_referee::queue::Key;
+use agentfs_referee::{Lines, MergeFileIdentity, NameHistory};
 
 /// An event commit's one blob: its chain's row, as the store wrote it.
 pub(in crate::tree_actor) const ROW_FILE: &str = "row.json";
@@ -366,7 +367,7 @@ pub(in crate::tree_actor) fn read_snapshot(
     repo: &TreeGit,
     commit: Oid,
     objects: &Objects,
-) -> Result<referee::Snapshot> {
+) -> Result<agentfs_referee::Snapshot> {
     let _timer = Timer::start(Which::SnapshotRead);
     let commit = repo.read_commit(commit)?;
     let entries = repo.list_tree(commit.tree)?;
@@ -375,9 +376,9 @@ pub(in crate::tree_actor) fn read_snapshot(
         // The Root commit alone has no envelope, and the root directory's
         // record alone.
         if entries.iter().all(|e| e.name == DIRS.as_bytes()) && dirs.contains_key("") {
-            return Ok(referee::Snapshot {
+            return Ok(agentfs_referee::Snapshot {
                 dirs,
-                ..referee::Snapshot::default()
+                ..agentfs_referee::Snapshot::default()
             });
         }
         return Err(Error::Format);
@@ -404,7 +405,7 @@ pub(in crate::tree_actor) fn read_snapshot(
         if files
             .insert(
                 id,
-                referee::File {
+                agentfs_referee::File {
                     object,
                     lines,
                     meta,
@@ -415,7 +416,7 @@ pub(in crate::tree_actor) fn read_snapshot(
             return Err(Error::Format);
         }
     }
-    Ok(referee::Snapshot { files, names, dirs })
+    Ok(agentfs_referee::Snapshot { files, names, dirs })
 }
 
 /// The object at `path` (slash-separated) under tree `tree`, if any.
@@ -469,11 +470,11 @@ pub(in crate::tree_actor) fn file_of(
 pub(in crate::tree_actor) fn meta_of(
     repo: &TreeGit,
     commit: Oid,
-    record: referee::Record<'_>,
+    record: agentfs_referee::Record<'_>,
 ) -> Result<Option<Meta>> {
     let tree = repo.read_commit(commit)?.tree;
     match record {
-        referee::Record::Dir(path) => {
+        agentfs_referee::Record::Dir(path) => {
             let Some(blob) = lookup(repo, tree, &dir_path(path))? else {
                 return Ok(None);
             };
@@ -483,7 +484,7 @@ pub(in crate::tree_actor) fn meta_of(
             }
             Ok(Some(meta))
         }
-        referee::Record::Meta(id) => {
+        agentfs_referee::Record::Meta(id) => {
             let Some(names) = lookup(repo, tree, &names_path(id))? else {
                 return Ok(None);
             };

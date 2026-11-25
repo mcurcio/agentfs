@@ -19,10 +19,11 @@ use crate::tree_actor::history::upstreams::Upstreams;
 use crate::tree_actor::pointers::Pointers;
 use crate::tree_actor::recording::layout::{Layout, Positions};
 use crate::tree_actor::recording::{Call, FileMap, pages};
-use crate::tree_actor::tree::{EventNumber, SavedTree};
+use crate::tree_actor::tree::SavedTree;
 use crate::tree_actor::{Error, Result};
 use agentfs_contracts::TreeId;
 use agentfs_contracts::meta::Meta;
+use agentfs_referee::EventNumber;
 
 /// A live write-open: a journal [`OpenRecord`] with its tree parsed.
 #[derive(Clone, Debug, PartialEq, Eq)]

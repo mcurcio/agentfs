@@ -16,11 +16,11 @@ use super::history::take::{self as plan, Decided};
 use super::history::{self, refs};
 use super::journal::durable::RecordNo;
 use super::journal::{Change, TakeHead, TakeRecord, Target};
-use super::queue::{self, Key};
 use super::stages::{Hold, Timer, Which, section};
-use super::tree::EventNumber;
-use super::{Error, Result, Took, TreeActor, referee};
+use super::{Error, Result, Took, TreeActor};
 use agentfs_contracts::TreeId;
+use agentfs_referee::EventNumber;
+use agentfs_referee::queue::{self, Key};
 
 /// What a decision needs from the actor, read under its lock.
 #[derive(Clone, Debug)]
@@ -150,7 +150,7 @@ pub(in crate::tree_actor) fn decide(
     let mut writes = plans[index].files.clone();
     let (files, names, dirs) = match &after {
         Some(after) => {
-            writes.extend(referee::touches(&mine, after));
+            writes.extend(agentfs_referee::touches(&mine, after));
             take_diff(&mine, after)
         }
         None => Default::default(),
@@ -318,7 +318,7 @@ impl TreeActor {
             return;
         }
         let touched = self.touched.entry(tree).or_default();
-        for key in referee::with_directories(keys) {
+        for key in agentfs_referee::with_directories(keys) {
             touched.insert(key, RecordNo::new(seq));
         }
     }
@@ -499,12 +499,12 @@ pub(in crate::tree_actor) type Touched = BTreeMap<TreeId, BTreeMap<Key, RecordNo
 /// A take's changed files, names and directories, as its record holds them.
 pub(in crate::tree_actor) type TakeDiff = (
     Vec<(
-        crate::tree_actor::tree::MergeFileIdentity,
-        Option<referee::File>,
+        agentfs_referee::MergeFileIdentity,
+        Option<agentfs_referee::File>,
     )>,
     Vec<(
-        crate::tree_actor::tree::MergeFileIdentity,
-        Option<crate::tree_actor::tree::NameHistory>,
+        agentfs_referee::MergeFileIdentity,
+        Option<agentfs_referee::NameHistory>,
     )>,
     Vec<(String, Option<agentfs_contracts::meta::Meta>)>,
 );
@@ -512,8 +512,8 @@ pub(in crate::tree_actor) type TakeDiff = (
 /// A take's decision on a built tree as a record: the files, names and
 /// directories that differ from `mine`.
 pub(in crate::tree_actor) fn take_diff(
-    mine: &referee::Snapshot,
-    decided: &referee::Snapshot,
+    mine: &agentfs_referee::Snapshot,
+    decided: &agentfs_referee::Snapshot,
 ) -> TakeDiff {
     let mut files = Vec::new();
     for (id, file) in &decided.files {

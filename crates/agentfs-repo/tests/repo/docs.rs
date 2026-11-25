@@ -76,7 +76,8 @@ fn every_module_is_in_the_architecture_map() {
 
 /// How docs/architecture.md's "Ranks" table differs from the workspace's
 /// ranks: its first column's code spans are the ranks in order, its second
-/// column's each rank's `uses`.
+/// column's each rank's `uses`, its third `yes` for a rank marked
+/// `no_std = true` and `no` for the rest (a reason may follow the word).
 fn ranks_table_problems(markdown: &str, ranks: &[Rank]) -> Vec<String> {
     let sections = doc_tables::sections(markdown);
     let Some(section) = doc_tables::section(&sections, "Ranks") else {
@@ -109,6 +110,15 @@ fn ranks_table_problems(markdown: &str, ranks: &[Rank]) -> Vec<String> {
                     rank.uses
                 ));
             }
+            let pure = row.get(2).map(|c| c.trim());
+            let word = if rank.no_std { "yes" } else { "no" };
+            if !pure.is_some_and(|c| c.split([' ', ':', ',']).next() == Some(word)) {
+                problems.push(format!(
+                    "`{name}` has no_std = {} in Cargo.toml; the table's no_std column says {:?}",
+                    rank.no_std,
+                    pure.unwrap_or("")
+                ));
+            }
         }
     }
     problems
@@ -136,26 +146,43 @@ fn the_ranks_table_is_read_in_order() {
         Rank {
             name: "a".into(),
             uses: vec!["a".into()],
+            no_std: false,
         },
         Rank {
             name: "b".into(),
             uses: vec![],
+            no_std: true,
         },
     ];
-    let page = |rows: &str| format!("## Ranks\n\n| Rank | Uses |\n|---|---|\n{rows}\n## Next\n");
+    let page = |rows: &str| {
+        format!("## Ranks\n\n| Rank | Uses | no_std |\n|---|---|---|\n{rows}\n## Next\n")
+    };
     assert_eq!(
-        ranks_table_problems(&page("| `a` | `a` |\n| `b` | none |\n"), &ranks),
+        ranks_table_problems(
+            &page("| `a` | `a` | no: its values carry paths |\n| `b` | none | yes |\n"),
+            &ranks
+        ),
         Vec::<String>::new()
     );
     assert_eq!(
-        ranks_table_problems(&page("| `b` | none |\n| `a` | `a` |\n"), &ranks).len(),
+        ranks_table_problems(&page("| `b` | none | yes |\n| `a` | `a` | no |\n"), &ranks).len(),
         1,
         "two rows swapped"
     );
     assert_eq!(
-        ranks_table_problems(&page("| `a` | none |\n| `b` | none |\n"), &ranks).len(),
+        ranks_table_problems(&page("| `a` | none | no |\n| `b` | none | yes |\n"), &ranks).len(),
         1,
         "a use missing"
+    );
+    assert_eq!(
+        ranks_table_problems(&page("| `a` | `a` | no |\n| `b` | none | no |\n"), &ranks),
+        ["`b` has no_std = true in Cargo.toml; the table's no_std column says \"no\""],
+        "a pure rank not marked"
+    );
+    assert_eq!(
+        ranks_table_problems(&page("| `a` | `a` | yes |\n| `b` | none |\n"), &ranks).len(),
+        2,
+        "an impure rank marked, a column missing"
     );
     assert_eq!(ranks_table_problems("# none\n", &ranks).len(), 1);
 }

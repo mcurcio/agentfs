@@ -16,6 +16,8 @@ repository = "https://github.com/mcurcio/agentfs"
 
 # The ranks of the workspace's packages, each listed after every rank it
 # uses; each package names its own in `[package.metadata.agentfs] rank`.
+# `no_std = true` marks a rank of pure code: each of its libraries is
+# `no_std` outside its tests.
 # What a rank permits: docs/architecture.md, "Ranks" (crates/agentfs-repo
 # checks it).
 [workspace.metadata.agentfs]
@@ -23,8 +25,8 @@ ranks = [
     { name = "line-identity", uses = ["line-identity"] },
     { name = "leaf", uses = ["line-identity", "leaf"] },
     { name = "shared-kernel", uses = [] },
-    { name = "domain", uses = ["shared-kernel"] },
-    { name = "landing-rules", uses = ["line-identity", "shared-kernel"] },
+    { name = "domain", uses = ["shared-kernel"], no_std = true },
+    { name = "landing-rules", uses = ["line-identity", "shared-kernel"], no_std = true },
     { name = "engine", uses = ["line-identity", "leaf", "shared-kernel", "domain", "landing-rules"] },
     { name = "service", uses = ["shared-kernel", "domain", "engine"] },
     { name = "filesystem", uses = ["leaf", "shared-kernel", "domain", "engine", "service", "filesystem"] },

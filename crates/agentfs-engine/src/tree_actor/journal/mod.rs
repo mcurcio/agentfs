@@ -62,10 +62,10 @@ use serde::{Deserialize, Serialize};
 use super::meta::{SetTime, Times};
 use super::recording::{Call, FileMap};
 use super::stages::{self, Timer, Which};
-use super::tree::{MergeFileIdentity, NameHistory};
-use super::{Error, Result, referee};
+use super::{Error, Result};
 use agentfs_contracts::TreeId;
 use agentfs_contracts::meta::Meta;
+use agentfs_referee::{MergeFileIdentity, NameHistory};
 use compaction::{Checkpoint, Live, Published};
 use durable::{Durability, RecordNo};
 #[cfg(test)]
@@ -418,9 +418,9 @@ pub(super) struct TakeRecord {
     /// Audit: the built point the decision read.
     pub decided_at: RecordNo,
     pub head: TakeHead,
-    pub files: Vec<(MergeFileIdentity, Option<referee::File>)>,
+    pub files: Vec<(MergeFileIdentity, Option<agentfs_referee::File>)>,
     pub names: Vec<(MergeFileIdentity, Option<NameHistory>)>,
-    pub collisions: Vec<referee::Collision>,
+    pub collisions: Vec<agentfs_referee::Collision>,
     /// Each directory it adds, changes (`Some`) or removes (`None`).
     pub dirs: Vec<(String, Option<Meta>)>,
     /// The length of each file it leaves, in `files` order.

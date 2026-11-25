@@ -22,6 +22,7 @@
 - [The library: agentfs-service](library/service.md)
 - [The library: agentfs-core](library/core.md)
 - [The library: agentfs-engine](library/engine.md)
+- [The library: agentfs-referee](library/referee.md)
 - [The filesystem: agentfs-fuse and agentfs-cli](library/filesystem.md)
 - [The Kubernetes adapter: agentfs-csi](library/kubernetes.md)
 

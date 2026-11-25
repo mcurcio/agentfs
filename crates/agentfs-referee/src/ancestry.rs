@@ -1,26 +1,26 @@
 //! The one ancestry walk and the one union of line ancestries, for names and lines alike
 //! (docs/target-architecture/git-model.md §7).
 
-use std::collections::{BTreeMap, BTreeSet};
+use alloc::collections::{BTreeMap, BTreeSet};
 
-use crate::tree_actor::tree::{EventNumber, LineVersion, NameHistory};
-use crate::tree_actor::{Error, Result};
+use crate::{Error, Result};
+use crate::{EventNumber, LineVersion, NameHistory};
 
 /// Versions, each written over at most one other.
-pub(in crate::tree_actor) trait Graph {
+pub(crate) trait Graph {
     type Version: Copy + Ord;
     /// What `v` was written over: `Ok(None)` for a first version; [`Broken::Missing`] if `v` is
     /// not on record.
-    fn over(&self, v: Self::Version) -> std::result::Result<Option<Self::Version>, Broken>;
+    fn over(&self, v: Self::Version) -> core::result::Result<Option<Self::Version>, Broken>;
 }
 
 /// A file's line ancestry: each line version and the version it was written over.
-pub(in crate::tree_actor) type Ancestors = BTreeMap<LineVersion, Option<LineVersion>>;
+pub(crate) type Ancestors = BTreeMap<LineVersion, Option<LineVersion>>;
 
 impl Graph for Ancestors {
     type Version = LineVersion;
 
-    fn over(&self, v: LineVersion) -> std::result::Result<Option<LineVersion>, Broken> {
+    fn over(&self, v: LineVersion) -> core::result::Result<Option<LineVersion>, Broken> {
         self.get(&v).copied().ok_or(Broken::Missing)
     }
 }
@@ -28,7 +28,7 @@ impl Graph for Ancestors {
 impl Graph for NameHistory {
     type Version = EventNumber;
 
-    fn over(&self, v: EventNumber) -> std::result::Result<Option<EventNumber>, Broken> {
+    fn over(&self, v: EventNumber) -> core::result::Result<Option<EventNumber>, Broken> {
         self.versions
             .get(&v)
             .map(|version| version.over)
@@ -38,7 +38,7 @@ impl Graph for NameHistory {
 
 /// An ancestry that is not a forest: history on record is damaged.
 #[derive(Debug, thiserror::Error)]
-pub(in crate::tree_actor) enum Broken {
+pub enum Broken {
     #[error("cyclic ancestry")]
     Cycle,
     #[error("missing ancestor")]
@@ -46,11 +46,11 @@ pub(in crate::tree_actor) enum Broken {
 }
 
 /// Whether `v` is `ancestor` or was written over it, at any depth.
-pub(in crate::tree_actor) fn descends<G: Graph + ?Sized>(
+pub(crate) fn descends<G: Graph + ?Sized>(
     g: &G,
     mut v: G::Version,
     ancestor: G::Version,
-) -> std::result::Result<bool, Broken> {
+) -> core::result::Result<bool, Broken> {
     let mut seen = BTreeSet::new();
     loop {
         if v == ancestor {
@@ -68,7 +68,7 @@ pub(in crate::tree_actor) fn descends<G: Graph + ?Sized>(
 
 /// Both graphs; [`Error::Format`] where they record one version over two others (a version is
 /// written once).
-pub(in crate::tree_actor) fn union(a: &Ancestors, b: &Ancestors) -> Result<Ancestors> {
+pub(crate) fn union(a: &Ancestors, b: &Ancestors) -> Result<Ancestors> {
     let mut graph = a.clone();
     for (version, over) in b {
         if graph.get(version).is_some_and(|existing| existing != over) {

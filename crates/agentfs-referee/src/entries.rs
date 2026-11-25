@@ -7,21 +7,25 @@
 //! identity; a directory has none: it is its path. Whether an entry is there is part of its
 //! value.
 
-use std::collections::{BTreeMap, BTreeSet};
-use std::ops::Bound;
+use alloc::borrow::ToOwned;
+use alloc::collections::{BTreeMap, BTreeSet};
+use alloc::format;
+use alloc::string::String;
+use alloc::vec::Vec;
+use core::ops::Bound;
 
 use serde::{Deserialize, Serialize};
 
 use super::{File, NameHistory, Snapshot};
-use crate::tree_actor::tree::MergeFileIdentity;
-use crate::tree_actor::{Error, Result, queue};
+use crate::MergeFileIdentity;
+use crate::{Error, Result, queue};
 use agentfs_contracts::meta::Meta;
 use agentfs_contracts::paths::parent_of;
 
 /// Why a change lost by rule 13 or 14: the cause its collision names.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
-pub(in crate::tree_actor) enum Cause {
+pub enum Cause {
     /// Rule 13: the upstream holds a value the change's writer never saw.
     Metadata,
     /// Rule 14: the change removes or moves a directory, or puts an entry onto a path, where
@@ -45,7 +49,7 @@ type Entry = (String, Option<MergeFileIdentity>);
 
 /// A record rule 13 compares: a file's metadata by identity, or a directory's by path.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub(in crate::tree_actor) enum Record<'a> {
+pub enum Record<'a> {
     Meta(MergeFileIdentity),
     Dir(&'a str),
 }
@@ -226,9 +230,7 @@ pub(super) fn consulted<L>(base: &Snapshot<L>, tip: &Snapshot<L>) -> Result<BTre
 /// `keys` with the key of every directory above each name: a step that makes, moves or
 /// removes an entry under a directory touches that directory for the takes that judged it.
 /// The root is never removed or moved, so it is left out.
-pub(in crate::tree_actor) fn with_directories(
-    keys: impl IntoIterator<Item = queue::Key>,
-) -> BTreeSet<queue::Key> {
+pub fn with_directories(keys: impl IntoIterator<Item = queue::Key>) -> BTreeSet<queue::Key> {
     let mut out = BTreeSet::new();
     for key in keys {
         if let queue::Key::Name(path) = &key {
@@ -282,7 +284,7 @@ pub(super) fn apply<L>(
 /// An upstream entry the fork never had, under a directory the fork's undecided change
 /// removed or moved, is a case the rules do not decide (`crates/agentfs-model/MODEL.md`,
 /// "Left out"). The result leaves it out and names its path ([`Synced::unruled`]): a sync
-/// that would show that result fails ([`Error::Unruled`]); one that delivers a later
+/// that would show that result fails (the engine's `Error::Unruled`); one that delivers a later
 /// upstream commit, which decided the change, passes through it.
 pub(super) fn sync<L>(
     upstream: &Snapshot<L>,
