@@ -617,23 +617,27 @@ fn a_front_that_is_more_or_less_than_reexports_is_found() {
 }
 
 /// The statements of `source` that give another crate's item a second path:
-/// each statement (up to its `;`) starting `pub use` or `pub type` (not
-/// `pub(..)`) that names a path of a crate `agentfs_<name>`, written
+/// each statement (up to its `;`) starting `pub use`, `pub type` or `pub
+/// extern crate` (not `pub(..)`) that names a crate `agentfs_<name>`. In a
+/// `use` the crate is a path's first segment, `agentfs_<name>` or
+/// `::agentfs_<name>`, the whole crate re-exported (`pub use agentfs_x;`,
+/// `pub use agentfs_x as x;`) or one of its items; in a `type` it is written
 /// `agentfs_<name>::` or `::agentfs_<name>`. The whole text is read, test
-/// modules included; a name such as `stale::agentfs_layers` is a path's
-/// last segment, not a crate. Not read: a private import re-exported
-/// through `self::` or `crate::`, a crate alias, a macro (docs/development.md).
+/// modules included; a name such as `stale::agentfs_layers` or
+/// `stale::{agentfs_layers}` is a module's item, not a crate. Not read: a
+/// private import re-exported through `self::` or `crate::`, a crate alias,
+/// a macro (docs/development.md).
 fn reexport_problems(source: &str) -> Vec<String> {
     let ident = |c: char| c.is_alphanumeric() || c == '_';
     let mut problems = Vec::new();
-    for keyword in ["use", "type"] {
+    for keyword in ["use", "type", "extern"] {
         let mut from = 0;
         while let Some(at) = source[from..].find("pub ").map(|i| i + from) {
             from = at + 4;
             let starts = source[..at]
                 .chars()
                 .next_back()
-                .is_none_or(|c| c.is_whitespace() || matches!(c, ';' | '{' | '}'));
+                .is_none_or(|c| c.is_whitespace() || matches!(c, ';' | '{' | '}' | ']'));
             let rest = source[from..].trim_start();
             let Some(after) = rest.strip_prefix(keyword) else {
                 continue;
@@ -648,14 +652,35 @@ fn reexport_problems(source: &str) -> Vec<String> {
                     return false;
                 }
                 let after = statement[i..].trim_start_matches(ident).trim_start();
-                match before.trim_end().strip_suffix("::") {
+                if let Some(head) = before.trim_end().strip_suffix("::") {
                     // A leading `::` starts a path at a crate; one after a
                     // segment makes this name a module's item.
-                    Some(head) => !head
+                    return !head
                         .chars()
                         .next_back()
-                        .is_some_and(|c| ident(c) || c == '>' || c == '}'),
-                    None => after.starts_with("::"),
+                        .is_some_and(|c| ident(c) || c == '>' || c == '}');
+                }
+                match keyword {
+                    "type" => after.starts_with("::"),
+                    "extern" => before.trim_end().ends_with("crate"),
+                    // A path's first segment: right after `use`, or after a
+                    // `{` or `,` of a group no prefix (`stale::{..}`) opens.
+                    _ => {
+                        let token = before.trim_end();
+                        let first =
+                            token.ends_with("use") || token.ends_with('{') || token.ends_with(',');
+                        let mut groups = Vec::new();
+                        for (j, c) in before.char_indices() {
+                            match c {
+                                '{' => groups.push(before[..j].trim_end().ends_with("::")),
+                                '}' => {
+                                    groups.pop();
+                                }
+                                _ => {}
+                            }
+                        }
+                        first && !groups.contains(&true)
+                    }
                 }
             });
             if names_a_crate {
@@ -722,14 +747,26 @@ fn a_second_path_is_found() {
              pub use {agentfs_contracts::TreeId};\n\
              pub type T = agentfs_contracts::TreeId;\n\
              pub use ::agentfs_contracts::NotATree;\n\
-             #[cfg(test)]\nmod tests {\n    pub use agentfs_contracts::meta::Meta;\n}\n"
+             #[cfg(test)]\nmod tests {\n    pub use agentfs_contracts::meta::Meta;\n}\n\
+             pub use agentfs_contracts;\n\
+             pub use agentfs_contracts as kernel;\n\
+             pub use {agentfs_contracts};\n\
+             pub use agentfs_contracts::{self as kernel};\n\
+             #[doc(inline)]pub use agentfs_contracts::TreeId;\n\
+             pub extern crate agentfs_contracts;\n"
         ),
         [
             "pub use agentfs_contracts::TreeId;",
             "pub use {agentfs_contracts::TreeId};",
             "pub use ::agentfs_contracts::NotATree;",
             "pub use agentfs_contracts::meta::Meta;",
+            "pub use agentfs_contracts;",
+            "pub use agentfs_contracts as kernel;",
+            "pub use {agentfs_contracts};",
+            "pub use agentfs_contracts::{self as kernel};",
+            "pub use agentfs_contracts::TreeId;",
             "pub type T = agentfs_contracts::TreeId;",
+            "pub extern crate agentfs_contracts;",
         ]
     );
     assert!(
@@ -740,6 +777,10 @@ fn a_second_path_is_found() {
              pub use stale::{MountState, agentfs_layers, detach};\n\
              pub use stale::agentfs_layers;\n\
              pub use self::meta::{Kind, Meta};\n\
+             pub use stale::{agentfs_layers as layers};\n\
+             pub use self::agentfs_layers;\n\
+             pub use crate::x as agentfs_y;\n\
+             extern crate agentfs_contracts;\n\
              pub user: u32,\n\
              pub typed: u32,\n"
         )

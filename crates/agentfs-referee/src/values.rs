@@ -124,19 +124,19 @@ impl NameHistory {
     }
 
     /// Whether the head ends the file: an unlink or a rename-over.
-    pub fn is_ended(&self) -> Result<bool> {
+    pub(crate) fn is_ended(&self) -> Result<bool> {
         Ok(self.path()?.is_none())
     }
 
     /// Whether this history's head is not `base`'s: the change it belongs to moved the name.
     /// A file `base` has no history of moved.
-    pub fn moved_since(&self, base: Option<&NameHistory>) -> bool {
+    pub(crate) fn moved_since(&self, base: Option<&NameHistory>) -> bool {
         base.is_none_or(|old| old.head != self.head)
     }
 
     /// Both histories' versions, keeping `self.head`; [`Error::Format`] where they record one
     /// version differently.
-    pub fn combine(&self, other: &NameHistory) -> Result<NameHistory> {
+    pub(crate) fn combine(&self, other: &NameHistory) -> Result<NameHistory> {
         let mut combined = self.clone();
         for (event, version) in other.versions.iter() {
             match combined.versions.get(event) {

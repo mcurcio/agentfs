@@ -161,7 +161,8 @@ publisher, each volume's refs under its own prefix, and history a mirror's reade
 claim are reused, re-homed under Replication, and recorded in architecture.md's "Technology choices". Its gate
 decides the published name's key, what a rename does to the old remote ref, the prefix's form, and whether a
 volume's name may change ([root branch name](root-branch-name.md), which M4 deletes; git-model's
-`refs/agentfs/<volume>/` stands for that prefix until then). Gate: a short run.
+`refs/agentfs/<volume>/` stands for that prefix until then). Its crates, agentfs-replication and
+agentfs-transport, are in [the crate split](crate-split.md). Gate: a short run.
 
 **M5. Keep operating.** Telemetry, alarms, liveness and restart in place
 ([tree-view telemetry](tree-view-telemetry.md), [health](../domains/health.md)). Its gate lists each of today's 12
@@ -262,7 +263,9 @@ sidecar and Docker jobs (image's `e2e (kind cluster)`, hermes' `sidecar` and `fe
 `serve-git` (rebuilt on trees by M6), its CSI entry points and one-shot commands, and every
 [deferred extra](#deferred-extras) it still serves. Adapters the tree engine uses stay where M4 and M5 re-homed
 them. Recording-only docs, runbooks, alert rules and CI jobs go, as M5's list and the deferred table say. This page
-goes; its deferred table moves to [the target architecture's index](../README.md) first. Gate: ci and image.
+goes; its deferred table moves to [the target architecture's index](../README.md) first. What the deletion ends in
+the crates (agentfs-repo's `NOT_REEXPORTED`, `ci/check-deps.sh`'s refusal of the recording engine, the front's `fuse`
+feature) is in [the crate split](crate-split.md), which goes with it. Gate: ci and image.
 
 ## Order
 

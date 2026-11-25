@@ -2,7 +2,8 @@
 
 **Design of what remains after the crate split's built steps (0 and A to G): M4's two crates and M9's deletion of
 the recording engine. The owner's answers are in [OWNER-GUIDANCE.md](../../../OWNER-GUIDANCE.md) ("Performance",
-2026-11-24); no question is open.** Layer: module (crate boundaries). **[read]**: in code. **[measured]**: timed in a
+2026-11-24); no question is open. [One engine](one-engine.md)'s M4 and M9 deliver what remains, and the commit
+that lands M9 deletes this page.** Layer: module (crate boundaries). **[read]**: in code. **[measured]**: timed in a
 4-CPU container, or `docs/development.md` "Build settings". What is built is described by the
 [architecture](../../architecture.md) (crates, ranks, module map) and the library pages; what the repository's
 checks of the crates do not read is in [development](../../development.md#build-settings).
@@ -21,14 +22,15 @@ hands consumers a working volume: "Q1 A"; cargo-nextest locally and in CI: "Q2 A
                  └─ agentfs-fuse (tree views, stale mounts)
  LIBRARY      agentfs-service (one volume: the domains wired onto one store, event dispatch, drain;
                  uses the domains below and agentfs-engine's adapters: state area, store, sessions)
-        ┌────────────┬──────────────┬──────────────┬───────────────────────┐
-   agentfs-volume agentfs-clients agentfs-trees agentfs-replication (M4)     pure domains over ports
-        └────────────┴──────┬───────┴──────────────┘
+        ┌────────────┬──────────────┬──────────────┬──────────────┬───────────────────────┐
+   agentfs-volume agentfs-clients agentfs-trees agentfs-rules agentfs-replication (M4)   pure domains (rank `domain`)
+        └────────────┴──────────────┴──────┬───────┴──────────────┘
                     agentfs-contracts (values incl. RepoPath and entry metadata, capabilities, traits, events, ports)
                             ▲ implements the ports
    agentfs-engine (the git model's aggregate: actor, journal, history, recording, sessions, store adapters, object store)
-        ├─ agentfs-referee (pure: land, sync, touches, their values) ─ agentfs-lines (line maps) ─ agentfs-align
-        ├─ agentfs-rules (pure)
+        ├─ agentfs-referee (pure: land, sync, touches, the queue's order and locks, their values)
+        │     uses agentfs-contracts and agentfs-lines (line maps) ─ agentfs-align
+        ├─ agentfs-rules
         ├─ agentfs-git (git_cli, libgit2 setup, pack settings)
         └─ agentfs-os (file locks, fsutil, confined, mountinfo, shared_fs, listening sockets, allocator) · agentfs-failpoints
    agentfs-transport (M4: SSH and HTTP clients, credentials) implements replication's Remote port
@@ -38,9 +40,9 @@ hands consumers a working volume: "Q1 A"; cargo-nextest locally and in CI: "Q2 A
 
 | Crate | Why it is a crate |
 |---|---|
-| agentfs-engine | The aggregate: one actor, one lock, one unit of work. Its modules are one cycle [read]: `impl TreeActor` in 8 files, `tree.rs` importing journal, recording, history and referee, 497 `pub(in crate::tree_actor)` items. It moves whole, module paths kept, and is not split further until a measurement says a boundary pays |
+| agentfs-engine | The aggregate: one actor, one lock, one unit of work. Its modules are one cycle [read]: `impl TreeActor` in 8 files, `tree.rs` importing journal, recording and history, 469 `pub(in crate::tree_actor)` items. It moves whole, module paths kept, and is not split further until a measurement says a boundary pays |
 | agentfs-referee | The landing rules are pure; as a crate with no git2 in what it links and `no_std` outside its tests, that is checked, and its tests run in seconds |
-| agentfs-lines | `tree_reconcile.rs` depends only on std, serde and align; the referee's values build on it |
+| agentfs-lines | The line maps need neither git2 nor the engine (they depend on align, serde and thiserror); the referee's values build on them |
 | agentfs-os, agentfs-git, agentfs-failpoints | The leaves both engines share; once out, M9 deletes agentfs-core whole |
 | agentfs-service | The library is an integration point (principle 10); before F only the binary wired a volume (its launcher's `domains.rs`, which F moved to `crates/agentfs-service/src/domains.rs`) |
 | agentfs (front) | Consumers' one name; internal crates keep names that say what they hold |
@@ -54,18 +56,14 @@ stale-mount judge (`agentfs_fuse::mount_state`, `stale::is_disconnected_io`): th
 engine through fuse until M9 deletes fuse's recording half. Giving that judge a home below fuse is not part of this
 course. The front re-exports neither agentfs-core nor agentfs-fuse until M9.
 
-**The `git` program's home.** agentfs-align, the lowest crate and the only one with no git2 that runs `git`, holds the
-program's isolated environment (`isolated`, `GIT_PATH`), so the model, which depends on align alone, runs `git` as the
-engines do. agentfs-git builds its repack and merge commands on it and re-exports `GIT_PATH` for the ranks that do
-not use `line-identity` (the binary); that is why the `leaf` rank uses `line-identity`. The counted spawn
-(`git_cli::counted`) stays in agentfs-git: line maps take the spawner from their caller rather than counting by
-construction, a convention that the spawn check in agentfs-repo and clippy's ban of `agentfs_align::histogram`
-hold.
+**The `git` program's home** is agentfs-align, and the counted spawn stays in agentfs-git
+([architecture](../../architecture.md#crates)); that is why the `leaf` rank uses `line-identity`.
 
 ## 2. What remains [read]
 
 - **M4** adds agentfs-replication, a pure domain over the shared kernel's ports, and agentfs-transport (the SSH and
-  HTTP clients and credentials), which implements replication's `Remote` port.
+  HTTP clients and credentials), which implements replication's `Remote` port. agentfs-replication takes the rank
+  `domain`, so it is `no_std` outside its tests and `the_pure_ranks_are_no_std` checks it.
 - **M9** deletes agentfs-core whole, and the FUSE layer's recording half with it; the front gains a `fuse` feature,
   and its rank `umbrella` then uses `filesystem`. That is why no rank uses `umbrella` (a rank using it under
   `filesystem` would then be a cycle) and why it is listed after `kubernetes`. The deletion also ends:
@@ -87,7 +85,7 @@ hold.
   `Filesystem`, so it is tested only where `/dev/fuse` exists. Each is its own work item.
 - `agentfs-fuse/src/backing.rs` keeps its own confined access beside `agentfs_os::confined` (they share the
   resolution flags and `proc_path`); it is the recording engine's FUSE half, so M9's deletion ends the copy.
-- The engine stays one crate of about 38k lines; a tree edit still runs every tree test: 64 s against the 77 s run
+- The engine stays one crate of about 36k lines; a tree edit still runs every tree test: 64 s against the 77 s run
   of all of core [measured, development.md "Build settings"]. The owner's test-time goal rests on nextest and the
   smaller local volumes, not on crate boundaries.
 - The tree library (engine and service alike) reports failures it cannot hand back as `tree <Name>` lines on stderr,

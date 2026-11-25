@@ -74,8 +74,8 @@ What it is meant to call:
   the domains' values they carry. Each item has one path, its own crate's: a
   tree's identity is `contracts::TreeId` and an entry's metadata
   `contracts::meta`, never re-exported by the engine. No crate the library
-  re-exports gives another crate's item a second path (`pub use` or `pub
-  type`), which `the_library_gives_each_item_one_path` in agentfs-repo
+  re-exports gives another crate's item, or a whole crate, a second path
+  (`pub use`, `pub type` or `pub extern crate`), which `the_library_gives_each_item_one_path` in agentfs-repo
   checks ([development](../development.md#build-settings)).
 - `operator_settings::OperatorSettings::read`, the one value `stage` takes.
 - `session::Sessions` and its `TreeSession`, a bound client's one route to

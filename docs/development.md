@@ -247,9 +247,10 @@ rules start a process; each library of a rank marked `no_std = true` is
 holds `#![cfg_attr(not(test), no_std)]` and no file of its `src` declares
 `extern crate std`; and each item of the library has one path
 (`the_library_gives_each_item_one_path`): no source of a crate the crate
-`agentfs` re-exports holds a statement starting `pub use` or `pub type` that
-names a path of another crate, `agentfs_<name>::` or `::agentfs_<name>`,
-test modules included. Not read by that check: a private import
+`agentfs` re-exports holds a statement starting `pub use`, `pub type` or
+`pub extern crate` that names another crate, an item of it or the whole
+crate (`pub use agentfs_contracts as kernel;`), written `agentfs_<name>` at
+the start of a path or `::agentfs_<name>`, test modules included. Not read by that check: a private import
 re-exported through `self::` or `crate::` (`use agentfs_contracts::TreeId;
 pub use self::TreeId as T;`), a crate alias (`use agentfs_contracts as c;
 pub use c::TreeId;`), and a macro that expands to one. rustdoc's JSON

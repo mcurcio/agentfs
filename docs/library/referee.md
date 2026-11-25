@@ -1,4 +1,4 @@
-# The library: `agentfs-referee`
+# The tree engine's landing rules: `agentfs-referee`
 
 `agentfs-referee` holds the tree views' landing rules: how a fork's change
 lands in its upstream and what a sync shows the fork. It is pure. It reads

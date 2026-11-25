@@ -84,17 +84,17 @@ When you learn something durable, write it to its home in the same commit. Never
 
 | Path | What |
 |---|---|
-| `crates/agentfs` | The library under one name, the one crate consumers depend on: re-exports of the tree engine, the shared kernel and the domains, each a module; no workspace crate depends on it |
+| `crates/agentfs` | The library under one name, the one crate consumers depend on: re-exports of the tree engine, the shared kernel, the domains and the service, each a module; no workspace crate depends on it |
 | `crates/agentfs-contracts` | The shared kernel of the domains around the git model: values (repository paths, durations and sizes among them), capabilities, each domain's trait and events, and the ports adapters implement. No I/O |
 | `crates/agentfs-volume`, `crates/agentfs-clients`, `crates/agentfs-trees` | The Volume, Clients and Trees domains, each pure over the ports in `agentfs-contracts` and `no_std` outside its tests |
-| `crates/agentfs-failpoints`, `crates/agentfs-os`, `crates/agentfs-git`, `crates/agentfs-lines` | Below both engines (ranks in [architecture](docs/architecture.md#ranks)): the failpoints registry; file locks, atomic files, confinement, mounts, the shared-filesystem check, listening sockets and the allocator; the `git` program and the one libgit2 setup; and the line maps |
+| `crates/agentfs-failpoints`, `crates/agentfs-os`, `crates/agentfs-git`, `crates/agentfs-lines` | Leaves (ranks in [architecture](docs/architecture.md#ranks)): below both engines, the failpoints registry; file locks, atomic files, confinement, mounts, the shared-filesystem check, listening sockets and the allocator; the `git` program and the one libgit2 setup; below the tree engine and the referee, the line maps |
 | `crates/agentfs-core` | The recording engine: journal, pending, history, push, credentials, lfs, patch, history_service, telemetry |
 | `crates/agentfs-engine` | The tree engine, the recording engine's sibling: the tree views' actor (`tree_actor`), its git store, sessions, the domains' store adapters, the state area, operator settings, its telemetry |
 | `crates/agentfs-service` | One tree volume composed, the only crate that composes one: the Volume, Trees and Clients domains wired onto the engine's store as one launcher from the capabilities its caller mints, the one queue that dispatches their events, the drain at a stop; the binary's `init`, `mount`, `host` and `fork end` use it |
 | `crates/agentfs-fuse` | FUSE operations, kernel-independent `Ops` plus a thin fuser adapter |
 | `crates/agentfs-cli` | The CLI package, whose binary is `agentfs`: `init`, `mount`, `fork end` and `probe` on tree volumes; `front` and `serve-history`, which the CSI driver starts; the recording engine's one-shot commands (`record`, `push`, `restore`, `revert`, `patch`, ...) on its state areas |
 | `crates/agentfs-csi` | CSI driver |
-| `crates/agentfs-rules` | The Rules domain of the tree views, pure: where each new name of a tree lives, recorded or in its untracked area, from the operator's `info/exclude` and `info/attributes` |
+| `crates/agentfs-rules` | The Rules domain of the tree views, pure and `no_std` outside its tests: where each new name of a tree lives, recorded or in its untracked area, from the operator's `info/exclude` and `info/attributes` |
 | `crates/agentfs-referee` | The tree views' landing rules, pure and `no_std` outside its tests: how a fork's change lands in its upstream (`land`), what a sync shows (`sync`), a step's lock keys (`touches`), the queue's order and locks (`queue`) and the values they read (event numbers, line versions, file identities, name histories); the tree engine is its one user |
 | `crates/agentfs-align` | Git's histogram diff, called one way: the alignment's one call, shared by the tree library and the model so line identity does not depend on how `git` is called |
 | `crates/agentfs-model` | Tests only: an executable model of the target architecture's landing rules (`docs/target-architecture`) on the `git` program, with seeded random interleavings. Depends only on `agentfs-align` |
