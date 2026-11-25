@@ -15,6 +15,7 @@ mod cli_init;
 mod cli_lfs;
 mod cli_lock;
 mod cli_mount;
+mod cli_name;
 mod cli_patch;
 mod cli_push;
 mod cli_record;

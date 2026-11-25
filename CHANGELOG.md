@@ -12,6 +12,9 @@ design was reviewed on 2026-10-12.
 
 ### Changed
 
+- **The CLI's package is `agentfs-cli`.** Its directory is `crates/agentfs-cli`
+  and its binary is still `agentfs`; build it from source with
+  `cargo build --release -p agentfs-cli`. No package is named `agentfs`.
 - **`agentfs init` and `mount` run the tree engine.** `agentfs trees` is gone:
   `init --volume NAME [--include FILE]... [--owner UID:GID]` creates or finds a
   tree volume (`<name> <id> created|found`), `mount ROOT` serves it (with every

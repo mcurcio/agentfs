@@ -55,7 +55,7 @@ jobs:
       - run: cargo nextest run --manifest-path vendor/fuser/Cargo.toml --lib raw_tmpfile_request_dispatches_and_returns_create_reply
         env:
           NEXTEST_PROFILE: default
-      - run: cargo build --locked -p agentfs -p agentfs-model --bin agentfs --bin phase1-oracle
+      - run: cargo build --locked -p agentfs-cli -p agentfs-model --bin agentfs --bin phase1-oracle
       - run: |
           set -o pipefail
           ci/e2e-tree-conformance.sh 2>&1 | tee "$RUNNER_TEMP/conformance.log"
@@ -77,7 +77,7 @@ jobs:
         run: target/debug/phase1-replay model "$RUNNER_TEMP/traces" --min-scenarios 94 --min-seeds "$MIN_SEEDS"
       - name: replay on the library
         run: target/debug/phase1-replay library "$RUNNER_TEMP/traces" --min-scenarios 94 --min-seeds "$MIN_SEEDS"
-      - run: cargo build --locked -p agentfs --features failpoints
+      - run: cargo build --locked -p agentfs-cli --features failpoints
       # As root: the model's entries are root's, and the harness chowns.
       - name: replay on mounts
         run: sudo env "PATH=$PATH" ci/e2e-tree-replay.sh "$RUNNER_TEMP/traces" 79 "$MIN_MOUNTED_SEEDS" "$RUNNER_TEMP/recorded"
@@ -132,7 +132,7 @@ jobs:
       # The tree views mount with FUSE allow_other by default.
       - run: echo user_allow_other | sudo tee -a /etc/fuse.conf
       - uses: ./.github/actions/pinned-git
-      - run: cargo build --locked -p agentfs
+      - run: cargo build --locked -p agentfs-cli
       - run: |
           set -o pipefail
           ci/e2e-tree-pagecache.sh 2>&1 | tee "$RUNNER_TEMP/page-cache.log"
@@ -166,7 +166,7 @@ jobs:
       # The tree views mount with FUSE allow_other by default.
       - run: echo user_allow_other | sudo tee -a /etc/fuse.conf
       - uses: ./.github/actions/pinned-git
-      - run: cargo build --locked -p agentfs --features failpoints
+      - run: cargo build --locked -p agentfs-cli --features failpoints
       - name: kill at recording boundaries
         run: ci/e2e-tree-recording-faults.sh
         env:
@@ -225,7 +225,7 @@ jobs:
       - run: ci/install-replay-log.sh "$RUNNER_TEMP/replay-log" >> "$GITHUB_ENV"
       # A failpoints build: the compaction marks park the compactor through
       # AGENTFS_COMPACT_GATE, which no other build reads.
-      - run: cargo build --locked -p agentfs --features failpoints
+      - run: cargo build --locked -p agentfs-cli --features failpoints
       - name: replay each flush checkpoint
         run: sudo env PATH="$PATH" REPLAY_LOG="$REPLAY_LOG" AGENTFS_BIN="$AGENTFS_BIN" POWER_LOSS_DIR="$POWER_LOSS_DIR" ci/power-loss-trees.sh "${{ matrix.fs }}" flush
         env:
@@ -263,7 +263,7 @@ jobs:
         with:
           tool: cargo-nextest@0.9.152
       - run: cargo nextest run --locked -p agentfs-engine --test tree_stages
-      - run: cargo build --locked -p agentfs
+      - run: cargo build --locked -p agentfs-cli
       - run: ci/measure-trees.sh smoke-kill "$RUNNER_TEMP/smoke-kill.json"
         env:
           AGENTFS_BIN: ${{ github.workspace }}/target/debug/agentfs
@@ -321,7 +321,7 @@ jobs:
       # bindfs, the plain-FUSE baseline, mounts with allow_other.
       - run: echo user_allow_other | sudo tee -a /etc/fuse.conf
       - uses: ./.github/actions/pinned-git
-      - run: cargo build --locked -p agentfs
+      - run: cargo build --locked -p agentfs-cli
       # Inside the job's 120 minutes, so the upload below still runs when the
       # step is cut: the report on disk says what the run reached.
       - run: ci/measure-trees.sh "${{ matrix.mode }}" "$RUNNER_TEMP/${{ matrix.mode }}.json"

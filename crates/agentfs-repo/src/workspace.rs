@@ -249,12 +249,14 @@ mod tests {
                 .iter()
                 .any(|d| d.name == "tempfile" && d.kind == DependencyKind::Dev)
         );
-        assert!(
-            ws.member("agentfs")
-                .unwrap()
-                .targets
-                .iter()
-                .any(|t| t.name == "agentfs" && t.kinds.iter().any(|k| k == "bin"))
-        );
+        let cli = ws.member("agentfs-cli").expect("agentfs-cli is a member");
+        assert_eq!(cli.dir, Path::new("crates/agentfs-cli"));
+        let bins: Vec<&str> = cli
+            .targets
+            .iter()
+            .filter(|t| t.kinds.iter().any(|k| k == "bin"))
+            .map(|t| t.name.as_str())
+            .collect();
+        assert_eq!(bins, ["agentfs"]);
     }
 }

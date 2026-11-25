@@ -1,4 +1,4 @@
-# The filesystem: `agentfs-fuse` and `agentfs`
+# The filesystem: `agentfs-fuse` and `agentfs-cli`
 
 The filesystem layer turns file calls into records. It is a FUSE filesystem
 over a real backing directory. Every change a workload makes through the

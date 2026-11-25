@@ -5,7 +5,7 @@
 # - crates/agentfs-core/tests/crash_points.rs: every recording-engine
 #   failpoint, killed and failed, against the crash oracle (no FUSE, no
 #   root);
-# - crates/agentfs/tests/crash_daemon.rs: `record`, `push`, `run`,
+# - crates/agentfs-cli/tests/crash_daemon.rs: `record`, `push`, `run`,
 #   `serve-history` with fronts and `patch apply`, killed (no FUSE, no
 #   root).
 #
@@ -23,7 +23,7 @@ step "engine crash matrix"
 cargo nextest run --locked -p agentfs-core --features failpoints --test crash_points --no-capture
 
 step "process crash tests"
-cargo nextest run --locked -p agentfs --features failpoints --test crash_daemon
+cargo nextest run --locked -p agentfs-cli --features failpoints --test crash_daemon
 
 
 step "tree engine kill"

@@ -9,7 +9,7 @@
 //! service and its fronts, the commit and push loops of `run`, the patch
 //! queue.
 //!
-//! Built only with the `failpoints` feature: `cargo test -p agentfs
+//! Built only with the `failpoints` feature: `cargo test -p agentfs-cli
 //! --features failpoints --test crash_daemon`. No FUSE and no root. Skipped, with a message, when
 //! `git` is not installed (the patch queue and fsck need it).
 

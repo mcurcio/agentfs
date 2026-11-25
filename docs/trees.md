@@ -55,7 +55,7 @@ You need Linux with `/dev/fuse`, `fusermount3` and the `git` release pinned in
 release in CI.
 
 ```sh
-cargo build --locked -p agentfs
+cargo build --locked -p agentfs-cli
 target/debug/agentfs --state /tmp/agentfs-trees/state init --volume trial
 target/debug/agentfs --state /tmp/agentfs-trees/state mount \
   /tmp/agentfs-trees/root --fork-mount /tmp/agentfs-trees/fork --fork-key trial

@@ -3,7 +3,7 @@
 //! merging, no FUSE.
 //!
 //! The tests that run the queue skip, with a message, when `git` is not
-//! installed, as `crates/agentfs/tests/cli/cli_patch.rs` does.
+//! installed, as `crates/agentfs-cli/tests/cli/cli_patch.rs` does.
 
 use std::fs;
 use std::path::{Path, PathBuf};

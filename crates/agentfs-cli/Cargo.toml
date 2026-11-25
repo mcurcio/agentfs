@@ -1,5 +1,5 @@
 [package]
-name = "agentfs"
+name = "agentfs-cli"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -9,6 +9,10 @@ description = "agentfs command-line tool and daemon"
 
 [package.metadata.agentfs]
 rank = "filesystem"
+
+[[bin]]
+name = "agentfs"
+path = "src/main.rs"
 
 [dependencies]
 agentfs-clients = { version = "0.1.0", path = "../agentfs-clients" }

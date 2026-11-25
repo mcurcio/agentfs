@@ -15,9 +15,11 @@
 //!   retries a failed push; every path filter of a workflow names a path
 //!   that exists.
 //! - [`crates`]: every dependency follows the ranks, every `failpoints`
-//!   feature is forwarded, every cargo command in the workflows, scripts,
+//!   feature is forwarded, every cargo command in `.github/`, the scripts,
 //!   docs and the crates' doc comments names packages, features, binaries
-//!   and test programs the workspace has,
+//!   and test programs the workspace has, and in a file that runs (not
+//!   markdown, not Rust) selects each package by a literal name; every path
+//!   under `crates/` that those files name (Rust: comments only) exists;
 //!   every failpoint call is in `agentfs_failpoints::POINTS`, and the tree
 //!   engine (agentfs-engine) starts `git` only through
 //!   `agentfs_git::git_cli::counted`.
@@ -25,10 +27,11 @@
 //! The configuration keys and operator attributes are checked by
 //! `agentfs-core`'s `tests/config_reference.rs`; the flags and environment
 //! variables by the binaries' own unit tests
-//! (`crates/agentfs/src/reference_tests.rs`, and the `reference_tests`
+//! (`crates/agentfs-cli/src/reference_tests.rs`, and the `reference_tests`
 //! module of `crates/agentfs-csi/src/main.rs`), which can walk their clap
 //! definitions.
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 mod ci;
@@ -47,6 +50,45 @@ pub(crate) fn files_under(dir: &Path, out: &mut Vec<PathBuf>) {
             out.push(path);
         }
     }
+}
+
+/// Why `entry`, a path a check read (a workflow's path filter, a path
+/// under `crates/` a text names), names nothing among `paths` (every path
+/// under the root, `/`-separated): without a `*` it must be one of them;
+/// with one, the text before the first `*` must start one of them.
+pub(crate) fn path_problem(entry: &str, paths: &BTreeSet<String>) -> Option<String> {
+    match entry.split_once('*') {
+        None if paths.contains(entry) => None,
+        None => Some(format!("{entry}: no such path")),
+        Some((prefix, _)) if paths.iter().any(|p| p.starts_with(prefix)) => None,
+        Some((prefix, _)) => Some(format!("{entry}: no path starts with {prefix:?}")),
+    }
+}
+
+/// Every file and directory under the root, `/`-separated, but `target/`
+/// and `.git/`.
+pub(crate) fn repository_paths() -> BTreeSet<String> {
+    fn walk(root: &Path, dir: &Path, out: &mut BTreeSet<String>) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            let shown = path
+                .strip_prefix(root)
+                .unwrap()
+                .to_string_lossy()
+                .into_owned();
+            if shown == "target" || shown == ".git" {
+                continue;
+            }
+            if path.is_dir() {
+                walk(root, &path, out);
+            }
+            out.insert(shown);
+        }
+    }
+    let root = root();
+    let mut out = BTreeSet::new();
+    walk(&root, &root, &mut out);
+    out
 }
 
 /// Every markdown file the link check covers: README.md and docs/**.

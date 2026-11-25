@@ -4,7 +4,7 @@
 //! binary, once per release, the release the binary's own hash; exit 2 while
 //! a flag stands, 75 while the volume is held. No FUSE.
 //!
-//! The flag needs the `failpoints` feature: `cargo test -p agentfs
+//! The flag needs the `failpoints` feature: `cargo test -p agentfs-cli
 //! --features failpoints --test cli cli_verify::`.
 #![allow(
     clippy::disallowed_methods,

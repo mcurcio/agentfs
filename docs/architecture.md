@@ -13,7 +13,7 @@ is. The libraries behind it, and why each was chosen, are under
 | `agentfs-core` | library | The recording engine: path rules, the journal, frozen copies, commits, pushes, restores, the patch queue, the history service, LFS, telemetry. No FUSE and no CLI |
 | `agentfs-engine` | library | The tree engine, the recording engine's sibling: the tree views' one actor per volume over its journal, history and rows (`tree_actor`), its git store (`tree_git`), sessions, the domains' store adapters, the state area, the operator's settings and its OpenTelemetry instruments ([library](library/engine.md)). No FUSE, no CLI and no remote |
 | `agentfs-fuse` | library | The FUSE layer: a passthrough filesystem over the backing tree that calls the engine at every change boundary |
-| `agentfs` | binary | The `agentfs` command (every subcommand is listed in [configuration](configuration.md#commands)); OpenTelemetry export |
+| `agentfs-cli` | binary | The `agentfs` command, the package's one binary (every subcommand is listed in [configuration](configuration.md#commands)); OpenTelemetry export |
 | `agentfs-csi` | library and binary | The CSI driver: `agentfs-csi`, one per node beside csi-provisioner, which makes each claim's tree volume with `agentfs init` and supervises one `agentfs host` per volume in use on the node, each pod's view opened on it at the kubelet's target ([csi](csi.md)) |
 | `agentfs-rules` | library | The Rules domain of the tree views, pure: where each new name of a tree lives, recorded or in its untracked area, from the operator's `info/exclude` and `info/attributes` ([trees](trees.md#rules-and-the-untracked-area)). Depends on `gix-ignore` and `gix-attributes` only; both engines and `agentfs-fuse` depend on it |
 | `agentfs-align` | library | Git's histogram diff, called one way, for line identity (git-model §7), and the `git` program's isolated environment (`isolated`, with the `PATH` every `git` child gets). It is the lowest crate with no git2, so the model and the line maps run `git` as the engines do. The engines and `agentfs-model` all reach the diff through it, so line identity does not depend on how `git` is called |
@@ -56,7 +56,7 @@ and this table against the workspace manifest.
 | `shared-kernel` | none | the library | The shared kernel of the domains: values, capabilities, traits, events and ports, with no I/O |
 | `domain` | `shared-kernel` | the library | The pure domains over the shared kernel's ports, and the tree views' rules; no domain depends on another |
 | `engine` | `line-identity`, `leaf`, `shared-kernel`, `domain` | the library | What implements the ports and owns the state on disk; no engine depends on another |
-| `filesystem` | `leaf`, `shared-kernel`, `domain`, `engine`, `filesystem` | the filesystem | The FUSE layer and the `agentfs` binary, the composition root |
+| `filesystem` | `leaf`, `shared-kernel`, `domain`, `engine`, `filesystem` | the filesystem | The FUSE layer and `agentfs-cli`, whose binary `agentfs` is the composition root |
 | `kubernetes` | `leaf`, `shared-kernel`, `engine`, `filesystem` | the kubernetes adapter | The CSI driver |
 | `tests` | `line-identity`, `leaf`, `shared-kernel`, `domain`, `engine`, `filesystem`, `kubernetes`, `tests` | none | Packages that exist only for tests: the model, the conformance replay, the metric reader, the repository checks. No other rank uses it |
 
@@ -329,7 +329,7 @@ row names a module that no longer exists; `tests.rs` files are not listed.
 | `mount.rs` | Layout checks, mounting (also stacked over a stale mount, for `--on-stale-mount recover`) and unmounting |
 | `stale.rs` | Stale agentfs mounts, shared by `mount.rs` and `tree_view.rs`: the mount state at a path (mountinfo read through `agentfs_os::mountinfo`), the volume a source names, detaching stale layers, and stacking a new mount over a stale one |
 
-### `agentfs`
+### `agentfs-cli`
 
 | Module | Role |
 |---|---|
@@ -633,7 +633,7 @@ test builds only) that stop the process at that point; the crash
 harnesses kill or fail at each of them and check
 that nothing promised is lost and nothing is committed twice: the recording
 engine's matrix in `agentfs-core/tests/crash_points.rs`, the processes in
-`agentfs/tests/crash_daemon.rs` (run by `ci/crash-tests.sh`). `none`:
+`agentfs-cli/tests/crash_daemon.rs` (run by `ci/crash-tests.sh`). `none`:
 covered by the process-level tests named in [development](development.md) instead.
 
 The daemon never holds the only copy of anything a returned call

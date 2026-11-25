@@ -1,7 +1,7 @@
 [workspace]
 resolver = "3"
 exclude = ["vendor/fuser"]
-members = ["crates/agentfs-align", "crates/agentfs-lines", "crates/agentfs-failpoints", "crates/agentfs-os", "crates/agentfs-git", "crates/agentfs-rules", "crates/agentfs-contracts", "crates/agentfs-volume", "crates/agentfs-clients", "crates/agentfs-trees", "crates/agentfs-engine", "crates/agentfs-core", "crates/agentfs-fuse", "crates/agentfs", "crates/agentfs-csi", "crates/agentfs-model", "crates/agentfs-conformance", "crates/agentfs-test-metrics", "crates/agentfs-repo"]
+members = ["crates/agentfs-align", "crates/agentfs-lines", "crates/agentfs-failpoints", "crates/agentfs-os", "crates/agentfs-git", "crates/agentfs-rules", "crates/agentfs-contracts", "crates/agentfs-volume", "crates/agentfs-clients", "crates/agentfs-trees", "crates/agentfs-engine", "crates/agentfs-core", "crates/agentfs-fuse", "crates/agentfs-cli", "crates/agentfs-csi", "crates/agentfs-model", "crates/agentfs-conformance", "crates/agentfs-test-metrics", "crates/agentfs-repo"]
 
 [workspace.package]
 # The product's one version, which every published package takes: it is

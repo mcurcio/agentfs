@@ -123,7 +123,7 @@ On Linux 5.6+ with `/dev/fuse`, as root, in a clone of this repository
 ([building](docs/development.md#building) lists what the build needs):
 
 ```sh
-cargo build --release -p agentfs
+cargo build --release -p agentfs-cli
 export PATH=$PWD/target/release:$PATH
 agentfs --state /data/state init --volume demo
 # Serve /workspace, run one command in it, then stop.

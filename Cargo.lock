@@ -40,7 +40,14 @@ dependencies = [
 ]
 
 [[package]]
-name = "agentfs"
+name = "agentfs-align"
+version = "0.1.0"
+dependencies = [
+ "thiserror",
+]
+
+[[package]]
+name = "agentfs-cli"
 version = "0.1.0"
 dependencies = [
  "agentfs-clients",
@@ -81,13 +88,6 @@ dependencies = [
  "tokio",
  "tonic",
  "tower",
-]
-
-[[package]]
-name = "agentfs-align"
-version = "0.1.0"
-dependencies = [
- "thiserror",
 ]
 
 [[package]]

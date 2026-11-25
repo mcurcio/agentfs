@@ -1,7 +1,7 @@
 //! Queues a one-commit patch in a volume's own history repository, as a
 //! producer pushing to the state area's git directory would.
 //!
-//! Shared (through `#[path]`) by `crates/agentfs/tests`.
+//! Shared (through `#[path]`) by `crates/agentfs-cli/tests`.
 
 #![allow(dead_code)]
 

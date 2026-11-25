@@ -64,7 +64,7 @@ const VOLUME: &str = "vol";
 const LFS_THRESHOLD: usize = 64;
 
 /// The failpoints this workload passes. The FUSE, history service,
-/// patch and repack points have their own harnesses (crates/agentfs/tests).
+/// patch and repack points have their own harnesses (crates/agentfs-cli/tests).
 const ENGINE_POINTS: &[&str] = &[
     "pending.after_freeze",
     "journal.before_write",

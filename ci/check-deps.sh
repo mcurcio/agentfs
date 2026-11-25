@@ -7,7 +7,7 @@
 set -euo pipefail
 
 packages() { # cargo-tree-args...
-  cargo tree --locked -p agentfs -e normal --prefix none --format '{p}' "$@" |
+  cargo tree --locked -p agentfs-cli -e normal --prefix none --format '{p}' "$@" |
     awk '{print $1}' | sort -u
 }
 

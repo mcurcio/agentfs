@@ -11,7 +11,7 @@ READMEs, generated from `values.yaml` and checked in CI
 operator attribute, flag or environment variable that agentfs reads is
 missing here, or when a row names one it no longer has
 (`crates/agentfs-core/tests/config_reference.rs`,
-`crates/agentfs/src/reference_tests.rs` and the `reference_tests` module
+`crates/agentfs-cli/src/reference_tests.rs` and the `reference_tests` module
 of `crates/agentfs-csi/src/main.rs`; the `docs` CI job). They rely on
 these conventions, so keep them when editing:
 
@@ -517,7 +517,7 @@ checked (a server that drops it) is `unreachable`. libgit2 uses the system's CA 
     agentfsKnownHosts = /run/secrets/agentfs/origin-ssh/known_hosts
 ```
 
-- **Build:** `cargo build -p agentfs --features ssh` (add `https` for both:
+- **Build:** `cargo build -p agentfs-cli --features ssh` (add `https` for both:
   `--features https,ssh`). Without it, SSH remotes are reported as
   misconfigured.
 - **User:** the URL's (`git@` above), else `git`.
@@ -947,7 +947,7 @@ section. A subcommand with its own subcommands lists them after it.
   JSON string>`, or `- - <commit> unreadable -` for a verdict note that
   does not parse. Exit 0 when no flag stands, 2 when one does, 1 on an
   error, 75 while another process holds the volume (the one home of this
-  contract is `crates/agentfs/src/launcher/verify.rs`).
+  contract is `crates/agentfs-cli/src/launcher/verify.rs`).
 - `fork`: forked volumes ([forks](forks.md)), with `create`, `finish`,
   `status`, `abandon`, `list` and `deliver`; and `end`, which ends a tree
   volume's keyed fork ([trees](trees.md#forks-keys-end-and-the-drop)): exit
@@ -1133,7 +1133,7 @@ equivalents above; a flag given on the command line wins.
 
 **Test builds only.** `AGENTFS_FAILPOINTS` sets failpoints on the durable
 path (`name=kill|error|panic|sleep(ms)[@n]`, joined with `;`, [architecture.md](architecture.md#crash-model)). Only a binary
-built with `--features agentfs/failpoints` reads it (its `--version` ends
+built with `--features agentfs-cli/failpoints` reads it (its `--version` ends
 in `+failpoints`, and it warns at start when the variable is set); release
 builds and the image have no failpoints and ignore it. Never set it in
 production. In the same builds, `AGENTFS_TAKE_GATE=<dir>` stops `mount`'s

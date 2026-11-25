@@ -113,7 +113,11 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "+failpoints");
 
 #[derive(Parser)]
-#[command(version = VERSION, about = "Records every change an agent makes, in git history")]
+#[command(
+    name = "agentfs",
+    version = VERSION,
+    about = "Records every change an agent makes, in git history"
+)]
 struct Cli {
     /// The volume's state area.
     #[arg(long, global = true, env = "AGENTFS_STATE", default_value = ".")]
@@ -1454,8 +1458,20 @@ fn current_gid() -> u32 {
 
 #[cfg(test)]
 mod cli_tests {
-    use super::Cli;
+    use super::{Cli, VERSION};
     use clap::CommandFactory;
+
+    /// The package is `agentfs-cli`, but the command is `agentfs`: its name,
+    /// its version line and its usage line, which clap would otherwise take
+    /// from the package's name.
+    #[test]
+    fn the_command_is_named_agentfs() {
+        let mut cli = Cli::command();
+        assert_eq!(cli.get_name(), "agentfs");
+        assert_eq!(cli.render_version(), format!("agentfs {VERSION}\n"));
+        let usage = cli.render_usage().to_string();
+        assert!(usage.starts_with("Usage: agentfs "), "{usage}");
+    }
 
     /// Clap stores a value by arg id, so a subcommand arg sharing an id with
     /// a global arg sends its value to the global one. No id may be shared.

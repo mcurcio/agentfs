@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 
 use agentfs_repo::workspace::Workspace;
 
-use crate::{files_under, markdown_files, root};
+use crate::{files_under, markdown_files, path_problem, repository_paths, root};
 
 /// The runner every CI job uses. Pinned, not `-latest`, so a
 /// new image cannot change the kernel, FUSE, kind or nginx under the
@@ -442,44 +442,6 @@ fn path_filters(text: &str) -> Vec<(usize, String)> {
     out
 }
 
-/// Why `entry`, a path filter, names nothing among `paths` (every path
-/// under the root, `/`-separated): without a `*` it must be one of them;
-/// with one, the text before the first `*` must start one of them.
-fn filter_problem(entry: &str, paths: &BTreeSet<String>) -> Option<String> {
-    match entry.split_once('*') {
-        None if paths.contains(entry) => None,
-        None => Some(format!("{entry}: no such path")),
-        Some((prefix, _)) if paths.iter().any(|p| p.starts_with(prefix)) => None,
-        Some((prefix, _)) => Some(format!("{entry}: no path starts with {prefix:?}")),
-    }
-}
-
-/// Every file and directory under the root, `/`-separated, but `target/`
-/// and `.git/`.
-fn repository_paths() -> BTreeSet<String> {
-    fn walk(root: &Path, dir: &Path, out: &mut BTreeSet<String>) {
-        for entry in std::fs::read_dir(dir).unwrap() {
-            let path = entry.unwrap().path();
-            let shown = path
-                .strip_prefix(root)
-                .unwrap()
-                .to_string_lossy()
-                .into_owned();
-            if shown == "target" || shown == ".git" {
-                continue;
-            }
-            if path.is_dir() {
-                walk(root, &path, out);
-            }
-            out.insert(shown);
-        }
-    }
-    let root = root();
-    let mut out = BTreeSet::new();
-    walk(&root, &root, &mut out);
-    out
-}
-
 /// Every path filter of the workflows names something that exists: a
 /// filter left naming a moved file never fires, and its workflow silently
 /// stops running for the change it was meant for.
@@ -499,7 +461,7 @@ fn workflow_path_filters_name_what_exists() {
         let name = file.file_name().unwrap().to_string_lossy();
         for (line, entry) in path_filters(&text) {
             entries += 1;
-            if let Some(problem) = filter_problem(&entry, &paths) {
+            if let Some(problem) = path_problem(&entry, &paths) {
                 problems.push(format!("{name}:{line}: {problem}"));
             }
         }
@@ -532,7 +494,7 @@ fn a_path_filter_naming_nothing_is_found() {
         .collect();
     let problems: Vec<String> = path_filters(text)
         .iter()
-        .filter_map(|(_, entry)| filter_problem(entry, &paths))
+        .filter_map(|(_, entry)| path_problem(entry, &paths))
         .collect();
     assert_eq!(
         problems,
