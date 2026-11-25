@@ -59,9 +59,9 @@ and this table against the workspace manifest.
 ## Module map
 
 Every module of every crate, one line each. A test
-(`crates/agentfs-core/tests/docs_reference.rs`) fails when a module is
-missing from these tables or a row names a module that no longer exists;
-`tests.rs` files are not listed.
+(`crates/agentfs-repo/tests/repo/docs.rs`) fails when a member of the
+workspace has no section here, a module is missing from these tables or a
+row names a module that no longer exists; `tests.rs` files are not listed.
 
 ### `agentfs-contracts`
 
@@ -87,6 +87,12 @@ missing from these tables or a row names a module that no longer exists;
 | `lib.rs` | Crate root: the Rules domain's overview |
 | `operator.rs` | `OperatorRules`: `info/exclude` and `info/attributes` parsed from buffers with `gix-ignore` and `gix-attributes`, case-sensitive, never a system, global or tree file |
 | `set.rs` | `RuleSet`: one volume's rules, built once at open, refusing rules tree volumes do not build (`RulesError`); `place` judges a new name `Tracked` or `Untracked` with its reason, built-ins first |
+
+### `agentfs-align`
+
+| Module | Role |
+|---|---|
+| `lib.rs` | Git's histogram diff, called one way: one program lookup, one environment, one parse of the hunks, shared by the tree library and the model; the `PATH` every `git` child gets |
 
 ### `agentfs-failpoints`
 
@@ -344,8 +350,34 @@ missing from these tables or a row names a module that no longer exists;
 | `lfs_cmd.rs` | `agentfs lfs`: fetching objects into the local LFS cache, and pruning it |
 | `otel.rs` | Telemetry export: the OpenTelemetry SDK, exporters (http/protobuf, http/json, gRPC on its own runtime) and the environment it reads |
 | `otel/tls.rs` | The `otlp-tls` feature: TLS to the collector (CA bundle or system store, client certificate) for the HTTP and gRPC exporters |
-| `doc_tables.rs` | Test only: a small markdown reader for the documentation tests |
 | `reference_tests.rs` | Test only: checks docs/configuration.md against the CLI's flags and variables |
+
+### `agentfs-model`
+
+| Module | Role |
+|---|---|
+| `lib.rs` | Crate root: the executable model of the owner's landing rules, in plain words in its `MODEL.md` |
+| `world.rs` | The model: the root and each fork as a git branch, each save a commit naming one writer, and the rules on top |
+| `service.rs` | The model's history service, its composition root: the trees and one mirror, with the step list over both |
+| `recording.rs` | Recording: the opens and their byte calls, the object each open holds, the orphans, and each close's save with its line identities |
+| `queue.rs` | Each tree's landing queue, the locks a take holds and the opens it waits for, the prefix a sync may deliver, the calls deferred behind a transaction |
+| `referee/mod.rs` | The referee: every line and name rule of one fork and its upstream, a plan to land or to sync, read from git through its port |
+| `referee/ancestry.rs` | The referee's ancestry: what git answers about versions and commits, and whether a writer saw a version |
+| `referee/names.rs` | The referee's names: two files claiming one path at a landing, the fork's names shown back at a sync |
+| `referee/placing.rs` | The referee's placing: where applied and kept versions go, and the joins no tree may show |
+| `referee/undecided.rs` | The referee's undecided versions, at a landing and at a sync |
+| `referee/verdicts.rs` | The referee's verdicts: each line identity's, then a file's existence coupled with its content |
+| `referee/whole.rs` | The referee's whole: a change lands whole or loses whole |
+| `entries.rs` | Directories, metadata and links: what a tree holds beside its files' lines, how a landing judges it, what a sync keeps |
+| `content.rs` | File content as a sequence of lines, each a version of a line identity |
+| `program.rs` | A program's line edits as the byte calls a program makes |
+| `mirror.rs` | A mirror: a remote copy of the root's history, pushed in its own step |
+| `git.rs` | The one adapter: the `git` program with a fixed identity and pinned dates |
+| `check.rs` | The invariants, read back from the repository and the trees after every step |
+| `check/lineage.rs` | What each version was written over, read from the version records in git, the checks' oracle |
+| `digest.rs` | A run's outcome as one digest, read only from git |
+| `calls.rs` | The calls a test makes of a tree system, shared by the model and the real system, recorded with what each tree showed |
+| `bin/phase1-oracle.rs` | Fixed phase 1 mounted conformance cases driven by the model, written as JSON |
 
 ### `agentfs-conformance`
 
@@ -365,6 +397,8 @@ missing from these tables or a row names a module that no longer exists;
 | Module | Role |
 |---|---|
 | `lib.rs` | Crate root: the repository checks' overview |
+| `doc_tables.rs` | A small markdown reader (headings, tables, code spans) for the documentation tests of this crate, `agentfs-core`, `agentfs` and `agentfs-csi` |
+| `workspace.rs` | The workspace as `cargo metadata` describes it: members, their dependencies, features and targets, and the ranks |
 
 ### `agentfs-csi`
 

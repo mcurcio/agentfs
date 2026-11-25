@@ -35,12 +35,13 @@ jobs:
       - name: the model's safety net (corpus runner, digest compare, mount refusal, stall alarm)
         run: python3 -m unittest discover -s crates/agentfs-model/planted -p 'test_*.py' -v
 
-  # The documentation against the code: every config key, operator
-  # attribute, flag and environment variable agentfs reads is in
-  # docs/configuration.md (and nothing stale is), every module is in
-  # docs/architecture.md, and every relative link and anchor in README.md
-  # and docs/ resolves. The same tests run in the test job; this job names
-  # the failure.
+  # The documentation against the code: the repository's checks first
+  # (agentfs-repo, which builds no engine: every module is in
+  # docs/architecture.md, the ranks are kept, every relative link and anchor
+  # in README.md and docs/ resolves, the workflows and scripts follow their
+  # rules), then every config key, operator attribute, flag and environment
+  # variable agentfs reads is in docs/configuration.md (and nothing stale
+  # is). The same tests run in the test job; this job names the failure.
   docs:
     runs-on: ubuntu-24.04
     steps:
@@ -52,12 +53,14 @@ jobs:
       - uses: taiki-e/install-action@fe3acb53a98b62c772db35de75ce0e4595e7ca8c # v2.90.8
         with:
           tool: cargo-nextest@0.9.152
+      - name: the repository's checks (docs, workflows, scripts, crates)
+        run: cargo nextest run --locked -p agentfs-repo
+      - name: configuration.md's keys and attributes against the engine
+        run: cargo nextest run --locked -p agentfs-core --test config_reference
       - name: config keys read = config::KEYS
         run: cargo nextest run --locked -p agentfs-core --lib config::tests::every_config_read_is_registered
-      - name: configuration.md and architecture.md against the code, and links
-        run: cargo nextest run --locked -p agentfs-core --test docs_reference
       - name: agentfs flags and environment variables
-        run: cargo nextest run --locked -p agentfs --bin agentfs reference_tests doc_tables plan_reads_only_env_vars
+        run: cargo nextest run --locked -p agentfs --bin agentfs reference_tests plan_reads_only_env_vars
       - name: agentfs-csi flags and environment variables
         run: cargo nextest run --locked -p agentfs-csi --bin agentfs-csi reference_tests
 

@@ -10,3 +10,13 @@ publish = false
 
 [package.metadata.agentfs]
 rank = "tests"
+
+# The library reads `cargo metadata`'s JSON; no agentfs crate, so a
+# documentation change builds these two and nothing of the engines.
+[dependencies]
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+
+[dev-dependencies]
+# The stand-in `docker` of the image-publishing test (tests/repo/ci.rs).
+tempfile = "3.27.0"

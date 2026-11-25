@@ -14,7 +14,7 @@
 use clap::CommandFactory;
 
 use crate::Cli;
-use crate::doc_tables::{self, Section};
+use agentfs_repo::doc_tables::{self, Section};
 
 /// A long flag of a (sub)command.
 struct Flag {
@@ -68,10 +68,7 @@ pub(crate) fn named_flags(cell: &str) -> Vec<String> {
 }
 
 fn doc() -> Vec<Section> {
-    doc_tables::sections(&doc_tables::read_doc(
-        env!("CARGO_MANIFEST_DIR"),
-        "configuration.md",
-    ))
+    doc_tables::sections(&doc_tables::read_doc("configuration.md"))
 }
 
 fn flag_tables(sections: &[Section]) -> &Section {

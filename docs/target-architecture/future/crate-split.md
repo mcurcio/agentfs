@@ -40,7 +40,7 @@ hands consumers a working volume: "Q1 A"; cargo-nextest locally and in CI: "Q2 A
 | agentfs-os, agentfs-git, agentfs-failpoints | The leaves both engines share; once out, M9 deletes agentfs-core whole |
 | agentfs-service | The library is an integration point (principle 10); today only the binary wires a volume (`agentfs/src/launcher/domains.rs`) |
 | agentfs (front) | Consumers' one name; internal crates keep names that say what they hold |
-| agentfs-repo | The repository-wide checks now in core's `docs_reference.rs`; a docs-only change stops compiling core |
+| agentfs-repo | The repository-wide checks, out of core's documentation test; a docs-only change stops compiling core |
 
 **While both engines exist:** agentfs-core (the recording engine) and agentfs-engine are siblings on agentfs-os and
 agentfs-git, neither depending on the other. agentfs-fuse and agentfs-cli depend on both; agentfs-csi and
@@ -64,7 +64,7 @@ agentfs-conformance on the engine only. The front re-exports neither agentfs-cor
 | PR | Does | Needs | Gate | Gain |
 |---|---|---|---|---|
 | 0 | Tests run with cargo-nextest locally and in CI; the two slow programs (`tree_batch_alloc`, 71 s; `tree_stages`, about 60 s [measured]) cut to a tenth of their volumes locally, keeping their ratios, and run at full size on GitHub Actions; the detection gaps this leaves, local only, are stated in each test | none | ci, image, phase-1 | `agentfs-core`'s test run, built first: 196 s under `cargo test`, 77 s under `cargo nextest run` with its doctests (128 s from nextest alone) [measured, 2026-11-24, development.md "Build settings"]; `agentfs`'s 15 s unchanged [measured] |
-| A | agentfs-repo: the repository-wide checks out of `docs_reference.rs` (`doc_tables` a module, not a `#[path]` include); the crate list derived from the workspace; checks that dependencies point only down the layers, that no bare `-p agentfs` remains, that every crate using failpoints forwards the feature | none | ci, docs | a docs-only change builds in seconds, not core's 88 s [est] |
+| A | agentfs-repo: the repository-wide checks out of core's documentation test (`doc_tables` a module, not a `#[path]` include); the crate list derived from the workspace; checks that dependencies point only down the layers, that no bare `-p agentfs` remains, that every crate using failpoints forwards the feature | none | ci, docs | a docs-only change builds in seconds, not core's 88 s [est] |
 | B | agentfs-os, -git, -failpoints, -lines; `RepoPath`, `parse_size`, `parse_duration` to contracts; section 2's back-edges cut (`FifoGate` generic, its `CompactGate` impl into the engine; `sha256_at` into `lfs`); csi calls `is_safe_name` | none | ci, image | none alone; makes C, and M9's whole deletion, possible |
 | C | agentfs-engine: `tree_actor/`, `tree_git`, `session`, `store`, `state_area`, `operator_settings`, their tests (`it/tree_*`, `tree_*.rs`, the tree half of `crash_points.rs`); its instruments registered on a `Meter` the binary makes; csi through the `StateArea` port; `docs/library/core.md`'s tree half becomes `engine.md` | B | ci, image, phase-1 | a recording-engine edit runs only the recording engine's tests; a tree edit runs the tree tests, against the 77 s nextest run of all of core [est] |
 | D | The CLI package renamed `agentfs-cli` (directory too), its binary and `#[command(name)]` still `agentfs`; every `-p agentfs` rewritten | C | ci, image, docker, hermes | none; with no package named `agentfs`, a missed reference fails |

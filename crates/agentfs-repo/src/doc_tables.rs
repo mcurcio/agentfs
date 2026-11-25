@@ -1,13 +1,10 @@
 //! A small reader of the markdown in `docs/`, for the tests that check the
 //! documentation against the code (docs/configuration.md, docs/architecture.md).
 //!
-//! Test-only, and shared by path (`#[path]`) between the `agentfs` and
-//! `agentfs-csi` binaries' unit tests and `agentfs-core`'s
-//! `tests/docs_reference.rs`, so no crate depends on another for it. It
-//! knows just enough markdown: ATX headings, fenced code blocks (skipped),
-//! GitHub tables (cells split on unescaped `|`) and code spans.
+//! It knows just enough markdown: ATX headings, fenced code blocks
+//! (skipped), GitHub tables (cells split on unescaped `|`) and code spans.
 
-#![allow(dead_code)]
+use std::collections::BTreeSet;
 
 /// A heading and what follows it up to the next heading of any level.
 #[derive(Debug, Clone)]
@@ -172,12 +169,19 @@ pub fn section<'a>(sections: &'a [Section], heading: &str) -> Option<&'a Section
     sections.iter().find(|s| s.heading == heading)
 }
 
-/// Reads `docs/<name>` from the workspace, given a crate's
-/// `CARGO_MANIFEST_DIR`.
-pub fn read_doc(manifest_dir: &str, name: &str) -> String {
-    let path = std::path::Path::new(manifest_dir)
-        .join("../../docs")
-        .join(name);
+/// The key cells of a section's tables: first cells that are exactly one
+/// code span.
+pub fn key_cells(section: &Section) -> BTreeSet<String> {
+    section
+        .rows()
+        .filter_map(|row| sole_code_span(&row[0]).map(str::to_owned))
+        .collect()
+}
+
+/// Reads `docs/<name>` from the workspace ([`crate::workspace::root`]).
+/// Panics naming the path when it cannot.
+pub fn read_doc(name: &str) -> String {
+    let path = crate::workspace::root().join("docs").join(name);
     std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("reading {}: {e}", path.display()))
 }
 

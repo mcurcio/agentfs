@@ -74,6 +74,8 @@ protox = "0.10.0"
 tonic-prost-build = { version = "0.14.6", default-features = false }
 
 [dev-dependencies]
+# The markdown reader of the documentation tests (tests/config_reference.rs).
+agentfs-repo = { version = "0.0.0", path = "../agentfs-repo" }
 # The Volume domain over the real state area (tests/it/state_area.rs).
 agentfs-volume = { version = "0.1.0", path = "../agentfs-volume" }
 # The Trees domain over the store adapter (tests/it/tree_store.rs).

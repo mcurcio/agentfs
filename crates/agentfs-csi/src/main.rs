@@ -187,27 +187,20 @@ async fn shutdown_signal() {
     eprintln!("{name}: shutting down");
 }
 
-/// Shared with the `agentfs` binary's and `agentfs-core`'s doc tests.
-#[cfg(test)]
-#[path = "../../agentfs/src/doc_tables.rs"]
-mod doc_tables;
-
 /// Checks the `agentfs-csi` flags table of docs/configuration.md against
 /// [`Cli`]: every flag and its environment variable, and no stale rows.
 #[cfg(test)]
 mod reference_tests {
     use clap::CommandFactory;
 
+    use agentfs_repo::doc_tables;
+
     use super::Cli;
-    use super::doc_tables;
 
     /// The `agentfs-csi` flags table: the table headed `Flag` in the CSI
     /// section, and the section's text.
     fn table() -> (doc_tables::Table, String) {
-        let sections = doc_tables::sections(&doc_tables::read_doc(
-            env!("CARGO_MANIFEST_DIR"),
-            "configuration.md",
-        ));
+        let sections = doc_tables::sections(&doc_tables::read_doc("configuration.md"));
         let section = doc_tables::section(&sections, "The CSI driver (`agentfs-csi`)")
             .expect("docs/configuration.md has no `## The CSI driver (`agentfs-csi`)` section");
         let table = section

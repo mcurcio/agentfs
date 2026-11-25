@@ -189,7 +189,7 @@ pub enum ConfigError {
 ///
 /// Every read goes through this module's helpers, which note the key in
 /// tests: a unit test checks this list against what [`Settings::load`]
-/// reads, and `tests/docs_reference.rs` checks docs/configuration.md
+/// reads, and `tests/config_reference.rs` checks docs/configuration.md
 /// against this list.
 pub const KEYS: &[&str] = &[
     "agentfs.volume",
@@ -1932,7 +1932,7 @@ mod tests {
     /// [`KEYS`] is exactly what loading a config that sets every key
     /// reads: a key read but not registered (or registered but never
     /// read) fails here, and docs/configuration.md is checked against
-    /// [`KEYS`] by `tests/docs_reference.rs`.
+    /// [`KEYS`] by `tests/config_reference.rs`.
     #[test]
     fn every_config_read_is_registered() {
         let dir = tempfile::tempdir().unwrap();

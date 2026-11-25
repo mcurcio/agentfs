@@ -127,7 +127,7 @@ Tests run with [cargo-nextest](https://nexte.st), each in its own process, all p
 curl -LsSf https://get.nexte.st/0.9.152/linux | tar zxf - -C ~/.cargo/bin
 ```
 
-A doc change also runs `cargo nextest run -p agentfs-core --test docs_reference`. Run one module of a merged test program with `cargo nextest run -p agentfs-core --test it tree_actor::` ([development](docs/development.md#test-programs)); `-E 'test(/^tree_actor::/)'` is nextest's exact form. `--all-features` needs OpenSSL and libssh2. CI builds it; a minimal container may not be able to.
+A doc change also runs `cargo nextest run -p agentfs-repo`; a change to docs/configuration.md also `cargo nextest run -p agentfs-core --test config_reference`, `cargo nextest run -p agentfs --bin agentfs reference_tests plan_reads_only_env_vars` and `cargo nextest run -p agentfs-csi --bin agentfs-csi reference_tests`; to docs/runbooks/fork-refused.md or patch-queue.md also `cargo nextest run -p agentfs --bin agentfs fork_cmd::`; to the rules ledger or git-model.md also `cargo nextest run -p agentfs-model --test ledger`. Run one module of a merged test program with `cargo nextest run -p agentfs-core --test it tree_actor::` ([development](docs/development.md#test-programs)); `-E 'test(/^tree_actor::/)'` is nextest's exact form. `--all-features` needs OpenSSL and libssh2. CI builds it; a minimal container may not be able to.
 
 ## What only CI can test
 

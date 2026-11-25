@@ -53,6 +53,8 @@ tiny_http = "0.12.0"
 git2 = { version = "0.21.0", default-features = false }
 
 [dev-dependencies]
+# The markdown reader of the documentation tests (src/reference_tests.rs).
+agentfs-repo = { version = "0.0.0", path = "../agentfs-repo" }
 # The tree engine's rule set, for the deploy examples' rule files
 # (deploy_examples.rs).
 agentfs-rules = { version = "0.1.0", path = "../agentfs-rules" }

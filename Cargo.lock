@@ -48,6 +48,7 @@ dependencies = [
  "agentfs-core",
  "agentfs-csi",
  "agentfs-fuse",
+ "agentfs-repo",
  "agentfs-rules",
  "agentfs-trees",
  "agentfs-volume",
@@ -123,6 +124,7 @@ dependencies = [
  "agentfs-align",
  "agentfs-clients",
  "agentfs-contracts",
+ "agentfs-repo",
  "agentfs-rules",
  "agentfs-trees",
  "agentfs-volume",
@@ -170,6 +172,7 @@ dependencies = [
  "agentfs-contracts",
  "agentfs-core",
  "agentfs-fuse",
+ "agentfs-repo",
  "clap",
  "hyper-util",
  "prost",
@@ -232,6 +235,11 @@ version = "0.1.0"
 [[package]]
 name = "agentfs-repo"
 version = "0.0.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tempfile",
+]
 
 [[package]]
 name = "agentfs-rules"

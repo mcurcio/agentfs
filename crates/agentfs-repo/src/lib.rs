@@ -7,3 +7,6 @@
 //! workspace as `cargo metadata` describes it. Tests only: no published
 //! crate depends on it, and its library depends on no other agentfs crate,
 //! so a change to most documentation builds and checks in seconds.
+
+pub mod doc_tables;
+pub mod workspace;

@@ -207,7 +207,7 @@ pub const RECORD_ATTR: &str = "agentfs";
 
 /// Every operator-only attribute agentfs reads, in
 /// the order docs/configuration.md lists them; `"agentfs"` is the one set
-/// as `-agentfs`. `tests/docs_reference.rs` checks the configuration
+/// as `-agentfs`. `tests/config_reference.rs` checks the configuration
 /// reference against this list.
 pub const OPERATOR_ATTRIBUTES: &[&str] = &[
     RECORD_ATTR,

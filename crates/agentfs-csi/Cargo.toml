@@ -42,6 +42,8 @@ protox = "0.10.0"
 tonic-prost-build = { version = "0.14.6", default-features = false, features = ["transport"] }
 
 [dev-dependencies]
+# The markdown reader of the documentation tests (the `reference_tests` module of src/main.rs).
+agentfs-repo = { version = "0.0.0", path = "../agentfs-repo" }
 # A tonic client over a Unix socket in the gRPC tests.
 hyper-util = { version = "0.1.21", features = ["tokio"] }
 tempfile = "3.27.0"

@@ -26,8 +26,8 @@ pass() { printf '\033[32mok\033[0m   %s\n' "$*"; }
 # uses. The trap compares the exiting shell's $BASHPID with the one that
 # registered it ($$ is the parent's inside a subshell), so a subshell may
 # register its own. `case` keeps $?, so COMMAND still reads the exit status.
-# Every ci/ script registers its EXIT cleanup here: docs_reference.rs
-# (`ci_exit_traps_run_in_their_own_shell`) refuses a bare `trap ... EXIT`.
+# Every ci/ script registers its EXIT cleanup here: agentfs-repo's tests
+# (`ci_exit_traps_run_in_their_own_shell`) refuse a bare `trap ... EXIT`.
 on_exit() { # command
   trap "case \$BASHPID in $BASHPID) $1 ;; esac" EXIT
 }

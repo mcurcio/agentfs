@@ -10,7 +10,7 @@ READMEs, generated from `values.yaml` and checked in CI
 **This page is checked against the code.** Tests fail when a config key,
 operator attribute, flag or environment variable that agentfs reads is
 missing here, or when a row names one it no longer has
-(`crates/agentfs-core/tests/docs_reference.rs`,
+(`crates/agentfs-core/tests/config_reference.rs`,
 `crates/agentfs/src/reference_tests.rs` and the `reference_tests` module
 of `crates/agentfs-csi/src/main.rs`; the `docs` CI job). They rely on
 these conventions, so keep them when editing:
