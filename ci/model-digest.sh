@@ -60,12 +60,17 @@ git_release() {
 # Set by collect when a test failed: the digests of the runs that finished still count.
 tests_failed=0
 
-# The path of test target $1 that cargo builds, as cargo prints it.
+# The path of test target $1 that cargo builds, as cargo prints it. Each cargo command
+# is written out, so the repository's checks can read the test program it selects.
 test_binary() {
-    local path
+    local path out
     # cargo test, not nextest: it only builds; collect runs each seed's program itself.
-    path=$(cargo test --locked -p agentfs-model --test "$1" --no-run 2>&1 |
-        sed -n "s|^ *Executable tests/$1\.rs (\(.*\))\$|\1|p")
+    case $1 in
+        scenarios) out=$(cargo test --locked -p agentfs-model --test scenarios --no-run 2>&1) ;;
+        interleavings) out=$(cargo test --locked -p agentfs-model --test interleavings --no-run 2>&1) ;;
+        *) echo "test_binary: unknown test program $1" >&2; return 1 ;;
+    esac
+    path=$(printf '%s\n' "$out" | sed -n "s|^ *Executable tests/$1\.rs (\(.*\))\$|\1|p")
     if [ -n "$path" ]; then realpath "$path"; fi
 }
 

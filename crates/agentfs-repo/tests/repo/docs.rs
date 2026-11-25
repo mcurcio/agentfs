@@ -1,14 +1,16 @@
 //! The documentation against the workspace and itself: the module map and
-//! the ranks of docs/architecture.md, links and anchors, the book's table of
-//! contents, and the runbooks' pushes.
+//! the ranks of docs/architecture.md, links and anchors, every path under
+//! `crates/` a tracked file names, the book's table of contents, and the
+//! runbooks' pushes.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use agentfs_repo::doc_tables::{self, key_cells};
 use agentfs_repo::workspace::{Rank, Workspace};
 
-use crate::{Comments, is_separator, lex, markdown_files, root};
+use crate::{Comments, is_separator, lex, markdown_files, path_problem, repository_paths, root};
 
 /// The `.rs` files under a member's `src/`, relative to it, without the
 /// `tests.rs` files of test-only submodules.
@@ -516,4 +518,222 @@ fn every_page_is_in_the_book() {
         "pages missing from docs/SUMMARY.md:\n  {}",
         missing.join("\n  ")
     );
+}
+/// Each path under `crates/` that `text` names, with its line: `crates/...`,
+/// or `<crate>/{src,tests,benches,proto}/...`, `<crate>/Cargo.toml`,
+/// `<crate>/build.rs` read under `crates/` (`<crate>` = `agentfs(-[a-z]+)*`).
+/// It starts a line or follows whitespace or one of `` ` ( [ " ' < : , = ``
+/// (then any `./`, `../`), runs over `[A-Za-z0-9_.*/-]`, and drops trailing
+/// `.` and `/`.
+fn crate_paths(text: &str) -> Vec<(usize, String)> {
+    let starts = |c: char| c.is_whitespace() || "`([\"'<:,=".contains(c);
+    let in_path = |c: char| c.is_ascii_alphanumeric() || "_.*/-".contains(c);
+    let mut out = Vec::new();
+    for (n, line) in text.lines().enumerate() {
+        let mut prev = None;
+        for (i, c) in line.char_indices() {
+            let at_start = prev.is_none_or(starts);
+            prev = Some(c);
+            if !at_start {
+                continue;
+            }
+            let mut rest = &line[i..];
+            while let Some(r) = rest.strip_prefix("./").or_else(|| rest.strip_prefix("../")) {
+                rest = r;
+            }
+            let len = rest.find(|c| !in_path(c)).unwrap_or(rest.len());
+            let run = rest[..len].trim_end_matches(['.', '/']);
+            if let Some(path) = under_crates(run) {
+                out.push((n + 1, path));
+            }
+        }
+    }
+    out
+}
+
+/// `run` as a path under `crates/`, if it names one (see [`crate_paths`]).
+fn under_crates(run: &str) -> Option<String> {
+    if let Some(rest) = run.strip_prefix("crates/") {
+        return (!rest.is_empty()).then(|| run.to_owned());
+    }
+    let (krate, rest) = run.split_once('/')?;
+    let tail = krate.strip_prefix("agentfs")?;
+    let is_crate = tail.is_empty()
+        || tail.strip_prefix('-').is_some_and(|words| {
+            words
+                .split('-')
+                .all(|w| !w.is_empty() && w.chars().all(|c| c.is_ascii_lowercase()))
+        });
+    let in_crate = matches!(rest, "Cargo.toml" | "build.rs")
+        || ["src/", "tests/", "benches/", "proto/"]
+            .iter()
+            .any(|dir| rest.strip_prefix(dir).is_some_and(|p| !p.is_empty()));
+    (is_crate && in_crate).then(|| format!("crates/{run}"))
+}
+
+/// `source` with each line that is not a comment (trimmed start `//`)
+/// emptied; line numbers kept. A comment after code is not kept.
+fn rust_comments(source: &str) -> String {
+    source
+        .lines()
+        .map(|l| {
+            if l.trim_start().starts_with("//") {
+                l
+            } else {
+                ""
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Records of past work, which name paths as they were then: excluded
+/// from [`referring_files`]. A prefix ends in `/`; `.patch` files (the
+/// conformance regressions, each against the code it was cut from) are
+/// excluded by extension.
+const RECORDS: &[&str] = &[
+    "vendor/",
+    ".claude/handoff/",
+    ".claude/errata.md",
+    "CHANGELOG.md",
+    "OWNER-GUIDANCE.md",
+];
+
+/// Whether `path` (from the root) is one of [`RECORDS`] or a patch.
+fn is_record(path: &str) -> bool {
+    path.ends_with(".patch")
+        || RECORDS
+            .iter()
+            .any(|r| path == *r || (r.ends_with('/') && path.starts_with(r)))
+}
+
+/// Every file git tracks (`git ls-files`), but [`RECORDS`] and patches:
+/// the files whose paths under `crates/` are read. A file not yet added to
+/// git is read once it is.
+fn referring_files() -> Vec<PathBuf> {
+    let root = root();
+    let out = Command::new("git")
+        .args(["ls-files", "-z"])
+        .current_dir(&root)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "git ls-files: {out:?}");
+    String::from_utf8(out.stdout)
+        .unwrap()
+        .split('\0')
+        .filter(|p| !p.is_empty() && !is_record(p))
+        .map(|p| root.join(p))
+        .collect()
+}
+
+/// Every path under `crates/` that a tracked file names (Rust: comments
+/// only, see [`rust_comments`]; files git does not read as text are
+/// skipped) exists: a path left to a moved or renamed crate sends its reader
+/// nowhere. Not read: [`RECORDS`] and patches; Rust string literals, judged
+/// by the compiler or the test that opens them; a Rust comment after code on
+/// its line, or in `/* */`.
+#[test]
+fn crate_paths_name_what_exists() {
+    let paths = repository_paths();
+    let root = root();
+    let mut problems = Vec::new();
+    let mut read = 0;
+    for path in referring_files() {
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let text = if path.extension().is_some_and(|e| e == "rs") {
+            rust_comments(&text)
+        } else {
+            text
+        };
+        let shown = path
+            .strip_prefix(&root)
+            .unwrap_or(&path)
+            .display()
+            .to_string();
+        for (line, found) in crate_paths(&text) {
+            read += 1;
+            if let Some(problem) = path_problem(&found, &paths) {
+                problems.push(format!("{shown}:{line}: {problem}"));
+            }
+        }
+    }
+    assert!(
+        read > 150,
+        "only {read} crate paths read: is the scan broken?"
+    );
+    assert!(problems.is_empty(), "{}", problems.join("\n"));
+}
+
+#[test]
+fn a_crate_path_naming_nothing_is_found() {
+    let text = [
+        "See crates/agentfs-core/src/lib.rs. And `agentfs-core/tests/it/main.rs`",
+        "[link](../crates/agentfs/tests/csi_trees.rs), crates/*/tests and",
+        "crates/agentfs-engine/src/{a,b}.rs.",
+        "Not refs/heads/agentfs/src-1, https://crates.io/crates/fuser or `agentfs/src`.",
+    ]
+    .join("\n");
+    let found = crate_paths(&text);
+    let p = |n: usize, s: &str| (n, s.to_owned());
+    assert_eq!(
+        found,
+        [
+            p(1, "crates/agentfs-core/src/lib.rs"),
+            p(1, "crates/agentfs-core/tests/it/main.rs"),
+            p(2, "crates/agentfs/tests/csi_trees.rs"),
+            p(2, "crates/*/tests"),
+            p(3, "crates/agentfs-engine/src"),
+        ]
+    );
+    let paths: BTreeSet<String> = [
+        "crates",
+        "crates/agentfs-core/src/lib.rs",
+        "crates/agentfs-core/tests/it/main.rs",
+        "crates/agentfs-engine/src",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect();
+    let problems: Vec<String> = found
+        .iter()
+        .filter_map(|(_, path)| path_problem(path, &paths))
+        .collect();
+    assert_eq!(
+        problems,
+        ["crates/agentfs/tests/csi_trees.rs: no such path"]
+    );
+    assert_eq!(
+        rust_comments("fn f() {}\n  // crates/x\n"),
+        "\n  // crates/x"
+    );
+}
+
+#[test]
+fn records_are_not_read_for_crate_paths() {
+    for record in [
+        "vendor/fuser/src/lib.rs",
+        ".claude/handoff/crate-split-d-pages.md",
+        ".claude/errata.md",
+        "CHANGELOG.md",
+        "crates/agentfs-conformance/tests/regressions/x.patch",
+    ] {
+        assert!(is_record(record), "{record}");
+    }
+    for read in [
+        "crates/agentfs-cli/Cargo.toml",
+        "crates/agentfs-model/planted/run.py",
+        ".config/nextest.toml",
+        "clippy.toml",
+        "docs/CHANGELOG.md",
+        "vendored.md",
+    ] {
+        assert!(!is_record(read), "{read}");
+    }
+    let files = referring_files();
+    let has = |p: &str| files.contains(&root().join(p));
+    assert!(has("crates/agentfs-cli/Cargo.toml") && has("Cargo.toml"));
+    assert!(has("crates/agentfs-model/planted/run.py") && has(".config/nextest.toml"));
+    assert!(!has("CHANGELOG.md") && !has("vendor/fuser/Cargo.toml"));
 }

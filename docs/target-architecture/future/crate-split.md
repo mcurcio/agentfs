@@ -83,9 +83,9 @@ are their own crates. What remains:
 | A (built) | agentfs-repo: the repository-wide checks out of core's documentation test (`doc_tables` a module, not a `#[path]` include); the crate list derived from the workspace; checks that dependencies point only down the layers, that no bare `-p agentfs` remains until E (after E a package named `agentfs` exists, and the check cannot tell a stale reference from a right one), that every crate using failpoints forwards the feature | none | ci, docs | the repository's checks build in 6.9 s from an empty target directory, not core's 88 s [measured, development.md]; local runs only: CI's docs job still builds core and both binaries for the reference tables |
 | B (built) | agentfs-os, -git, -failpoints, -lines; `RepoPath`, `parse_size`, `parse_duration` to contracts; the tree engine's back-edges into the recording engine cut (`FifoGate` generic, its `CompactGate` impl into the engine; `sha256_at` into `lfs`); csi calls `is_safe_name` | none | ci, image | none alone; makes C, and M9's whole deletion, possible |
 | C (built) | agentfs-engine: `tree_actor/`, `tree_git`, `session`, `store`, `state_area`, `operator_settings`, their tests (`it/tree_*`, `tree_*.rs`, the tree half of `crash_points.rs`); its instruments registered on a `Meter` the binary makes; csi through the `StateArea` port; `docs/library/core.md`'s tree half becomes `engine.md`. The crate boundary replaces agentfs-repo's recording-module check; the engine keeps git2, so the ban on opening a remote stays clippy's (`clippy.toml`, the SSH transport's registration rests on it) | B | ci, image, phase-1 | a recording-engine edit builds and runs only the recording engine's tests (23 s and 20 s), a tree edit only the tree engine's (25 s and 64 s), against the 77 s nextest run of all of core [measured, 2026-11-25, development.md "Build settings"] |
-| D (built) | The CLI package renamed `agentfs-cli` (directory too), its binary and `#[command(name)]` still `agentfs`; every `-p agentfs` rewritten; agentfs-repo refuses a package selected through a variable in a file that runs, and a path under `crates/` that names nothing | C | ci, image, docker, hermes | none; with no package named `agentfs`, a missed reference fails |
-| E | The front `agentfs`: re-exports of the engine, contracts and the domains; a doctest opens a tree volume through it; AGENTS.md principle 10's mapping updated; the domain invariants and the rows-and-events contract out of `engine.md` to a library page of the shared kernel and the domains, which `engine.md` links | D | ci, docs | the owner's one name |
-| F | agentfs-service: `launcher/domains.rs`, `shared.rs`, `domain_events.rs` and the drain, used by the binary; the front re-exports it; the launch's reads of core (`identity::Context` to contracts, the telemetry scope and the export counter's name to the binary) | E | ci, image | consumers compose a volume in one call |
+| D (built) | The CLI package renamed `agentfs-cli` (directory too), its binary still `agentfs` (`[[bin]] name`, which clap reads through `CARGO_BIN_NAME`); every `-p agentfs` rewritten; agentfs-repo refuses, in a file that runs, a package, feature, binary or test program selected through a variable and a `cargo build` of a package with no binary, and, in any tracked file, a path under `crates/` that names nothing | C | ci, image, docker, hermes | none; with no package named `agentfs`, a missed reference fails |
+| E | The front `agentfs`, in a new rank `library` between `engine` and `filesystem` (it uses `shared-kernel`, `domain`, `engine` and itself; `filesystem` and `tests` use it): re-exports of the engine, contracts and the domains; a doctest opens a tree volume through it; AGENTS.md principle 10's mapping updated; the domain invariants and the rows-and-events contract out of `engine.md` to a library page of the shared kernel and the domains, which `engine.md` links | D | ci, docs | the owner's one name |
+| F | agentfs-service, rank `library`: `launcher/domains.rs`, `shared.rs`, `domain_events.rs` and the drain, used by the binary; the front re-exports it; the launch's reads of core (`identity::Context` to contracts, the telemetry scope and the export counter's name to the binary) | E | ci, image | consumers compose a volume in one call |
 | G | agentfs-referee: its own error enum (`From` into the engine's); the line values (`tree.rs:27-205`) to lines; `MergeFileIdentity`, `NameHistory`, `Meta`, `queue::Key` public; `queue::held` (`queue.rs:50`, takes `&Shape`) up to its caller; ref naming for `Upstreams::merges` (`upstreams.rs:69`) resolved | C | ci, phase-1 | purity checked; rule tests in seconds |
 
 The waiting-marks PR lands in the engine after C, beside G (disjoint files); whether its `Waiters` gets a crate is its
@@ -93,13 +93,20 @@ architect's call. **Later:** a journal or history crate only if a measurement sh
 agentfs-replication and agentfs-transport; M9 deletes agentfs-core whole and fuse's recording half, and the front
 gains `fuse`.
 
-**Traps, each closed by a check, not a habit, but the first after E.** A stale `-p agentfs` building the front: D
-before E, then A's check, which after E cannot tell a stale reference from a right one; a reference added after E is
-a habit.
-Clap printing `agentfs-cli`: an explicit name and a test. A script selecting a package through a variable, which no
-check can read: agentfs-repo refuses it in a file that runs (not markdown, not Rust). A path left to a renamed crate in
-prose, a comment or a code span: agentfs-repo's check that every path under `crates/` the scanned files name exists
-(Rust string literals are left to the compiler and the tests that open them). A new crate missing from the module map: the list derived
+**Traps, each closed by a check, and what each check does not read.** A stale `-p agentfs` meant for the binary: D
+before E, then A's check; after E it names the front, so in a file that runs agentfs-repo refuses a `cargo build` of a
+package with no binary (a script builds to run what it built). A stale `cargo test` or `nextest run -p agentfs` after
+E, or one in markdown, is in form a right use of the front: not checked. Prose naming a package ("`agentfs` is a
+binary only") is read by no check: each rename's acceptance (E, F, G) runs ``git grep -nE '`agentfs`[^|]{0,60}(crate|package|manifest|tests|program|library|binary only)'``
+over everything but the records of past work, and every hit is read.
+Clap printing `agentfs-cli`: the bin's name read through `CARGO_BIN_NAME`, and a test. A script selecting through a
+variable, which no check can read: agentfs-repo refuses, in a file that runs (not markdown, not Rust, not an issue
+template), a package, feature, binary or test program that is not a literal name; it reads shell words and Python
+calls written as one list. Not read: cargo run through a variable (`$CARGO`) or built by code other than one list.
+A path left to a renamed crate: agentfs-repo's check that every path under `crates/` a tracked file names exists, but
+in the records of past work (vendor/, `.claude/handoff/`, the errata, CHANGELOG.md, OWNER-GUIDANCE.md, patches); in
+Rust it reads whole-line comments only, so a comment after code, a `/* */` comment and string literals (left to the
+compiler and the tests that open them) are not read. A new crate missing from the module map: the list derived
 from the workspace. An unforwarded `failpoints` feature, or a dependency its rank does not use: A's checks. Two libgit2 setups:
 one `agentfs_git::init`. Visibility widened in C: module paths kept, the 497 count held. A library crate making its own
 `Meter`: clippy bans `opentelemetry::global::meter*`, `MeterProvider::{meter, meter_with_scope}` and `Meter::new`,
@@ -122,6 +129,7 @@ checked).
 **Decided without the owner (design choices):** the engine crate is `agentfs-engine` (both architects, independently);
 the front does not re-export the recording engine.
 
-**For each PR's code architect:** exact re-exports and public surfaces; nextest's profile (doctests run separately,
+**For each PR's code architect:** exact re-exports and public surfaces; the `library` rank (E adds it to the
+workspace's ranks and docs/architecture.md "Ranks"); nextest's profile (doctests run separately,
 test groups for the heavy programs, no retries); a home for the failpoints registry's per-engine groups; `phase-1.yml`
 path filters by crate; tikv's `fail` as prior art for failpoints.

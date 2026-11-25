@@ -414,7 +414,7 @@ row names a module that no longer exists; `tests.rs` files are not listed.
 | Module | Role |
 |---|---|
 | `lib.rs` | Crate root: the repository checks' overview |
-| `doc_tables.rs` | A small markdown reader (headings, tables, code spans) for the documentation tests of this crate, `agentfs-core`, `agentfs` and `agentfs-csi` |
+| `doc_tables.rs` | A small markdown reader (headings, tables, code spans) for the documentation tests of this crate, `agentfs-core`, `agentfs-cli` and `agentfs-csi` |
 | `workspace.rs` | The workspace as `cargo metadata` describes it: members, their dependencies, features and targets, and the ranks |
 
 ### `agentfs-csi`

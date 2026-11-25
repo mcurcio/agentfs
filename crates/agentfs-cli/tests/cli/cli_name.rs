@@ -1,6 +1,7 @@
 //! The binary names itself `agentfs`, though its package is `agentfs-cli`:
-//! `--version` on the real binary, which the upgrade runbook reads, and the
-//! usage line of `--help`. No FUSE.
+//! `--version` on the real binary, which the upgrade runbook reads. Clap
+//! takes `--help`'s usage name from argv[0], so the usage line is judged by
+//! the unit test `the_command_is_named_agentfs`. No FUSE.
 
 use std::process::Command;
 
@@ -27,6 +28,4 @@ fn run(arg: &str) -> String {
 #[test]
 fn the_binary_names_itself_agentfs() {
     assert_eq!(run("--version"), version());
-    let help = run("--help");
-    assert!(help.contains("\nUsage: agentfs "), "{help}");
 }

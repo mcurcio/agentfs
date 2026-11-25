@@ -73,7 +73,7 @@ docker build -t agentfs:dev .                 # https, ssh and otlp-tls features
 `cargo nextest run` runs every test in a process of its own, several at
 once, so a test never shares globals, an allocator or counters with
 another. nextest does not run doctests: `cargo test --doc` does, for a
-package with a library (`agentfs` is a binary only and has none). AGENTS.md
+package with a library (`agentfs-cli` is a binary only and has none). AGENTS.md
 gives the pinned nextest release and how to install it.
 
 [`.config/nextest.toml`](../.config/nextest.toml) holds two profiles. Both

@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 
 use agentfs_repo::workspace::{Dependency, DependencyKind, Member, Rank, Target, Workspace};
 
-use crate::{Comments, files_under, is_separator, lex, path_problem, repository_paths, root};
+use crate::{Comments, files_under, is_separator, lex, root};
 
 /// Where `workspace` breaks its ranks: a rank listed twice, a rank using
 /// one listed after it, a member naming no rank or an unknown one, a
@@ -462,13 +462,15 @@ fn an_unforwarded_failpoints_feature_is_found() {
 /// not an option), the packages (`-p`, `--package`), the features
 /// (`--features`, `-F`), the binaries (`--bin`) and the test programs
 /// (`--test`). Only values made of
-/// `[A-Za-z0-9_-]` are kept: `<crate>` or `$pkg` is no name.
+/// `[A-Za-z0-9_-]` are kept: `<crate>` or `$pkg` is no name, and its kind
+/// is kept in `variables`.
 #[derive(Debug, Default, PartialEq, Eq)]
 struct Selection {
     subcommand: Option<String>,
     packages: Vec<String>,
-    /// Whether every package selection was a literal name.
-    literal: bool,
+    /// Each kind of selection with a value that is no name, once:
+    /// `package`, `feature`, `binary`, `test program`.
+    variables: Vec<&'static str>,
     /// `(Some(package), feature)` for `pkg/feat`, `(None, feature)` bare.
     features: Vec<(Option<String>, String)>,
     bins: Vec<String>,
@@ -506,26 +508,43 @@ fn cargo_commands(line: &str, out: &mut Vec<Vec<String>>) {
 
 /// What the command whose words follow `cargo` selects.
 fn selection(words: &[String]) -> Selection {
-    let mut s = Selection {
-        literal: true,
-        ..Selection::default()
+    let mut s = Selection::default();
+    let variable = |s: &mut Selection, kind: &'static str| {
+        if !s.variables.contains(&kind) {
+            s.variables.push(kind);
+        }
     };
     let package = |s: &mut Selection, value: &str| {
         if is_name(value) {
             s.packages.push(value.to_owned());
         } else {
-            s.literal = false;
+            variable(s, "package");
         }
     };
     let features = |s: &mut Selection, value: &str| {
         for item in value.split(|c: char| c == ',' || c.is_whitespace()) {
             match item.split_once('/') {
+                _ if item.is_empty() => {}
                 Some((p, f)) if is_name(p) && is_name(f) => {
                     s.features.push((Some(p.to_owned()), f.to_owned()))
                 }
                 None if is_name(item) => s.features.push((None, item.to_owned())),
-                _ => {}
+                _ => variable(s, "feature"),
             }
+        }
+    };
+    let bin = |s: &mut Selection, value: &str| {
+        if is_name(value) {
+            s.bins.push(value.to_owned());
+        } else {
+            variable(s, "binary");
+        }
+    };
+    let test = |s: &mut Selection, value: &str| {
+        if is_name(value) {
+            s.tests.push(value.to_owned());
+        } else {
+            variable(s, "test program");
         }
     };
     let mut i = 0;
@@ -547,14 +566,14 @@ fn selection(words: &[String]) -> Selection {
                 takes_next = true;
             }
             "--bin" => {
-                if let Some(v) = next.filter(|v| is_name(v)) {
-                    s.bins.push(v.to_owned());
+                if let Some(v) = next {
+                    bin(&mut s, v);
                 }
                 takes_next = true;
             }
             "--test" => {
-                if let Some(v) = next.filter(|v| is_name(v)) {
-                    s.tests.push(v.to_owned());
+                if let Some(v) = next {
+                    test(&mut s, v);
                 }
                 takes_next = true;
             }
@@ -568,13 +587,9 @@ fn selection(words: &[String]) -> Selection {
                 } else if let Some(v) = word.strip_prefix("--features=") {
                     features(&mut s, v);
                 } else if let Some(v) = word.strip_prefix("--bin=") {
-                    if is_name(v) {
-                        s.bins.push(v.to_owned());
-                    }
+                    bin(&mut s, v);
                 } else if let Some(v) = word.strip_prefix("--test=") {
-                    if is_name(v) {
-                        s.tests.push(v.to_owned());
-                    }
+                    test(&mut s, v);
                 } else if s.subcommand.is_none() && !word.starts_with(['-', '+']) {
                     s.subcommand = Some(word.to_owned());
                 }
@@ -587,12 +602,13 @@ fn selection(words: &[String]) -> Selection {
 
 /// Why `s` names what `workspace` does not have: a package, a package's
 /// feature, a feature no selected package declares (cargo's rule, read
-/// only when every selection is literal), a binary of no selected package
+/// only when every package is a literal name), a binary of no selected package
 /// (of no member when none is selected), a test program of no selected
 /// package (of no member when none is selected), or `cargo run` of a
 /// package with no binary.
 fn selection_problems(workspace: &Workspace, s: &Selection) -> Vec<String> {
     let mut problems = Vec::new();
+    let literal = !s.variables.contains(&"package");
     let selected: Vec<&Member> = s
         .packages
         .iter()
@@ -621,7 +637,7 @@ fn selection_problems(workspace: &Workspace, s: &Selection) -> Vec<String> {
                 Some(_) => {}
             },
             // cargo's rule: a bare feature is one a selected package declares.
-            None if s.literal
+            None if literal
                 && !s.packages.is_empty()
                 && !selected.iter().any(|m| m.features.contains_key(feature)) =>
             {
@@ -633,7 +649,7 @@ fn selection_problems(workspace: &Workspace, s: &Selection) -> Vec<String> {
             None => {}
         }
     }
-    if s.literal {
+    if literal {
         for bin in &s.bins {
             let found = if s.packages.is_empty() {
                 workspace.members.iter().any(|m| has_bin(m, Some(bin)))
@@ -667,8 +683,8 @@ fn selection_problems(workspace: &Workspace, s: &Selection) -> Vec<String> {
     problems
 }
 
-/// The files whose cargo commands (and paths under `crates/`) are read:
-/// the crates' Rust sources for their comments only.
+/// The files whose cargo commands are read: the crates' Rust sources for
+/// their doc comments only, and their Python scripts.
 fn command_files() -> Vec<PathBuf> {
     let root = root();
     let mut files = Vec::new();
@@ -705,7 +721,7 @@ fn command_files() -> Vec<PathBuf> {
     files.extend(
         sources
             .into_iter()
-            .filter(|p| p.extension().is_some_and(|e| e == "rs")),
+            .filter(|p| p.extension().is_some_and(|e| e == "rs" || e == "py")),
     );
     for file in ["Dockerfile", "AGENTS.md", "README.md", "CONTRIBUTING.md"] {
         files.push(root.join(file));
@@ -715,19 +731,106 @@ fn command_files() -> Vec<PathBuf> {
 }
 
 /// Whether a scanned file runs, so its cargo commands execute: any but
-/// markdown and Rust, whose commands are read by people. The literal rule
-/// reads it.
+/// markdown, Rust (whose commands are read by people) and the issue
+/// templates' forms. [`script_problems`] reads it.
 fn runs(path: &Path) -> bool {
     !path.extension().is_some_and(|e| e == "md" || e == "rs")
+        && !path.to_string_lossy().contains(".github/ISSUE_TEMPLATE/")
 }
 
-/// Why a command `s` of the file at `path` cannot be checked: in a file
-/// that runs, a package selected through a variable is one no check can
-/// read (markdown keeps placeholders such as `-p <crate>`).
-fn literal_problem(path: &Path, s: &Selection) -> Option<String> {
-    (runs(path) && !s.literal).then(|| {
-        "selects a package through a variable: name it, so this check can read it".to_owned()
-    })
+/// Why a command `s` of the file at `path`, one that runs, is refused
+/// though it may name what the workspace has: a package, feature, binary or
+/// test program selected through a variable, which no check can read
+/// (markdown keeps placeholders such as `-p <crate>`); and `cargo build` of
+/// a package with no binary, since a script builds to run what it built (a
+/// stale `-p agentfs` once the library front has that name).
+fn script_problems(workspace: &Workspace, path: &Path, s: &Selection) -> Vec<String> {
+    if !runs(path) {
+        return Vec::new();
+    }
+    let mut problems: Vec<String> = s
+        .variables
+        .iter()
+        .map(|kind| {
+            format!("selects a {kind} through a variable: name it, so this check can read it")
+        })
+        .collect();
+    if s.subcommand.as_deref() == Some("build") {
+        for m in s.packages.iter().filter_map(|p| workspace.member(p)) {
+            if !m.targets.iter().any(|t| t.kinds.iter().any(|k| k == "bin")) {
+                problems.push(format!(
+                    "cargo build -p {}: it has no binary for this file to run",
+                    m.name
+                ));
+            }
+        }
+    }
+    problems
+}
+
+/// Every cargo call of a Python `text` written as a list, `["cargo", ...]`,
+/// with the line it starts on: its string items as the words after
+/// `cargo`, any other item as `$item`, which is no name. A list may run
+/// over lines.
+fn list_commands(text: &str) -> Vec<(usize, Vec<String>)> {
+    let mut out = Vec::new();
+    let chars: Vec<char> = text.chars().collect();
+    let line_at = |i: usize| chars[..i].iter().filter(|c| **c == '\n').count() + 1;
+    for (start, _) in chars.iter().enumerate().filter(|(_, c)| **c == '[') {
+        let mut items = Vec::new();
+        let mut i = start + 1;
+        loop {
+            while chars.get(i).is_some_and(|c| c.is_whitespace()) {
+                i += 1;
+            }
+            match chars.get(i) {
+                None => break,
+                Some(']') => break,
+                Some(q @ ('"' | '\'')) => {
+                    let q = *q;
+                    let mut item = String::new();
+                    i += 1;
+                    while let Some(&c) = chars.get(i) {
+                        i += 1;
+                        if c == q {
+                            break;
+                        }
+                        item.push(c);
+                    }
+                    items.push(item);
+                }
+                Some(_) => {
+                    let mut item = String::from("$");
+                    let mut depth = 0usize;
+                    while let Some(&c) = chars.get(i) {
+                        match c {
+                            ',' | ']' if depth == 0 => break,
+                            '(' | '[' | '{' => depth += 1,
+                            ')' | ']' | '}' => depth = depth.saturating_sub(1),
+                            _ => {}
+                        }
+                        item.push(c);
+                        i += 1;
+                    }
+                    items.push(item.trim_end().to_owned());
+                }
+            }
+            if items.first().is_some_and(|f| f != "cargo") {
+                break;
+            }
+            while chars.get(i).is_some_and(|c| c.is_whitespace()) {
+                i += 1;
+            }
+            match chars.get(i) {
+                Some(',') => i += 1,
+                _ => break,
+            }
+        }
+        if items.first().is_some_and(|f| f == "cargo") {
+            out.push((line_at(start), items.split_off(1)));
+        }
+    }
+    out
 }
 
 /// Every cargo command of `text`, with the line it starts on: lines ending
@@ -805,14 +908,16 @@ fn doc_commands(source: &str) -> Vec<(usize, Vec<String>)> {
 }
 
 /// Every cargo command in the workflows and the rest of `.github/`, the CI
-/// scripts, the Dockerfile, the docs, the skills, the examples and the
-/// crates' doc comments selects packages, features and binaries the
-/// workspace has: chiefly a reference left to a renamed package. No package
-/// is named `agentfs`: the binary `agentfs` is package `agentfs-cli`'s. In a
-/// file that runs, every package is selected by a literal name, so this
-/// check can read it. After the library front takes the name `agentfs`, a
-/// bare `-p agentfs` meant for the binary is, in form, a correct use of the
-/// front: this check cannot see it.
+/// scripts, the Dockerfile, the docs, the skills, the examples, the crates'
+/// doc comments and Python scripts (a call written as a list too) selects
+/// packages, features, binaries and test programs the workspace has: chiefly
+/// a reference left to a renamed package. No package is named `agentfs`: the
+/// binary `agentfs` is package `agentfs-cli`'s. In a file that runs, every
+/// selection is a literal name, so this check can read it, and `cargo build`
+/// selects only packages with a binary, so a stale `-p agentfs` building the
+/// library front is refused there. Not read: cargo run through a variable
+/// (`$CARGO`), a cargo call built by other code than one list, and a
+/// command in a Rust comment that is not a doc comment.
 #[test]
 fn cargo_commands_name_what_the_workspace_has() {
     let workspace = Workspace::load();
@@ -828,17 +933,20 @@ fn cargo_commands_name_what_the_workspace_has() {
             .unwrap_or(&path)
             .display()
             .to_string();
-        let found = if path.extension().is_some_and(|e| e == "rs") {
+        let mut found = if path.extension().is_some_and(|e| e == "rs") {
             doc_commands(&text)
         } else {
             commands_in(&text)
         };
+        if path.extension().is_some_and(|e| e == "py") {
+            found.extend(list_commands(&text));
+        }
         for (line, words) in found {
             commands += 1;
             let s = selection(&words);
             let problems_here = selection_problems(&workspace, &s)
                 .into_iter()
-                .chain(literal_problem(&path, &s));
+                .chain(script_problems(&workspace, &path, &s));
             for why in problems_here {
                 problems.push(format!("{shown}:{line}: cargo {}: {why}", words.join(" ")));
             }
@@ -957,7 +1065,7 @@ fn cargo_commands_are_read_as_sh_reads_them() {
     );
     assert_eq!(s.subcommand.as_deref(), Some("nextest"));
     assert_eq!(s.packages, ["agentfs-core", "agentfs-fuse", "x"]);
-    assert!(!s.literal);
+    assert_eq!(s.variables, ["package"]);
     assert_eq!(s.features, [(None, "a".into()), (None, "b".into())]);
     assert_eq!(s.bins, ["y"]);
     assert_eq!(s.tests, ["it", "z"]);
@@ -981,7 +1089,9 @@ fn cargo_commands_are_refused_where_the_workspace_lacks_their_names() {
         ranks: ranks(),
         members: vec![cli, binary("agentfs-csi", "agentfs-csi", &[])],
     };
-    // Once the library front is `agentfs`: a library with no features.
+    // Once the library front is `agentfs`: a library with no features. Its
+    // rank here is any: the cargo checks do not read ranks (crate-split.md
+    // gives the front its rank).
     let mut front = Workspace {
         ranks: ranks(),
         members: now.members.clone(),
@@ -1033,170 +1143,92 @@ fn cargo_commands_are_refused_where_the_workspace_lacks_their_names() {
     ));
     assert!(refused(&now, "cargo test --test nowhere"));
     assert!(!refused(&now, "cargo build --bin agentfs-csi"));
-    // A package through a variable: no name to judge, but a file that runs
-    // must name it.
-    let variable = one_selection(r#"cargo test --locked -p "$p" --no-run"#);
-    assert!(selection_problems(&now, &variable).is_empty());
-    assert!(literal_problem(Path::new("ci/x.sh"), &variable).is_some());
-    assert!(literal_problem(Path::new("docs/x.md"), &variable).is_none());
-    assert!(literal_problem(Path::new("crates/x/src/lib.rs"), &variable).is_none());
+    // A selection through a variable: no name to judge, but a file that
+    // runs must name it.
+    let script = |workspace: &Workspace, path: &str, line: &str| {
+        script_problems(workspace, Path::new(path), &one_selection(line))
+    };
+    for (line, kind) in [
+        (r#"cargo test --locked -p "$p" --no-run"#, "package"),
+        (
+            r#"cargo test --locked -p agentfs-cli --test "$1" --no-run"#,
+            "test program",
+        ),
+        ("cargo build -p agentfs-cli --bin=$bin", "binary"),
+        ("cargo build -p agentfs-cli --features ssh,$f", "feature"),
+    ] {
+        let variable = one_selection(line);
+        assert_eq!(variable.variables, [kind], "{line}");
+        assert!(selection_problems(&now, &variable).is_empty(), "{line}");
+        assert_eq!(script(&now, "ci/x.sh", line).len(), 1, "{line}");
+        assert_eq!(script(&now, "ci/x.py", line).len(), 1, "{line}");
+        assert!(script(&now, "docs/x.md", line).is_empty(), "{line}");
+        assert!(
+            script(&now, "crates/x/src/lib.rs", line).is_empty(),
+            "{line}"
+        );
+        assert!(
+            script(&now, ".github/ISSUE_TEMPLATE/bug_report.yml", line).is_empty(),
+            "{line}"
+        );
+    }
     assert!(
-        literal_problem(
-            Path::new("ci/x.sh"),
-            &one_selection("cargo test -p agentfs-cli")
+        script(
+            &now,
+            "ci/x.sh",
+            "cargo test -p agentfs-cli --test csi_trees"
         )
-        .is_none()
+        .is_empty()
     );
-}
-
-/// Each path under `crates/` that `text` names, with its line: `crates/...`,
-/// or `<crate>/{src,tests,benches,proto}/...`, `<crate>/Cargo.toml`,
-/// `<crate>/build.rs` read under `crates/` (`<crate>` = `agentfs(-[a-z]+)*`).
-/// It starts a line or follows whitespace or one of `` ` ( [ " ' < : , = ``
-/// (then any `./`, `../`), runs over `[A-Za-z0-9_.*/-]`, and drops trailing
-/// `.` and `/`.
-fn crate_paths(text: &str) -> Vec<(usize, String)> {
-    let starts = |c: char| c.is_whitespace() || "`([\"'<:,=".contains(c);
-    let in_path = |c: char| c.is_ascii_alphanumeric() || "_.*/-".contains(c);
-    let mut out = Vec::new();
-    for (n, line) in text.lines().enumerate() {
-        let mut prev = None;
-        for (i, c) in line.char_indices() {
-            let at_start = prev.is_none_or(starts);
-            prev = Some(c);
-            if !at_start {
-                continue;
-            }
-            let mut rest = &line[i..];
-            while let Some(r) = rest.strip_prefix("./").or_else(|| rest.strip_prefix("../")) {
-                rest = r;
-            }
-            let len = rest.find(|c| !in_path(c)).unwrap_or(rest.len());
-            let run = rest[..len].trim_end_matches(['.', '/']);
-            if let Some(path) = under_crates(run) {
-                out.push((n + 1, path));
-            }
-        }
+    // A script's `cargo build` builds something to run: a stale
+    // `-p agentfs` building the library front is refused there.
+    assert!(script(&now, "ci/x.sh", "cargo build -p agentfs-cli -p agentfs-csi").is_empty());
+    for line in [
+        "cargo build -p agentfs",
+        "cargo build -p agentfs -p agentfs-csi",
+    ] {
+        assert_eq!(script(&front, "ci/x.sh", line).len(), 1, "{line}");
+        assert!(script(&front, "docs/x.md", line).is_empty(), "{line}");
     }
-    out
-}
-
-/// `run` as a path under `crates/`, if it names one (see [`crate_paths`]).
-fn under_crates(run: &str) -> Option<String> {
-    if let Some(rest) = run.strip_prefix("crates/") {
-        return (!rest.is_empty()).then(|| run.to_owned());
-    }
-    let (krate, rest) = run.split_once('/')?;
-    let tail = krate.strip_prefix("agentfs")?;
-    let is_crate = tail.is_empty()
-        || tail.strip_prefix('-').is_some_and(|words| {
-            words
-                .split('-')
-                .all(|w| !w.is_empty() && w.chars().all(|c| c.is_ascii_lowercase()))
-        });
-    let in_crate = matches!(rest, "Cargo.toml" | "build.rs")
-        || ["src/", "tests/", "benches/", "proto/"]
-            .iter()
-            .any(|dir| rest.strip_prefix(dir).is_some_and(|p| !p.is_empty()));
-    (is_crate && in_crate).then(|| format!("crates/{run}"))
-}
-
-/// `source` with each line that is not a comment (trimmed start `//`)
-/// emptied; line numbers kept.
-fn rust_comments(source: &str) -> String {
-    source
-        .lines()
-        .map(|l| {
-            if l.trim_start().starts_with("//") {
-                l
-            } else {
-                ""
-            }
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-/// Every path under `crates/` that the files of [`command_files`] name
-/// (Rust: comments only) exists: a path left to a moved or renamed crate
-/// sends its reader nowhere. String literals are judged by the compiler or
-/// the test that opens them.
-#[test]
-fn crate_paths_name_what_exists() {
-    let paths = repository_paths();
-    let root = root();
-    let mut problems = Vec::new();
-    let mut read = 0;
-    for path in command_files() {
-        let Ok(text) = std::fs::read_to_string(&path) else {
-            continue;
-        };
-        let text = if path.extension().is_some_and(|e| e == "rs") {
-            rust_comments(&text)
-        } else {
-            text
-        };
-        let shown = path
-            .strip_prefix(&root)
-            .unwrap_or(&path)
-            .display()
-            .to_string();
-        for (line, found) in crate_paths(&text) {
-            read += 1;
-            if let Some(problem) = path_problem(&found, &paths) {
-                problems.push(format!("{shown}:{line}: {problem}"));
-            }
-        }
-    }
-    assert!(
-        read > 150,
-        "only {read} crate paths read: is the scan broken?"
-    );
-    assert!(problems.is_empty(), "{}", problems.join("\n"));
+    assert!(script(&front, "ci/x.sh", "cargo test -p agentfs").is_empty());
 }
 
 #[test]
-fn a_crate_path_naming_nothing_is_found() {
+fn cargo_calls_written_as_python_lists_are_read() {
     let text = [
-        "See crates/agentfs-core/src/lib.rs. And `agentfs-core/tests/it/main.rs`",
-        "[link](../crates/agentfs/tests/csi_trees.rs), crates/*/tests and",
-        "crates/agentfs-engine/src/{a,b}.rs.",
-        "Not refs/heads/agentfs/src-1, https://crates.io/crates/fuser or `agentfs/src`.",
+        "CARGO = [\"cargo\", \"test\", \"--locked\", \"-p\", \"agentfs-model\", \"--test\", \"scenarios\",",
+        "         \"--test\", \"interleavings\"]",
+        "run(['cargo', 'build', '-p', pkg, \"--bin=x\"], cwd=ROOT)",
+        "subprocess.run([\"git\", \"cargo\"], [f(a, b)])",
+        "x = [\"cargo\"]",
     ]
     .join("\n");
-    let found = crate_paths(&text);
-    let p = |n: usize, s: &str| (n, s.to_owned());
+    let found = list_commands(&text);
+    let words = |w: &[&str]| w.iter().map(|w| (*w).to_owned()).collect::<Vec<_>>();
     assert_eq!(
         found,
         [
-            p(1, "crates/agentfs-core/src/lib.rs"),
-            p(1, "crates/agentfs-core/tests/it/main.rs"),
-            p(2, "crates/agentfs/tests/csi_trees.rs"),
-            p(2, "crates/*/tests"),
-            p(3, "crates/agentfs-engine/src"),
+            (
+                1,
+                words(&[
+                    "test",
+                    "--locked",
+                    "-p",
+                    "agentfs-model",
+                    "--test",
+                    "scenarios",
+                    "--test",
+                    "interleavings"
+                ])
+            ),
+            (3, words(&["build", "-p", "$pkg", "--bin=x"])),
+            (5, Vec::new()),
         ]
     );
-    let paths: BTreeSet<String> = [
-        "crates",
-        "crates/agentfs-core/src/lib.rs",
-        "crates/agentfs-core/tests/it/main.rs",
-        "crates/agentfs-engine/src",
-    ]
-    .into_iter()
-    .map(str::to_owned)
-    .collect();
-    let problems: Vec<String> = found
-        .iter()
-        .filter_map(|(_, path)| path_problem(path, &paths))
-        .collect();
-    assert_eq!(
-        problems,
-        ["crates/agentfs/tests/csi_trees.rs: no such path"]
-    );
-    assert_eq!(
-        rust_comments("fn f() {}\n  // crates/x\n"),
-        "\n  // crates/x"
-    );
+    let s = selection(&found[1].1);
+    assert_eq!(s.variables, ["package"]);
+    assert_eq!(s.bins, ["x"]);
+    assert_eq!(selection(&found[0].1).tests, ["scenarios", "interleavings"]);
 }
 
 /// Every `.rs` file under the `src` of each member, but `except`'s, with its

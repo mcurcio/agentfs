@@ -114,7 +114,7 @@ const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "+failpoints");
 
 #[derive(Parser)]
 #[command(
-    name = "agentfs",
+    name = env!("CARGO_BIN_NAME"),
     version = VERSION,
     about = "Records every change an agent makes, in git history"
 )]
@@ -1463,7 +1463,8 @@ mod cli_tests {
 
     /// The package is `agentfs-cli`, but the command is `agentfs`: its name,
     /// its version line and its usage line, which clap would otherwise take
-    /// from the package's name.
+    /// from the package's name. The name's one home is the manifest's
+    /// `[[bin]] name`, read through `CARGO_BIN_NAME`; this pins it.
     #[test]
     fn the_command_is_named_agentfs() {
         let mut cli = Cli::command();

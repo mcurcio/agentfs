@@ -2,9 +2,11 @@
 //!
 //! - [`docs`]: every member's modules are in docs/architecture.md's module
 //!   map, and its "Ranks" table is the workspace's; every relative link and
-//!   `#anchor` in README.md and docs/ resolves; every page under docs/ is in
-//!   the book's docs/SUMMARY.md; every `git push` in a runbook writes only
-//!   refs literally under `refs/agentfs/` and never forces (F8 S2).
+//!   `#anchor` in README.md and docs/ resolves; every path under `crates/`
+//!   that a tracked file names (Rust: comments only; records of past work
+//!   excepted) exists; every page under docs/ is in the book's
+//!   docs/SUMMARY.md; every `git push` in a runbook writes only refs
+//!   literally under `refs/agentfs/` and never forces (F8 S2).
 //! - [`ci`]: every CI job runs on the pinned runner, `ubuntu-24.04`, runs
 //!   its tests with cargo-nextest, pinned to one release, and pulls Docker
 //!   Hub through the mirror; the Rust release is pinned once; the
@@ -16,10 +18,10 @@
 //!   that exists.
 //! - [`crates`]: every dependency follows the ranks, every `failpoints`
 //!   feature is forwarded, every cargo command in `.github/`, the scripts,
-//!   docs and the crates' doc comments names packages, features, binaries
-//!   and test programs the workspace has, and in a file that runs (not
-//!   markdown, not Rust) selects each package by a literal name; every path
-//!   under `crates/` that those files name (Rust: comments only) exists;
+//!   docs, the crates' doc comments and Python scripts names packages,
+//!   features, binaries and test programs the workspace has, and in a file
+//!   that runs (not markdown, not Rust) selects each by a literal name and
+//!   builds only packages with a binary;
 //!   every failpoint call is in `agentfs_failpoints::POINTS`, and the tree
 //!   engine (agentfs-engine) starts `git` only through
 //!   `agentfs_git::git_cli::counted`.
