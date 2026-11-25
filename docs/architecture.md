@@ -43,9 +43,10 @@ workspace manifest lists the ranks, each after every rank it uses, with the
 ranks each may use (`[workspace.metadata.agentfs] ranks`). A normal or build
 dependency on another package of the workspace must be in a rank its own
 rank uses, so two packages of one rank never depend on each other unless the
-rank uses itself. A dev-dependency may point anywhere but at a sibling of
-a rank that does not use itself, as a test of the binary drives the CSI
-driver; one engine's tests never build the other. `crates/agentfs-repo` checks the manifests,
+rank uses itself. A dev-dependency may point anywhere, as a test of the binary
+drives the CSI driver, but at a package that builds a sibling of a rank that
+does not use itself: the sibling, or a package whose normal and build
+dependencies reach it. So one engine's tests never build the other. `crates/agentfs-repo` checks the manifests,
 and this table against the workspace manifest.
 
 | Rank | Uses | Layer | What it holds |

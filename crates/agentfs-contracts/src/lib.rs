@@ -2,7 +2,7 @@
 //! the values every domain shares, the capabilities and their minter, each
 //! domain's trait, error and events, and the ports their adapters implement.
 //! No I/O: the domain crates (`agentfs-volume`, `agentfs-clients`,
-//! `agentfs-trees`) and the adapters in `agentfs-core` depend on it, and it
+//! `agentfs-trees`) and the adapters in `agentfs-engine` depend on it, and it
 //! depends on no other agentfs crate.
 
 pub mod audit;

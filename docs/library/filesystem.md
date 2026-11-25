@@ -2,7 +2,8 @@
 
 The filesystem layer turns file calls into records. It is a FUSE filesystem
 over a real backing directory. Every change a workload makes through the
-mount is recorded, through [`agentfs-core`](core.md), before the call
+mount is recorded, through [`agentfs-core`](core.md) or, on a tree view,
+[`agentfs-engine`](engine.md), before the call
 returns, or the call fails.
 
 There are three ways to integrate at this layer:

@@ -15,9 +15,9 @@
 //!   retries a failed push; every path filter of a workflow names a path
 //!   that exists.
 //! - [`crates`]: every dependency follows the ranks, every `failpoints`
-//!   feature is forwarded, every cargo command in the workflows, scripts
-//!   and docs names packages, features, binaries and test programs the
-//!   workspace has,
+//!   feature is forwarded, every cargo command in the workflows, scripts,
+//!   docs and the crates' doc comments names packages, features, binaries
+//!   and test programs the workspace has,
 //!   every failpoint call is in `agentfs_failpoints::POINTS`, and the tree
 //!   engine (agentfs-engine) starts `git` only through
 //!   `agentfs_git::git_cli::counted`.

@@ -5,8 +5,45 @@
 //! the fix and says, in its header, the base it applies to and how the fixture
 //! was recorded.
 
+use std::path::{Path, PathBuf};
+use std::process::Command;
+
 use agentfs_conformance::{against_library, against_model};
 use agentfs_model::calls::{Recorded, Recorder, TreeId, parse};
+
+/// Every `.patch` still applies to today's source (`git apply --check` at the
+/// workspace root): a fix moved or rewritten fails here, and its patch is
+/// re-cut with it, or the patch no longer removes the fix it names.
+#[test]
+fn every_patch_applies_to_todays_source() {
+    let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let root = crate_dir
+        .ancestors()
+        .nth(2)
+        .expect("crates/<name> under the root");
+    let mut patches: Vec<PathBuf> = std::fs::read_dir(crate_dir.join("tests/regressions"))
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| p.extension().is_some_and(|e| e == "patch"))
+        .collect();
+    patches.sort();
+    assert!(patches.len() >= 2, "patches found: {patches:?}");
+    for patch in patches {
+        let out = Command::new("git")
+            .current_dir(root)
+            .args(["apply", "--check"])
+            .arg(&patch)
+            .output()
+            .expect("running git");
+        assert!(
+            out.status.success(),
+            "{} does not apply ({}): {}",
+            patch.display(),
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}
 
 /// The library without the shows-the-same guard of e9ab747 (6049b1b's regression,
 /// finding 51; phase-1 run 42547765643, seeds 123, 172 and 198), on the scenario

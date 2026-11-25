@@ -29,7 +29,8 @@ hands consumers a working volume: "Q1 A"; cargo-nextest locally and in CI: "Q2 A
         ├─ agentfs-git (git_cli, libgit2 setup, pack settings)
         └─ agentfs-os (file locks, fsutil, confined, mountinfo, shared_fs, listening sockets, allocator) · agentfs-failpoints
    agentfs-transport (M4: SSH and HTTP clients, credentials) implements replication's Remote port
-   tests only: agentfs-model, agentfs-conformance, agentfs-repo (checks over the whole repository)
+   tests only: agentfs-model, agentfs-conformance, agentfs-repo (checks over the whole repository),
+               agentfs-test-metrics (an in-memory metric reader both engines' tests use)
 ```
 
 | Crate | Why it is a crate |
@@ -41,6 +42,7 @@ hands consumers a working volume: "Q1 A"; cargo-nextest locally and in CI: "Q2 A
 | agentfs-service | The library is an integration point (principle 10); today only the binary wires a volume (`agentfs/src/launcher/domains.rs`) |
 | agentfs (front) | Consumers' one name; internal crates keep names that say what they hold |
 | agentfs-repo | The repository-wide checks, out of core's documentation test; a docs-only change stops compiling core |
+| agentfs-test-metrics | Both engines' tests read their instruments; a dev edge between the engines is refused, so the reader is its own crate (rank `tests`). After M9 the engine is its one user |
 
 **While both engines exist:** agentfs-core (the recording engine) and agentfs-engine are siblings on agentfs-os and
 agentfs-git, neither depending on the other. agentfs-fuse and agentfs-cli depend on both; agentfs-conformance on the
@@ -63,6 +65,13 @@ After A, B and C the tree engine is its own crate, agentfs-engine, beside the re
 are their own crates. What remains:
 
 - The referee's purity is a convention: `referee/entries.rs` imports the actor's `Error` and `queue`. G's.
+- The tree path still reads the recording engine at launch: `crates/agentfs/src/otel.rs` and `launcher/mod.rs` use
+  core's `identity::Context`, and `otel.rs`'s `meter_of` scopes the binary's `Meter` with core's
+  `telemetry::scope()`; the export-failure counter is named from core's `telemetry::names`. M9's deletion of core
+  must cut them first: F's.
+- The domain layer's rules are documented on an adapter's page: docs/library/engine.md's "Domain invariants" and
+  its rows and events hold the Volume, Clients and Trees domains' invariants, and the shared kernel and the domains
+  cite it. E's.
 - The tree view has no kernel-independent layer (`agentfs-fuse/src/tree_view.rs:43` uses `fuser::*`; `:1592`
   implements `Filesystem`), so it is tested only where `/dev/fuse` exists.
 
@@ -75,8 +84,8 @@ are their own crates. What remains:
 | B (built) | agentfs-os, -git, -failpoints, -lines; `RepoPath`, `parse_size`, `parse_duration` to contracts; the tree engine's back-edges into the recording engine cut (`FifoGate` generic, its `CompactGate` impl into the engine; `sha256_at` into `lfs`); csi calls `is_safe_name` | none | ci, image | none alone; makes C, and M9's whole deletion, possible |
 | C (built) | agentfs-engine: `tree_actor/`, `tree_git`, `session`, `store`, `state_area`, `operator_settings`, their tests (`it/tree_*`, `tree_*.rs`, the tree half of `crash_points.rs`); its instruments registered on a `Meter` the binary makes; csi through the `StateArea` port; `docs/library/core.md`'s tree half becomes `engine.md`. The crate boundary replaces agentfs-repo's recording-module check; the engine keeps git2, so the ban on opening a remote stays clippy's (`clippy.toml`, the SSH transport's registration rests on it) | B | ci, image, phase-1 | a recording-engine edit builds and runs only the recording engine's tests (23 s and 20 s), a tree edit only the tree engine's (25 s and 64 s), against the 77 s nextest run of all of core [measured, 2026-11-25, development.md "Build settings"] |
 | D | The CLI package renamed `agentfs-cli` (directory too), its binary and `#[command(name)]` still `agentfs`; every `-p agentfs` rewritten | C | ci, image, docker, hermes | none; with no package named `agentfs`, a missed reference fails |
-| E | The front `agentfs`: re-exports of the engine, contracts and the domains; a doctest opens a tree volume through it; AGENTS.md principle 10's mapping updated | D | ci, docs | the owner's one name |
-| F | agentfs-service: `launcher/domains.rs`, `shared.rs`, `domain_events.rs` and the drain, used by the binary; the front re-exports it | E | ci, image | consumers compose a volume in one call |
+| E | The front `agentfs`: re-exports of the engine, contracts and the domains; a doctest opens a tree volume through it; AGENTS.md principle 10's mapping updated; the domain invariants and the rows-and-events contract out of `engine.md` to a library page of the shared kernel and the domains, which `engine.md` links | D | ci, docs | the owner's one name |
+| F | agentfs-service: `launcher/domains.rs`, `shared.rs`, `domain_events.rs` and the drain, used by the binary; the front re-exports it; the launch's reads of core (`identity::Context` to contracts, the telemetry scope and the export counter's name to the binary) | E | ci, image | consumers compose a volume in one call |
 | G | agentfs-referee: its own error enum (`From` into the engine's); the line values (`tree.rs:27-205`) to lines; `MergeFileIdentity`, `NameHistory`, `Meta`, `queue::Key` public; `queue::held` (`queue.rs:50`, takes `&Shape`) up to its caller; ref naming for `Upstreams::merges` (`upstreams.rs:69`) resolved | C | ci, phase-1 | purity checked; rule tests in seconds |
 
 The waiting-marks PR lands in the engine after C, beside G (disjoint files); whether its `Waiters` gets a crate is its
@@ -90,14 +99,16 @@ a habit.
 Clap printing `agentfs-cli`: an explicit name and a test. A new crate missing from the module map: the list derived
 from the workspace. An unforwarded `failpoints` feature, or a dependency its rank does not use: A's checks. Two libgit2 setups:
 one `agentfs_git::init`. Visibility widened in C: module paths kept, the 497 count held. A library crate making its own
-`Meter`: clippy bans `opentelemetry::global::meter*` outside the binary.
+`Meter`: clippy bans `opentelemetry::global::meter*`, `MeterProvider::{meter, meter_with_scope}` and `Meter::new`,
+allowed only in the binary's `otel::meter_of` and agentfs-test-metrics (a library building an SDK provider is not
+checked).
 
 ## 4. What this gives up
 
-- The engine stays one crate of about 38k lines; a tree edit still runs the tree tests, about 11% less than today
-  [est]. The owner's test-time goal rests on PR 0, not on crate boundaries.
+- The engine stays one crate of about 38k lines; a tree edit still runs every tree test: 64 s against the 77 s run
+  of all of core [measured, row C]. The owner's test-time goal rests on PR 0, not on crate boundaries.
 - About 240 imports in the recording engine are rewritten in B, for code M9 deletes.
-- Nine new crates (repo, failpoints, os, git, lines, engine, referee, service and the front), each a manifest, a module-map entry and a public surface to document; values moved down become `pub`.
+- Ten new crates (repo, failpoints, os, git, lines, engine, test-metrics, referee, service and the front), each a manifest, a module-map entry and a public surface to document; values moved down become `pub`. test-metrics is about 160 lines in the `tests` rank, a crate only because the rank check keeps the engines apart.
 - Not delivered here: the duplicated fork rules (a fork's upstream in the Trees row and in `Upstreams`; "no forks of
   forks" checked in both), and a kernel-independent tree view. Each is its own work item. `agentfs-fuse/src/backing.rs`
   keeps its own confined access beside `agentfs_os::confined` (B shares the resolution flags and `proc_path`); it is

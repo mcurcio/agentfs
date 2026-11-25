@@ -17,8 +17,10 @@ use crate::{Comments, files_under, is_separator, lex, root};
 /// Where `workspace` breaks its ranks: a rank listed twice, a rank using
 /// one listed after it, a member naming no rank or an unknown one, a
 /// normal or build dependency on a member in a rank its own rank does not
-/// use, and a dev-dependency on another member of its own rank when that
-/// rank does not use itself. Other dev-dependencies may point anywhere.
+/// use, and a dev-dependency that builds another member of its own rank when
+/// that rank does not use itself: the sibling itself, or any member whose
+/// normal and build dependencies reach it (one engine's tests would build
+/// the other). Other dev-dependencies may point anywhere.
 fn rank_problems(workspace: &Workspace) -> Vec<String> {
     let mut problems = Vec::new();
     let mut seen = BTreeSet::new();
@@ -62,13 +64,29 @@ fn rank_problems(workspace: &Workspace) -> Vec<String> {
             };
             let used = rank.uses.iter().any(|u| u == their);
             if dependency.kind == DependencyKind::Dev {
-                // A test may drive anything but a sibling the rank keeps
-                // apart: one engine's tests would build the other.
-                if their == name && !used {
-                    edges.insert(format!(
-                        "{} -> {} (dev; {name} does not use {their})",
-                        member.name, dependency.name
-                    ));
+                // A test may drive anything but what builds a sibling the
+                // rank keeps apart: one engine's tests would build the other.
+                if rank.uses.iter().any(|u| u == name) {
+                    continue;
+                }
+                for sibling in built_by(workspace, &dependency.name) {
+                    let of_rank = workspace
+                        .member(&sibling)
+                        .is_some_and(|s| s.rank.as_deref() == Some(name.as_str()));
+                    if sibling == member.name || !of_rank {
+                        continue;
+                    }
+                    edges.insert(if sibling == dependency.name {
+                        format!(
+                            "{} -> {} (dev; {name} does not use {name})",
+                            member.name, dependency.name
+                        )
+                    } else {
+                        format!(
+                            "{} -> {} (dev; it builds {sibling}, and {name} does not use {name})",
+                            member.name, dependency.name
+                        )
+                    });
                 }
                 continue;
             }
@@ -82,6 +100,29 @@ fn rank_problems(workspace: &Workspace) -> Vec<String> {
     }
     problems.extend(edges);
     problems
+}
+
+/// The members building `from` builds: itself, and every member its normal
+/// and build dependencies reach. A member's dev-dependencies are built only
+/// for its own tests, so they are not followed.
+fn built_by(workspace: &Workspace, from: &str) -> BTreeSet<String> {
+    let mut built = BTreeSet::new();
+    let mut next = vec![from.to_owned()];
+    while let Some(name) = next.pop() {
+        let Some(m) = workspace.member(&name) else {
+            continue;
+        };
+        if !built.insert(name) {
+            continue;
+        }
+        next.extend(
+            m.dependencies
+                .iter()
+                .filter(|d| d.kind != DependencyKind::Dev)
+                .map(|d| d.name.clone()),
+        );
+    }
+    built
 }
 
 #[test]
@@ -267,6 +308,38 @@ fn the_ranks_refuse_sideways_and_upward_edges() {
         rank_problems(&engines),
         ["agentfs-core -> agentfs-engine (dev; engine does not use engine)"]
     );
+    // Nor a member above the rank that builds the sibling: the FUSE layer
+    // links the recording engine, so the tree engine's tests would build it.
+    let mut above = today();
+    above.members.push(member("agentfs-engine", "engine", &[]));
+    dev_edge(&mut above, "agentfs-engine", "agentfs-fuse");
+    assert_eq!(
+        rank_problems(&above),
+        [
+            "agentfs-engine -> agentfs-fuse (dev; it builds agentfs-core, and engine does not use engine)"
+        ]
+    );
+    // Nor a test helper whose own dependencies reach the sibling.
+    let mut helper = today();
+    helper.members.push(member("agentfs-engine", "engine", &[]));
+    helper
+        .members
+        .push(member("agentfs-test-metrics", "tests", &["agentfs-core"]));
+    helper.ranks.push(Rank {
+        name: "tests".into(),
+        uses: vec!["engine".into()],
+    });
+    dev_edge(&mut helper, "agentfs-engine", "agentfs-test-metrics");
+    assert_eq!(
+        rank_problems(&helper),
+        [
+            "agentfs-engine -> agentfs-test-metrics (dev; it builds agentfs-core, and engine does not use engine)"
+        ]
+    );
+    // A dev cycle back to the member itself is no sibling.
+    let mut cycle = today();
+    dev_edge(&mut cycle, "agentfs-core", "agentfs-fuse");
+    assert_eq!(rank_problems(&cycle), Vec::<String>::new());
     // A build dependency counts.
     let mut build = today();
     build.members[0].dependencies.push(Dependency {
@@ -594,7 +667,8 @@ fn selection_problems(workspace: &Workspace, s: &Selection) -> Vec<String> {
     problems
 }
 
-/// The files whose cargo commands are read.
+/// The files whose cargo commands are read: the crates' Rust sources for
+/// their doc comments only.
 fn command_files() -> Vec<PathBuf> {
     let root = root();
     let mut files = Vec::new();
@@ -626,6 +700,13 @@ fn command_files() -> Vec<PathBuf> {
             }
         }
     }
+    let mut sources = Vec::new();
+    files_under(&root.join("crates"), &mut sources);
+    files.extend(
+        sources
+            .into_iter()
+            .filter(|p| p.extension().is_some_and(|e| e == "rs")),
+    );
     for file in ["Dockerfile", "AGENTS.md", "README.md", "CONTRIBUTING.md"] {
         files.push(root.join(file));
     }
@@ -662,9 +743,54 @@ fn commands_in(text: &str) -> Vec<(usize, Vec<String>)> {
     out
 }
 
+/// Every cargo command of the doc comments (`//!`, `///`) of a Rust
+/// `source`, with the line its paragraph starts on: a code span may run
+/// over lines, as rustdoc reads it; a fenced block is read line by line.
+fn doc_commands(source: &str) -> Vec<(usize, Vec<String>)> {
+    let mut out = Vec::new();
+    let mut prose = String::new();
+    let mut first = 0;
+    let mut fenced = false;
+    let flush = |prose: &mut String, first: usize, out: &mut Vec<(usize, Vec<String>)>| {
+        for span in prose.split('`').skip(1).step_by(2) {
+            let mut commands = Vec::new();
+            cargo_commands(span, &mut commands);
+            out.extend(commands.into_iter().map(|c| (first, c)));
+        }
+        prose.clear();
+    };
+    for (n, line) in source.lines().enumerate() {
+        let t = line.trim_start();
+        let doc = t
+            .strip_prefix("//!")
+            .or_else(|| t.strip_prefix("///").filter(|_| !t.starts_with("////")));
+        let Some(text) = doc else {
+            flush(&mut prose, first, &mut out);
+            fenced = false;
+            continue;
+        };
+        if text.trim_start().starts_with("```") {
+            flush(&mut prose, first, &mut out);
+            fenced = !fenced;
+        } else if fenced {
+            out.extend(commands_in(text).into_iter().map(|(_, c)| (n + 1, c)));
+        } else if text.trim().is_empty() {
+            flush(&mut prose, first, &mut out);
+        } else {
+            if prose.is_empty() {
+                first = n + 1;
+            }
+            prose.push_str(text);
+            prose.push(' ');
+        }
+    }
+    flush(&mut prose, first, &mut out);
+    out
+}
+
 /// Every cargo command in the workflows, the CI scripts, the Dockerfile,
-/// the docs, the skills and the examples selects packages, features and
-/// binaries the workspace has: chiefly a reference meant for the binary
+/// the docs, the skills, the examples and the crates' doc comments selects
+/// packages, features and binaries the workspace has: chiefly a reference meant for the binary
 /// once its package is renamed. After the library front takes the name
 /// `agentfs`, a bare `cargo build -p agentfs` meant for the binary is, in
 /// form, a correct use of the front: this check cannot see it.
@@ -683,7 +809,12 @@ fn cargo_commands_name_what_the_workspace_has() {
             .unwrap_or(&path)
             .display()
             .to_string();
-        for (line, words) in commands_in(&text) {
+        let found = if path.extension().is_some_and(|e| e == "rs") {
+            doc_commands(&text)
+        } else {
+            commands_in(&text)
+        };
+        for (line, words) in found {
             commands += 1;
             for why in selection_problems(&workspace, &selection(&words)) {
                 problems.push(format!("{shown}:{line}: cargo {}: {why}", words.join(" ")));
@@ -744,6 +875,41 @@ fn one_selection(line: &str) -> Selection {
     let commands = commands_in(line);
     assert_eq!(commands.len(), 1, "{line}: {commands:?}");
     selection(&commands[0].1)
+}
+
+#[test]
+fn cargo_commands_in_doc_comments_are_read_across_lines() {
+    let source = [
+        "//! Needs the feature: `cargo test -p agentfs-core",
+        "//! --features failpoints --test it tree_verify::`. It's",
+        "//! `cargo nextest run -p a`'s too.",
+        "//!",
+        "//! ```sh",
+        "//! cargo build -p b",
+        "//! cargo build -p c",
+        "//! ```",
+        "    /// `cargo run -p d`",
+        "fn f() {} // `cargo run -p e`",
+        "//// `cargo run -p f`",
+    ]
+    .join("\n");
+    let found = doc_commands(&source);
+    let packages: Vec<(usize, Vec<String>)> = found
+        .iter()
+        .map(|(n, words)| (*n, selection(words).packages))
+        .collect();
+    let p = |n: usize, s: &str| (n, vec![s.to_owned()]);
+    assert_eq!(
+        packages,
+        [
+            p(1, "agentfs-core"),
+            p(1, "a"),
+            p(6, "b"),
+            p(7, "c"),
+            p(9, "d")
+        ]
+    );
+    assert_eq!(selection(&found[0].1).tests, ["it"]);
 }
 
 #[test]

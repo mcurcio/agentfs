@@ -1,5 +1,5 @@
 //! The ports the domains reach their adapters through (docs/target-architecture/
-//! system.md, "Deployment compositions and crate layout"). agentfs-core
+//! system.md, "Deployment compositions and crate layout"). agentfs-engine
 //! implements them over the tree actor: every write here is one journal step,
 //! the volume's one commit point, and each event is a commit on a row chain
 //! beside the tree it concerns (`refs/agentfs/{volume,trees/<tree>,clients/<tree>}`).

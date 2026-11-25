@@ -55,7 +55,7 @@ impl MetricReader {
     /// # Panics
     ///
     /// The provider could not flush, or the exporter could not be read.
-    pub fn collect(&self) -> Option<ResourceMetrics> {
+    fn collect(&self) -> Option<ResourceMetrics> {
         self.metrics.reset();
         self.meters.force_flush().unwrap();
         self.metrics.get_finished_metrics().unwrap().pop()

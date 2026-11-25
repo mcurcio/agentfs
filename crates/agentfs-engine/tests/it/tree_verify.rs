@@ -5,7 +5,7 @@
 //! leaves the notes refs alone.
 //!
 //! The flags are made with the failpoint `tree.build_replay_skew`, so most
-//! tests need the `failpoints` feature: `cargo test -p agentfs-core
+//! tests need the `failpoints` feature: `cargo test -p agentfs-engine
 //! --features failpoints --test it tree_verify::`.
 #![allow(
     clippy::disallowed_methods,

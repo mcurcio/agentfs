@@ -1,7 +1,10 @@
 Removes the fix of finding-51-sync-fast-forward.trace: the shows-the-same guard
 on a sync's fast-forward (introduced without it in 6049b1b, fixed in e9ab747).
-Base: 7474470; the fix now lives in tree_actor/history/take.rs (module cut 5.2), where
-this hunk applies.
+Base: 7474470; the fix now lives in agentfs-engine's tree_actor/history/take.rs, where
+this hunk applies (re-cut 2026-11-25 against the free function `shows_the_same`, the
+same guard). Not re-recorded since: the trace was recorded with the earlier hunk, and
+with this one `todays_library_differs_from_the_regression_only_at_its_call` did not
+finish in 750 s (it takes about 10 s with the fix), so the recording is open work.
 git: the release in ci/git-release.
 Re-record (crates/agentfs-model/VERIFYING.md, "A regression found on the engine")
 in a scratch worktree with this applied. Give it fresh volumes, since --record
@@ -22,12 +25,12 @@ Verified 2026-11-12: these commands reproduce the committed trace byte for byte 
 
 --- a/crates/agentfs-engine/src/tree_actor/history/take.rs
 +++ b/crates/agentfs-engine/src/tree_actor/history/take.rs
-@@ -288,7 +288,7 @@
-             // for the upstream and the sync shows what the upstream's commit shows (the
-             // model's `World::sync`). The fork then takes that commit's line maps and names,
-             // so a version the upstream decided against stays in history only (finding 51).
--            let head = if Self::shows_the_same(&parent, &snapshot) && !self.pending_from(tree)? {
-+            let head = if !self.pending_from(tree)? {
-                 for (id, file) in &mut snapshot.files {
-                     if let Some(theirs) = parent.files.get(id) {
-                         file.lines = theirs.lines.clone();
+@@ -515,7 +515,7 @@
+     // for the upstream and the sync shows what the upstream's commit shows (the
+     // model's `World::sync`). The fork then takes that commit's line maps and names,
+     // so a version the upstream decided against stays in history only (finding 51).
+-    let head = if shows_the_same(&parent, &synced) && !pending_from(snapshot, tree, upstream)? {
++    let head = if !pending_from(snapshot, tree, upstream)? {
+         for (id, file) in &mut synced.files {
+             if let Some(theirs) = parent.files.get(id) {
+                 file.lines = theirs.lines.clone();

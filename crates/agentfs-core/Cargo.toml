@@ -11,14 +11,13 @@ description = "Recording, journal and history engine for agentfs"
 rank = "engine"
 
 [dependencies]
-# The shared kernel: values (the tree identity among them), capabilities and the
-# ports agentfs-core's adapters implement.
+# The shared kernel's values: repository paths, names, sizes and durations.
 agentfs-contracts = { version = "0.1.0", path = "../agentfs-contracts" }
 # The leaves both engines share: failpoints, the operating system, git.
 agentfs-failpoints = { version = "0.1.0", path = "../agentfs-failpoints" }
 agentfs-git = { version = "0.1.0", path = "../agentfs-git" }
 agentfs-os = { version = "0.1.0", path = "../agentfs-os" }
-# The Rules domain: where each new name of a tree lives (tree_actor's untracked areas).
+# The Rules domain's attribute states, read by the operator rules (rules.rs).
 agentfs-rules = { version = "0.1.0", path = "../agentfs-rules" }
 # known_hosts key blobs and hashed host names, and OpenSSH private key
 # headers.

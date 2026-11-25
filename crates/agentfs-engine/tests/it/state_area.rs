@@ -207,6 +207,28 @@ fn a_create_cut_short_is_created_again() {
     assert!(!root.join("initializing").exists());
 }
 
+/// A state area that cannot be read is said to be unreadable, naming it,
+/// through the port and through `ensure`, with nothing written.
+#[test]
+fn a_state_area_that_cannot_be_read_is_unreadable() {
+    use agentfs_contracts::ports::StateArea;
+    let tmp = tempfile::tempdir().unwrap();
+    let file = tmp.path().join("file");
+    fs::write(&file, b"").unwrap();
+    // Its parent is a regular file: reading it fails (ENOTDIR) as root too.
+    let root = file.join("state");
+    let shown = root.display().to_string();
+    match TreeStateArea::at(&root).inspect() {
+        Err(VolumeError::Unreadable(m)) => assert!(m.starts_with(&shown), "{m}"),
+        other => panic!("inspect: {other:?}"),
+    }
+    match volume(&root).ensure(spec("t"), &PodContext::default(), &root_cap()) {
+        Err(VolumeError::Unreadable(m)) => assert!(m.starts_with(&shown), "{m}"),
+        other => panic!("ensure: {other:?}"),
+    }
+    assert_eq!(fs::read(&file).unwrap(), b"");
+}
+
 #[test]
 fn open_never_creates() {
     let tmp = tempfile::tempdir().unwrap();
