@@ -52,16 +52,16 @@ fn the_csi_example_profile_loads() {
         .output()
         .unwrap();
     assert!(out.status.success(), "{}", text(&out.stderr));
-    agentfs_core::operator_settings::install_rules(
+    agentfs_engine::operator_settings::install_rules(
         &state,
-        agentfs_core::operator_settings::RuleFiles {
+        agentfs_engine::operator_settings::RuleFiles {
             exclude: Some(&profiles.join("example.exclude")),
             attributes: Some(&profiles.join("example.attributes")),
         },
     )
     .unwrap();
 
-    let settings = agentfs_core::operator_settings::OperatorSettings::read(&state).unwrap();
+    let settings = agentfs_engine::operator_settings::OperatorSettings::read(&state).unwrap();
     assert!(settings.missing_includes().is_empty());
     let gaps: BTreeSet<(String, String)> = settings
         .not_built()
@@ -79,7 +79,7 @@ fn the_csi_example_profile_loads() {
         );
     }
 
-    let rules = rule_set(&agentfs_core::tree_actor::rules_dir(&state));
+    let rules = rule_set(&agentfs_engine::tree_actor::rules_dir(&state));
     let kept = ["notes.md", "src/main.rs"];
     let dropped = ["app.log", "tmp/scratch", "secrets/token"];
     let placed = placed(&rules, &[&kept[..], &dropped[..]].concat());
@@ -222,9 +222,9 @@ fn placed(rules: &agentfs_rules::RuleSet, layout: &[&str]) -> BTreeMap<String, b
 /// include, that tree volumes log as not built: key and capability.
 fn not_built(config: &str) -> BTreeSet<(String, String)> {
     let state = tempfile::tempdir().unwrap();
-    agentfs_core::operator_settings::write_includes(state.path(), &[repo_root().join(config)])
+    agentfs_engine::operator_settings::write_includes(state.path(), &[repo_root().join(config)])
         .unwrap();
-    let settings = agentfs_core::operator_settings::OperatorSettings::read(state.path()).unwrap();
+    let settings = agentfs_engine::operator_settings::OperatorSettings::read(state.path()).unwrap();
     assert!(settings.missing_includes().is_empty(), "{config}");
     settings
         .not_built()

@@ -95,7 +95,7 @@ slowest test of ci.yml's test job, and the two `tree_stages` tests 42 s to
 78 s. To run CI's sizes locally:
 
 ```sh
-AGENTFS_TEST_VOLUMES=full cargo nextest run -p agentfs-core --test tree_batch_alloc --test tree_stages
+AGENTFS_TEST_VOLUMES=full cargo nextest run -p agentfs-engine --test tree_batch_alloc --test tree_stages
 ```
 
 `cargo test --no-run` is still used where a script builds a test program
@@ -106,12 +106,12 @@ process per seed. Each says so in a comment.
 ### Test programs
 
 Cargo links one program per file in a crate's `tests/`. To link fewer,
-`agentfs-core` and `agentfs` put the integration tests that can share a
-process in one program each, a module per file: `tests/it/` and
-`tests/cli/`. Run one file's tests by its module:
+`agentfs-engine`, `agentfs-core` and `agentfs` put the integration tests
+that can share a process in one program each, a module per file:
+`tests/it/` and `tests/cli/`. Run one file's tests by its module:
 
 ```sh
-cargo nextest run -p agentfs-core --test it tree_actor::
+cargo nextest run -p agentfs-engine --test it tree_actor::
 cargo nextest run -p agentfs --test cli cli_fork::
 ```
 
@@ -191,13 +191,26 @@ No profile setting changed between the two columns, so the build times
 differ by noise only. nextest alone, on the "Before" tests, ran
 `agentfs-core` in 128 s: `tree_batch_alloc` took 81 s and each of the two
 10,000-file `tree_stages` tests 42 s, beside the other tests. Smaller
-volumes took the run to 75 s. Under nextest a package's run lasts about as
-long as its slowest test. For `agentfs-core` that is `tree_batch_alloc`
-(about 30 s locally), which builds a 10,000-file volume and must have its
-process to itself; CI runs it at full size (above), and its run lasts
-about as long. `agentfs`'s run gains nothing: most of its tests are in one program
+volumes took the run to 75 s. Under nextest a package's run lasts at least
+as long as its slowest test. For the tree engine (in `agentfs-core` then,
+`agentfs-engine` now) that is `tree_batch_alloc` (about 30 s locally),
+which builds a 10,000-file volume and must have its process to itself; CI
+runs it at full size (above), and its run lasts about as long. `agentfs`'s run gains nothing: most of its tests are in one program
 (`tests/cli/`), which already ran them several at a time (14 s), and its
 slowest test takes about 5 s.
+
+The two engines are two packages, and neither depends on the other, so an
+edit in one rebuilds and runs only its own tests. Measured on 2026-11-25 in
+a container with 4 CPUs and 15 GB, at cargo's default jobs, with every test
+program built first, after touching one file:
+
+| Step | Build | Run | Tests |
+|---|---|---|---|
+| `tree_actor/recording/mod.rs`, then `cargo nextest run -p agentfs-engine` | 25 s | 64 s | 475 |
+| `volume.rs`, then `cargo nextest run -p agentfs-core` | 23 s | 20 s | 761 |
+
+The tree engine's run is bound by its four CPUs more than by its slowest
+test, `tree_batch_alloc` (about 33 s).
 
 The checks over the whole repository (`agentfs-repo`) build no engine: its
 library depends only on serde and serde_json. Measured on 2026-11-25 in a

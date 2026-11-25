@@ -1,5 +1,5 @@
 //! Sessions: the history service's side of each attached client
-//! (docs/library/core.md, "Sessions"; docs/trees.md, "Clients"). Clients
+//! (docs/library/engine.md, "Sessions"; docs/trees.md, "Clients"). Clients
 //! binds a client's authority to a session, a `ClientCap` for a read-write
 //! client or its tree for a read-only one; a view reaches its tree only
 //! through its session, so its calls name no tree and no writer (C5), a

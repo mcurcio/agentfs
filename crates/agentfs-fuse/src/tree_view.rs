@@ -1,14 +1,14 @@
 //! The view host (docs/library/filesystem.md, "The view host"): each view is
 //! a FUSE mount of one tree, its directories, files and symbolic links with
 //! their recorded modes and owners and the tree's own times, reached only
-//! through its client's session (`agentfs_core::session`), so its calls name
+//! through its client's session (`agentfs_engine::session`), so its calls name
 //! no tree and no writer. The kernel judges every permission
 //! (`default_permissions`). Inode 1 is the root directory;
 //! every other entry's inode is its node number + 2. Direct I/O and zero
 //! TTLs; no passthrough or writeback-cache
 //! negotiation. Shared mappings go through the kernel's page cache all the
 //! same, so a read with no lock owner is a page fill and a write with
-//! `FUSE_WRITE_CACHE` a page write; `agentfs_core::tree_actor`'s `pages`
+//! `FUSE_WRITE_CACHE` a page write; `agentfs_engine::tree_actor`'s `pages`
 //! module holds their rules (R1.4).
 //!
 //! The tree's untracked area (docs/trees.md, "Rules and the untracked area")
@@ -33,9 +33,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use crate::stale::{self, MountState};
 use agentfs_contracts::clients::{Access, Binding, FileOwner};
 use agentfs_contracts::views::{MountOptions, MountPoint, ViewError, ViewId, Views};
-use agentfs_core::session::{SessionGuard, Sessions, TreeSession};
-use agentfs_core::tree_actor::stages as measured;
-use agentfs_core::tree_actor::{
+use agentfs_engine::session::{SessionGuard, Sessions, TreeSession};
+use agentfs_engine::tree_actor::stages as measured;
+use agentfs_engine::tree_actor::{
     Attrs, Closing, Error, FileMap, Kind, Meta, Node, PathStep, Perm, Progress, Recording,
     RenameMode, SavePending, Saved, SetTime, TreeId,
 };
@@ -505,9 +505,9 @@ fn run_take_gate(
         let changed = actor.drain_changed().map_err(io::Error::other)?;
         invalidate_changed(&notifiers(views), &changed);
         let answer = match took {
-            Ok(agentfs_core::tree_actor::Took::Taken) => "taken".to_owned(),
-            Ok(agentfs_core::tree_actor::Took::Waiting) => "waiting".to_owned(),
-            Ok(agentfs_core::tree_actor::Took::Empty) => "empty".to_owned(),
+            Ok(agentfs_engine::tree_actor::Took::Taken) => "taken".to_owned(),
+            Ok(agentfs_engine::tree_actor::Took::Waiting) => "waiting".to_owned(),
+            Ok(agentfs_engine::tree_actor::Took::Empty) => "empty".to_owned(),
             Err(e) => format!("error {e}"),
         };
         gate.answer(&answer)?;
@@ -784,7 +784,7 @@ fn sync_flags(flags: i32) -> bool {
 
 /// An FSYNC, FSYNCDIR or `O_SYNC` write answered once its records are durable, from
 /// whichever thread the durability wait ends on.
-fn answer_empty(reply: ReplyEmpty) -> agentfs_core::tree_actor::Then {
+fn answer_empty(reply: ReplyEmpty) -> agentfs_engine::tree_actor::Then {
     Box::new(move |result| match result {
         Ok(()) => reply.ok(),
         Err(e) => reply.error(errno(e)),
@@ -2397,7 +2397,7 @@ mod tests {
     use agentfs_contracts::pod::{PodContext, WriterAt};
     use agentfs_contracts::ports::{SessionAuthority, SessionBinder};
     use agentfs_contracts::volume::{VolumeId, VolumeIdentity};
-    use agentfs_core::tree_actor::SaveToDecide;
+    use agentfs_engine::tree_actor::SaveToDecide;
 
     fn new_actor(dir: &Path) -> Arc<Recording> {
         new_named(dir, "test")

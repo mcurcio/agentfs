@@ -712,7 +712,7 @@ impl Otel {
     }
 
     /// The meter the tree engine's instruments register on
-    /// (`agentfs_core::tree_telemetry`): the API's no-op meter, which
+    /// (`agentfs_engine::telemetry`): the API's no-op meter, which
     /// drops them, when metrics are not exported.
     pub fn meter(&self) -> &Meter {
         &self.meter

@@ -1,4 +1,4 @@
-//! The whole-file replace (`TreeActor::replace_file`; docs/library/core.md):
+//! The whole-file replace (`TreeActor::replace_file`; docs/library/engine.md):
 //! the atomic save a program makes by renaming a finished file over a
 //! tracked one, as one step that keeps the file's identity and its unchanged
 //! lines' identities, built as a close's save is.
@@ -12,8 +12,8 @@ use std::io::Read;
 use std::path::Path;
 
 use agentfs_contracts::clients::FileOwner;
-use agentfs_core::tree_actor::{Attrs, Error, Kind, Perm, Saved, SetTime, TreeActor, TreeId};
-use agentfs_core::tree_git::TreeGit;
+use agentfs_engine::tree_actor::{Attrs, Error, Kind, Perm, Saved, SetTime, TreeActor, TreeId};
+use agentfs_engine::tree_git::TreeGit;
 use trees::{ATTRS, fanned, new_actor, reopen, rowless_fork, writer};
 
 use crate::trees;

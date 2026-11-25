@@ -25,7 +25,6 @@ use std::sync::Arc;
 
 use agentfs_contracts::host::{Envelope, Reply, Request};
 use agentfs_contracts::ports::{Found, StateArea as _};
-use agentfs_core::state_area::TreeStateArea;
 use agentfs_csi::controller::ControllerService;
 use agentfs_csi::csi::v1::controller_client::ControllerClient;
 use agentfs_csi::csi::v1::node_client::NodeClient;
@@ -39,6 +38,7 @@ use agentfs_csi::mounter::KernelMounter;
 use agentfs_csi::node::NodeService;
 use agentfs_csi::server;
 use agentfs_csi::supervisor::{NodeConfig, Supervisor};
+use agentfs_engine::state_area::TreeStateArea;
 use agentfs_fuse::stale::{MountState, mount_state};
 use hyper_util::rt::TokioIo;
 use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};

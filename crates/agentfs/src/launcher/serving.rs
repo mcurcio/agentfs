@@ -16,7 +16,7 @@ use agentfs_contracts::clients::{Binding, ClientId, ClientSet};
 use agentfs_contracts::pod::PodContext;
 use agentfs_contracts::views::{MountOptions, MountPoint, ViewError, ViewId, Views};
 use agentfs_contracts::volume::{Volume, VolumeError};
-use agentfs_core::state_area::TreeStateArea;
+use agentfs_engine::state_area::TreeStateArea;
 use agentfs_fuse::stale::{MountState, mount_state};
 use agentfs_fuse::tree_view::{HostEvent, ViewHost};
 use agentfs_volume::VolumeService;

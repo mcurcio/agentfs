@@ -6,7 +6,7 @@ use agentfs_contracts::clients::FileOwner;
 use agentfs_contracts::name::{VolumeName, WriterLabel};
 use agentfs_contracts::pod::{PodContext, WriterAt};
 use agentfs_contracts::volume::{VolumeId, VolumeIdentity};
-use agentfs_core::tree_actor::{
+use agentfs_engine::tree_actor::{
     self, Attrs, Error, Kind as EngineKind, Perm, RenameMode, TreeActor, TreeId as EngineTree,
     Upkeep,
 };

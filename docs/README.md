@@ -34,7 +34,8 @@ are under [Future designs](#future-designs).
 
 | Page | For |
 |---|---|
-| [The library: `agentfs-core`](library/core.md) | The engine: recording, history, pushing, restore, patches, forks and the history service, for building another front end or tooling |
+| [The library: `agentfs-core`](library/core.md) | The recording engine: recording, history, pushing, restore, patches, forks and the history service, for building another front end or tooling |
+| [The library: `agentfs-engine`](library/engine.md) | The tree engine: git-backed tree views, their sessions, the domains' rows and the state area, for building another front end over tree views or tooling |
 | [The filesystem: `agentfs-fuse` and `agentfs`](library/filesystem.md) | The FUSE operations, the binary's commands, exit codes and control socket |
 | [The Kubernetes adapter: `agentfs-csi`](library/kubernetes.md) | The CSI driver as the adapter layer, and how to build on it |
 

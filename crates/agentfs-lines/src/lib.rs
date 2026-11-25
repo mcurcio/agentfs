@@ -3,7 +3,7 @@
 //! line's bytes, aligned across saves by git's histogram diff
 //! (`agentfs-align`). It reads the images it is given, which may be files,
 //! and starts no process itself: a diff's `git` child is started by the
-//! spawner its caller passes. docs/library/core.md explains its use.
+//! spawner its caller passes. docs/library/engine.md explains its use.
 //!
 //! A file's bytes have one home: its blob, its checkout or the journal frames
 //! that hold them. A [`LineMap`] says how those bytes divide into lines and names

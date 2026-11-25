@@ -17,8 +17,8 @@ on:
       - ci/lib.sh
       - .github/workflows/alerts.yml
       - crates/agentfs-core/src/telemetry.rs
-      - crates/agentfs-core/src/tree_telemetry.rs
-      - crates/agentfs-core/src/operator_settings.rs
+      - crates/agentfs-engine/src/telemetry.rs
+      - crates/agentfs-engine/src/operator_settings.rs
       - crates/agentfs/src/otel.rs
       - crates/agentfs/src/launcher/**
       - Cargo.lock

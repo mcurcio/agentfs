@@ -85,7 +85,7 @@ pub use untracked::{AreaWrite, UntrackedArea};
 
 const FORMAT: &str = "agentfs-trees-15\n";
 
-/// How one open volume keeps its journal (docs/library/core.md, "Git-backed
+/// How one open volume keeps its journal (docs/library/engine.md, "Git-backed
 /// tree views"). Fixed for the life of the open; nothing of it is stored in
 /// the state area.
 #[derive(Clone)]
@@ -215,7 +215,7 @@ pub enum Error {
     /// A sync met a case the landing rules do not decide: an upstream entry
     /// the fork never had, at `path`, under a directory the fork's undecided
     /// change removed or moved. The sync stays queued until the upstream
-    /// decides that change (docs/library/core.md, "Landing directories,
+    /// decides that change (docs/library/engine.md, "Landing directories,
     /// metadata and links").
     #[error("sync of {path} waits: the fork's undecided change removed its directory")]
     Unruled { path: String },

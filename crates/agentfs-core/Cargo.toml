@@ -18,10 +18,6 @@ agentfs-contracts = { version = "0.1.0", path = "../agentfs-contracts" }
 agentfs-failpoints = { version = "0.1.0", path = "../agentfs-failpoints" }
 agentfs-git = { version = "0.1.0", path = "../agentfs-git" }
 agentfs-os = { version = "0.1.0", path = "../agentfs-os" }
-# The git program's isolated environment (tree_git's `git` children).
-agentfs-align = { version = "0.1.0", path = "../agentfs-align" }
-# Line maps: which version wrote each line of a tree's files (tree_actor).
-agentfs-lines = { version = "0.1.0", path = "../agentfs-lines" }
 # The Rules domain: where each new name of a tree lives (tree_actor's untracked areas).
 agentfs-rules = { version = "0.1.0", path = "../agentfs-rules" }
 # known_hosts key blobs and hashed host names, and OpenSSH private key
@@ -35,10 +31,6 @@ gix-ignore = "0.24.0"
 # Only for its `parallel` feature, which backs gix-attributes' names with
 # `Arc` instead of `Rc`, so the rules engine is `Send + Sync`.
 gix-parallel = { version = "0.50.0", features = ["parallel"] }
-# Persistent (structurally shared) ordered maps: a tree view's state crosses
-# from the builder to History and the actor as a snapshot whose clone is
-# O(1), and a large file map's pieces (docs/trees.md, "File maps").
-imbl = "7"
 # The API only: the binary picks the SDK and exporters.
 opentelemetry = { version = "0.33.1", default-features = false, features = ["trace", "metrics", "logs"] }
 # SO_PEERCRED on local sockets:
@@ -56,8 +48,6 @@ sha2 = "0.11"
 # TLS unless the `https` feature adds native-tls (OpenSSL, as libgit2 uses).
 ureq = { version = "3.4", default-features = false }
 thiserror = "2.0.21"
-# A new volume's id (RFC 9562 version 4), made in state_area.rs only.
-uuid = { version = "1", default-features = false, features = ["std", "v4"] }
 # The SSH transport (`ssh` feature): russh with ring, the
 # runtime that drives one connection.
 russh = { version = "0.64", default-features = false, features = ["ring", "rsa"], optional = true }
@@ -84,12 +74,6 @@ tonic-prost-build = { version = "0.14.6", default-features = false }
 agentfs-os = { version = "0.1.0", path = "../agentfs-os", features = ["test-util"] }
 # The markdown reader of the documentation tests (tests/config_reference.rs).
 agentfs-repo = { version = "0.0.0", path = "../agentfs-repo" }
-# The Volume domain over the real state area (tests/it/state_area.rs).
-agentfs-volume = { version = "0.1.0", path = "../agentfs-volume" }
-# The Trees domain over the store adapter (tests/it/tree_store.rs).
-agentfs-trees = { version = "0.1.0", path = "../agentfs-trees" }
-# The Clients domain over the store adapter and sessions (tests/it/tree_clients.rs).
-agentfs-clients = { version = "0.1.0", path = "../agentfs-clients" }
 # The in-memory metric reader of the telemetry tests.
 agentfs-test-metrics = { version = "0.0.0", path = "../agentfs-test-metrics" }
 # In-memory span and log exporters for the telemetry tests.

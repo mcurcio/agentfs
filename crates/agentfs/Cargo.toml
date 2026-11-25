@@ -14,6 +14,7 @@ rank = "filesystem"
 agentfs-clients = { version = "0.1.0", path = "../agentfs-clients" }
 agentfs-contracts = { version = "0.1.0", path = "../agentfs-contracts" }
 agentfs-core = { version = "0.1.0", path = "../agentfs-core" }
+agentfs-engine = { version = "0.1.0", path = "../agentfs-engine" }
 agentfs-failpoints = { version = "0.1.0", path = "../agentfs-failpoints" }
 agentfs-fuse = { version = "0.1.0", path = "../agentfs-fuse" }
 # The `git` program's environment (serve_git.rs).
@@ -92,4 +93,4 @@ otlp-tls = ["dep:reqwest", "dep:rustls", "dep:rustls-native-certs", "dep:rustls-
 # Test builds only: failpoints on the durable path,
 # set by AGENTFS_FAILPOINTS. `--version` says `+failpoints`. Never in a
 # release or image.
-failpoints = ["agentfs-core/failpoints", "agentfs-failpoints/failpoints", "agentfs-fuse/failpoints"]
+failpoints = ["agentfs-core/failpoints", "agentfs-engine/failpoints", "agentfs-failpoints/failpoints", "agentfs-fuse/failpoints"]

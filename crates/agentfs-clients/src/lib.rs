@@ -1,4 +1,4 @@
-//! The Clients domain (docs/trees.md, "Clients"; docs/library/core.md): who is
+//! The Clients domain (docs/trees.md, "Clients"; docs/library/engine.md): who is
 //! attached to which tree, with what grant, and each fork's one writer. Pure,
 //! over the ports in `agentfs_contracts::ports`.
 

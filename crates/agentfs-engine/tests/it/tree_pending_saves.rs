@@ -20,8 +20,8 @@ use agentfs_contracts::clients::{ClientId, Ordinal, SessionId};
 use agentfs_contracts::name::{ClientLabel, LauncherId};
 use agentfs_contracts::pod::{PodContext, WriterAt};
 use agentfs_contracts::ports::{SessionAuthority, SessionBinder};
-use agentfs_core::session::{Sessions, TreeSession};
-use agentfs_core::tree_actor::{
+use agentfs_engine::session::{Sessions, TreeSession};
+use agentfs_engine::tree_actor::{
     Closing, PathStep, Recording, RenameMode, SaveToDecide, Saved, Took, TreeId,
 };
 use trees::{ATTRS, fanned, identity, rowless_fork, writer};
@@ -121,7 +121,7 @@ fn root_subjects(dir: &Path) -> Vec<String> {
 }
 
 /// A callback for `when_saved_then` that says when it ran.
-fn noted() -> (agentfs_core::tree_actor::Then, mpsc::Receiver<bool>) {
+fn noted() -> (agentfs_engine::tree_actor::Then, mpsc::Receiver<bool>) {
     let (ran, heard) = mpsc::channel();
     (
         Box::new(move |result| ran.send(result.is_ok()).unwrap()),

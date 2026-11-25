@@ -39,7 +39,7 @@ pub const ENV_VAR: &str = "AGENTFS_FAILPOINTS";
 /// A test (`every_hit_is_listed`, in crates/agentfs-repo) keeps this list
 /// equal to the `hit` calls in the workspace's sources.
 pub const POINTS: &[&str] = &[
-    // The tree engine (agentfs_core::tree_actor, tree_git), and the tree
+    // The tree engine (agentfs_engine::tree_actor, tree_git), and the tree
     // view's FUSE layer.
     //
     // Tree actor recording and publication (target git-model §3, §12).

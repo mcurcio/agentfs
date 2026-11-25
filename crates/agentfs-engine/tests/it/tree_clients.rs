@@ -25,9 +25,9 @@ use agentfs_contracts::name::{ClientLabel, Label, LauncherId};
 use agentfs_contracts::pod::PodContext;
 use agentfs_contracts::ports::{Event, EventSink};
 use agentfs_contracts::trees::{ForkSettings, Landing, Trees};
-use agentfs_core::session::{Sessions, TreeSession};
-use agentfs_core::store::TreeStore;
-use agentfs_core::tree_actor::{Error, Recording, RenameMode, Saved, TreeId};
+use agentfs_engine::session::{Sessions, TreeSession};
+use agentfs_engine::store::TreeStore;
+use agentfs_engine::tree_actor::{Error, Recording, RenameMode, Saved, TreeId};
 use agentfs_trees::TreesService;
 use trees::{ATTRS, identity};
 

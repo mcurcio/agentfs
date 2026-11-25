@@ -2,7 +2,7 @@
 
 **Proposed, partly built.** Attach, rebind, detach, reconcile, sessions, each fork's one writer for life and no
 attach while the volume drains are built and described in [docs/trees.md](../../trees.md#clients) and the
-[library](../../library/core.md#domain-invariants), as are a launcher's bound to the forks it created and the
+[library](../../library/engine.md#domain-invariants), as are a launcher's bound to the forks it created and the
 invariants C1 to C6. This page proposes the rest: grants with view profiles and `Sees`, a launcher's profile bound,
 snapshot clients and `advance`, operator actors, and a session close that ends its client. It is one part of the system around the git model ([the system](../system.md)); the git model
 ([git-model.md](../git-model.md)) wins wherever the two disagree. Rust sketches show surfaces only. The commit that

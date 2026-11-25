@@ -2,7 +2,7 @@
 //! takes the volume's lock and opens only its `history.git`, so a release of
 //! another state format can run it, then checks every save history flagged
 //! unverified, whose flag still stands, with this binary
-//! ([`agentfs_core::tree_actor::verify_flagged`]). One line per flag:
+//! ([`agentfs_engine::tree_actor::verify_flagged`]). One line per flag:
 //!
 //! ```text
 //! <step> <tree> <commit> verified|mismatch-confirmed|same-release|no-evidence <path as a JSON string>
@@ -19,7 +19,7 @@
 use std::path::Path;
 use std::process::ExitCode;
 
-use agentfs_core::tree_actor::{self, Outcome};
+use agentfs_engine::tree_actor::{self, Outcome};
 use anyhow::{Context, Result};
 
 use super::busy;

@@ -9,7 +9,7 @@ use agentfs_contracts::clients::FileOwner;
 use agentfs_contracts::name::{VolumeName, WriterLabel};
 use agentfs_contracts::pod::{PodContext, WriterAt};
 use agentfs_contracts::volume::{VolumeId, VolumeIdentity};
-use agentfs_core::tree_actor::{
+use agentfs_engine::tree_actor::{
     Attrs, ChannelGate, Checkpointed, CompactGate, Gap, Perm, RecordNo, TreeActor, TreeId, Upkeep,
 };
 
@@ -163,7 +163,7 @@ impl CompactGate for FailAt {
 }
 
 /// A fork of the root with no row: the engine's own tests, below the store
-/// adapter that writes each fork's row (`agentfs_core::store`).
+/// adapter that writes each fork's row (`agentfs_engine::store`).
 #[allow(
     clippy::disallowed_methods,
     reason = "a tree actor test forks below the store"
@@ -184,7 +184,7 @@ pub fn reopen(dir: &Path) -> TreeActor {
 /// lease can outlive the process a test waited for. Taking the lease, blocking,
 /// is the event that every holder is gone; it is released at once.
 pub fn wait_for_lease(dir: &Path) {
-    agentfs_core::tree_actor::wait_for_lease(dir).expect("takes the lease");
+    agentfs_engine::tree_actor::wait_for_lease(dir).expect("takes the lease");
 }
 
 /// [`reopen`] after the process that served the volume was killed.

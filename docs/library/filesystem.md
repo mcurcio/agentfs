@@ -631,7 +631,7 @@ See [telemetry](../telemetry.md).
 ## Tree views
 
 `init`, `mount`, `host` and `fork end` run the tree views over a git-backed tree
-library (`agentfs_core::tree_actor`), with their own state format, mounting
+library (`agentfs_engine::tree_actor`), with their own state format, mounting
 directories and regular files with their recorded modes ([trees](../trees.md)).
 
 ```sh
@@ -783,7 +783,7 @@ another process holds the volume.
 ### The view host
 
 `tree_view::ViewHost` serves one volume's views through its sessions
-(`agentfs_core::session::Sessions`) and implements the `Views` port:
+(`agentfs_engine::session::Sessions`) and implements the `Views` port:
 
 ```rust
 use std::sync::Arc;

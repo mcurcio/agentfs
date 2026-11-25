@@ -22,9 +22,9 @@ use agentfs_contracts::volume::{
     Blocker, Disposition, Drain, EnsureOutcome, ReleaseVerdict, SpecField, StartPoint, Volume,
     VolumeError, VolumeEvent, VolumeSpec, VolumeState,
 };
-use agentfs_core::state_area::TreeStateArea;
-use agentfs_core::store::TreeStore;
-use agentfs_core::tree_actor::{Error, Recording, TreeActor};
+use agentfs_engine::state_area::TreeStateArea;
+use agentfs_engine::store::TreeStore;
+use agentfs_engine::tree_actor::{Error, Recording, TreeActor};
 use agentfs_volume::VolumeService;
 use std::sync::Arc;
 
@@ -389,7 +389,7 @@ fn the_lifecycle_is_a_chain_of_events() {
 fn a_drain_goes_on_while_the_builder_fails() {
     use agentfs_contracts::ports::ForkStore;
     use agentfs_contracts::trees::{ForkSettings, Landing};
-    use agentfs_core::tree_actor::{Progress, TreeId};
+    use agentfs_engine::tree_actor::{Progress, TreeId};
 
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().join("state");

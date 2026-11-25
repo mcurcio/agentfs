@@ -10,7 +10,7 @@ use std::path::Path;
 use std::process::Command;
 
 use agentfs_contracts::clients::FileOwner;
-use agentfs_core::tree_actor::{
+use agentfs_engine::tree_actor::{
     Attrs, Error, Kind, Node, Perm, RenameMode, SetTime, Took, TreeActor, TreeId,
 };
 use trees::{ATTRS, checkout, fanned, new_actor, reopen, rowless_fork, writer};

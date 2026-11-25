@@ -784,7 +784,7 @@ fn recording_command(command: &Command) -> Option<&'static str> {
 /// marker cannot be read is refused too (exit 1, naming the error): the
 /// guard fails closed. `None` when no tree volume is there.
 fn refuse_tree_volume(state: &Path, command: &'static str) -> Option<ExitCode> {
-    match agentfs_core::tree_actor::holds_tree_format(state) {
+    match agentfs_engine::tree_actor::holds_tree_format(state) {
         Ok(false) => None,
         Ok(true) => {
             eprintln!(

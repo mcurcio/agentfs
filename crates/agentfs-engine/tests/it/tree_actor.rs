@@ -9,13 +9,13 @@ use std::os::unix::fs::FileExt;
 
 use agentfs_contracts::name::WriterLabel;
 use agentfs_contracts::pod::PodContext;
-use agentfs_core::tree_actor::{
+use agentfs_engine::tree_actor::{
     Error, Gap, RecordNo, RenameMode, Saved, Took, TreeActor, TreeId, Upkeep,
 };
 use trees::{ATTRS, checkout, fanned, new_actor, reopen, reopen_after_kill, rowless_fork, writer};
 
 const ROOT: TreeId = TreeId::Root;
-use agentfs_core::tree_git::TreeGit;
+use agentfs_engine::tree_git::TreeGit;
 
 use crate::trees;
 
@@ -1968,7 +1968,7 @@ fn a_failed_compaction_fsync_stops_the_actor() {
     v.mkdir(ROOT, "d", ATTRS, &writer("w")).unwrap();
     assert!(matches!(
         v.history().wait_checkpointed(generation),
-        Err(agentfs_core::tree_actor::WaitError::Stopped)
+        Err(agentfs_engine::tree_actor::WaitError::Stopped)
     ));
     assert!(
         v.write_open(ROOT, "a", &writer("w"), Some(ATTRS)).is_err(),
@@ -2538,4 +2538,60 @@ fn descriptors_worker() {
         );
     }
     println!("READ ALL");
+}
+
+/// A tree view's write is appended to the journal, with no fsync, before it
+/// returns: in the kernel, it outlives a kill of agentfs. The child is killed
+/// as the write's frame is written (its second append, after the create);
+/// the next open, on the same kernel, saves it as the write's close would.
+#[cfg(feature = "failpoints")]
+#[test]
+fn a_kill_after_a_write_returned_keeps_it() {
+    use std::os::unix::process::ExitStatusExt;
+    use std::path::Path;
+    use std::process::{Command, Stdio};
+
+    use agentfs_engine::tree_actor::Recording;
+
+    if let Some(dir) = std::env::var_os("TREE_CRASH_CHILD") {
+        let rec = Recording::create(
+            Path::new(&dir),
+            &trees::identity(),
+            None,
+            &PodContext::default(),
+        )
+        .unwrap();
+        let mut v = rec.actor().unwrap();
+        let h = v
+            .write_open(TreeId::Root, "a", &trees::writer("w"), Some(trees::ATTRS))
+            .unwrap();
+        v.write(h, 0, b"kept", false).unwrap();
+        unreachable!("the failpoint kills the child at the write");
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("state");
+    let output = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            test_name!("a_kill_after_a_write_returned_keeps_it").as_str(),
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env("TREE_CRASH_CHILD", &dir)
+        .env(agentfs_failpoints::ENV_VAR, "tree.wal_after_payload=kill@2")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.signal(),
+        Some(rustix::process::Signal::KILL.as_raw()),
+        "the child was not killed: {stderr}"
+    );
+    assert!(stderr.contains("agentfs failpoint tree.wal_after_payload triggered (kill)"));
+    let v = trees::reopen_after_kill(&dir);
+    assert_eq!(v.read(TreeId::Root, "a").unwrap(), b"kept");
 }

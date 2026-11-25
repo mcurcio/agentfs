@@ -11,7 +11,7 @@ use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use agentfs_contracts::clients::FileOwner;
-use agentfs_core::tree_actor::{Attrs, Perm, TreeActor, TreeId};
+use agentfs_engine::tree_actor::{Attrs, Perm, TreeActor, TreeId};
 use trees::{ATTRS, new_actor, reopen, rowless_fork, writer};
 
 use crate::trees;

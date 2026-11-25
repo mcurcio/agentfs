@@ -36,7 +36,7 @@ These are the owner's priorities. When a choice is unclear, decide by them. Each
 7. **History is the product.** Never rewrite history or force-push automatically. A divergence is saved and an alarm is raised, never overwritten ([remotes](docs/remotes.md#divergence)). History rewrites are manual operator procedures ([runbook](docs/runbooks/history-rewrite.md)).
 8. **Recovery is manual but supported.** Recovery uses `restore`, `revert` and the [runbooks](docs/runbooks/recovery-and-undo.md). Further undo tooling is added as real use shows the need ([future design](docs/target-architecture/future/recovery-tooling.md)).
 9. **Merging is an extra.** The core records history. The patch queue applies producers' changes only at mount, with nothing attached: in order, holding a patch that cannot land whole and going on, and stopping only at a gap, unrecorded changes or a failure, with the rest left queued ([patches](docs/patches.md)). The owner, 2026-10-29: "No live landing yet" ([OWNER-GUIDANCE.md](OWNER-GUIDANCE.md)).
-10. **Three layers, each an integration point.** The owner, 2026-10-29: "There is “the library” of agentfs, and “the filesystem” agentfs, and the kubernetes adapter layer — and each of these provides a unique integration point for consumers to tap into". The library is `agentfs-core`, the filesystem is `agentfs-fuse` and the `agentfs` binary, and the adapter is `agentfs-csi`. Put each primitive in the lowest layer that can own it, and give it a good API and docs there ([library pages](docs/library/core.md)). All are Rust. OpenTelemetry is used for everything observable ([telemetry](docs/telemetry.md)).
+10. **Three layers, each an integration point.** The owner, 2026-10-29: "There is “the library” of agentfs, and “the filesystem” agentfs, and the kubernetes adapter layer — and each of these provides a unique integration point for consumers to tap into". The library is the two engines, `agentfs-core` (recording) and `agentfs-engine` (tree views), the filesystem is `agentfs-fuse` and the `agentfs` binary, and the adapter is `agentfs-csi`. Put each primitive in the lowest layer that can own it, and give it a good API and docs there ([library pages](docs/library/core.md)). All are Rust. OpenTelemetry is used for everything observable ([telemetry](docs/telemetry.md)).
 
 ## Working with the owner
 
@@ -53,7 +53,7 @@ Every fact has one home, and other files link to it rather than copying it.
 |---|---|
 | `README.md` | What users need: pitch, install, quick start |
 | `docs/guarantees.md`, `docs/recording.md`, `docs/remotes.md`, `docs/patches.md`, `docs/forks.md`, `docs/trees.md` | What agentfs does and promises, in the present tense |
-| `docs/library/` | The three layers as integration points: `agentfs-core`, `agentfs-fuse` and `agentfs`, `agentfs-csi` |
+| `docs/library/` | The three layers as integration points: `agentfs-core` and `agentfs-engine`, `agentfs-fuse` and `agentfs`, `agentfs-csi` |
 | `docs/architecture.md`, `docs/configuration.md` | Code map and reference. Tests check them against the code |
 | `docs/runbooks/` | Operator procedures for each failure mode |
 | `docs/target-architecture/` | Designs for slices that are not built, and the baseline: the git model, the rules ledger, the model and the walkthrough |
@@ -87,7 +87,8 @@ When you learn something durable, write it to its home in the same commit. Never
 | `crates/agentfs-contracts` | The shared kernel of the domains around the git model: values (repository paths, durations and sizes among them), capabilities, each domain's trait and events, and the ports adapters implement. No I/O |
 | `crates/agentfs-volume`, `crates/agentfs-clients`, `crates/agentfs-trees` | The Volume, Clients and Trees domains, each pure over the ports in `agentfs-contracts` |
 | `crates/agentfs-failpoints`, `crates/agentfs-os`, `crates/agentfs-git`, `crates/agentfs-lines` | Below both engines (ranks in [architecture](docs/architecture.md#ranks)): the failpoints registry; file locks, atomic files, confinement, mounts, the shared-filesystem check, listening sockets and the allocator; the `git` program and the one libgit2 setup; and the line maps |
-| `crates/agentfs-core` | Engine: journal, pending, history, push, credentials, lfs, patch, history_service, telemetry |
+| `crates/agentfs-core` | The recording engine: journal, pending, history, push, credentials, lfs, patch, history_service, telemetry |
+| `crates/agentfs-engine` | The tree engine, the recording engine's sibling: the tree views' actor (`tree_actor`), its git store, sessions, the domains' store adapters, the state area, operator settings, its telemetry |
 | `crates/agentfs-fuse` | FUSE operations, kernel-independent `Ops` plus a thin fuser adapter |
 | `crates/agentfs` | CLI binary: `init`, `mount`, `fork end` and `probe` on tree volumes; `front` and `serve-history`, which the CSI driver starts; the recording engine's one-shot commands (`record`, `push`, `restore`, `revert`, `patch`, ...) on its state areas |
 | `crates/agentfs-csi` | CSI driver |
@@ -128,7 +129,7 @@ Tests run with [cargo-nextest](https://nexte.st), each in its own process, all p
 curl -LsSf https://get.nexte.st/0.9.152/linux | tar zxf - -C ~/.cargo/bin
 ```
 
-A doc change also runs `cargo nextest run -p agentfs-repo`; a change to docs/configuration.md also `cargo nextest run -p agentfs-core --test config_reference`, `cargo nextest run -p agentfs --bin agentfs reference_tests plan_reads_only_env_vars` and `cargo nextest run -p agentfs-csi --bin agentfs-csi reference_tests`; to docs/runbooks/fork-refused.md or patch-queue.md also `cargo nextest run -p agentfs --bin agentfs fork_cmd::`; to the rules ledger or git-model.md also `cargo nextest run -p agentfs-model --test ledger`. Run one module of a merged test program with `cargo nextest run -p agentfs-core --test it tree_actor::` ([development](docs/development.md#test-programs)); `-E 'test(/^tree_actor::/)'` is nextest's exact form. `--all-features` needs OpenSSL and libssh2. CI builds it; a minimal container may not be able to.
+A doc change also runs `cargo nextest run -p agentfs-repo`; a change to docs/configuration.md also `cargo nextest run -p agentfs-core --test config_reference`, `cargo nextest run -p agentfs --bin agentfs reference_tests plan_reads_only_env_vars` and `cargo nextest run -p agentfs-csi --bin agentfs-csi reference_tests`; to docs/runbooks/fork-refused.md or patch-queue.md also `cargo nextest run -p agentfs --bin agentfs fork_cmd::`; to the rules ledger or git-model.md also `cargo nextest run -p agentfs-model --test ledger`. Run one module of a merged test program with `cargo nextest run -p agentfs-engine --test it tree_actor::` ([development](docs/development.md#test-programs)); `-E 'test(/^tree_actor::/)'` is nextest's exact form. `--all-features` needs OpenSSL and libssh2. CI builds it; a minimal container may not be able to.
 
 ## What only CI can test
 

@@ -20,7 +20,7 @@
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use agentfs_core::tree_actor::{TreeActor, TreeId};
+use agentfs_engine::tree_actor::{TreeActor, TreeId};
 use trees::{ATTRS, Volumes, new_actor, writer};
 
 #[path = "support/trees.rs"]

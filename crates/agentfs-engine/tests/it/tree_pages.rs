@@ -5,7 +5,7 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use agentfs_core::tree_actor::{TreeActor, TreeId};
+use agentfs_engine::tree_actor::{TreeActor, TreeId};
 use trees::{ATTRS, checkout, new_actor, reopen, rowless_fork, writer};
 
 use crate::trees;
@@ -519,11 +519,11 @@ fn a_fill_with_no_write_open_reads_saved_bytes_and_keeps_no_state() {
     assert_eq!(k.v.inode_size(TREE, object), None);
     assert!(matches!(
         k.v.page_fill(TREE, object + 1000, 0, 3),
-        Err(agentfs_core::tree_actor::Error::NotFound)
+        Err(agentfs_engine::tree_actor::Error::NotFound)
     ));
     assert!(matches!(
         k.v.page_writeback(1 << 40, 0, b"x"),
-        Err(agentfs_core::tree_actor::Error::NotFound)
+        Err(agentfs_engine::tree_actor::Error::NotFound)
     ));
 }
 

@@ -12,7 +12,7 @@
 use crate::compact_turns::{Turns, answer_fifos, end_fifos};
 use crate::engine_names::EngineNames;
 use crate::library::{fail, seed};
-use agentfs_core::tree_actor::TreeId as EngineTree;
+use agentfs_engine::tree_actor::TreeId as EngineTree;
 use agentfs_model::calls::{CallError, Caller, Kind, Meta, Took, TreeCalls, TreeId};
 use std::collections::{BTreeMap, VecDeque};
 use std::ffi::CString;
@@ -59,12 +59,12 @@ const FORK_KEY: &str = "conformance";
 /// domain on the store adapter, under [`FORK_KEY`], so the fork's row is on
 /// its chain and the mount finds it.
 fn keyed_fork(
-    recording: &std::sync::Arc<agentfs_core::tree_actor::Recording>,
+    recording: &std::sync::Arc<agentfs_engine::tree_actor::Recording>,
 ) -> Result<EngineTree, CallError> {
     use agentfs_contracts::caps::{LaunchCap, LaunchScope, Minter};
     use agentfs_contracts::name::{ForkKey, LauncherId};
     use agentfs_contracts::trees::{ForkSettings, Landing, Trees};
-    let store = agentfs_core::store::TreeStore::new(std::sync::Arc::clone(recording));
+    let store = agentfs_engine::store::TreeStore::new(std::sync::Arc::clone(recording));
     let mut trees = agentfs_trees::TreesService::restore(store, NoConsumers)
         .map_err(|e| CallError::new(e.to_string()))?;
     #[allow(
@@ -141,7 +141,7 @@ impl Mounted {
         // SAFETY: a plain call; the harness creates every file with a mode it names.
         unsafe { libc::umask(0) };
         {
-            let recording = agentfs_core::tree_actor::Recording::create(
+            let recording = agentfs_engine::tree_actor::Recording::create(
                 &state,
                 &crate::library::identity(),
                 None,
@@ -246,7 +246,7 @@ impl Mounted {
             .arg(&self.root)
             .env("AGENTFS_TAKE_GATE", &self.gate)
             .env(
-                agentfs_core::tree_actor::COMPACT_GATE_VAR,
+                agentfs_engine::tree_actor::COMPACT_GATE_VAR,
                 &self.compact_gate,
             )
             .stdin(Stdio::null())
@@ -597,7 +597,7 @@ impl TreeCalls for Mounted {
             // Its tree Git children share its lease and die of their
             // parent-death signal after it: taking the lease, blocking, is
             // the event that every holder is gone.
-            agentfs_core::tree_actor::wait_for_lease(&self.state)
+            agentfs_engine::tree_actor::wait_for_lease(&self.state)
                 .map_err(|e| io_fail("lease", &e))?;
         }
         for (fd, _) in std::mem::take(&mut self.opens) {

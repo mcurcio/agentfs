@@ -10,7 +10,7 @@ use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
 use std::path::Path;
 
 use agentfs_contracts::clients::FileOwner;
-use agentfs_core::tree_actor::{Error, Kind, Meta, Perm, RenameMode, TreeActor, TreeId};
+use agentfs_engine::tree_actor::{Error, Kind, Meta, Perm, RenameMode, TreeActor, TreeId};
 use trees::{ATTRS, new_actor, reopen, rowless_fork, writer};
 
 use crate::trees;
@@ -143,7 +143,7 @@ fn a_rule_not_built_refuses_the_open_before_anything_is_written() {
         "operator rules: info/attributes line 2: agentfs.group=x is not built for tree volumes"
     );
     assert_eq!(snapshot(tmp.path()), before, "the state area is unchanged");
-    let Err(error) = agentfs_core::tree_actor::Recording::open(tmp.path(), &Default::default())
+    let Err(error) = agentfs_engine::tree_actor::Recording::open(tmp.path(), &Default::default())
     else {
         panic!("opened");
     };

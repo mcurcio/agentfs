@@ -1,5 +1,6 @@
-//! The agentfs engine: records change boundaries durably, then turns them
-//! into git history. See `docs/architecture.md` and
+//! The recording engine of agentfs: records change boundaries durably, then
+//! turns them into git history. The tree engine is its sibling,
+//! `agentfs-engine`. See `docs/architecture.md` and
 //! `docs/library/core.md`.
 //!
 //! The FUSE layer calls [`volume::Recorder::record`] at each change boundary
@@ -31,7 +32,6 @@ pub mod lock;
 pub mod nested;
 pub mod non_empty;
 pub mod operations;
-pub mod operator_settings;
 pub mod patch;
 pub mod pending;
 pub mod probe;
@@ -47,17 +47,11 @@ pub mod repack;
 pub mod restore;
 pub mod rules;
 pub mod service;
-pub mod session;
 #[cfg(feature = "ssh")]
 pub(crate) mod ssh_transport;
 pub mod stamps;
-pub mod state_area;
-pub mod store;
 pub mod telemetry;
 pub mod tracked;
-pub mod tree_actor;
-pub mod tree_git;
-pub mod tree_telemetry;
 pub mod visibility;
 pub mod volume;
 pub(crate) mod watched;

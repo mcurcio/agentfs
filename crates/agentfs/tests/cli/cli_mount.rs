@@ -9,8 +9,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 use agentfs_contracts::pod::PodContext;
-use agentfs_core::tree_actor::Recording;
 use agentfs_core::volume::StateDir;
+use agentfs_engine::tree_actor::Recording;
 
 struct Layout {
     dir: tempfile::TempDir,

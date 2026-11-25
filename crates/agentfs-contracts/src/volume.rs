@@ -112,7 +112,7 @@ pub enum Blocker {
     QueuesNotEmpty(Vec<TreeId>),
 }
 
-/// The pure release judgement of facts asked at that moment (docs/library/core.md, VO1 and VO4).
+/// The pure release judgement of facts asked at that moment (docs/library/engine.md, VO1 and VO4).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReleaseVerdict {
     /// At least one blocker.
@@ -139,7 +139,7 @@ pub enum IoKind {
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum VolumeError {
-    /// A fork launcher (docs/library/core.md, VO6).
+    /// A fork launcher (docs/library/engine.md, VO6).
     #[error("only the volume's own launcher may do this")]
     NotPermitted,
     /// `stage` at a location `ensure` never created: mount never creates.

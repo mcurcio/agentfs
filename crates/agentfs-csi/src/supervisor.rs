@@ -74,8 +74,8 @@ use agentfs_contracts::pod::PodContext;
 use agentfs_contracts::ports::{Found, StateArea as _};
 use agentfs_contracts::tree::TreeId;
 use agentfs_contracts::trees::ForkSettings;
-use agentfs_core::operator_settings::{RuleFiles, install_rules};
-use agentfs_core::state_area::TreeStateArea;
+use agentfs_engine::operator_settings::{RuleFiles, install_rules};
+use agentfs_engine::state_area::TreeStateArea;
 use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard, watch};
 
 use crate::error::Error;

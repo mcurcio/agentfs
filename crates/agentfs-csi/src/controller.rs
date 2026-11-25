@@ -31,7 +31,7 @@ use std::sync::Arc;
 use agentfs_contracts::host::TreeRef;
 use agentfs_contracts::name::ForkKey;
 use agentfs_contracts::ports::{Found, StateArea as _};
-use agentfs_core::state_area::TreeStateArea;
+use agentfs_engine::state_area::TreeStateArea;
 use tokio::sync::Mutex;
 use tonic::{Request, Response, Status};
 

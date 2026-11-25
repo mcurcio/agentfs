@@ -6,7 +6,7 @@ own architect and design gate, one layer down. M1 (volumes, clients, forks and t
 M2 (directories, metadata and links), M3 (operator rules and the untracked area), M7 (the `agentfs` binary's
 `init` and `mount`, so the sidecar, the Docker examples and the CLI) and M8 (the CSI driver, through `agentfs host`)
 are built and described in [tree views](../../trees.md), [the CSI driver](../../csi.md) and the
-[library](../../library/core.md#git-backed-tree-views). The commit that lands the last milestone (M9) deletes this page and
+[library](../../library/engine.md#git-backed-tree-views). The commit that lands the last milestone (M9) deletes this page and
 moves the behaviour into the library and operator docs.
 
 ## Today
@@ -121,7 +121,7 @@ manual trigger. Only a milestone that changes save or land logic needs the full 
 **M1. Volumes and their lifecycle.** Built. Volume (`ensure`, `stage`, `unstage`, the Stop drain and the release
 verdict), Clients (attach, rebind, detach, sessions, one writer per fork), Views (the view host) and Trees (create
 with settings and a key, end, drop) are in [tree views](../../trees.md); their invariants are in the
-[library](../../library/core.md#domain-invariants). A volume gets its UUID at create, zero remotes is a valid volume,
+[library](../../library/engine.md#domain-invariants). A volume gets its UUID at create, zero remotes is a valid volume,
 other users reach the tree mount, and every commit carries the "where" trailers. The tracer and the release figures
 run in `image.yml` ([tracer](#tracer), [performance](../../performance.md#tree-views-release-build)), and
 `phase-1.yml` runs on every PR. Left to later milestones: a start point from another volume's line

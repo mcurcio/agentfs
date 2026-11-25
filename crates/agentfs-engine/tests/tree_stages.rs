@@ -7,8 +7,8 @@ use std::path::Path;
 use std::sync::{Mutex, PoisonError};
 
 use agentfs_contracts::pod::PodContext;
-use agentfs_core::tree_actor::stages::Stages;
-use agentfs_core::tree_actor::{Recording, Saved, Took, TreeActor, TreeId};
+use agentfs_engine::tree_actor::stages::Stages;
+use agentfs_engine::tree_actor::{Recording, Saved, Took, TreeActor, TreeId};
 use trees::{ATTRS, Volumes, identity, new_actor, reopen, rowless_fork, writer};
 
 #[path = "support/trees.rs"]
@@ -30,8 +30,8 @@ fn put(v: &mut TreeActor, path: &str, bytes: &[u8]) {
 fn count(stages: &Stages, before: &Stages) -> Vec<(&'static str, u64)> {
     let diff =
         |name,
-         a: agentfs_core::tree_actor::stages::Stage,
-         b: agentfs_core::tree_actor::stages::Stage| { (name, a.count - b.count) };
+         a: agentfs_engine::tree_actor::stages::Stage,
+         b: agentfs_engine::tree_actor::stages::Stage| { (name, a.count - b.count) };
     vec![
         diff(
             "journal_append",
@@ -213,7 +213,7 @@ fn the_call_path_runs_no_git() {
             TreeId::Root,
             "a",
             "b",
-            agentfs_core::tree_actor::RenameMode::Replace,
+            agentfs_engine::tree_actor::RenameMode::Replace,
             &w,
         )
         .unwrap();

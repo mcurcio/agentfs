@@ -1,5 +1,5 @@
 //! Rules 13, 14 and 15 between a fork and the root, on real repositories
-//! (docs/library/core.md, "Directories, metadata and links"): the library's
+//! (docs/library/engine.md, "Directories, metadata and links"): the library's
 //! referee decides each of the model's scenarios (crates/agentfs-model/tests/
 //! scenarios.rs, `r13_*`, `r14_*`, `r15_*`) as the model does. Each test reads
 //! every tree's entries and metadata with the library, and each collision's
@@ -11,7 +11,7 @@ use std::path::Path;
 use std::process::Command;
 
 use agentfs_contracts::clients::FileOwner;
-use agentfs_core::tree_actor::{Attrs, Kind, Meta, Perm, RenameMode, TreeActor, TreeId};
+use agentfs_engine::tree_actor::{Attrs, Kind, Meta, Perm, RenameMode, TreeActor, TreeId};
 use trees::{ATTRS, fanned, new_actor, rowless_fork, writer};
 
 const ROOT: TreeId = TreeId::Root;
@@ -477,7 +477,7 @@ fn a_sync_keeps_the_directory_of_an_undecided_entry() {
     rmdir(&mut v, ROOT, "q");
     assert_eq!(
         v.take_next(fork).unwrap(),
-        agentfs_core::tree_actor::Took::Taken
+        agentfs_engine::tree_actor::Took::Taken
     );
     assert_eq!(entries(&v, fork), ["a", "q/", "q/x"]);
     assert_eq!(entries(&v, ROOT), ["a"]);

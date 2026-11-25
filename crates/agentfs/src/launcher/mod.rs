@@ -44,10 +44,10 @@ use agentfs_contracts::volume::{
     EnsureOutcome, StartPoint, Volume, VolumeError, VolumeIdentity, VolumeSpec,
 };
 use agentfs_core::identity::Context as Identity;
-use agentfs_core::operator_settings;
-use agentfs_core::state_area::TreeStateArea;
-use agentfs_core::tree_actor::{self, Recording, TreeId, Upkeep};
-use agentfs_core::tree_telemetry;
+use agentfs_engine::operator_settings;
+use agentfs_engine::state_area::TreeStateArea;
+use agentfs_engine::telemetry;
+use agentfs_engine::tree_actor::{self, Recording, TreeId, Upkeep};
 use agentfs_volume::VolumeService;
 use anyhow::{Context, Result, bail};
 use opentelemetry::metrics::Meter;
@@ -82,7 +82,7 @@ fn observe_unverified(meter: &Meter, domains: &Domains) -> Result<UnverifiedGaug
         .context("reading the volume's flagged saves")?
         .verification();
     let gauge: UnverifiedGauge = std::sync::Arc::new(move || verification.counts());
-    tree_telemetry::observe_unverified(meter, std::sync::Arc::downgrade(&gauge));
+    telemetry::observe_unverified(meter, std::sync::Arc::downgrade(&gauge));
     Ok(gauge)
 }
 
@@ -410,7 +410,7 @@ pub fn mount(state: &Path, args: MountArgs, minter: Minter) -> Result<ExitCode> 
     mountpoint::outside_the_state_area(state, &views)?;
     let boot = settings::at_boot(state, &views)?;
     let otel = crate::otel::init(name.as_str(), &identity(name.as_str(), &args.pod));
-    tree_telemetry::observe_process(otel.meter(), &boot.not_built);
+    telemetry::observe_process(otel.meter(), &boot.not_built);
     let expect: Vec<mountpoint::Expect> = std::iter::once(mountpoint::Expect::Source(
         agentfs_fuse::tree_view::view_source(name.as_str(), TreeId::Root),
     ))
@@ -482,7 +482,7 @@ fn identity(volume: &str, pod: &PodArgs) -> Identity {
 pub(crate) fn upkeep() -> Upkeep {
     #[cfg(feature = "failpoints")]
     {
-        use agentfs_core::tree_actor::COMPACT_GATE_VAR;
+        use agentfs_engine::tree_actor::COMPACT_GATE_VAR;
         use agentfs_failpoints::FifoGate;
         if let Some(dir) = std::env::var_os(COMPACT_GATE_VAR) {
             match FifoGate::open(Path::new(&dir)) {

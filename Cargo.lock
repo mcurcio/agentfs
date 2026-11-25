@@ -47,6 +47,7 @@ dependencies = [
  "agentfs-contracts",
  "agentfs-core",
  "agentfs-csi",
+ "agentfs-engine",
  "agentfs-failpoints",
  "agentfs-fuse",
  "agentfs-git",
@@ -101,7 +102,7 @@ name = "agentfs-conformance"
 version = "0.0.0"
 dependencies = [
  "agentfs-contracts",
- "agentfs-core",
+ "agentfs-engine",
  "agentfs-model",
  "agentfs-trees",
  "libc",
@@ -124,18 +125,13 @@ dependencies = [
 name = "agentfs-core"
 version = "0.1.0"
 dependencies = [
- "agentfs-align",
- "agentfs-clients",
  "agentfs-contracts",
  "agentfs-failpoints",
  "agentfs-git",
- "agentfs-lines",
  "agentfs-os",
  "agentfs-repo",
  "agentfs-rules",
  "agentfs-test-metrics",
- "agentfs-trees",
- "agentfs-volume",
  "base64 0.23.1",
  "bstr",
  "crc32fast",
@@ -146,7 +142,6 @@ dependencies = [
  "gix-parallel",
  "hyper",
  "hyper-util",
- "imbl",
  "libc",
  "opentelemetry",
  "opentelemetry_sdk",
@@ -169,7 +164,6 @@ dependencies = [
  "tonic-prost-build",
  "tower",
  "ureq",
- "uuid",
 ]
 
 [[package]]
@@ -177,7 +171,7 @@ name = "agentfs-csi"
 version = "0.1.0"
 dependencies = [
  "agentfs-contracts",
- "agentfs-core",
+ "agentfs-engine",
  "agentfs-fuse",
  "agentfs-os",
  "agentfs-repo",
@@ -203,6 +197,31 @@ dependencies = [
 [[package]]
 name = "agentfs-engine"
 version = "0.1.0"
+dependencies = [
+ "agentfs-align",
+ "agentfs-clients",
+ "agentfs-contracts",
+ "agentfs-failpoints",
+ "agentfs-git",
+ "agentfs-lines",
+ "agentfs-os",
+ "agentfs-rules",
+ "agentfs-test-metrics",
+ "agentfs-trees",
+ "agentfs-volume",
+ "crc32fast",
+ "git2",
+ "imbl",
+ "libc",
+ "opentelemetry",
+ "rustix",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror",
+ "uuid",
+]
 
 [[package]]
 name = "agentfs-failpoints"
@@ -220,6 +239,7 @@ version = "0.1.0"
 dependencies = [
  "agentfs-contracts",
  "agentfs-core",
+ "agentfs-engine",
  "agentfs-failpoints",
  "agentfs-os",
  "agentfs-rules",

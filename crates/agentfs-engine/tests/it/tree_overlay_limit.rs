@@ -7,7 +7,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use agentfs_core::tree_actor::{Recording, TreeId};
+use agentfs_engine::tree_actor::{Recording, TreeId};
 use trees::{ATTRS, identity, writer};
 
 use crate::trees;

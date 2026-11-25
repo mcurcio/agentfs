@@ -1,5 +1,5 @@
 //! The domains' rows over the volume's one tree actor (docs/trees.md, "Rows
-//! and event commits"; docs/library/core.md): the store ports of
+//! and event commits"; docs/library/engine.md): the store ports of
 //! `agentfs_contracts::ports`. Each write is one journal step, the volume's
 //! one commit point, durable before it returns (one group-commit fsync, off
 //! the actor's lock); its event commit on the row's chain trails, built with

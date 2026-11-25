@@ -250,7 +250,7 @@ The documentation is published at <https://mcurcio.github.io/agentfs/>;
 | [Configuration](docs/configuration.md) | Every setting, attribute, flag and environment variable |
 | [Runbooks](docs/README.md#runbooks) | One procedure per failure mode |
 | [Guarantees](docs/guarantees.md), [Recording](docs/recording.md), [Remotes](docs/remotes.md) | What agentfs promises, what the recording engine records and when, and how it pushes |
-| [Library](docs/library/core.md) | Building on `agentfs-core`, `agentfs-fuse` and `agentfs-csi` |
+| [Library](docs/library/core.md), [tree engine](docs/library/engine.md) | Building on `agentfs-core`, `agentfs-engine`, `agentfs-fuse` and `agentfs-csi` |
 | [Architecture](docs/architecture.md) | The crates and modules, and how a change flows through them |
 
 ## Status and roadmap

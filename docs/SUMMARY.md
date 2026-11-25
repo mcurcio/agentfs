@@ -18,6 +18,7 @@
 # Library
 
 - [The library: agentfs-core](library/core.md)
+- [The library: agentfs-engine](library/engine.md)
 - [The filesystem: agentfs-fuse and agentfs](library/filesystem.md)
 - [The Kubernetes adapter: agentfs-csi](library/kubernetes.md)
 

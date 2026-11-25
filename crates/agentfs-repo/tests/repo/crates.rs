@@ -1022,7 +1022,7 @@ fn starts_in(source: &str) -> Vec<&'static str> {
 
 /// The tree engine starts each `git` child through
 /// `agentfs_git::git_cli::counted`, the one site that counts it: none of
-/// its production sources ([`tree_engine_files`]), nor the line maps'
+/// its production sources (agentfs-engine's `src`), nor the line maps'
 /// (`agentfs-lines`, which take the spawner from their caller), starts a
 /// process itself, but the history's repack task, whose `git repack` is not
 /// on the actor's path and stays uncounted, so each operation's count of
@@ -1032,8 +1032,9 @@ fn the_tree_engine_starts_git_only_through_counted() {
     let workspace = Workspace::load();
     let root = root();
     let dir = |name: &str| root.join(&workspace.member(name).unwrap().dir);
-    let src = dir("agentfs-core").join("src");
-    let mut files = tree_engine_files(&src);
+    let src = dir("agentfs-engine").join("src");
+    let mut files = Vec::new();
+    files_under(&src, &mut files);
     files_under(&dir("agentfs-lines").join("src"), &mut files);
     let repack = src.join("tree_actor/history/repack.rs");
     let mut problems = Vec::new();
@@ -1081,156 +1082,4 @@ fn a_process_started_outside_counted_is_found() {
         starts_in("#[cfg(test)]\nconst X: u8 = 0;\nfn f() { cmd.output(); }"),
         [".output()"]
     );
-}
-
-/// The tree engine's modules in agentfs-core, the ones its own crate takes
-/// whole: each names only the others through `crate::`.
-const TREE_ENGINE: [&str; 7] = [
-    "tree_actor",
-    "tree_git",
-    "session",
-    "store",
-    "state_area",
-    "operator_settings",
-    "tree_telemetry",
-];
-
-/// The production sources of the tree engine's modules in agentfs-core
-/// (`src`): [`TREE_ENGINE`]'s files and directories.
-fn tree_engine_files(src: &Path) -> Vec<PathBuf> {
-    let mut files = Vec::new();
-    for module in TREE_ENGINE {
-        let dir = src.join(module);
-        if dir.is_dir() {
-            files_under(&dir, &mut files);
-        }
-        let file = src.join(format!("{module}.rs"));
-        if file.is_file() {
-            files.push(file);
-        }
-    }
-    files.sort();
-    files
-}
-
-/// The first module of each `crate::` path in `text`, with the line it is
-/// on: `crate::a::b` names `a`, and `crate::{a, b::c}` names `a` and `b`.
-fn crate_paths(text: &str) -> Vec<(usize, String)> {
-    const PATH: &str = "crate::";
-    let ident = |s: &str| -> String {
-        s.trim_start()
-            .chars()
-            .take_while(|c| c.is_alphanumeric() || *c == '_')
-            .collect()
-    };
-    let mut out = Vec::new();
-    for (at, _) in text.match_indices(PATH) {
-        // `agentfs_crate::` or `$crate::` is another path.
-        if text[..at]
-            .chars()
-            .next_back()
-            .is_some_and(|c| c.is_alphanumeric() || c == '_' || c == '$')
-        {
-            continue;
-        }
-        let line = text[..at].matches('\n').count() + 1;
-        let rest = &text[at + PATH.len()..];
-        let Some(group) = rest.strip_prefix('{') else {
-            out.push((line, ident(rest)));
-            continue;
-        };
-        // The group's items at its own depth, each to its first `::`.
-        let (mut depth, mut item) = (0usize, String::new());
-        for c in group.chars() {
-            match c {
-                '{' => depth += 1,
-                '}' if depth == 0 => break,
-                '}' => depth -= 1,
-                ',' if depth == 0 => {
-                    out.push((line, ident(&item)));
-                    item.clear();
-                    continue;
-                }
-                _ => {}
-            }
-            if depth == 0 {
-                item.push(c);
-            }
-        }
-        if !item.trim().is_empty() {
-            out.push((line, ident(&item)));
-        }
-    }
-    out
-}
-
-/// Where `source`'s production text reaches past the tree engine: a
-/// `crate::` path to a module not in [`TREE_ENGINE`].
-fn recording_engine_uses(source: &str) -> Vec<String> {
-    crate_paths(production(source))
-        .into_iter()
-        .filter(|(_, module)| !TREE_ENGINE.contains(&module.as_str()))
-        .map(|(line, module)| format!("{line}: names `crate::{module}`"))
-        .collect()
-}
-
-/// The tree engine's modules in agentfs-core name no recording-engine
-/// module, so they move to their own crate whole. `super::` chains that
-/// reach the crate root are not read; there are none. The crate boundary
-/// replaces this check. (That the tree engine opens no remote is clippy's
-/// ban in `clippy.toml`, which outlives the boundary.)
-#[test]
-fn the_tree_engine_names_no_recording_engine_module() {
-    let workspace = Workspace::load();
-    let root = root();
-    let src = root
-        .join(&workspace.member("agentfs-core").unwrap().dir)
-        .join("src");
-    let files = tree_engine_files(&src);
-    let mut problems = Vec::new();
-    let mut paths = 0;
-    for file in &files {
-        let source = std::fs::read_to_string(file).unwrap();
-        paths += crate_paths(production(&source)).len();
-        let shown = file.strip_prefix(&root).unwrap_or(file).display();
-        for problem in recording_engine_uses(&source) {
-            problems.push(format!("{shown}:{problem}"));
-        }
-    }
-    assert!(
-        files.len() > 20 && paths > 100,
-        "only {} files and {paths} paths read: is the scan broken?",
-        files.len()
-    );
-    assert!(problems.is_empty(), "{}", problems.join("\n"));
-}
-
-#[test]
-fn a_tree_engine_use_of_the_recording_engine_is_found() {
-    assert_eq!(
-        crate_paths(
-            "use crate::tree_actor::Error;\nuse crate::{session::{A, B}, store, history::x};"
-        ),
-        [
-            (1, "tree_actor".to_owned()),
-            (2, "session".to_owned()),
-            (2, "store".to_owned()),
-            (2, "history".to_owned()),
-        ]
-    );
-    assert!(
-        recording_engine_uses(
-            "use crate::{tree_git::TreeGit, session};\nfn f() { agentfs_crate::x(); $crate::y(); }"
-        )
-        .is_empty()
-    );
-    assert_eq!(
-        recording_engine_uses("fn f() {\n    crate::history::init_git();\n}"),
-        ["2: names `crate::history`"]
-    );
-    assert_eq!(
-        recording_engine_uses("use crate::{store, paths::RepoPath};"),
-        ["1: names `crate::paths`"]
-    );
-    assert!(recording_engine_uses("#[cfg(test)]\nmod tests { use crate::config; }").is_empty());
 }

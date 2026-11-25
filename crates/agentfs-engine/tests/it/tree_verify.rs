@@ -24,10 +24,10 @@ use std::path::Path;
 use std::process::Command;
 
 use agentfs_contracts::pod::PodContext;
-use agentfs_core::tree_actor::{
+use agentfs_engine::tree_actor::{
     EVIDENCE_REF, Outcome, TreeActor, TreeId, UnverifiedCounts, VERIFY_REF, Verdict, verify_flagged,
 };
-use agentfs_core::tree_git::{RefUpdate, TreeGit};
+use agentfs_engine::tree_git::{RefUpdate, TreeGit};
 use git2::Oid;
 use trees::{ATTRS, fanned, new_actor, reopen, writer};
 
@@ -206,7 +206,7 @@ fn a_later_release_checks_a_flag_again() {
     let tmp = tempfile::tempdir().unwrap();
     let head = flagged_volume(tmp.path());
     let pod = PodContext::default();
-    let report = verify_flagged(tmp.path(), &pod, agentfs_core::tree_actor::release()).unwrap();
+    let report = verify_flagged(tmp.path(), &pod, agentfs_engine::tree_actor::release()).unwrap();
     assert_eq!(report.checked.len(), 1);
     assert_eq!(report.checked[0].outcome, Outcome::SameRelease);
     assert_eq!(report.checked[0].path, "a");
@@ -323,7 +323,7 @@ fn a_start_under_another_release_checks_a_flag() {
         note.starts_with("Agentfs-Verdict: verified by agentfs "),
         "{note}"
     );
-    let mine = agentfs_core::tree_actor::release().unwrap();
+    let mine = agentfs_engine::tree_actor::release().unwrap();
     assert!(!note.contains(mine), "written by the other release: {note}");
     let v = reopen(&root);
     assert_eq!(v.verification().counts(), counts(0, 0));
@@ -362,7 +362,7 @@ fn verify_refuses_a_held_volume() {
     let v = new_actor(tmp.path());
     let held = verify_flagged(tmp.path(), &PodContext::default(), None);
     assert!(
-        matches!(held, Err(agentfs_core::tree_actor::Error::Busy)),
+        matches!(held, Err(agentfs_engine::tree_actor::Error::Busy)),
         "{held:?}"
     );
     drop(v);

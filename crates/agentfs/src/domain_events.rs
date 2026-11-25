@@ -1,4 +1,4 @@
-//! The composition root's event queue (docs/library/core.md, "Rows and
+//! The composition root's event queue (docs/library/engine.md, "Rows and
 //! domain events"): each domain publishes to it once its step is durable, and
 //! the root hands each event, in order, to its consumers after the call that
 //! caused it returns. In-process and not durable: at boot every consumer

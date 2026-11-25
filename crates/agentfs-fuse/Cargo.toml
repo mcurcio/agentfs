@@ -13,6 +13,8 @@ rank = "filesystem"
 [dependencies]
 agentfs-contracts = { version = "0.1.0", path = "../agentfs-contracts" }
 agentfs-core = { version = "0.1.0", path = "../agentfs-core" }
+# The tree engine: the tree views' actor, sessions and rules (tree_view).
+agentfs-engine = { version = "0.1.0", path = "../agentfs-engine" }
 agentfs-failpoints = { version = "0.1.0", path = "../agentfs-failpoints" }
 # Mounts (stale.rs, views.rs), and confined access (tree_view, backing.rs).
 agentfs-os = { version = "0.1.0", path = "../agentfs-os" }
@@ -33,6 +35,6 @@ tempfile = "3.27.0"
 uuid = { version = "1", default-features = false, features = ["std"] }
 
 [features]
-# Test builds only: agentfs-core's failpoints, and the FUSE layer's own.
+# Test builds only: both engines' failpoints, and the FUSE layer's own.
 # Never in a release or image.
-failpoints = ["agentfs-core/failpoints", "agentfs-failpoints/failpoints"]
+failpoints = ["agentfs-core/failpoints", "agentfs-engine/failpoints", "agentfs-failpoints/failpoints"]

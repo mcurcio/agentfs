@@ -10,7 +10,7 @@ use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicI64, Ordering};
 
 use agentfs_contracts::pod::PodContext;
-use agentfs_core::tree_actor::{Recording, TreeId};
+use agentfs_engine::tree_actor::{Recording, TreeId};
 use trees::{ATTRS, identity, writer};
 
 #[path = "support/trees.rs"]

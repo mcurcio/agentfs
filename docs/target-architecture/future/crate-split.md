@@ -1,6 +1,6 @@
 # agentfs-core along domain lines: the crates, and the course to them
 
-**Design; rows A and B of section 3 are built, the rest is not. The owner's answers are in [OWNER-GUIDANCE.md](../../../OWNER-GUIDANCE.md) ("Performance",
+**Design; rows A, B and C of section 3 are built, the rest is not. The owner's answers are in [OWNER-GUIDANCE.md](../../../OWNER-GUIDANCE.md) ("Performance",
 2026-11-24); no question is open.** Layer: module (crate boundaries). Counts read at main 7efd868. **[read]**: in
 code. **[measured]**: timed in a 4-CPU container, or `docs/development.md` "Build settings". **[est]**: to be measured
 by the step that claims it.
@@ -59,12 +59,9 @@ hold.
 
 ## 2. What the code does that the end state does not [read]
 
-After A and B the tree engine names no recording-engine module (agentfs-repo's
-`the_tree_engine_names_no_recording_engine_module`), and the shared leaves are their own crates. What remains:
+After A, B and C the tree engine is its own crate, agentfs-engine, beside the recording engine, and the shared leaves
+are their own crates. What remains:
 
-- `telemetry.rs` reaches into the tree engine (`:672`, `:684`, `:801`; tests `:1886`, `:1947`). C's.
-- agentfs-csi calls `tree_actor::inspect` (`controller.rs:79`, and in `supervisor.rs`) instead of the
-  `StateArea::inspect` port. C's.
 - The referee's purity is a convention: `referee/entries.rs` imports the actor's `Error` and `queue`. G's.
 - The tree view has no kernel-independent layer (`agentfs-fuse/src/tree_view.rs:43` uses `fuser::*`; `:1592`
   implements `Filesystem`), so it is tested only where `/dev/fuse` exists.
@@ -76,7 +73,7 @@ After A and B the tree engine names no recording-engine module (agentfs-repo's
 | 0 | Tests run with cargo-nextest locally and in CI; the two slow programs (`tree_batch_alloc`, 71 s; `tree_stages`, about 60 s [measured]) cut to a tenth of their volumes locally, keeping their ratios, and run at full size on GitHub Actions; the detection gaps this leaves, local only, are stated in each test | none | ci, image, phase-1 | `agentfs-core`'s test run, built first: 196 s under `cargo test`, 77 s under `cargo nextest run` with its doctests (128 s from nextest alone) [measured, 2026-11-24, development.md "Build settings"]; `agentfs`'s 15 s unchanged [measured] |
 | A (built) | agentfs-repo: the repository-wide checks out of core's documentation test (`doc_tables` a module, not a `#[path]` include); the crate list derived from the workspace; checks that dependencies point only down the layers, that no bare `-p agentfs` remains until E (after E a package named `agentfs` exists, and the check cannot tell a stale reference from a right one), that every crate using failpoints forwards the feature | none | ci, docs | the repository's checks build in 6.9 s from an empty target directory, not core's 88 s [measured, development.md]; local runs only: CI's docs job still builds core and both binaries for the reference tables |
 | B (built) | agentfs-os, -git, -failpoints, -lines; `RepoPath`, `parse_size`, `parse_duration` to contracts; the tree engine's back-edges into the recording engine cut (`FifoGate` generic, its `CompactGate` impl into the engine; `sha256_at` into `lfs`); csi calls `is_safe_name` | none | ci, image | none alone; makes C, and M9's whole deletion, possible |
-| C | agentfs-engine: `tree_actor/`, `tree_git`, `session`, `store`, `state_area`, `operator_settings`, their tests (`it/tree_*`, `tree_*.rs`, the tree half of `crash_points.rs`); its instruments registered on a `Meter` the binary makes; csi through the `StateArea` port; `docs/library/core.md`'s tree half becomes `engine.md`. The crate boundary replaces agentfs-repo's recording-module check; the engine keeps git2, so the ban on opening a remote stays clippy's (`clippy.toml`, the SSH transport's registration rests on it) | B | ci, image, phase-1 | a recording-engine edit runs only the recording engine's tests; a tree edit runs the tree tests, against the 77 s nextest run of all of core [est] |
+| C (built) | agentfs-engine: `tree_actor/`, `tree_git`, `session`, `store`, `state_area`, `operator_settings`, their tests (`it/tree_*`, `tree_*.rs`, the tree half of `crash_points.rs`); its instruments registered on a `Meter` the binary makes; csi through the `StateArea` port; `docs/library/core.md`'s tree half becomes `engine.md`. The crate boundary replaces agentfs-repo's recording-module check; the engine keeps git2, so the ban on opening a remote stays clippy's (`clippy.toml`, the SSH transport's registration rests on it) | B | ci, image, phase-1 | a recording-engine edit builds and runs only the recording engine's tests (23 s and 20 s), a tree edit only the tree engine's (25 s and 64 s), against the 77 s nextest run of all of core [measured, 2026-11-25, development.md "Build settings"] |
 | D | The CLI package renamed `agentfs-cli` (directory too), its binary and `#[command(name)]` still `agentfs`; every `-p agentfs` rewritten | C | ci, image, docker, hermes | none; with no package named `agentfs`, a missed reference fails |
 | E | The front `agentfs`: re-exports of the engine, contracts and the domains; a doctest opens a tree volume through it; AGENTS.md principle 10's mapping updated | D | ci, docs | the owner's one name |
 | F | agentfs-service: `launcher/domains.rs`, `shared.rs`, `domain_events.rs` and the drain, used by the binary; the front re-exports it | E | ci, image | consumers compose a volume in one call |

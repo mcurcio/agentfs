@@ -33,8 +33,8 @@ use agentfs_contracts::host::{
 use agentfs_contracts::name::{ClientLabel, ForkKey, LauncherId};
 use agentfs_contracts::trees::{ForkPhase, ForkSettings, TreeError};
 use agentfs_contracts::views::{MountOptions, ViewError, ViewId};
-use agentfs_core::tree_actor::TreeId;
-use agentfs_core::tree_telemetry;
+use agentfs_engine::telemetry;
+use agentfs_engine::tree_actor::TreeId;
 use anyhow::{Context as _, Result};
 
 use super::serving::{self, Driver, Serving, Trigger};
@@ -115,7 +115,7 @@ pub fn host(state: &Path, args: HostArgs, minter: Minter) -> Result<ExitCode> {
         volume.name.as_str(),
         &identity(volume.name.as_str(), &args.pod),
     );
-    tree_telemetry::observe_process(otel.meter(), &boot.not_built);
+    telemetry::observe_process(otel.meter(), &boot.not_built);
     let cap = LaunchCap::mint(&minter, launcher, LaunchScope::Root);
     let staged = match serving::stage::<Line>(state, &at, cap, minter, boot.overlay_limit)? {
         Ok(staged) => staged,

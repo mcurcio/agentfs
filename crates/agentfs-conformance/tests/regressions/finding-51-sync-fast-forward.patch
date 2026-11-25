@@ -20,8 +20,8 @@ refuses a non-empty OUT: export MODEL_TARGET_VOLUME=mt-fixture MODEL_WORK_VOLUME
 Verified 2026-11-12: these commands reproduce the committed trace byte for byte (cmp).
 `git apply` skips these lines.
 
---- a/crates/agentfs-core/src/tree_actor/history/take.rs
-+++ b/crates/agentfs-core/src/tree_actor/history/take.rs
+--- a/crates/agentfs-engine/src/tree_actor/history/take.rs
++++ b/crates/agentfs-engine/src/tree_actor/history/take.rs
 @@ -288,7 +288,7 @@
              // for the upstream and the sync shows what the upstream's commit shows (the
              // model's `World::sync`). The fork then takes that commit's line maps and names,

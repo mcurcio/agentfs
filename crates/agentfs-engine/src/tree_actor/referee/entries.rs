@@ -1,5 +1,5 @@
 //! Directories, metadata and links: what a landing judges beside lines and names, and what a
-//! sync keeps of a fork's (MODEL.md rules 13, 14 and 15; docs/library/core.md, "Landing
+//! sync keeps of a fork's (MODEL.md rules 13, 14 and 15; docs/library/engine.md, "Landing
 //! directories, metadata and links").
 //!
 //! An entry is a file (a link is a file whose bytes are its target, rule 15) or a directory.

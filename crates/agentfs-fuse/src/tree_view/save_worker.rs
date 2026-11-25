@@ -5,7 +5,7 @@
 //!
 //! The worker knows nothing of saves: it runs jobs, first in first out,
 //! each caught on its own, so a panicking job leaves its save a failed
-//! pending save (`agentfs_core::tree_actor::SaveToDecide`'s drop) and the
+//! pending save (`agentfs_engine::tree_actor::SaveToDecide`'s drop) and the
 //! worker goes on with the next.
 
 use std::io;
@@ -13,7 +13,7 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::{Mutex, PoisonError, mpsc};
 use std::thread::JoinHandle;
 
-use agentfs_core::tree_actor::TreeId;
+use agentfs_engine::tree_actor::TreeId;
 
 /// One unit of the worker's work: the view's finish of one pending save,
 /// with its logging.

@@ -1,5 +1,5 @@
 //! The referee: every line, name, metadata and directory rule of one pair of trees, a fork and
-//! its upstream (docs/target-architecture/git-model.md §7, §8; docs/library/core.md).
+//! its upstream (docs/target-architecture/git-model.md §7, §8; docs/library/engine.md).
 //! Pure: it reads history only through [`Landed`], writes nothing, and gives back plans: `land` a
 //! [`Decision`], `sync` a fork's snapshot. The actor owns queue order and durability.
 

@@ -50,7 +50,7 @@ agentfs exports these signals through the OpenTelemetry API only. The
 recording engine's go through `agentfs_core::telemetry`; the tree volumes'
 figures (`agentfs.not_built`, the latency figures, the journal's
 checkpoints and `agentfs.history.unverified`) through
-`agentfs_core::tree_telemetry`, on the binary's meter. The binary picks the
+`agentfs_engine::telemetry`, on the binary's meter. The binary picks the
 SDK and the exporter.
 
 ## Metrics
@@ -71,7 +71,7 @@ SDK and the exporter.
 | `agentfs.start.moved` | gauge, per remote (the start remote of a started volume) | 1 while the start-branch alarm holds, as the last push to that remote saw it; 0 before the first push and after one that does not raise it |
 | `agentfs.push.limited` | counter, per remote | Pushes that sent only part of the backlog because it was over `agentfsMaxPushSize` |
 | `agentfs.remote.misconfigured` | gauge, per remote | 1 for each invalid `[remote]` section |
-| `agentfs.not_built` | gauge, by `capability` | Operator settings a tree volume has configured whose capability it does not build yet: `push`, `patches`, `lfs` or `other`; no point for a capability with none ([core](library/core.md#operator-settings)) |
+| `agentfs.not_built` | gauge, by `capability` | Operator settings a tree volume has configured whose capability it does not build yet: `push`, `patches`, `lfs` or `other`; no point for a capability with none ([core](library/engine.md#operator-settings)) |
 | `agentfs.remotes.mode` | gauge, by `mode` | 1, with the volume's remotes mode: `pushed`, `none_valid` or `local_only` |
 | `agentfs.precheck.rejected_paths` | counter | Paths refused by fsck or limit checks, by stage and reason |
 | `agentfs.patch.queue_depth` | gauge | Patches queued after the last applied one, the blocked one included |

@@ -1,5 +1,5 @@
 //! One domain service shared by the composition root and another service
-//! that asks it questions (docs/library/core.md, "Rows and domain events"):
+//! that asks it questions (docs/library/engine.md, "Rows and domain events"):
 //! Clients asks Trees `facts` while the root also calls Trees, and Volume asks
 //! Clients `attached_any`, Clients being restored only once Volume has staged.
 //! In-process and on one thread, as the services and their event queue are.

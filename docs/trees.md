@@ -443,7 +443,7 @@ row and counts as released.
   saw; a link lands as a file whose bytes are its target. A change that loses by
   these rules loses whole and names its cause: `metadata`,
   `directory-not-empty` or `directory-gone` ([landing directories, metadata and
-  links](library/core.md#landing-directories-metadata-and-links)).
+  links](library/engine.md#landing-directories-metadata-and-links)).
 - **After a truncate**, writes count as a rewrite unless every call is an append.
 - **The release of `git` decides alignment.** An upgrade is a known change: later
   saves can align repeated lines differently. Stored bytes and identities do not
@@ -641,7 +641,7 @@ A view reads a map with the actor unlocked: the lock is held only to clone it.
 
 ## The library
 
-`agentfs_core::tree_actor::TreeActor` holds an exclusive state-area lease.
+`agentfs_engine::tree_actor::TreeActor` holds an exclusive state-area lease.
 `TreeActor::create` makes a volume, `TreeActor::open` recovers one and never creates,
 and `state_area::TreeStateArea`'s `inspect` (the `StateArea` port) reads what a state
 area holds without the lease.
@@ -658,10 +658,10 @@ its writer as a `WriterAt` (the writer and its pod context). `write_open`, `writ
 `rename`, `unlink`, `set_meta` (chmod and chown) and `set_times` the recorded
 steps on names, metadata and times. `node`, `node_at` and `children` show each
 entry as a view presents it. A view reaches them through
-`agentfs_core::session`: a `TreeSession` locks the actor with its client's tree and
+`agentfs_engine::session`: a `TreeSession` locks the actor with its client's tree and
 writer, and `Sessions` is the binder Clients binds each client's authority to. Upstream and fork
 share one bare repository. Merge identity is separate from an open object's
-identity. See [library/core.md](library/core.md).
+identity. See [library/engine.md](library/engine.md).
 
 ## What a commit holds
 
@@ -1136,7 +1136,7 @@ by `take_next`. Each take runs in three parts:
 
 A take judges directories, metadata and links by the model's rules 13 to 15, as
 the library describes ([landing directories, metadata and
-links](library/core.md#landing-directories-metadata-and-links)); a landing that
+links](library/engine.md#landing-directories-metadata-and-links)); a landing that
 fast-forwards takes the fork's commit, directories and all. A take never leaves
 an entry without its directory.
 

@@ -7,7 +7,7 @@
 
 use std::path::{Path, PathBuf};
 
-use agentfs_core::operator_settings::{NotBuilt, OperatorSettings};
+use agentfs_engine::operator_settings::{NotBuilt, OperatorSettings};
 use anyhow::{Context as _, Result, bail};
 
 use super::mountpoint::resolved;
@@ -72,7 +72,7 @@ mod tests {
     fn a_bad_overlay_limit_fails_at_boot() {
         let state = tempfile::tempdir().unwrap();
         std::fs::write(
-            state.path().join(agentfs_core::operator_settings::FILE),
+            state.path().join(agentfs_engine::operator_settings::FILE),
             "[agentfs]\n\toverlayLimit = 0\n",
         )
         .unwrap();
@@ -88,10 +88,10 @@ mod tests {
         let state = tempfile::tempdir().unwrap();
         assert_eq!(
             at_boot(state.path(), &[]).unwrap().overlay_limit,
-            agentfs_core::operator_settings::DEFAULT_OVERLAY_LIMIT
+            agentfs_engine::operator_settings::DEFAULT_OVERLAY_LIMIT
         );
         std::fs::write(
-            state.path().join(agentfs_core::operator_settings::FILE),
+            state.path().join(agentfs_engine::operator_settings::FILE),
             "[agentfs]\n\toverlayLimit = 1m\n",
         )
         .unwrap();

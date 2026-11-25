@@ -50,9 +50,9 @@ fn verify(binary: &Path, state: &Path) -> Output {
 /// The verdict lines of the flagged commit's note.
 #[cfg(feature = "failpoints")]
 fn verdicts(state: &Path, commit: git2::Oid) -> Vec<String> {
-    agentfs_core::tree_git::TreeGit::open(state.join("history.git"))
+    agentfs_engine::tree_git::TreeGit::open(state.join("history.git"))
         .unwrap()
-        .note(agentfs_core::tree_actor::VERIFY_REF, commit)
+        .note(agentfs_engine::tree_actor::VERIFY_REF, commit)
         .unwrap()
         .unwrap_or_default()
         .lines()
@@ -91,7 +91,7 @@ fn verify_takes_the_state_flag_only() {
 #[test]
 fn verify_checks_a_flag_once_per_release() {
     use agentfs_contracts::pod::{PodContext, WriterAt};
-    use agentfs_core::tree_actor::{Attrs, Perm, TreeActor, TreeId};
+    use agentfs_engine::tree_actor::{Attrs, Perm, TreeActor, TreeId};
     let tmp = tempfile::tempdir().unwrap();
     let state = tmp.path().join("state");
     init(&state);
