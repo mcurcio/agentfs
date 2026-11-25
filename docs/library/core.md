@@ -5,7 +5,9 @@ durably, turns them into git history, pushes that history, restores from it,
 applies the patch queue, runs forks, and serves the history service. It has
 no FUSE and no command line. Anything that can tell it "this path now holds
 this content" can record into a volume with it. Git-backed tree views are the
-tree engine's, its sibling crate: [`agentfs-engine`](engine.md).
+tree engine's, its sibling crate: [`agentfs-engine`](engine.md). The library
+crate `agentfs` does not re-export it ([what it leaves out](agentfs.md#not-re-exported)):
+a consumer of the recording engine depends on `agentfs-core` by name.
 
 Use this layer when you build a different front end over agentfs's
 recording (another filesystem, a build tool, a test harness), when you

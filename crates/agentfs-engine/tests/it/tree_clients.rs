@@ -1,7 +1,8 @@
 //! Clients over the store adapter and sessions on a real tree actor
 //! (docs/trees.md, "Clients"): a save names its client, a fork has one writer
 //! for life, a restored writer is rebound with its id, an ended client's opens
-//! are saved, and none of it waits for history.
+//! are saved, and none of it waits for history. The labels (C3 to C6) are
+//! docs/library/domains.md's.
 #![allow(
     clippy::disallowed_methods,
     reason = "a test is its own composition root and reads the store History writes"

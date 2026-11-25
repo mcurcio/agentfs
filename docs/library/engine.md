@@ -5,7 +5,8 @@ actor per volume orders every save of its trees into a journal, builds them
 into git history, lands forks into their upstream, and keeps the rows of the
 Volume, Clients and Trees domains. It has no FUSE and no command line, and it
 opens no remote. It is the recording engine's sibling
-([`agentfs-core`](core.md)): neither depends on the other.
+([`agentfs-core`](core.md)): neither depends on the other. A consumer reaches
+it as `agentfs::engine`, through [the library crate `agentfs`](agentfs.md).
 
 Use this layer when you build a different front end over tree views (the
 [filesystem layer](filesystem.md#tree-views) is one), when you write tooling
@@ -415,16 +416,18 @@ with a save in flight begun before the end is saved when that save lands, after
 it. A failure (of an append or a save) is logged and an unsaved close stays
 pending, saved at its tree's next step. Lock order: the actor, then the bindings.
 
-### Rows and domain events
+### The domains' store
 
-The domains (`agentfs-volume`, `agentfs-clients`, `agentfs-trees`) keep their
-records as rows on the volume's one tree actor, through the ports in
-`agentfs_contracts::ports`. `store::TreeStore::new(recording)` implements
-them over a served volume (`Arc<Recording>`): Trees' `ForkStore` (`load`,
-`create`, `end`, `drop_fork`), Clients' `ClientStore`, Volume's `VolumeStore` and `QueueFacts`. Each write is one journal step, the same commit
-point as a save: a fork's branch and its row are one record, or a row step
-holds rows alone. The store makes it durable (one group-commit fsync, outside
-the actor's lock) before it returns. Each row is the domain's value with its
+The Volume, Clients and Trees domains keep their records as rows on the
+volume's one tree actor, through the ports in `agentfs_contracts::ports`;
+their services, rows, events and invariants are on [the shared kernel and
+the domains](domains.md). `store::TreeStore::new(recording)` implements the
+ports over a served volume (`Arc<Recording>`): Trees' `ForkStore` (`load`,
+`create`, `end`, `drop_fork`), Clients' `ClientStore`, Volume's `VolumeStore`
+and `QueueFacts`. Each write is one journal step, the same commit point as a
+save: a fork's branch and its row are one record, or a row step holds rows
+alone. The store makes it durable (one group-commit fsync, outside the
+actor's lock) before it returns. Each row is the domain's value with its
 audit stamps (`agentfs_contracts::audit::Audited`): the store sets `created`
 at a row's first write and keeps it, and sets `changed` at every write.
 
@@ -447,73 +450,17 @@ a claim's release, an end or a release the domains judge) carries
 are the journal's too: `queued()` never waits for history, and a stopped actor
 answers `Stopped`, never an empty queue.
 
-Clients' `ClientStore` (`load`, `attach`, `rebind`, `end`) keeps one row per
-tree on `Chain::Clients(tree)`: its attached clients (`ClientRow`: the id, the
-grant and the pod context) and a fork's writer claim, each entry stamped. An
-attach's step number is the client's ordinal. One `end` step removes every
-ended client with its `AttachmentEnded`, then writes `LastDetached` for each
-tree left empty. `release_claim` removes a dropped fork's writer claim with
-`ClaimReleased` (nothing to release writes nothing).
-
-`TreesService` (`agentfs-trees`) answers a second keyed `create` with its open
-fork and ends forks (`end`, `end_keyed`). `settle(clients)` is its one
-judgement from facts asked now: every open unkeyed fork no client is attached
-to (asked of Clients' `attached_any`) ends, and every ended fork the store lets
-go drops. It runs at boot after Clients' `reconcile`, at each `LastDetached`
-and after each take, so an end a crash or a failed step left undone is judged
-again. `ClientsService::on_fork_dropped` releases the claim, and `reconcile`
-(at boot and at the drain) also releases the claim of every fork Trees reports
-dropped. `detach` is idempotent within a run: rows are removed at an end, so a
-client ended in an earlier run answers `UnknownClient`. The composition root
-dispatches the events between them ([trees](../trees.md#forks-keys-end-and-the-drop)).
-
-Volume's `VolumeStore` (`load`, `record`) keeps the lifecycle row on
-`Chain::Volume` (`refs/agentfs/volume`): one row step per move, `VolumeStaged`,
-`VolumeDraining` (detail `Stop`) or `VolumeReleased` (detail `Keep`).
 `TreeStateArea` is Volume's `StateArea`, `VolumeStore` and `QueueFacts` in one:
 `open` recovers the volume and makes a `TreeStore` over it, to which the other
 two delegate; before `open` the row, a write and the queues answer `Stopped`:
-never a default nobody read. `VolumeService` (`agentfs-volume`) stages the volume
-(`stage` opens the state area), unstages it, and on each `rejudge` while it
-drains records the release once no client is attached and no queue holds an
-entry; `ClientsService::on_volume_draining` and `on_volume_staged` refuse and
-allow attaches meanwhile ([trees](../trees.md#volume-lifecycle)). Its
-`release_verdict` judges a row or a queue it cannot read as `Staged`: never a
-release on facts nobody read.
+never a default nobody read.
 
 `StoreError` from a tree actor failure: `Stopped` and an unknown fsync
 outcome are `Stopped` (the reopen decides whether the step survived); a failed
 append is `NotDurable` (nothing recorded); damaged state is `Damaged`; a step
 the actor refused (a drop while anything holds the fork, a row or upstream
-that is not there) is `Refused`. Each domain's error has one `From<StoreError>`:
-`Stopped` for a stopped or damaged store, its own word for a refusal
-(`ClientError::UnknownClient`, `TreeError::ForkUnknown`), and `NotDurable` or
-`Io` for a write that changed nothing. One function maps a tree actor failure
-to its `IoKind` for every adapter (`store::io_kind`). A domain publishes its
-event to its `EventSink` once the store returns; the composition root's queue
-hands each on in order. Each event is on record as a commit on its chain
-([trees](../trees.md#rows-and-event-commits)).
-
-### Domain invariants
-
-The Volume, Clients and Trees domains hold these, and the code cites them by
-their labels. What the domains do not do yet is on their design pages
-([target architecture](../target-architecture/README.md)).
-
-| # | Invariant | Enforced by |
-|---|---|---|
-| C1 | Only Clients mints a `ClientCap`, so only Clients makes a client writer | private fields; `ClientCap::mint` takes the composition root's `Minter`; clippy bans `Minter::new` outside it |
-| C2 | A `ForksItCreates` launcher reaches only the forks it created, never the root | `ClientsService` checks the launcher against Trees' `facts(fork)` before any row |
-| C3 | A read-only client has no `ClientCap`: its session writes nothing | the session's authority is `Read` for a read-only grant |
-| C4 | A fork has at most one read-write client, for life | the writer claim in the fork's clients row, kept after its client ends and released only at `ForkDropped` |
-| C5 | A session binds one client, and the client acts only through it: its calls name no tree and no writer | `agentfs_engine::session` owns the `ClientCap` |
-| C6 | `LastDetached{tree}` is published exactly once each time a tree's last client ends | the end and its events are one row step |
-| C7 | Every end has an event (detach, reconcile, a fork's end); no lease or heartbeat ends an attachment | no clock in the domains |
-| VO1 | `Released` only when the volume is not staged, no client is attached and every queue is empty | only the pure `release::decide` builds a `Cleared` |
-| VO3 | A move and its event are one unit | one row step, its event commit built from it |
-| VO4 | The release verdict reads only facts asked at judgement time; nothing polls | the verdict is pure over `ReleaseFacts`; no clock in the domain |
-| VO5 | A volume's id never changes, and an `ensure` with another name at the same location writes nothing | `decide_ensure` answers `SpecMismatch` before any write |
-| VO6 | A fork launcher cannot `ensure`, stage or unstage the volume | `LaunchCap` with `may: Root`, else `NotPermitted` |
+that is not there) is `Refused`. One function maps a tree actor failure to
+its `IoKind` for every adapter (`store::io_kind`).
 
 ## Telemetry
 

@@ -486,7 +486,7 @@ pub(in crate::tree_actor) fn fold(frames: &[Frame]) -> Result<Folded> {
     }
     let mut folded = Folded {
         // A pointer a record after the checkpoint may still name by its
-        // step stands as that step (C4); its oid is the checkpoint's.
+        // step stands as that step (JC4); its oid is the checkpoint's.
         pointers: Pointers::new(
             pointers
                 .iter()

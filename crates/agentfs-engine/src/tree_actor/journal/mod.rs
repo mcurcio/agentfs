@@ -1084,7 +1084,7 @@ impl Journal {
     /// Starts segment `first` before a frame of `bytes` bytes when the
     /// current one has records and would pass its size. The new segment is
     /// in the table before any record is appended to it: the roll event the
-    /// compaction's coverage rule reads (C2a).
+    /// compaction's coverage rule reads (JC2a).
     fn roll(&mut self, first: RecordNo, bytes: u64) -> io::Result<bool> {
         let length = self.current.len();
         if length == 0
@@ -1270,7 +1270,7 @@ mod tests {
         stats
     }
 
-    /// C1 and the reader's own checks, at construction: a checkpoint past
+    /// JC1 and the reader's own checks, at construction: a checkpoint past
     /// what is durable, or one recovery's fold would refuse, is not sealed.
     #[test]
     fn a_checkpoint_recovery_could_not_read_is_not_sealed() {
@@ -1371,7 +1371,7 @@ mod tests {
     }
 
     /// The newest segment is never covered, and one is covered only once the
-    /// next starts at or before the checkpoint's `built + 1` (C2, C2a).
+    /// next starts at or before the checkpoint's `built + 1` (JC2, JC2a).
     #[test]
     fn only_a_segment_the_journal_rolled_past_is_covered() {
         let (_tmp, dir, mut journal) = journal_of(1);
@@ -1569,7 +1569,7 @@ mod tests {
         assert_eq!(segment::list(&dir).unwrap().len(), 1);
     }
 
-    /// C7: covered segments unlinked and the next segment's frames lost, or
+    /// JC7: covered segments unlinked and the next segment's frames lost, or
     /// no segment left at all, with nothing after the checkpoint durable:
     /// the journal opens at the checkpoint, a segment named for the next
     /// record made where none is left.

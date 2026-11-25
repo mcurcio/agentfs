@@ -190,7 +190,7 @@ pub struct ClientRow {
 pub struct TreeClients {
     pub tree: TreeId,
     pub attached: Vec<Audited<ClientRow>>,
-    /// A fork's one writer, for life (docs/library/engine.md, C4): kept after its client ends, removed
+    /// A fork's one writer, for life (docs/library/domains.md, C4): kept after its client ends, removed
     /// only at `ForkDropped`.
     pub writer_claim: Option<Audited<ClientId>>,
 }

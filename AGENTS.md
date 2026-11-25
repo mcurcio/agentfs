@@ -36,7 +36,7 @@ These are the owner's priorities. When a choice is unclear, decide by them. Each
 7. **History is the product.** Never rewrite history or force-push automatically. A divergence is saved and an alarm is raised, never overwritten ([remotes](docs/remotes.md#divergence)). History rewrites are manual operator procedures ([runbook](docs/runbooks/history-rewrite.md)).
 8. **Recovery is manual but supported.** Recovery uses `restore`, `revert` and the [runbooks](docs/runbooks/recovery-and-undo.md). Further undo tooling is added as real use shows the need ([future design](docs/target-architecture/future/recovery-tooling.md)).
 9. **Merging is an extra.** The core records history. The patch queue applies producers' changes only at mount, with nothing attached: in order, holding a patch that cannot land whole and going on, and stopping only at a gap, unrecorded changes or a failure, with the rest left queued ([patches](docs/patches.md)). The owner, 2026-10-29: "No live landing yet" ([OWNER-GUIDANCE.md](OWNER-GUIDANCE.md)).
-10. **Three layers, each an integration point.** The owner, 2026-10-29: "There is “the library” of agentfs, and “the filesystem” agentfs, and the kubernetes adapter layer — and each of these provides a unique integration point for consumers to tap into". The library is the two engines, `agentfs-core` (recording) and `agentfs-engine` (tree views), the filesystem is `agentfs-fuse` and `agentfs-cli`, whose binary is `agentfs`, and the adapter is `agentfs-csi`. Put each primitive in the lowest layer that can own it, and give it a good API and docs there ([library pages](docs/library/core.md)). All are Rust. OpenTelemetry is used for everything observable ([telemetry](docs/telemetry.md)).
+10. **Three layers, each an integration point.** The owner, 2026-10-29: "There is “the library” of agentfs, and “the filesystem” agentfs, and the kubernetes adapter layer — and each of these provides a unique integration point for consumers to tap into". The library is the crate `agentfs`, the one name consumers depend on, which re-exports the tree engine `agentfs-engine` (tree views), the shared kernel and the domains; the recording engine `agentfs-core` is a library crate beside it. The filesystem is `agentfs-fuse` and `agentfs-cli`, whose binary is `agentfs`, and the adapter is `agentfs-csi`. Put each primitive in the lowest layer that can own it, and give it a good API and docs there ([library pages](docs/library/agentfs.md)). All are Rust. OpenTelemetry is used for everything observable ([telemetry](docs/telemetry.md)).
 
 ## Working with the owner
 
@@ -53,7 +53,7 @@ Every fact has one home, and other files link to it rather than copying it.
 |---|---|
 | `README.md` | What users need: pitch, install, quick start |
 | `docs/guarantees.md`, `docs/recording.md`, `docs/remotes.md`, `docs/patches.md`, `docs/forks.md`, `docs/trees.md` | What agentfs does and promises, in the present tense |
-| `docs/library/` | The three layers as integration points: `agentfs-core` and `agentfs-engine`, `agentfs-fuse` and `agentfs-cli`, `agentfs-csi` |
+| `docs/library/` | The three layers as integration points: `agentfs` (with the shared kernel and the domains), `agentfs-engine` and `agentfs-core`, `agentfs-fuse` and `agentfs-cli`, `agentfs-csi` |
 | `docs/architecture.md`, `docs/configuration.md` | Code map and reference. Tests check them against the code |
 | `docs/runbooks/` | Operator procedures for each failure mode |
 | `docs/target-architecture/` | Designs for slices that are not built, and the baseline: the git model, the rules ledger, the model and the walkthrough |
@@ -84,6 +84,7 @@ When you learn something durable, write it to its home in the same commit. Never
 
 | Path | What |
 |---|---|
+| `crates/agentfs` | The library under one name, the one crate consumers depend on: re-exports of the tree engine, the shared kernel and the domains, each a module; no workspace crate depends on it |
 | `crates/agentfs-contracts` | The shared kernel of the domains around the git model: values (repository paths, durations and sizes among them), capabilities, each domain's trait and events, and the ports adapters implement. No I/O |
 | `crates/agentfs-volume`, `crates/agentfs-clients`, `crates/agentfs-trees` | The Volume, Clients and Trees domains, each pure over the ports in `agentfs-contracts` |
 | `crates/agentfs-failpoints`, `crates/agentfs-os`, `crates/agentfs-git`, `crates/agentfs-lines` | Below both engines (ranks in [architecture](docs/architecture.md#ranks)): the failpoints registry; file locks, atomic files, confinement, mounts, the shared-filesystem check, listening sockets and the allocator; the `git` program and the one libgit2 setup; and the line maps |

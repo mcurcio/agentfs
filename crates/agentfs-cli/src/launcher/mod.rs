@@ -105,7 +105,8 @@ fn other_format(state: &Path) -> ExitCode {
     ExitCode::FAILURE
 }
 
-/// What `mount` says when a fork's one writer has gone (C4).
+/// What `mount` says when a fork's one writer has gone (C4,
+/// docs/library/domains.md).
 const FORK_TAKEN: &str =
     "this fork has had its writer; mount it with --fork-read-only or use a new fork";
 

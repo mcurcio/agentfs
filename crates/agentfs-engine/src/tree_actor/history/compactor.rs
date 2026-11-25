@@ -5,7 +5,7 @@
 //! Lock order: the actor, then History, then Durability, then the
 //! relocations. The compactor takes History's lock only to clone its
 //! persistent maps at the built point (O(1)), and Durability's only to read
-//! or change the segment table; it holds neither across I/O or a wait (C9).
+//! or change the segment table; it holds neither across I/O or a wait (JC9).
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -24,7 +24,7 @@ use crate::tree_actor::tree::Tree;
 
 /// What the compactor reads of History at its built point B, in one hold of
 /// History's lock ([`History::at_built`]): every field a persistent map or an
-/// `Arc`, so the hold is O(1) (C9).
+/// `Arc`, so the hold is O(1) (JC9).
 #[derive(Clone)]
 pub(in crate::tree_actor) struct AtBuilt {
     /// B: History's built point.
@@ -187,10 +187,10 @@ fn run(history: &History, journal: &JournalCompaction, compact_from: u64) {
 }
 
 /// The checkpoint at `at`'s built point, from History's state there and the
-/// fold of the records at or below it (C8). `carried` is left empty:
+/// fold of the records at or below it (JC8). `carried` is left empty:
 /// [`Sealed::new`] writes it.
 fn checkpoint_at(at: &AtBuilt, folded: &Folded) -> Checkpoint {
-    // The fold alone says which pointers stand at a step at B (C4): a
+    // The fold alone says which pointers stand at a step at B (JC4): a
     // switch record at or below B has made its pointer an oid already.
     let step_heads: BTreeMap<String, RecordNo> = folded
         .pointers
@@ -256,11 +256,11 @@ fn checkpoint_at(at: &AtBuilt, folded: &Folded) -> Checkpoint {
 
 /// One compaction at History's built point B, the thread's one sequence:
 /// the gate at [`Gap::Covered`]; wait until every record at or below B is
-/// durable (C1); fold the records at or below B; carry live frames; seal and
+/// durable (JC1); fold the records at or below B; carry live frames; seal and
 /// publish the checkpoint (the gate at [`Gap::Written`] and
 /// [`Gap::Renamed`]); the gate at [`Gap::DirSynced`]; tell History it is
-/// published (only then may it forget what it covers, C3); the gate at
-/// [`Gap::BeforeUnlink`]; unlink what it covers (C2, C2a). With what it
+/// published (only then may it forget what it covers, JC3); the gate at
+/// [`Gap::BeforeUnlink`]; unlink what it covers (JC2, JC2a). With what it
 /// dropped, the next baseline. `None` before
 /// History's first built event since open, or when B is not past the last
 /// published checkpoint's `built`.

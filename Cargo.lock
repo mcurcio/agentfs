@@ -49,6 +49,7 @@ dependencies = [
  "agentfs-rules",
  "agentfs-trees",
  "agentfs-volume",
+ "tempfile",
 ]
 
 [[package]]

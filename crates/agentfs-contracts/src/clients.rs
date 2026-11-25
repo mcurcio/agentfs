@@ -212,7 +212,7 @@ pub enum AttachmentEndReason {
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ClientError {
-    /// The grant exceeds the launcher (docs/library/engine.md, C2).
+    /// The grant exceeds the launcher (docs/library/domains.md, C2).
     #[error("the grant exceeds the launcher's")]
     NotPermitted,
     #[error("no such client")]
@@ -221,7 +221,7 @@ pub enum ClientError {
     NotItsLauncher,
     #[error("no such tree, or the fork has ended")]
     TreeUnknown,
-    /// One writer per fork, for life (docs/library/engine.md, C4).
+    /// One writer per fork, for life (docs/library/domains.md, C4).
     #[error("the fork has had its writer")]
     ForkTaken,
     /// After `VolumeDraining`; attach only.
@@ -256,13 +256,13 @@ pub enum ClientEvent {
         client: ClientId,
         why: AttachmentEndReason,
     },
-    /// `attached(tree)` became empty: exactly once each time (docs/library/engine.md, C6).
+    /// `attached(tree)` became empty: exactly once each time (docs/library/domains.md, C6).
     LastDetached {
         tree: TreeId,
     },
 }
 
-/// Volume's one question to Clients (docs/library/engine.md, VO1).
+/// Volume's one question to Clients (docs/library/domains.md, VO1).
 pub trait AttachedLookup {
     fn attached_any(&self) -> ClientSet;
 }

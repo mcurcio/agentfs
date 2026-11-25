@@ -1,6 +1,6 @@
 # agentfs-core along domain lines: the crates, and the course to them
 
-**Design; rows A to D of section 3 are built, the rest is not. The owner's answers are in [OWNER-GUIDANCE.md](../../../OWNER-GUIDANCE.md) ("Performance",
+**Design; rows A to E of section 3 are built, the rest is not. The owner's answers are in [OWNER-GUIDANCE.md](../../../OWNER-GUIDANCE.md) ("Performance",
 2026-11-24); no question is open.** Layer: module (crate boundaries). Counts read at main 7efd868. **[read]**: in
 code. **[measured]**: timed in a 4-CPU container, or `docs/development.md` "Build settings". **[est]**: to be measured
 by the step that claims it.
@@ -69,9 +69,6 @@ are their own crates. What remains:
   core's `identity::Context`, and `otel.rs`'s `meter_of` scopes the binary's `Meter` with core's
   `telemetry::scope()`; the export-failure counter is named from core's `telemetry::names`. M9's deletion of core
   must cut them first: F's.
-- The domain layer's rules are documented on an adapter's page: docs/library/engine.md's "Domain invariants" and
-  its rows and events hold the Volume, Clients and Trees domains' invariants, and the shared kernel and the domains
-  cite it. E's.
 - The tree view has no kernel-independent layer (`agentfs-fuse/src/tree_view.rs:43` uses `fuser::*`; `:1592`
   implements `Filesystem`), so it is tested only where `/dev/fuse` exists.
 
@@ -84,7 +81,7 @@ are their own crates. What remains:
 | B (built) | agentfs-os, -git, -failpoints, -lines; `RepoPath`, `parse_size`, `parse_duration` to contracts; the tree engine's back-edges into the recording engine cut (`FifoGate` generic, its `CompactGate` impl into the engine; `sha256_at` into `lfs`); csi calls `is_safe_name` | none | ci, image | none alone; makes C, and M9's whole deletion, possible |
 | C (built) | agentfs-engine: `tree_actor/`, `tree_git`, `session`, `store`, `state_area`, `operator_settings`, their tests (`it/tree_*`, `tree_*.rs`, the tree half of `crash_points.rs`); its instruments registered on a `Meter` the binary makes; csi through the `StateArea` port; `docs/library/core.md`'s tree half becomes `engine.md`. The crate boundary replaces agentfs-repo's recording-module check; the engine keeps git2, so the ban on opening a remote stays clippy's (`clippy.toml`, the SSH transport's registration rests on it) | B | ci, image, phase-1 | a recording-engine edit builds and runs only the recording engine's tests (23 s and 20 s), a tree edit only the tree engine's (25 s and 64 s), against the 77 s nextest run of all of core [measured, 2026-11-25, development.md "Build settings"] |
 | D (built) | The CLI package renamed `agentfs-cli` (directory too), its binary still `agentfs` (`[[bin]] name`, which clap reads through `CARGO_BIN_NAME`); every `-p agentfs` rewritten; agentfs-repo refuses, in a file that runs, a package, feature, binary or test program selected through a variable and a `cargo build` of a package with no binary, and, in any tracked file, a path under `crates/` that names nothing | C | ci, image, docker, hermes | none; with no package named `agentfs`, a missed reference fails |
-| E | The front `agentfs`, in a new rank `umbrella` that no rank uses (it uses `shared-kernel`, `domain` and `engine`; listed after `kubernetes`, so M9 only adds `filesystem` to its uses): re-exports of the engine, contracts and the domains; a doctest opens a tree volume through it; AGENTS.md principle 10's mapping updated; the domain invariants and the rows-and-events contract out of `engine.md` to a library page of the shared kernel and the domains, which `engine.md` links | D | ci, docs | the owner's one name |
+| E (built) | The front `agentfs`, in a new rank `umbrella` that no rank uses (it uses `shared-kernel`, `domain` and `engine`; listed after `kubernetes`, so M9 only adds `filesystem` to its uses): re-exports of the engine, contracts and the domains; a doctest opens a tree volume through it; AGENTS.md principle 10's mapping updated; the domain invariants and the rows-and-events contract out of `engine.md` to a library page of the shared kernel and the domains, which `engine.md` links | D | ci, docs | the owner's one name |
 | F | agentfs-service, in a rank of its own below `umbrella`, which `umbrella` and `filesystem` use: `launcher/domains.rs`, `shared.rs`, `domain_events.rs` and the drain, used by the binary; the front re-exports it; the launch's reads of core (`identity::Context` to contracts, the telemetry scope and the export counter's name to the binary) | E | ci, image | consumers compose a volume in one call |
 | G | agentfs-referee: its own error enum (`From` into the engine's); the line values (`tree.rs:27-205`) to lines; `MergeFileIdentity`, `NameHistory`, `Meta`, `queue::Key` public; `queue::held` (`queue.rs:50`, takes `&Shape`) up to its caller; ref naming for `Upstreams::merges` (`upstreams.rs:69`) resolved | C | ci, phase-1 | purity checked; rule tests in seconds |
 

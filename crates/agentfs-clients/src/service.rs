@@ -1,6 +1,7 @@
 //! The Clients domain over its ports (slice S4): attach, rebind, detach,
 //! reconcile and the per-tree index, rebuilt from the rows at boot; no attach
-//! while the volume drains (slice S6) (docs/trees.md, "Clients").
+//! while the volume drains (slice S6) (docs/trees.md, "Clients"). Its
+//! invariants' labels (C1 to C7) are docs/library/domains.md's.
 
 use std::collections::{BTreeMap, BTreeSet};
 

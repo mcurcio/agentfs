@@ -4,7 +4,7 @@
 //! client or its tree for a read-only one; a view reaches its tree only
 //! through its session, so its calls name no tree and no writer (C5), a
 //! read-only session cannot write (C3) and a session reaches only its own
-//! client's opens.
+//! client's opens (the labels are docs/library/domains.md's).
 //!
 //! Lock order: the tree actor's lock, then the bindings'.
 

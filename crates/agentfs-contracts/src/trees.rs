@@ -97,7 +97,7 @@ pub enum TreesEvent {
     ForkDropped(ForkId),
 }
 
-/// Clients' one question to Trees (docs/library/engine.md, C2).
+/// Clients' one question to Trees (docs/library/domains.md, C2).
 pub trait ForkLookup {
     fn facts(&self, fork: ForkId) -> Option<ForkFacts>;
 }

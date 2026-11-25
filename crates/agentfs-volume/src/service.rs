@@ -1,5 +1,6 @@
 //! The Volume domain over its ports: `ensure` (slice S1), `stage`, `unstage`
-//! and the Stop drain (slice S6; docs/trees.md, "Volume lifecycle").
+//! and the Stop drain (slice S6; docs/trees.md, "Volume lifecycle"). Its
+//! invariants' labels (VO1 to VO6) are docs/library/domains.md's.
 
 use agentfs_contracts::audit::Principal;
 use agentfs_contracts::caps::{LaunchCap, LaunchScope};

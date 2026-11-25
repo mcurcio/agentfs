@@ -1,6 +1,7 @@
 //! The store adapter over a real tree actor: a fork's row is one journal
 //! record with its branch, durable before the store returns, its event commit
 //! built behind it on its own chain (docs/trees.md, "Rows and event commits").
+//! C4's label is docs/library/domains.md's.
 #![allow(
     clippy::disallowed_methods,
     reason = "a test is its own composition root and reads the store History writes"

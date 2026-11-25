@@ -1,14 +1,22 @@
 #!/usr/bin/env bash
-# Checks what C and crypto the agentfs binary links, per feature set:
-# the default build is pure Rust apart from libgit2 (no
-# OpenSSL, no ring, no aws-lc); `otlp-tls` adds ring and rustls only; `ssh`
-# adds russh with ring and never OpenSSL or libssh2; only `https` brings
-# OpenSSL.
+# Checks what the agentfs binary and the library crate `agentfs` link.
+# The binary, per feature set: the default build is pure Rust apart from
+# libgit2 (no OpenSSL, no ring, no aws-lc); `otlp-tls` adds ring and rustls
+# only; `ssh` adds russh with ring and never OpenSSL or libssh2; only `https`
+# brings OpenSSL. The library: no recording engine, no FUSE, no
+# OpenTelemetry SDK or exporter, no TLS and no libssh2. The recording engine
+# is refused here, not by the ranks: its rank is the tree engine's
+# (docs/target-architecture/future/crate-split.md, "Traps"). The ranks
+# refuse the FUSE layer.
 set -euo pipefail
 
 packages() { # cargo-tree-args...
   cargo tree --locked -p agentfs-cli -e normal --prefix none --format '{p}' "$@" |
     awk '{print $1}' | sort -u
+}
+
+library() {
+  cargo tree --locked -p agentfs -e normal --prefix none --format '{p}' | awk '{print $1}' | sort -u
 }
 
 fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
@@ -34,3 +42,8 @@ check "otlp-tls" 'aws-lc-rs|aws-lc-sys|openssl|openssl-sys|native-tls' 'rustls' 
 check "ssh" 'aws-lc-rs|aws-lc-sys|openssl|openssl-sys|native-tls|libssh2-sys' 'russh' --features ssh
 check "ssh" 'aws-lc-rs|aws-lc-sys|openssl|openssl-sys|native-tls|libssh2-sys' 'ring' --features ssh
 check "image features" 'aws-lc-rs|aws-lc-sys' 'ring' --features https,ssh,otlp-tls
+
+all=$(library)
+found=$(grep -Ex "agentfs-core|fuser|opentelemetry_sdk|opentelemetry-otlp|$NO_TLS|libssh2-sys" <<<"$all" || true)
+[ -z "$found" ] || fail "library links $(echo "$found" | tr '\n' ' ')"
+echo "ok   library"

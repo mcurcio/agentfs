@@ -545,7 +545,7 @@ fn built_events_under_a_held_open_do_not_each_compact() {
 /// 2.1: a kill at any gap of a compaction loses nothing returned, and the
 /// volume opens with the same reads. While the compactor is parked before
 /// its checkpoint is in place, History still reports the last published
-/// one (C3), so the builder's batch trims nothing a restart needs.
+/// one (JC3), so the builder's batch trims nothing a restart needs.
 #[test]
 fn a_kill_at_each_gap_keeps_every_returned_call() {
     for gap in Gap::ALL {

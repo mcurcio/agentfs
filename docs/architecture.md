@@ -12,6 +12,7 @@ is. The libraries behind it, and why each was chosen, are under
 |---|---|---|
 | `agentfs-core` | library | The recording engine: path rules, the journal, frozen copies, commits, pushes, restores, the patch queue, the history service, LFS, telemetry. No FUSE and no CLI |
 | `agentfs-engine` | library | The tree engine, the recording engine's sibling: the tree views' one actor per volume over its journal, history and rows (`tree_actor`), its git store (`tree_git`), sessions, the domains' store adapters, the state area, the operator's settings and its OpenTelemetry instruments ([library](library/engine.md)). No FUSE, no CLI and no remote |
+| `agentfs` | library | The library under one name, the one crate a consumer depends on: re-exports only, the tree engine, the shared kernel and the domains each as a module, whole ([library](library/agentfs.md)). No crate of the workspace depends on it |
 | `agentfs-fuse` | library | The FUSE layer: a passthrough filesystem over the backing tree that calls the engine at every change boundary |
 | `agentfs-cli` | binary | The `agentfs` command, the package's one binary (every subcommand is listed in [configuration](configuration.md#commands)); OpenTelemetry export |
 | `agentfs-csi` | library and binary | The CSI driver: `agentfs-csi`, one per node beside csi-provisioner, which makes each claim's tree volume with `agentfs init` and supervises one `agentfs host` per volume in use on the node, each pod's view opened on it at the kubelet's target ([csi](csi.md)) |
@@ -46,7 +47,9 @@ rank uses, so two packages of one rank never depend on each other unless the
 rank uses itself. A dev-dependency may point anywhere, as a test of the binary
 drives the CSI driver, but at a package that builds a sibling of a rank that
 does not use itself: the sibling, or a package whose normal and build
-dependencies reach it. So one engine's tests never build the other. `crates/agentfs-repo` checks the manifests,
+dependencies reach it. So one engine's tests never build the other. A rank no
+rank uses takes no dependency, dev included: no package depends on one of its
+packages. `crates/agentfs-repo` checks the manifests,
 and this table against the workspace manifest.
 
 | Rank | Uses | Layer | What it holds |

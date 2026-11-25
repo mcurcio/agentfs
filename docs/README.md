@@ -34,6 +34,8 @@ are under [Future designs](#future-designs).
 
 | Page | For |
 |---|---|
+| [The library: `agentfs`](library/agentfs.md) | The one crate a consumer depends on: the tree engine, the shared kernel and the domains under one name, the consumer API and what it leaves out |
+| [The library: the shared kernel and the domains](library/domains.md) | The Volume, Clients and Trees domains over the shared kernel's ports: their services, rows, events and invariants |
 | [The library: `agentfs-core`](library/core.md) | The recording engine: recording, history, pushing, restore, patches, forks and the history service, for building another front end or tooling |
 | [The library: `agentfs-engine`](library/engine.md) | The tree engine: git-backed tree views, their sessions, the domains' rows and the state area, for building another front end over tree views or tooling |
 | [The filesystem: `agentfs-fuse` and `agentfs-cli`](library/filesystem.md) | The FUSE operations, the `agentfs` binary's commands, exit codes and control socket |

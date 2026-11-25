@@ -15,26 +15,26 @@
 //! module, on its own thread; the call path never imports it.
 //!
 //! Invariants:
-//! - **C1.** [`JournalCompaction::publish`] takes a [`Sealed`] checkpoint,
+//! - **JC1.** [`JournalCompaction::publish`] takes a [`Sealed`] checkpoint,
 //!   which only [`Sealed::new`] makes, from a [`Durable`] proof that every
 //!   record at or below the checkpoint's `built` is durable.
-//! - **C2, C2a.** A segment is covered when the next segment in the table
+//! - **JC2, JC2a.** A segment is covered when the next segment in the table
 //!   starts at or before `built + 1`: the actor has rolled past it, and every
 //!   record in it is at or below `built`. The newest segment is never
 //!   covered. [`JournalCompaction::unlink_covered`] unlinks a covered segment
 //!   only once a [`Published`] checkpoint covers it and every live frame in it
 //!   has a durable copy the checkpoint names.
-//! - **C3.** History forgets what a checkpoint covers only once
+//! - **JC3.** History forgets what a checkpoint covers only once
 //!   [`Published`] reports it (`History::published`).
-//! - **C4.** The checkpoint keeps, per pointer, the step at or below `built`
+//! - **JC4.** The checkpoint keeps, per pointer, the step at or below `built`
 //!   that a record after it may still name (`step_heads`); the fold seeds
 //!   each such pointer with that step, so a record folds the same on the old
 //!   and the new checkpoint.
-//! - **C5, C7.** A torn tail never removes the checkpoint, and the journal
+//! - **JC5, JC7.** A torn tail never removes the checkpoint, and the journal
 //!   always opens: the salt, the redo start `built + 1` and "no record after
 //!   `built`" come from the checkpoint file; a missing or wholly torn segment
 //!   after `built` is judged as the first invalid frame (`Journal::open`).
-//! - **C9.** No method holds the lock of Durability's state, of the segment
+//! - **JC9.** No method holds the lock of Durability's state, of the segment
 //!   table or of the relocations across I/O or a wait, and the volume's gate
 //!   ([`CompactGate`]) is called with no lock held.
 
@@ -63,7 +63,7 @@ pub(in crate::tree_actor) const CHECKPOINT: &str = "checkpoint";
 /// The file name a checkpoint is written to before it is renamed into place.
 pub(in crate::tree_actor) const CHECKPOINT_TMP: &str = "checkpoint.tmp";
 
-/// What every record at or below `built` adds up to (C8). Each field's one
+/// What every record at or below `built` adds up to (JC8). Each field's one
 /// source at `built` (B):
 ///
 /// | Field | Source at B |
@@ -78,7 +78,7 @@ pub(in crate::tree_actor) const CHECKPOINT_TMP: &str = "checkpoint.tmp";
 /// | `page_saved` | the fold's last saving step per file with a live write-open (`Folded::saved_through`) |
 /// | `page_writes` | the page writes the fold holds (`Folded::page_writes`), sorted, each once |
 /// | `chunks` | the fold's chunk records no take, replace or save step has taken yet (`Folded::bytes`) |
-/// | `step_heads` | every pointer, row chains included, the fold gives as `Target::Step(s)`: one a switch record at or below B names is an oid there. Its oid is `pointers[pointer]`. At most one per pointer (C3, C4) |
+/// | `step_heads` | every pointer, row chains included, the fold gives as `Target::Step(s)`: one a switch record at or below B names is an oid there. Its oid is `pointers[pointer]`. At most one per pointer (JC3, JC4) |
 /// | `carried` | the carry files this checkpoint names live frames in, written only by [`Sealed::new`] |
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(in crate::tree_actor) struct Checkpoint {
@@ -228,7 +228,7 @@ pub(super) fn write_first(dir: &Path, checkpoint: &Checkpoint) -> io::Result<()>
 }
 
 /// Every record at or below `through` is durable: what [`Sealed::new`]
-/// takes as proof of C1. Only [`JournalCompaction::wait_durable`] makes one.
+/// takes as proof of JC1. Only [`JournalCompaction::wait_durable`] makes one.
 #[derive(Debug, PartialEq, Eq)]
 pub(in crate::tree_actor) struct Durable {
     through: RecordNo,
@@ -357,7 +357,7 @@ impl Sealed {
 }
 
 /// A checkpoint at `built` renamed into place with its directory synced:
-/// what [`JournalCompaction::unlink_covered`] takes as proof of C2. Made by
+/// what [`JournalCompaction::unlink_covered`] takes as proof of JC2. Made by
 /// [`JournalCompaction::publish`], or by `Journal::open` for the checkpoint
 /// it read.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -712,7 +712,7 @@ impl JournalCompaction {
     }
 
     /// The covered segments: each before the newest whose next segment
-    /// starts at or before `built + 1` (C2, C2a).
+    /// starts at or before `built + 1` (JC2, JC2a).
     fn covered(&self, built: RecordNo) -> Vec<Arc<Segment>> {
         let table = self.durability.table();
         table
@@ -975,7 +975,7 @@ impl JournalCompaction {
 
     /// The linked files' length, segments and carry files: what compaction
     /// is due by (`Durability::linked`). An unlinked file a reader still
-    /// holds (C6) counts in `Durability::len`, the journal's figure, and
+    /// holds (JC6) counts in `Durability::len`, the journal's figure, and
     /// not here.
     pub(in crate::tree_actor) fn len(&self) -> u64 {
         self.durability.linked()

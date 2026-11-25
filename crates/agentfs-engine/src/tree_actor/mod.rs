@@ -1702,7 +1702,7 @@ impl TreeActor {
                 self.before_record();
             }
             // Each chain's pointer, as the records name it: its old value may
-            // be a step a checkpoint keeps the head of (C4).
+            // be a step a checkpoint keeps the head of (JC4).
             let step = Target::Step(RecordNo::new(self.next + ahead));
             let mut chains = BTreeSet::new();
             for row in &rows {
@@ -2155,7 +2155,7 @@ mod tests {
         same_fold(&fold(&compacted).unwrap(), &folded);
 
         // What follows lands on the checkpoint and folds there: a record
-        // that names a step the checkpoint covers finds its head (C4).
+        // that names a step the checkpoint covers finds its head (JC4).
         v.write(held, 0, b"held-2", false).unwrap();
         v.write(shared, 0, b"!", true).unwrap();
         let again = v.write_open(ROOT, "again", &w, Some(ATTRS)).unwrap();
@@ -2599,7 +2599,7 @@ mod tests {
         v.history().wait_compacted(published.generation).unwrap();
         assert!(v.metrics().journal_dropped >= 1);
         // The linked files: an unlinked segment a holder still reads counts
-        // in `Durability::len` until it lets go (C6), which the deferred
+        // in `Durability::len` until it lets go (JC6), which the deferred
         // drops do on their own thread.
         let linked: u64 = fs::read_dir(tmp.path().join(JOURNAL))
             .unwrap()

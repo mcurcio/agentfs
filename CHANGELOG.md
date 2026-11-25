@@ -14,7 +14,8 @@ design was reviewed on 2026-10-12.
 
 - **The CLI's package is `agentfs-cli`.** Its directory is `crates/agentfs-cli`
   and its binary is still `agentfs`; build it from source with
-  `cargo build --release -p agentfs-cli`. No package is named `agentfs`.
+  `cargo build --release -p agentfs-cli`. The package `agentfs` is the
+  library crate (below).
 - **`agentfs init` and `mount` run the tree engine.** `agentfs trees` is gone:
   `init --volume NAME [--include FILE]... [--owner UID:GID]` creates or finds a
   tree volume (`<name> <id> created|found`), `mount ROOT` serves it (with every
@@ -105,6 +106,13 @@ design was reviewed on 2026-10-12.
 
 ### Added
 
+- **The library crate `agentfs`.** The one crate a consumer depends on: the
+  tree engine, the shared kernel and the Volume, Clients, Trees and Rules
+  domains under one name (`agentfs::engine`, `agentfs::contracts`, ...), with
+  a doctest that opens a tree volume through it. It does not re-export the
+  recording engine or the FUSE layer. No crate of the workspace depends on it
+  (docs/library/agentfs.md). The domains' contract and invariants are on
+  their own page, docs/library/domains.md.
 - **`AgentfsNotBuilt`.** An example alert rule, a warning while
   `agentfs_not_built` counts a configured operator setting whose capability
   tree volumes do not build yet, labelled by capability. The telemetry,

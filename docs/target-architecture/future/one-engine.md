@@ -121,7 +121,7 @@ manual trigger. Only a milestone that changes save or land logic needs the full 
 **M1. Volumes and their lifecycle.** Built. Volume (`ensure`, `stage`, `unstage`, the Stop drain and the release
 verdict), Clients (attach, rebind, detach, sessions, one writer per fork), Views (the view host) and Trees (create
 with settings and a key, end, drop) are in [tree views](../../trees.md); their invariants are in the
-[library](../../library/engine.md#domain-invariants). A volume gets its UUID at create, zero remotes is a valid volume,
+[library](../../library/domains.md#domain-invariants). A volume gets its UUID at create, zero remotes is a valid volume,
 other users reach the tree mount, and every commit carries the "where" trailers. The tracer and the release figures
 run in `image.yml` ([tracer](#tracer), [performance](../../performance.md#tree-views-release-build)), and
 `phase-1.yml` runs on every PR. Left to later milestones: a start point from another volume's line

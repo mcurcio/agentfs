@@ -16,8 +16,10 @@ use crate::{Comments, files_under, is_separator, lex, root};
 
 /// Where `workspace` breaks its ranks: a rank listed twice, a rank using
 /// one listed after it, a member naming no rank or an unknown one, a
-/// normal or build dependency on a member in a rank its own rank does not
-/// use, and a dev-dependency that builds another member of its own rank when
+/// dependency of any kind on a member whose rank no rank uses, its own
+/// included (the crate `agentfs`, which only consumers use), a normal or build
+/// dependency on a member in a rank its own rank does not use, and a
+/// dev-dependency that builds another member of its own rank when
 /// that rank does not use itself: the sibling itself, or any member whose
 /// normal and build dependencies reach it (one engine's tests would build
 /// the other). Other dev-dependencies may point anywhere.
@@ -62,6 +64,17 @@ fn rank_problems(workspace: &Workspace) -> Vec<String> {
             else {
                 continue;
             };
+            if !workspace
+                .ranks
+                .iter()
+                .any(|r| r.uses.iter().any(|u| u == their))
+            {
+                edges.insert(format!(
+                    "{} -> {} (no rank uses {their})",
+                    member.name, dependency.name
+                ));
+                continue;
+            }
             let used = rank.uses.iter().any(|u| u == their);
             if dependency.kind == DependencyKind::Dev {
                 // A test may drive anything but what builds a sibling the
@@ -180,6 +193,20 @@ fn ranks() -> Vec<Rank> {
             "kubernetes",
             &["leaf", "shared-kernel", "engine", "filesystem"],
         ),
+        ("umbrella", &["shared-kernel", "domain", "engine"]),
+        (
+            "tests",
+            &[
+                "line-identity",
+                "leaf",
+                "shared-kernel",
+                "domain",
+                "engine",
+                "filesystem",
+                "kubernetes",
+                "tests",
+            ],
+        ),
     ]
     .into_iter()
     .map(|(name, uses)| Rank {
@@ -190,7 +217,8 @@ fn ranks() -> Vec<Rank> {
 }
 
 /// Today's shape, small: the line maps on the alignment, a leaf, the
-/// shared kernel, two domains, the engine, the FUSE layer, the CSI driver.
+/// shared kernel, two domains, the engine, the FUSE layer, the CSI driver,
+/// the library crate `agentfs`.
 fn today() -> Workspace {
     Workspace {
         ranks: ranks(),
@@ -212,6 +240,11 @@ fn today() -> Workspace {
                 "agentfs-csi",
                 "kubernetes",
                 &["agentfs-core", "agentfs-fuse"],
+            ),
+            member(
+                "agentfs",
+                "umbrella",
+                &["agentfs-contracts", "agentfs-volume"],
             ),
         ],
     }
@@ -255,6 +288,9 @@ fn the_ranks_refuse_sideways_and_upward_edges() {
             "agentfs-csi",
             "filesystem does not use kubernetes",
         ),
+        // No member depends on the library crate, whatever its rank uses.
+        ("agentfs-fuse", "agentfs", "no rank uses umbrella"),
+        ("agentfs-csi", "agentfs", "no rank uses umbrella"),
     ] {
         assert_eq!(
             rank_problems(&with_edge(today(), from, to)),
@@ -269,7 +305,7 @@ fn the_ranks_refuse_sideways_and_upward_edges() {
         rank_problems(&two_engines),
         ["agentfs-core -> agentfs-engine (engine does not use engine)"]
     );
-    // A test may drive anything...
+    // A test may drive anything a rank uses...
     let mut dev = today();
     dev.members[0].dependencies.push(Dependency {
         name: "agentfs-csi".into(),
@@ -293,6 +329,13 @@ fn the_ranks_refuse_sideways_and_upward_edges() {
             kind: DependencyKind::Dev,
         });
     };
+    // ...and never the library crate, which no rank uses.
+    let mut umbrella = today();
+    dev_edge(&mut umbrella, "agentfs-fuse", "agentfs");
+    assert_eq!(
+        rank_problems(&umbrella),
+        ["agentfs-fuse -> agentfs (no rank uses umbrella)"]
+    );
     let mut domains = today();
     dev_edge(&mut domains, "agentfs-trees", "agentfs-volume");
     assert_eq!(
@@ -325,10 +368,6 @@ fn the_ranks_refuse_sideways_and_upward_edges() {
     helper
         .members
         .push(member("agentfs-test-metrics", "tests", &["agentfs-core"]));
-    helper.ranks.push(Rank {
-        name: "tests".into(),
-        uses: vec!["engine".into()],
-    });
     dev_edge(&mut helper, "agentfs-engine", "agentfs-test-metrics");
     assert_eq!(
         rank_problems(&helper),
@@ -743,7 +782,7 @@ fn runs(path: &Path) -> bool {
 /// test program selected through a variable, which no check can read
 /// (markdown keeps placeholders such as `-p <crate>`); and `cargo build` of
 /// a package with no binary, since a script builds to run what it built (a
-/// stale `-p agentfs` once the library front has that name).
+/// stale `-p agentfs`, now the library crate's name).
 fn script_problems(workspace: &Workspace, path: &Path, s: &Selection) -> Vec<String> {
     if !runs(path) {
         return Vec::new();
@@ -911,13 +950,13 @@ fn doc_commands(source: &str) -> Vec<(usize, Vec<String>)> {
 /// scripts, the Dockerfile, the docs, the skills, the examples, the crates'
 /// doc comments and Python scripts (a call written as a list too) selects
 /// packages, features, binaries and test programs the workspace has: chiefly
-/// a reference left to a renamed package. No package is named `agentfs`: the
-/// binary `agentfs` is package `agentfs-cli`'s. In a file that runs, every
-/// selection is a literal name, so this check can read it, and `cargo build`
-/// selects only packages with a binary, so a stale `-p agentfs` building the
-/// library front is refused there. Not read: cargo run through a variable
-/// (`$CARGO`), a cargo call built by other code than one list, and a
-/// command in a Rust comment that is not a doc comment.
+/// a reference left to a renamed package. The binary `agentfs` is package
+/// `agentfs-cli`'s; the package `agentfs` is the library crate. In a file
+/// that runs, every selection is a literal name, so this check can read it,
+/// and `cargo build` selects only packages with a binary, so a stale
+/// `-p agentfs` building the library crate is refused there. Not read: cargo
+/// run through a variable (`$CARGO`), a cargo call built by other code than
+/// one list, and a command in a Rust comment that is not a doc comment.
 #[test]
 fn cargo_commands_name_what_the_workspace_has() {
     let workspace = Workspace::load();
@@ -1078,8 +1117,8 @@ fn cargo_commands_are_refused_where_the_workspace_lacks_their_names() {
     let refused = |workspace: &Workspace, line: &str| {
         !selection_problems(workspace, &one_selection(line)).is_empty()
     };
-    // Today: the binary `agentfs` is package `agentfs-cli`'s, with a test
-    // program; no package is named `agentfs`.
+    // Before the library crate: the binary `agentfs` is package
+    // `agentfs-cli`'s, with a test program; no package is named `agentfs`.
     let mut cli = binary("agentfs-cli", "agentfs", &["https", "ssh", "otlp-tls"]);
     cli.targets.push(Target {
         name: "csi_trees".into(),
@@ -1089,20 +1128,18 @@ fn cargo_commands_are_refused_where_the_workspace_lacks_their_names() {
         ranks: ranks(),
         members: vec![cli, binary("agentfs-csi", "agentfs-csi", &[])],
     };
-    // Once the library front is `agentfs`: a library with no features. Its
-    // rank here is any: the cargo checks do not read ranks (crate-split.md
-    // gives the front its rank).
+    // Once the library crate is `agentfs`: a library with no features.
     let mut front = Workspace {
         ranks: ranks(),
         members: now.members.clone(),
     };
-    front.members.push(member("agentfs", "filesystem", &[]));
+    front.members.push(member("agentfs", "umbrella", &[]));
     for (line, ..) in LINES {
         assert!(!refused(&now, line), "{line}");
         assert!(!refused(&front, line), "{line}");
     }
-    // A reference left to the old package: refused today; once the front
-    // has the name, only where it asks for what the front lacks.
+    // A reference left to the old package: refused before the library
+    // crate; once it has the name, only where it asks for what it lacks.
     for (line, on_front) in [
         ("cargo build -p agentfs", false),
         ("cargo test --doc -p agentfs", false),

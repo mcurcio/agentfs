@@ -73,7 +73,10 @@ docker build -t agentfs:dev .                 # https, ssh and otlp-tls features
 `cargo nextest run` runs every test in a process of its own, several at
 once, so a test never shares globals, an allocator or counters with
 another. nextest does not run doctests: `cargo test --doc` does, for a
-package with a library (`agentfs-cli` is a binary only and has none). AGENTS.md
+package with a library (`agentfs-cli` is a binary only and has none). The
+library crate `agentfs` has no tests but its doctest:
+`cargo test --doc -p agentfs` runs it, and `cargo nextest run -p agentfs`
+finds nothing to run. AGENTS.md
 gives the pinned nextest release and how to install it.
 
 [`.config/nextest.toml`](../.config/nextest.toml) holds two profiles. Both
@@ -229,7 +232,8 @@ Every push runs [`.github/workflows/ci.yml`](../.github/workflows/ci.yml):
 
 - **lint:** rustfmt, clippy with default and all features, and
   [`ci/check-deps.sh`](../ci/check-deps.sh): what C and crypto each feature
-  set links.
+  set of the binary links, and that the library crate `agentfs` links no
+  recording engine, FUSE, OpenTelemetry SDK, TLS or SSH.
 - **test:** the workspace tests under nextest's `ci` profile, then the
   doctests with `cargo test --doc`, with default and all features. They
   include `restore` and `revert` without a mount

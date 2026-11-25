@@ -729,7 +729,7 @@ impl History {
     }
 
     /// The compactor's view of History at its built point, read in one hold
-    /// (C8, C9): O(1), every field shared. `None` until the first built
+    /// (JC8, JC9): O(1), every field shared. `None` until the first built
     /// event since open, when History has no trees at the built point.
     pub(in crate::tree_actor) fn at_built(&self) -> Option<super::compactor::AtBuilt> {
         let state = self.state();
@@ -742,7 +742,7 @@ impl History {
     }
 
     /// A checkpoint at `published.built()` is in place: only now may History
-    /// forget the built-log entries it covers (C3). From now
+    /// forget the built-log entries it covers (JC3). From now
     /// [`History::checkpointed_through`] reports `published.built()`, or the
     /// record before `published.oldest_head()` when that is earlier, so the
     /// builder keeps every step head a later record may name. Moves the
