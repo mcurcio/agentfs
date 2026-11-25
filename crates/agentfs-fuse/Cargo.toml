@@ -7,6 +7,9 @@ license.workspace = true
 repository.workspace = true
 description = "The agentfs FUSE layer: a recording passthrough filesystem over a backing tree"
 
+[package.metadata.agentfs]
+layer = "filesystem"
+
 [dependencies]
 agentfs-contracts = { version = "0.1.0", path = "../agentfs-contracts" }
 agentfs-core = { version = "0.1.0", path = "../agentfs-core" }

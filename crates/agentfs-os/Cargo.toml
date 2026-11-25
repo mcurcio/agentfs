@@ -1,0 +1,11 @@
+[package]
+name = "agentfs-os"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "agentfs's operating-system leaves: file locks, atomic files, confined directory access, mounts, listening and local sockets, the allocator"
+
+[package.metadata.agentfs]
+layer = "leaf"

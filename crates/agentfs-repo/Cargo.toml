@@ -1,0 +1,12 @@
+[package]
+name = "agentfs-repo"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Checks over the whole agentfs repository: its documentation against its code, its workflows and its crates' layers"
+publish = false
+
+[package.metadata.agentfs]
+layer = "tests"

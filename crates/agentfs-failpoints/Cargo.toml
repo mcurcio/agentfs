@@ -1,0 +1,15 @@
+[package]
+name = "agentfs-failpoints"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "agentfs's failpoints: named places on the durable path where a test build can kill, fail, stall or park the process"
+
+[package.metadata.agentfs]
+layer = "leaf"
+
+[features]
+# Test builds only: the registry acts on its spec. Never in a release or image.
+failpoints = []

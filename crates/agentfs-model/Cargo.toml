@@ -8,6 +8,9 @@ repository.workspace = true
 description = "An executable model of the target architecture's landing rules, built on the git CLI"
 publish = false
 
+[package.metadata.agentfs]
+layer = "tests"
+
 # This models the target design (docs/target-architecture), not today's code, so the
 # one agentfs crate it depends on is the alignment's call, which it shares with the
 # library so that line identity does not depend on how git is called (MODEL.md,

@@ -1,0 +1,11 @@
+[package]
+name = "agentfs-git"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "agentfs's git leaves: the git program's environment, the one libgit2 setup, pack settings, and a tree volume's object store"
+
+[package.metadata.agentfs]
+layer = "leaf"

@@ -1,7 +1,7 @@
 [workspace]
 resolver = "3"
 exclude = ["vendor/fuser"]
-members = ["crates/agentfs-align", "crates/agentfs-rules", "crates/agentfs-contracts", "crates/agentfs-volume", "crates/agentfs-clients", "crates/agentfs-trees", "crates/agentfs-core", "crates/agentfs-fuse", "crates/agentfs", "crates/agentfs-csi", "crates/agentfs-model", "crates/agentfs-conformance"]
+members = ["crates/agentfs-align", "crates/agentfs-lines", "crates/agentfs-failpoints", "crates/agentfs-os", "crates/agentfs-git", "crates/agentfs-rules", "crates/agentfs-contracts", "crates/agentfs-volume", "crates/agentfs-clients", "crates/agentfs-trees", "crates/agentfs-core", "crates/agentfs-fuse", "crates/agentfs", "crates/agentfs-csi", "crates/agentfs-model", "crates/agentfs-conformance", "crates/agentfs-repo"]
 
 [workspace.package]
 edition = "2024"
@@ -9,6 +9,14 @@ edition = "2024"
 rust-version = "1.89"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/mcurcio/agentfs"
+
+# The layers of the workspace's packages, lowest first. Each package names its
+# own in `[package.metadata.agentfs] layer`; a normal or build dependency
+# points to a package of the same layer or a lower one, and a dev-dependency
+# may point anywhere (docs/architecture.md, "Layers"; crates/agentfs-repo
+# checks it).
+[workspace.metadata.agentfs]
+layers = ["leaf", "kernel", "domain", "engine", "filesystem", "kubernetes", "tests"]
 
 [patch.crates-io]
 fuser = { path = "vendor/fuser" }

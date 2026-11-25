@@ -7,6 +7,9 @@ license.workspace = true
 repository.workspace = true
 description = "The Rules domain of agentfs's tree views: which new names a tree records"
 
+[package.metadata.agentfs]
+layer = "domain"
+
 [dependencies]
 bstr = "1.13.1"
 gix-attributes = "0.37.0"

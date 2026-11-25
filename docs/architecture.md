@@ -16,11 +16,16 @@ is. The libraries behind it, and why each was chosen, are under
 | `agentfs-csi` | library and binary | The CSI driver: `agentfs-csi`, one per node beside csi-provisioner, which makes each claim's tree volume with `agentfs init` and supervises one `agentfs host` per volume in use on the node, each pod's view opened on it at the kubelet's target ([csi](csi.md)) |
 | `agentfs-rules` | library | The Rules domain of the tree views, pure: where each new name of a tree lives, recorded or in its untracked area, from the operator's `info/exclude` and `info/attributes` ([trees](trees.md#rules-and-the-untracked-area)). Depends on `gix-ignore` and `gix-attributes` only; `agentfs-core` and `agentfs-fuse` depend on it |
 | `agentfs-align` | library | Git's histogram diff, called one way, for line identity (git-model §7). `agentfs-core` and `agentfs-model` both depend on it, so line identity does not depend on how `git` is called; one module, `lib.rs` |
+| `agentfs-failpoints` | library | The one registry of failpoints, named places on the durable path where a test build can kill, fail, stall or park the process, and the gates a test drives over FIFOs. In a release build each point is an inlined `Ok(())` |
+| `agentfs-os` | library | The operating-system leaves both engines share: advisory file locks, atomic files, confined access to a directory tree, the mount table, the shared-filesystem check, listening and local Unix sockets, the allocator's arenas. Knows nothing of git, volumes or trees |
+| `agentfs-git` | library | Git as both engines use it: the `git` program in an environment of its own, the process's one libgit2 setup, every repack's memory bounds, and a tree volume's object store |
+| `agentfs-lines` | library | Line maps: which version wrote each line of a file, aligned across saves by `agentfs-align`'s histogram diff. Pure apart from the diff's `git` child, which the caller starts |
 | `agentfs-contracts` | library | The shared kernel of the domains around the git model ([the system](target-architecture/system.md)): values (the tree and volume identities, names, the pod context), capabilities and their minter, each domain's trait, errors and events, and the ports adapters implement. No I/O; depends on no other agentfs crate |
 | `agentfs-volume` | library | The Volume domain, pure over its ports: `ensure`, the lifecycle and the release verdict |
 | `agentfs-clients` | library | The Clients domain, pure over its ports: attachments, grants and each fork's one writer |
 | `agentfs-trees` | library | The Trees domain, pure over its ports: each fork's lifecycle |
 | `agentfs-conformance` | library and binary, tests only | The model's recorded calls against the real tree library and real mounts (git-model §18). Depends on `agentfs-core` and `agentfs-model`; nothing depends on it |
+| `agentfs-repo` | library, tests only | Checks over the whole repository, as its tests: the documentation against the code, the workflows and CI scripts, the crates and their layers. Its library is what the documentation tests share: a reader of the markdown in `docs/` and of the workspace as `cargo metadata` describes it. Depends on no other agentfs crate |
 
 The dependencies run one way: `agentfs-csi` → (`agentfs` as a child
 process) → `agentfs-fuse` → `agentfs-core` → `agentfs-contracts`. The
@@ -28,6 +33,26 @@ domain crates (`agentfs-volume`, `agentfs-clients`, `agentfs-trees`) depend
 on `agentfs-contracts` alone, and on no other domain. `agentfs-csi` links
 `agentfs-core` only to create state areas and read their status; it never
 records.
+
+## Layers
+
+Every package names its layer in its manifest
+(`[package.metadata.agentfs] layer`), and the workspace manifest lists the
+layers, lowest first (`[workspace.metadata.agentfs] layers`). A normal or
+build dependency points to a package of the same layer or a lower one; a
+dev-dependency may point anywhere, as a test of the binary may drive the
+CSI driver. `crates/agentfs-repo` checks both, and this table against the
+workspace manifest.
+
+| Layer | What it holds |
+|---|---|
+| `leaf` | Mechanisms both engines share that know no domain value: the alignment, line maps, failpoints, the operating system, git |
+| `kernel` | The shared kernel of the domains: values, capabilities, traits, events and ports, with no I/O |
+| `domain` | The pure domains over the kernel's ports, and the tree views' rules |
+| `engine` | What implements the ports and owns the state on disk: the recording engine and the tree engine |
+| `filesystem` | The FUSE layer and the `agentfs` binary, the composition root |
+| `kubernetes` | The CSI driver |
+| `tests` | Packages that exist only for tests: the model, the conformance replay, the repository checks |
 
 ## Module map
 
@@ -60,6 +85,30 @@ missing from these tables or a row names a module that no longer exists;
 | `lib.rs` | Crate root: the Rules domain's overview |
 | `operator.rs` | `OperatorRules`: `info/exclude` and `info/attributes` parsed from buffers with `gix-ignore` and `gix-attributes`, case-sensitive, never a system, global or tree file |
 | `set.rs` | `RuleSet`: one volume's rules, built once at open, refusing rules tree volumes do not build (`RulesError`); `place` judges a new name `Tracked` or `Untracked` with its reason, built-ins first |
+
+### `agentfs-failpoints`
+
+| Module | Role |
+|---|---|
+| `lib.rs` | Crate root: the failpoints registry's overview |
+
+### `agentfs-os`
+
+| Module | Role |
+|---|---|
+| `lib.rs` | Crate root: the operating-system leaves' overview |
+
+### `agentfs-git`
+
+| Module | Role |
+|---|---|
+| `lib.rs` | Crate root: git as both engines use it |
+
+### `agentfs-lines`
+
+| Module | Role |
+|---|---|
+| `lib.rs` | Crate root: the line maps' overview |
 
 ### `agentfs-volume`
 
@@ -308,6 +357,12 @@ missing from these tables or a row names a module that no longer exists;
 | `mounted.rs` | `Mounted`: the shared calls as real system calls on a mount of a failpoints build, each take through the take gate |
 | `invariants.rs` | What must hold in the real system, read from `git`, its own reader of line maps and name histories and its own byte oracle, never `tree_actor` |
 | `bin/phase1-replay.rs` | `phase1-replay model\|library\|mount DIR [--record OUT]`: replays the traces, with floors, against `open-findings.txt`; `--record` writes what the system did with each |
+
+### `agentfs-repo`
+
+| Module | Role |
+|---|---|
+| `lib.rs` | Crate root: the repository checks' overview |
 
 ### `agentfs-csi`
 

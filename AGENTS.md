@@ -86,6 +86,7 @@ When you learn something durable, write it to its home in the same commit. Never
 |---|---|
 | `crates/agentfs-contracts` | The shared kernel of the domains around the git model: values, capabilities, each domain's trait and events, and the ports adapters implement. No I/O |
 | `crates/agentfs-volume`, `crates/agentfs-clients`, `crates/agentfs-trees` | The Volume, Clients and Trees domains, each pure over the ports in `agentfs-contracts` |
+| `crates/agentfs-failpoints`, `crates/agentfs-os`, `crates/agentfs-git`, `crates/agentfs-lines` | The leaves both engines share: the failpoints registry; file locks, atomic files, confinement, mounts, sockets and the allocator; the `git` program, the one libgit2 setup and a tree volume's object store; line maps |
 | `crates/agentfs-core` | Engine: journal, pending, history, push, credentials, lfs, patch, history_service, telemetry |
 | `crates/agentfs-fuse` | FUSE operations, kernel-independent `Ops` plus a thin fuser adapter |
 | `crates/agentfs` | CLI binary: `init`, `mount`, `fork end` and `probe` on tree volumes; `front` and `serve-history`, which the CSI driver starts; the recording engine's one-shot commands (`record`, `push`, `restore`, `revert`, `patch`, ...) on its state areas |
@@ -94,6 +95,7 @@ When you learn something durable, write it to its home in the same commit. Never
 | `crates/agentfs-align` | Git's histogram diff, called one way: the alignment's one call, shared by the tree library and the model so line identity does not depend on how `git` is called |
 | `crates/agentfs-model` | Tests only: an executable model of the target architecture's landing rules (`docs/target-architecture`) on the `git` program, with seeded random interleavings. Depends only on `agentfs-align` |
 | `crates/agentfs-conformance` | Tests only: the model's recorded calls replayed on the real tree library and on real mounts, with invariants read from git (`crates/agentfs-model/VERIFYING.md`, "Phase 1") |
+| `crates/agentfs-repo` | Tests only: checks over the whole repository (docs against code, workflows, the crates' layers); its library, a reader of `docs/` and of `cargo metadata`, is shared with the binaries' documentation tests |
 | `ci/` | End-to-end scripts run by GitHub Actions; `ci/lib.sh` has the shared helpers |
 | `deploy/` | Kubernetes manifests for the sidecar and CSI, plus examples (Hermes) |
 | `examples/docker` | Docker examples: `docker run` and compose (docs/docker.md) |

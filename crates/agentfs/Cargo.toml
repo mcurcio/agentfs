@@ -7,6 +7,9 @@ license.workspace = true
 repository.workspace = true
 description = "agentfs command-line tool and daemon"
 
+[package.metadata.agentfs]
+layer = "filesystem"
+
 [dependencies]
 agentfs-clients = { version = "0.1.0", path = "../agentfs-clients" }
 agentfs-contracts = { version = "0.1.0", path = "../agentfs-contracts" }
