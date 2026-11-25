@@ -68,7 +68,10 @@ are their own crates. What remains:
 - The tree path still reads the recording engine at launch: `crates/agentfs-cli/src/otel.rs` and `launcher/mod.rs` use
   core's `identity::Context`, and `otel.rs`'s `meter_of` scopes the binary's `Meter` with core's
   `telemetry::scope()`; the export-failure counter is named from core's `telemetry::names`. M9's deletion of core
-  must cut them first: F's.
+  must cut them first: F's. Two reads stay until M9 deletes what they serve: `otel.rs` builds core's
+  `telemetry::Telemetry` (with `OtelAlarmLog`) at every `otel::init`, a tree mount's included, so a tree process's
+  meter also carries the recording engine's `agentfs.nested.gitdir_heuristic`; and `daemon.rs` names core's
+  `service::Stop` in `Daemon::watch`, the recording mount's (a tree mount's hold uses `start` and `wait` only).
 - The tree view has no kernel-independent layer (`agentfs-fuse/src/tree_view.rs:43` uses `fuser::*`; `:1592`
   implements `Filesystem`), so it is tested only where `/dev/fuse` exists.
 
@@ -141,7 +144,17 @@ what each re-exported crate makes `pub`.
   root, so `Minter::new` is its to call and is consumer API; the routes around the Volume and Clients domains are not:
   the `StateArea` port's `create` called directly (around VO5 and VO6) and the actor guard's calls that name a tree and
   a writer (around C1 and C5). E's doctest takes both, as no one-call route exists yet. F owns the fix: the service's
-  one-call volume is the consumer's route, and F decides what the front re-exports of the engine once it exists. F or
+  one-call volume is the consumer's route, and F decides what the front re-exports of the engine once it exists.
+  **F's decision:** the front keeps the engine whole, and the engine's items `pub` only for the workspace's tests
+  (the store-only row writes, `close_writer`, the hand-made-id `create`s, `TreeGit`'s opens, the compaction gate)
+  become `pub(crate)` or `pub` only under its `test-util` feature, which the library never enables
+  (`ci/check-deps.sh`). The alternative, a front of contracts, the domains and the service with the engine reached by
+  name, narrows nothing (naming the engine reaches all of it), needs a second dependency or re-exports for the engine
+  types the service's API carries, and drops the engine from principle 10's library. `Minter::new` stays consumer API:
+  a consumer's `main` is its composition root and hands the service its capabilities. What stays reachable and
+  outside the route: the `StateArea` port's `create`, the guard's calls that name a writer, and any consumer that
+  turns `test-util` on itself. The tree library (engine and service alike) reports failures it cannot hand back as
+  `tree <Name>` lines on stderr, not through OpenTelemetry; moving them to an alarm port is one change for both. F or
   G decides whether the engine's `Error::Reconcile` keeps exposing a leaf's type (`agentfs_lines::Error`), which a
   consumer can name only by depending on agentfs-lines. The engine's re-export of the shared
   kernel's `TreeId` and `NotATree` (`tree_actor/mod.rs`) gives the library two paths to one value: G removes it, or
