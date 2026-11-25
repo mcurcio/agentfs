@@ -10,6 +10,7 @@ is. The libraries behind it, and why each was chosen, are under
 
 | Crate | Kind | What it is |
 |---|---|---|
+| `agentfs-engine` | library | The tree engine: git-backed tree views whose saves one actor orders, with its journal, history, sessions, operator settings and the store adapters that implement the domains' ports. The recording engine's sibling: neither depends on the other ([trees](trees.md)) |
 | `agentfs-core` | library | The engine: path rules, the journal, frozen copies, commits, pushes, restores, the patch queue, the history service, LFS, telemetry. No FUSE and no CLI |
 | `agentfs-fuse` | library | The FUSE layer: a passthrough filesystem over the backing tree that calls the engine at every change boundary |
 | `agentfs` | binary | The `agentfs` command (every subcommand is listed in [configuration](configuration.md#commands)); OpenTelemetry export |
@@ -151,6 +152,12 @@ row names a module that no longer exists; `tests.rs` files are not listed.
 |---|---|
 | `lib.rs` | Crate root: the Trees domain's overview |
 | `service.rs` | The Trees domain over its ports: every fork's row restored at boot, the facts Clients asks, the live forks, an unkeyed fork create (`ForkCreated` once its step is durable); end, end by key, the drop and the reaction to a tree's last detach (slice S5) |
+
+### `agentfs-engine`
+
+| Module | Role |
+|---|---|
+| `lib.rs` | Crate root: the tree engine's overview |
 
 ### `agentfs-core`
 

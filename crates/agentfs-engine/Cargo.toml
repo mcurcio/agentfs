@@ -1,0 +1,13 @@
+[package]
+name = "agentfs-engine"
+# Kept equal to agentfs-core's: history's verification notes carry the
+# crate's CARGO_PKG_VERSION (tree_actor/history/verify.rs).
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "The tree engine of agentfs: git-backed tree views whose saves one actor orders, its journal and history, sessions and the domains' store adapters"
+
+[package.metadata.agentfs]
+rank = "engine"

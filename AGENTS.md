@@ -87,6 +87,7 @@ When you learn something durable, write it to its home in the same commit. Never
 | `crates/agentfs-contracts` | The shared kernel of the domains around the git model: values (repository paths, durations and sizes among them), capabilities, each domain's trait and events, and the ports adapters implement. No I/O |
 | `crates/agentfs-volume`, `crates/agentfs-clients`, `crates/agentfs-trees` | The Volume, Clients and Trees domains, each pure over the ports in `agentfs-contracts` |
 | `crates/agentfs-failpoints`, `crates/agentfs-os`, `crates/agentfs-git`, `crates/agentfs-lines` | Below both engines (ranks in [architecture](docs/architecture.md#ranks)): the failpoints registry; file locks, atomic files, confinement, mounts, the shared-filesystem check, listening sockets and the allocator; the `git` program and the one libgit2 setup; and the line maps |
+| `crates/agentfs-engine` | The tree engine: the tree actor, its journal and history, sessions, operator settings and the store adapters behind the domains' ports; the recording engine's sibling, neither depending on the other |
 | `crates/agentfs-core` | Engine: journal, pending, history, push, credentials, lfs, patch, history_service, telemetry |
 | `crates/agentfs-fuse` | FUSE operations, kernel-independent `Ops` plus a thin fuser adapter |
 | `crates/agentfs` | CLI binary: `init`, `mount`, `fork end` and `probe` on tree volumes; `front` and `serve-history`, which the CSI driver starts; the recording engine's one-shot commands (`record`, `push`, `restore`, `revert`, `patch`, ...) on its state areas |
