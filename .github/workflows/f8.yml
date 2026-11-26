@@ -63,9 +63,7 @@ jobs:
           ls -l /dev/fuse
           uname -a
       - name: install kind and kubectl
-        run: |
-          ci/install-kind.sh "$RUNNER_TEMP/kind" >>"$GITHUB_ENV"
-          echo "$RUNNER_TEMP/kind/bin" >>"$GITHUB_PATH"
+        uses: ./.github/actions/kind
       - name: create the cluster
         run: |
           ci/kind-cluster.sh agentfs-move ci/kind/two-workers.yaml 180s
@@ -111,9 +109,7 @@ jobs:
           sudo modprobe fuse
           ls -l /dev/fuse
       - name: install kind and kubectl
-        run: |
-          ci/install-kind.sh "$RUNNER_TEMP/kind" >>"$GITHUB_ENV"
-          echo "$RUNNER_TEMP/kind/bin" >>"$GITHUB_PATH"
+        uses: ./.github/actions/kind
       - name: create the cluster
         run: |
           ci/kind-cluster.sh agentfs-server ci/kind/cluster.yaml 120s
@@ -155,11 +151,9 @@ jobs:
         run: |
           sudo modprobe fuse
           ls -l /dev/fuse
-          sudo apt-get update && sudo apt-get install -y nginx fcgiwrap
+          ci/apt-install.sh nginx fcgiwrap
       - name: install kind and kubectl
-        run: |
-          ci/install-kind.sh "$RUNNER_TEMP/kind" >>"$GITHUB_ENV"
-          echo "$RUNNER_TEMP/kind/bin" >>"$GITHUB_PATH"
+        uses: ./.github/actions/kind
       - name: create the cluster
         run: |
           ci/kind-cluster.sh agentfs-fork-of-fork ci/kind/cluster.yaml 120s

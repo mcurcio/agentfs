@@ -1,0 +1,32 @@
+name: kind and kubectl
+description: >-
+  Puts the pinned kind and kubectl of ci/install-kind.sh in $RUNNER_TEMP/kind/bin, on the
+  path, and its KIND_NODE_IMAGE in the environment. The release binaries, checked against
+  their SHA-256s, are kept in the Actions cache under a key made of those pins
+  (ci/install-kind.sh --cache-key), so a job downloads them only on a miss. A kind built
+  from Go's module proxy, when the release download is refused, is not saved. Run it
+  after checkout.
+runs:
+  using: composite
+  steps:
+    - id: key
+      shell: bash
+      run: echo "key=$(ci/install-kind.sh --cache-key)" >>"$GITHUB_OUTPUT"
+    - id: restore
+      uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ${{ runner.temp }}/kind/bin
+        key: ${{ steps.key.outputs.key }}
+    - id: install
+      shell: bash
+      run: |
+        ci/install-kind.sh "$RUNNER_TEMP/kind" >>"$GITHUB_ENV"
+        echo "$RUNNER_TEMP/kind/bin" >>"$GITHUB_PATH"
+        if ci/install-kind.sh --verified "$RUNNER_TEMP/kind"; then
+          echo release=true >>"$GITHUB_OUTPUT"
+        fi
+    - if: steps.restore.outputs.cache-hit != 'true' && steps.install.outputs.release == 'true'
+      uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ${{ runner.temp }}/kind/bin
+        key: ${{ steps.key.outputs.key }}

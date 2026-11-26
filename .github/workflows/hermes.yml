@@ -26,6 +26,7 @@ on:
       - ci/docker-hub-mirror.sh
       - ci/docker/daemon.json
       - .github/actions/docker-hub-mirror/**
+      - .github/actions/kind/**
       - deploy/examples/hermes/**
       - deploy/sidecar/**
       - deploy/csi/**
@@ -94,9 +95,7 @@ jobs:
           sudo modprobe fuse
           ls -l /dev/fuse
       - name: install kind and kubectl
-        run: |
-          ci/install-kind.sh "$RUNNER_TEMP/kind" >>"$GITHUB_ENV"
-          echo "$RUNNER_TEMP/kind/bin" >>"$GITHUB_PATH"
+        uses: ./.github/actions/kind
       - name: create the cluster
         run: |
           ci/kind-cluster.sh agentfs-hermes ci/kind/cluster.yaml 120s

@@ -608,6 +608,31 @@ evidence. CI scripts judge the build:
   sets up buildx or creates a kind cluster around these helpers, or a job
   that pulls without the action. The examples and charts users run keep
   Docker Hub as their default.
+- **Outside tools have one home each, and a refused host does not fail
+  CI.** Debian packages come from
+  [`ci/apt-install.sh`](../ci/apt-install.sh) `<packages>`, which runs
+  `apt-get update` and `apt-get install` against the runner's Ubuntu
+  archive alone (`/etc/apt/sources.list.d/ubuntu.sources`), never the
+  third-party sources the runner image preinstalls, such as
+  packages.microsoft.com, so one of them answering 403 cannot fail the
+  job. kind and kubectl come from the
+  [`kind`](../.github/actions/kind/action.yml) action around
+  [`ci/install-kind.sh`](../ci/install-kind.sh), the one home of their
+  versions and SHA-256s. The action restores both binaries from the
+  Actions cache under a key made of those pins (`ci/install-kind.sh
+  --cache-key`); the script keeps a restored binary only when its SHA-256
+  is the pinned one, and downloads it otherwise. When GitHub refuses the
+  kind release, the script builds kind at the same version with `go
+  install` from Go's module proxy, which checks every module against Go's
+  checksum database (sum.golang.org) in place of the release's SHA-256,
+  and raises a warning on the run. That build is not cached: only binaries
+  that match the release checksums are. kubectl has no fallback, because
+  its main package is in `k8s.io/kubernetes`, which `go install` cannot
+  build; the cache is what shelters it from dl.k8s.io. A bad checksum
+  always fails. A test (`ci_installs_outside_tools_through_their_homes`)
+  refuses an `apt-get` outside `ci/apt-install.sh`, a kind or kubectl
+  download outside `ci/install-kind.sh`, and a workflow that runs the
+  script without the action.
 - **The image is published after the kind jobs pass.** The `image`
   workflow publishes to `ghcr.io/mcurcio/agentfs` as the commit sha and
   `latest`, only from main and only after both kind end-to-end jobs

@@ -44,7 +44,7 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           key: phase-1-conformance
-      - run: sudo apt-get update && sudo apt-get install -y fuse3 git python3 util-linux curl gcc zlib1g-dev
+      - run: ci/apt-install.sh fuse3 git python3 util-linux curl gcc zlib1g-dev
       # The tree views mount with FUSE allow_other by default.
       - run: echo user_allow_other | sudo tee -a /etc/fuse.conf
       - uses: ./.github/actions/pinned-git
@@ -109,7 +109,7 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           key: phase-1-replay-seeds
-      - run: sudo apt-get update && sudo apt-get install -y git gcc zlib1g-dev
+      - run: ci/apt-install.sh git gcc zlib1g-dev
       - uses: ./.github/actions/pinned-git
       - run: ci/replay-seeds.sh "${{ matrix.shard }}" 4 500 "$RUNNER_TEMP/traces"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
@@ -128,7 +128,7 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           key: phase-1-page-cache
-      - run: sudo apt-get update && sudo apt-get install -y fuse3 git python3
+      - run: ci/apt-install.sh fuse3 git python3
       # The tree views mount with FUSE allow_other by default.
       - run: echo user_allow_other | sudo tee -a /etc/fuse.conf
       - uses: ./.github/actions/pinned-git
@@ -162,7 +162,7 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           key: phase-1-faults
-      - run: sudo apt-get update && sudo apt-get install -y fuse3 git python3 util-linux curl gcc zlib1g-dev
+      - run: ci/apt-install.sh fuse3 git python3 util-linux curl gcc zlib1g-dev
       # The tree views mount with FUSE allow_other by default.
       - run: echo user_allow_other | sudo tee -a /etc/fuse.conf
       - uses: ./.github/actions/pinned-git
@@ -212,13 +212,13 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           key: phase-1-power-loss
-      - run: sudo apt-get update && sudo apt-get install -y fuse3 git python3 util-linux e2fsprogs xfsprogs kmod dmsetup curl gcc zlib1g-dev strace
+      - run: ci/apt-install.sh fuse3 git python3 util-linux e2fsprogs xfsprogs kmod dmsetup curl gcc zlib1g-dev strace
       - uses: ./.github/actions/pinned-git
       - name: device mapper modules
         run: |
           uname -a
           if ! sudo modprobe dm_log_writes; then
-            sudo apt-get install -y "linux-modules-extra-$(uname -r)"
+            ci/apt-install.sh "linux-modules-extra-$(uname -r)"
             sudo modprobe dm_log_writes
           fi
           sudo modprobe dm_snapshot
@@ -255,7 +255,7 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           key: phase-1-measure
-      - run: sudo apt-get update && sudo apt-get install -y fuse3 git python3 util-linux curl gcc zlib1g-dev
+      - run: ci/apt-install.sh fuse3 git python3 util-linux curl gcc zlib1g-dev
       # The tree views mount with FUSE allow_other by default.
       - run: echo user_allow_other | sudo tee -a /etc/fuse.conf
       - uses: ./.github/actions/pinned-git
@@ -317,7 +317,7 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           key: phase-1-measure
-      - run: sudo apt-get update && sudo apt-get install -y fuse3 bindfs git python3 util-linux curl gcc zlib1g-dev
+      - run: ci/apt-install.sh fuse3 bindfs git python3 util-linux curl gcc zlib1g-dev
       # bindfs, the plain-FUSE baseline, mounts with allow_other.
       - run: echo user_allow_other | sudo tee -a /etc/fuse.conf
       - uses: ./.github/actions/pinned-git
