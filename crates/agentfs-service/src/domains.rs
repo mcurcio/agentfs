@@ -233,6 +233,19 @@ impl Domains {
         Unstaged::Draining
     }
 
+    /// The stop with no drain: every git child of the volume ended
+    /// (`Recording::end_git_children`), so that once the caller's process
+    /// exits the volume's lease is free, though the volume is not released
+    /// and its clients stay attached. The caller then ends its process
+    /// without dropping `self`, as a crash leaves the volume.
+    ///
+    /// # Errors
+    ///
+    /// As `Recording::end_git_children`.
+    pub fn end_git_children(&self) -> std::io::Result<()> {
+        todo!("page exit-3-reap")
+    }
+
     /// Whether Volume has released the volume (`VolumeReleased` consumed).
     pub fn released(&self) -> bool {
         self.released

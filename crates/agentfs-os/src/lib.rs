@@ -1,5 +1,6 @@
 //! The operating-system leaves agentfs uses outside the recording engine
-//! too: advisory file locks, atomic files and directory syncs, confined
+//! too: advisory file locks, a file lock its holder's child processes
+//! share, atomic files and directory syncs, confined
 //! access to a directory tree, the mount table, the shared-filesystem check,
 //! listening Unix sockets, and the allocator's arenas (docs/library/core.md
 //! explains each). Linux system calls only: nothing here knows git, a volume
@@ -9,6 +10,7 @@ pub mod allocator;
 pub mod confined;
 pub mod file_lock;
 pub mod fsutil;
+pub mod inherited_lock;
 pub mod listening_socket;
 pub mod mountinfo;
 pub mod shared_fs;

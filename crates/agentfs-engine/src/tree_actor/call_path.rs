@@ -534,6 +534,24 @@ impl Recording {
         Self::serve(TreeActor::open_with(root, service, upkeep)?)
     }
 
+    /// Ends every git child of the volume (the builder's packer, a read's
+    /// git, the repack's) at once, as a crash ends them (SIGKILL), and
+    /// returns once each has exited; no git child starts after it, and a
+    /// call that needs one fails. For a process that ends without a drain
+    /// (`agentfs host` stopped with views open): when it returns, the
+    /// process is the one holder of the volume's lease, so the volume is
+    /// free once the process exits. What the journal holds and history
+    /// lacks is built at the next open, as after a crash (docs/trees.md,
+    /// "Recording and durability").
+    ///
+    /// # Errors
+    ///
+    /// A signal or a wait the kernel refused
+    /// (`agentfs_os::inherited_lock::InheritedLock::end_children`).
+    pub fn end_git_children(&self) -> std::io::Result<()> {
+        todo!("page exit-3-reap")
+    }
+
     /// The operator's rules, read when the volume opened: where each new
     /// name of a tree lives (docs/trees.md, "Rules and the untracked area").
     pub fn rules(&self) -> &Arc<agentfs_rules::RuleSet> {
