@@ -233,16 +233,18 @@ impl Domains {
         Unstaged::Draining
     }
 
-    /// The stop with no drain: every git child of the volume ended
-    /// (`Recording::end_git_children`), so that once the caller's process
-    /// exits the volume's lease is free, though the volume is not released
-    /// and its clients stay attached. The caller then ends its process
-    /// without dropping `self`, as a crash leaves the volume.
+    /// The stop with no drain, which ends the domains: the volume stays
+    /// staged and its clients attached, as a crash leaves them, and no
+    /// drop of the domains runs (they are forgotten, so nothing waits on a
+    /// session). Before it returns, the engine has ended the volume's own
+    /// processes (`Recording::end_git_children`): once the caller's process
+    /// exits, the volume's lease is free. The caller ends its process next.
     ///
     /// # Errors
     ///
-    /// As `Recording::end_git_children`.
-    pub fn end_git_children(&self) -> std::io::Result<()> {
+    /// As `Recording::end_git_children`: the lease is then free only once
+    /// those processes have exited. The domains are forgotten all the same.
+    pub fn abandon(self) -> std::io::Result<()> {
         todo!("page exit-3-reap")
     }
 

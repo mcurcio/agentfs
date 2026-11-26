@@ -534,15 +534,23 @@ impl Recording {
         Self::serve(TreeActor::open_with(root, service, upkeep)?)
     }
 
-    /// Ends every git child of the volume (the builder's packer, a read's
-    /// git, the repack's) at once, as a crash ends them (SIGKILL), and
-    /// returns once each has exited; no git child starts after it, and a
-    /// call that needs one fails. For a process that ends without a drain
-    /// (`agentfs host` stopped with views open): when it returns, the
-    /// process is the one holder of the volume's lease, so the volume is
-    /// free once the process exits. What the journal holds and history
-    /// lacks is built at the next open, as after a crash (docs/trees.md,
-    /// "Recording and durability").
+    /// Ends every git child of the volume (the builder's packer and its
+    /// alignment's `git diff`, a read's git, the repack's) at once, as a
+    /// crash ends them (SIGKILL), and returns once each has exited. Every
+    /// process the engine starts holds the volume's lease and starts no
+    /// process of its own (`agentfs_os::inherited_lock::InheritedLock`), so
+    /// when it returns none holds the lease, and none starts after it. For
+    /// a process that ends without a drain (`agentfs host` stopped with
+    /// views open): its exit then frees the lease, unless a process it
+    /// started outside the engine is between its fork and its exec.
+    ///
+    /// After it, a call that needs git answers `Error::TreeGit(Io)` with
+    /// `ENOTCONN`, the errno a view answers once its server has ended; a
+    /// git that it killed reads the same. Dropping the Recording after it
+    /// makes the journal durable, ends at most one batch as failed (logged
+    /// `tree HistoryBuildFailed`), stops the builder and unlocks the lease.
+    /// What the journal holds and history lacks is built at the next open,
+    /// as after a crash (docs/trees.md, "Recording and durability").
     ///
     /// # Errors
     ///

@@ -181,8 +181,14 @@ pub enum Error {
     Json(#[from] serde_json::Error),
     #[error(transparent)]
     Lines(#[from] agentfs_lines::Error),
+    /// A call refused while something it must wait for is in flight
+    /// (`EBUSY`): never the lease's.
     #[error("tree volume is busy")]
     Busy,
+    /// Another process holds the state area's lease (`EBUSY`): only
+    /// `lock_area` answers it, so a start's exit 75 always means the lease.
+    #[error("the volume is busy: another process holds its state area")]
+    LeaseHeld,
     #[error("not a tree state area (or unsupported format)")]
     Format,
     #[error("tree supports git-safe UTF-8 names only")]
@@ -273,7 +279,7 @@ impl Error {
             Self::ReadOnly => libc::EROFS,
             Self::Name => libc::EINVAL,
             Self::TooLarge => libc::EFBIG,
-            Self::Busy => libc::EBUSY,
+            Self::Busy | Self::LeaseHeld => libc::EBUSY,
             Self::Untracked { .. } => libc::EXDEV,
             Self::Rules(_) => libc::EINVAL,
             Self::Durable(e) => e.errno(),
