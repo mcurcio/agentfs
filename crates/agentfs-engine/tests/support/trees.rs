@@ -182,11 +182,13 @@ pub fn reopen(dir: &Path) -> TreeActor {
 
 /// Returns once no process holds the state area's lease. A killed process's
 /// tree Git children (the builder's `git fast-import`) share its lease and die
-/// of their parent-death signal after it (`tree_git`'s `attach_lease`), so the
+/// of their parent-death signal after it (`agentfs_os::inherited_lock`), so the
 /// lease can outlive the process a test waited for. Taking the lease, blocking,
 /// is the event that every holder is gone; it is released at once.
 pub fn wait_for_lease(dir: &Path) {
-    agentfs_engine::tree_actor::wait_for_lease(dir).expect("takes the lease");
+    agentfs_engine::state_area::TreeStateArea::at(dir)
+        .wait_for_lease()
+        .expect("takes the lease");
 }
 
 /// [`reopen`] after the process that served the volume was killed.

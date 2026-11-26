@@ -18,6 +18,7 @@ use agentfs_contracts::tree::TreeId;
 use agentfs_contracts::volume::{
     EnsureOutcome, VolumeError, VolumeEvent, VolumeId, VolumeIdentity, VolumeState,
 };
+use agentfs_os::file_lock::{FileLock, Mode};
 
 use crate::store::{TreeStore, io_kind};
 use crate::tree_actor::{self, Recording, Upkeep};
@@ -59,7 +60,9 @@ impl TreeStateArea {
     ///
     /// A failed open or lock of the lease file (the state area gone).
     pub fn wait_for_lease(&self) -> std::io::Result<()> {
-        todo!("page csi-lease-wait")
+        let file = FileLock::open(&self.root.join(tree_actor::LOCK))?;
+        drop(FileLock::wait(file, Mode::Exclusive)?);
+        Ok(())
     }
 
     /// The volume `open` recovered, served; `None` before.
@@ -80,7 +83,7 @@ impl TreeStateArea {
 /// the state area it is on, are said here (a full filesystem is named).
 fn volume_error(root: &Path, error: &tree_actor::Error) -> VolumeError {
     match error {
-        tree_actor::Error::Busy => VolumeError::Busy,
+        tree_actor::Error::LeaseHeld => VolumeError::Busy,
         tree_actor::Error::NotCreated => VolumeError::NotCreated,
         tree_actor::Error::Format => VolumeError::OtherFormat,
         tree_actor::Error::Rules(refusal) => VolumeError::RulesRefused(refusal.to_string()),

@@ -55,7 +55,7 @@ pub fn verify(state: &Path, args: VerifyArgs) -> Result<ExitCode> {
     let at = args.pod.context()?;
     let report = match tree_actor::verify_flagged(state, &at, tree_actor::release()) {
         Ok(report) => report,
-        Err(tree_actor::Error::Busy) => return Ok(busy()),
+        Err(tree_actor::Error::LeaseHeld) => return Ok(busy()),
         Err(e) => return Err(e).context("verifying the flagged saves"),
     };
     for checked in &report.checked {

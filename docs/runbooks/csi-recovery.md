@@ -46,7 +46,13 @@ each kubelet target, rebinding each view's client so a fork keeps its one
 writer, then reconciles.
 
 1. Check the log: `[host <pv>] exited: <exit>; restarting in 1s`, then
-   `published volume <pv> at <target>, over a stale mount`.
+   `published volume <pv> at <target>, over a stale mount`. The crashed
+   host's git children hold the volume's lease until each dies, so the
+   restart may exit 75 first: the log says `starting the host of volume <pv>
+   again: volume <pv> is busy: another process holds its state area; trying
+   again once its state area's lease is free`, and the plugin starts it as
+   soon as the lease is free. A wait that does not end means another process
+   on the node holds the volume.
 2. A container without `mountPropagation: HostToContainer` keeps seeing
    the dead mount: restart that container (or its pod).
 3. Repeated restarts with growing delays mean the host fails at start: its
@@ -60,9 +66,10 @@ host"`.
 
 A node plugin's restart stops that node's hosts: on SIGTERM (or when the
 plugin dies) each host's control channel closes. A host with no view open
-drains and exits 0; a host with views open exits at once with status 3,
-logging `stopped with N view(s) open`, and leaves each mount stale as a
-crash does. Their FUSE sessions cannot be handed to another process, so the
+drains and exits 0; a host with views open ends its git children, so the
+volume's lease is free when it exits, then exits with status 3, logging
+`stopped with N view(s) open`, and leaves each mount stale as a crash
+does. Their FUSE sessions cannot be handed to another process, so the
 node's mounts answer `ENOTCONN` until the new plugin opens them again from
 `<nodeState>/published/`, stacked over the stale mounts; each view's client
 is rebound, so a fork claim keeps its writer. The DaemonSet is

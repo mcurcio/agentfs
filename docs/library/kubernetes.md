@@ -160,13 +160,20 @@ host on the node. Three locks order its calls, each named for what it orders:
   clones of the client other tasks still hold.
   With no view open (every stop the supervisor asks for) the host drains and
   exits 0 once Volume releases the volume; with views open (the plugin's
-  shutdown) it exits 3 at once and leaves them stale for the next host
+  shutdown) it ends its git children, so the volume's lease is free, exits 3
+  and leaves them stale for the next host
   ([the view host command](filesystem.md#the-view-host-command)).
 - **A host that exits unasked** is started again after `next_backoff` (1 s,
   doubling to `Backoff::max`, back to 1 s after a minute of uptime) while
-  records of the volume remain, with every view replayed. A start that fails
-  is tried again with backoff. These delays are its only timers, beside one
-  bound: `AgentfsLauncher` waits up to 1 s per output pipe for a child's last
+  records of the volume remain, with every view replayed: no event says a
+  crashed host would start now, and the backoff throttles a crash loop. A
+  start that exits 75 (`Next::Lease`: another process holds the volume's
+  lease, such as a killed host's git children until they die) is tried again
+  once `TreeStateArea::wait_for_lease` returns, on a thread of its own and
+  outside the volume's start lock, so an unpublish never waits on another
+  process ([library/engine](engine.md)). A start that fails otherwise is tried
+  again with backoff, and one of another protocol version never. These
+  delays are its only timers, beside one bound: `AgentfsLauncher` waits up to 1 s per output pipe for a child's last
   lines before it reports the exit, because a grandchild may hold the pipes
   open; lines later than that miss the exit's error text.
 - **Release** starts the volume's host with no view and stops it; its exit 0

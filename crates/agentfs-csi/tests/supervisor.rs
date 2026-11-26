@@ -23,8 +23,9 @@ use agentfs_csi::launcher::{Exit, Launcher, ProcessSpec, Spawned};
 use agentfs_csi::layout::{Layout, target_key};
 use agentfs_csi::mounter::Mounter;
 use agentfs_csi::records::{self, ClaimKind, ClaimRecord, PublishedRecord, RECORD_VERSION};
-use agentfs_csi::supervisor::{NodeConfig, Supervisor, ViewSpec};
+use agentfs_csi::supervisor::{Backoff, NodeConfig, Supervisor, ViewSpec};
 use agentfs_fuse::MountState;
+use agentfs_os::file_lock::{FileLock, Mode};
 use rustix::process::Signal;
 use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
 use tokio::sync::{Mutex as AsyncMutex, oneshot, watch};
@@ -50,6 +51,9 @@ struct World {
     hello_v: Option<u32>,
     /// A target every host but the first refuses to open (`fork_taken`).
     refuse_reopen: Option<PathBuf>,
+    /// How many of the next hosts exit 75 before their hello, as a host
+    /// does while another process holds the volume's lease.
+    busy_starts: usize,
 }
 
 #[derive(Clone)]
@@ -167,8 +171,10 @@ impl Launcher for Fake {
         let (ours, theirs) = tokio::net::UnixStream::pair()?;
         let requests = Arc::new(Mutex::new(Vec::new()));
         let (kill, mut killed) = oneshot::channel();
-        let (eof_exit, hello_v, refuse) = {
+        let (eof_exit, hello_v, refuse, busy) = {
             let mut world = self.world.lock().unwrap();
+            let busy = world.busy_starts > 0;
+            world.busy_starts = world.busy_starts.saturating_sub(1);
             let refuse = if world.hosts.is_empty() {
                 None
             } else {
@@ -184,9 +190,21 @@ impl Launcher for Fake {
                 world.eof_exit,
                 world.hello_v.unwrap_or(HOST_PROTOCOL),
                 refuse,
+                busy,
             )
         };
         Self::event(&self.log, format!("spawn host {volume}"));
+        if busy {
+            // No hello: its stream ends, and it exits 75.
+            drop(theirs);
+            exit_tx.send(Some(Exit::Code(75))).unwrap();
+            return Ok(Spawned {
+                pid: 2,
+                exited,
+                recent_log: Arc::default(),
+                control: Some(ours),
+            });
+        }
         let log = self.log.clone();
         let world = self.world.clone();
         let held = self.held.clone();
@@ -1080,4 +1098,84 @@ async fn a_host_of_another_protocol_is_refused_and_not_retried() {
     assert_eq!(report.hosts, 0);
     tokio::time::sleep(std::time::Duration::from_secs(600)).await;
     assert_eq!(n.fake.hosts(), 2, "not tried again: {:?}", n.fake.events());
+}
+
+/// A start that exits 75 (another process holds the volume's lease) is
+/// tried again once the lease is free, not after a timer: a crash's restart
+/// and a reconcile's start alike.
+#[tokio::test(start_paused = true)]
+async fn a_busy_restart_waits_for_the_lease() {
+    let max = Backoff::default().max;
+    let n = Node::new();
+    n.volume("v");
+    let a = n.target("a");
+    n.sup.publish(n.view("v", "v", &a)).await.unwrap();
+    let lease = FileLock::try_take(&n.layout.state("v").join("actor.lock"), Mode::Exclusive)
+        .unwrap()
+        .expect("the test takes the lease");
+    n.fake.world.lock().unwrap().busy_starts = 1;
+    n.fake.kill(0);
+    n.fake.until("spawn host v", 2).await;
+    settle().await;
+    tokio::time::advance(10 * max).await;
+    settle().await;
+    assert_eq!(
+        n.fake.hosts(),
+        2,
+        "no timer starts it: {:?}",
+        n.fake.events()
+    );
+    drop(lease);
+    n.fake.until("spawn host v", 3).await;
+    n.fake.until("reconcile", 2).await;
+    let replayed: Vec<String> = n.fake.requests(2).iter().map(describe).collect();
+    assert_eq!(
+        replayed,
+        [format!("open {}", a.display()), "reconcile".to_owned()]
+    );
+    n.sup.shutdown().await;
+
+    // At plugin start, a recorded view whose host exits 75.
+    let n = Node::new();
+    n.volume("v");
+    let a = n.target("a");
+    fs::create_dir_all(&a).unwrap();
+    records::store_published(
+        &n.layout,
+        &PublishedRecord {
+            v: RECORD_VERSION,
+            handle: "v".into(),
+            volume: "v".into(),
+            tree: TreeRef::Root,
+            target: a.clone(),
+            read_only: false,
+            pod: PodContext::default(),
+            label: ClientLabel::parse(&format!("csi-{}", target_key(&a))).unwrap(),
+        },
+    )
+    .unwrap();
+    let lease = FileLock::try_take(&n.layout.state("v").join("actor.lock"), Mode::Exclusive)
+        .unwrap()
+        .expect("the test takes the lease");
+    n.fake.world.lock().unwrap().busy_starts = 1;
+    let report = n.sup.reconcile().await;
+    assert_eq!(report.hosts, 0);
+    settle().await;
+    tokio::time::advance(10 * max).await;
+    settle().await;
+    assert_eq!(
+        n.fake.hosts(),
+        1,
+        "no timer starts it: {:?}",
+        n.fake.events()
+    );
+    drop(lease);
+    n.fake.until("spawn host v", 2).await;
+    n.fake.until("reconcile", 1).await;
+    let replayed: Vec<String> = n.fake.requests(1).iter().map(describe).collect();
+    assert_eq!(
+        replayed,
+        [format!("open {}", a.display()), "reconcile".to_owned()]
+    );
+    n.sup.shutdown().await;
 }

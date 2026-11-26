@@ -488,7 +488,7 @@ fn single_actor_and_invalid_names_fail_before_recording() {
     let journal = trees::journal_len(tmp.path());
     assert!(matches!(
         TreeActor::open(tmp.path(), &PodContext::default()),
-        Err(Error::Busy)
+        Err(Error::LeaseHeld)
     ));
     for path in [
         "../a", "a//b", "a/", ".git", "d/.git", ".GiT", "git~1", "", "/tmp",

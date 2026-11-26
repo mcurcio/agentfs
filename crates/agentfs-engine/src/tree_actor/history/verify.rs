@@ -680,7 +680,7 @@ fn flagged_in(repo: &TreeGit, pointers: &Pointers) -> Result<Vec<Unverified>> {
 ///
 /// # Errors
 ///
-/// [`Error::Busy`] while another process holds the volume;
+/// [`Error::LeaseHeld`] while another process holds the volume;
 /// [`Error::NotCreated`] for a store with no root branch; a store read or a
 /// verdict's write.
 pub fn verify_flagged(root: &Path, by: &PodContext, release: Option<&str>) -> Result<VerifyReport> {

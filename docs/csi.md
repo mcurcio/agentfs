@@ -339,18 +339,23 @@ of DeleteVolume succeeds.
   container), and rebinds each view's client (same launcher, tree, label and
   access), so a fork keeps its one writer. It then reconciles: what no view
   uses any more is ended. Containers with `mountPropagation: HostToContainer`
-  see the new mount at once; others after a container restart. A restart that
-  cannot start (a full disk, PID pressure) is tried again with the same
-  backoff while the volume has records.
+  see the new mount at once; others after a container restart. The crashed
+  host's git children share the volume's lease until each dies of its
+  parent-death signal, so the new host may exit 75 (busy): the plugin then
+  waits for the lease to be free, not a timer, and starts it again. A restart
+  that cannot start otherwise (a full disk, PID pressure) is tried again with
+  the same backoff while the volume has records.
 - **The node plugin restarts** (an upgrade, a crash): its hosts' control
   channels close, whether it stopped on SIGTERM or died. A host with no view
-  open drains and exits 0. A host with views open exits at once (status 3),
-  leaving each view's mount stale and its client attached, as a crash does:
+  open drains and exits 0. A host with views open ends its git children, so
+  the volume's lease is free when it exits, and exits with status 3, leaving
+  each view's mount stale and its client attached, as a crash does:
   the pods' mounts answer `ENOTCONN` meanwhile, and a fork claim keeps its one
   writer. Every change a view took is already in the volume's journal. The new
   plugin reconciles from `<nodeState>/published/`: records whose target the
   kubelet removed are dropped, and every other volume gets a host that replays
-  its views, stacked over the stale mounts, as for a crashed host. Because this interrupts the node's mounts, the
+  its views, stacked over the stale mounts, as for a crashed host; one that
+  exits 75 is started again once the volume's lease is free. Because this interrupts the node's mounts, the
   DaemonSet uses `updateStrategy: OnDelete`: roll it node by node
   ([runbook](runbooks/csi-recovery.md)).
 - **The node reboots**: the kubelet publishes the volumes of the pods it

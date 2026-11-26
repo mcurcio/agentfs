@@ -152,22 +152,8 @@ const INITIALIZING: &str = "initializing";
 /// The state area's lease file, under the state area: an exclusive `flock`
 /// held by the serving process and shared with its tree Git children, which
 /// outlive a killed holder until their parent-death signal lands.
-const LOCK: &str = "actor.lock";
+pub(crate) const LOCK: &str = "actor.lock";
 
-/// Returns once no process holds the state area's lease: taking it, blocking,
-/// is the event that every holder is gone (a killed server's Git children
-/// included); it is released at once. What a harness waits on before it
-/// reopens a volume whose server it killed.
-///
-/// # Errors
-///
-/// A failed open or lock of the lease file.
-#[cfg(any(test, feature = "test-util"))]
-pub fn wait_for_lease(root: &Path) -> io::Result<()> {
-    let file = FileLock::open(&root.join(LOCK))?;
-    drop(FileLock::wait(file, Mode::Exclusive)?);
-    Ok(())
-}
 type Result<T> = std::result::Result<T, Error>;
 
 #[derive(Debug, thiserror::Error)]
@@ -546,7 +532,6 @@ pub fn rules_dir(state: &Path) -> PathBuf {
     state.join("history.git").join("info")
 }
 
-/// The state area's exclusive lock: [`Error::Busy`] while another holds it.
 /// The operator's rules: `history.git/info/exclude` and
 /// `history.git/info/attributes`, a missing file empty, built into the rule
 /// set every new name is judged by (docs/trees.md, "Rules and the untracked
@@ -574,9 +559,10 @@ fn read_rules(root: &Path) -> Result<agentfs_rules::RuleSet> {
     )?)
 }
 
+/// The state area's exclusive lock: [`Error::LeaseHeld`] while another holds it.
 fn lock_area(root: &Path) -> Result<Arc<InheritedLock>> {
     Ok(Arc::new(InheritedLock::new(
-        FileLock::try_take(&root.join(LOCK), Mode::Exclusive)?.ok_or(Error::Busy)?,
+        FileLock::try_take(&root.join(LOCK), Mode::Exclusive)?.ok_or(Error::LeaseHeld)?,
     )))
 }
 
@@ -678,7 +664,7 @@ impl TreeActor {
     ///
     /// # Errors
     ///
-    /// [`Error::Exists`] for any other directory, [`Error::Busy`] while another
+    /// [`Error::Exists`] for any other directory, [`Error::LeaseHeld`] while another
     /// holds the state area, and any failed write.
     #[cfg(any(test, feature = "test-util"))]
     pub fn create(
@@ -2589,7 +2575,9 @@ mod tests {
             .parse()
             .unwrap();
         // The killed process's git children share its lease until they die.
-        wait_for_lease(tmp.path()).unwrap();
+        crate::state_area::TreeStateArea::at(tmp.path())
+            .wait_for_lease()
+            .unwrap();
         let frames = frames_of(tmp.path());
         assert!(
             matches!(frames[0].0.entry, Entry::Checkpoint { .. }),
