@@ -3,6 +3,9 @@
 //! verdict. Pure: the state area, rows and facts are reached through the ports
 //! in `agentfs_contracts::ports`, and `decide_ensure` and `decide` take facts
 //! and answer decisions.
+#![cfg_attr(not(test), no_std)]
+
+extern crate alloc;
 
 pub mod ensure;
 pub mod release;

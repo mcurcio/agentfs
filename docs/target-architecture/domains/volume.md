@@ -2,8 +2,8 @@
 
 **Partly built; this page proposes the rest.** The Volume domain's `ensure`, its lifecycle (`stage`, `unstage`, the Stop drain) and the
 release verdict over attached clients and queues are built and described in
-[docs/trees.md](../../trees.md#volume-lifecycle) and the [library](../../library/core.md#rows-and-domain-events),
-with the built parts of VO1 to VO6 in its [domain invariants](../../library/core.md#domain-invariants). This
+[docs/trees.md](../../trees.md#volume-lifecycle) and the [library](../../library/domains.md#rows-and-domain-events),
+with the built parts of VO1 to VO6 in its [domain invariants](../../library/domains.md#domain-invariants). This
 page proposes the rest: the start point and its line, the upgrade drain, settlement by the remotes, and what happens to a
 released volume's directory. It is one part of the system around the git model ([the system](../system.md)); the git
 model ([git-model.md](../git-model.md)) wins wherever the two disagree. Rust sketches show surfaces only. The commit

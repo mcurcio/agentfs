@@ -2,9 +2,11 @@
 //!
 //! - [`docs`]: every member's modules are in docs/architecture.md's module
 //!   map, and its "Ranks" table is the workspace's; every relative link and
-//!   `#anchor` in README.md and docs/ resolves; every page under docs/ is in
-//!   the book's docs/SUMMARY.md; every `git push` in a runbook writes only
-//!   refs literally under `refs/agentfs/` and never forces (F8 S2).
+//!   `#anchor` in README.md and docs/ resolves; every path under `crates/`
+//!   that a tracked file names (Rust: comments only; records of past work
+//!   excepted) exists; every page under docs/ is in the book's
+//!   docs/SUMMARY.md; every `git push` in a runbook writes only refs
+//!   literally under `refs/agentfs/` and never forces (F8 S2).
 //! - [`ci`]: every CI job runs on the pinned runner, `ubuntu-24.04`, runs
 //!   its tests with cargo-nextest, pinned to one release, and pulls Docker
 //!   Hub through the mirror; the Rust release is pinned once; the
@@ -12,22 +14,29 @@
 //!   every script under ci/ is executable, registers its EXIT cleanup with
 //!   `on_exit`, and no pipe in one ends in a reader that exits early
 //!   (pipefail turns its SIGPIPE into a failure); publishing an image
-//!   retries a failed push.
-//! - [`crates`]: every dependency follows the ranks, every `failpoints`
-//!   feature is forwarded, every cargo command in the workflows, scripts
-//!   and docs names packages, features and binaries the workspace has,
-//!   every failpoint call is in `agentfs_failpoints::POINTS`, the tree
-//!   engine starts `git` only through `agentfs_git::git_cli::counted`, and
-//!   the tree engine's modules in agentfs-core name no recording-engine
-//!   module and open no remote.
+//!   retries a failed push; every path filter of a workflow names a path
+//!   that exists.
+//! - [`crates`]: every dependency follows the ranks, the library front
+//!   `agentfs` re-exports, and only re-exports, every library of the ranks
+//!   it uses but the recording engine, only the service crate (with the
+//!   front and the tests) depends on the domains it composes, every `failpoints`
+//!   feature is forwarded, every cargo command in `.github/`, the scripts,
+//!   docs, the crates' doc comments and Python scripts names packages,
+//!   features, binaries and test programs the workspace has, and in a file
+//!   that runs (not markdown, not Rust) selects each by a literal name and
+//!   builds only packages with a binary;
+//!   every failpoint call is in `agentfs_failpoints::POINTS`, and the tree
+//!   engine (agentfs-engine) starts `git` only through
+//!   `agentfs_git::git_cli::counted`.
 //!
 //! The configuration keys and operator attributes are checked by
 //! `agentfs-core`'s `tests/config_reference.rs`; the flags and environment
 //! variables by the binaries' own unit tests
-//! (`crates/agentfs/src/reference_tests.rs`, and the `reference_tests`
+//! (`crates/agentfs-cli/src/reference_tests.rs`, and the `reference_tests`
 //! module of `crates/agentfs-csi/src/main.rs`), which can walk their clap
 //! definitions.
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 mod ci;
@@ -46,6 +55,45 @@ pub(crate) fn files_under(dir: &Path, out: &mut Vec<PathBuf>) {
             out.push(path);
         }
     }
+}
+
+/// Why `entry`, a path a check read (a workflow's path filter, a path
+/// under `crates/` a text names), names nothing among `paths` (every path
+/// under the root, `/`-separated): without a `*` it must be one of them;
+/// with one, the text before the first `*` must start one of them.
+pub(crate) fn path_problem(entry: &str, paths: &BTreeSet<String>) -> Option<String> {
+    match entry.split_once('*') {
+        None if paths.contains(entry) => None,
+        None => Some(format!("{entry}: no such path")),
+        Some((prefix, _)) if paths.iter().any(|p| p.starts_with(prefix)) => None,
+        Some((prefix, _)) => Some(format!("{entry}: no path starts with {prefix:?}")),
+    }
+}
+
+/// Every file and directory under the root, `/`-separated, but `target/`
+/// and `.git/`.
+pub(crate) fn repository_paths() -> BTreeSet<String> {
+    fn walk(root: &Path, dir: &Path, out: &mut BTreeSet<String>) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            let shown = path
+                .strip_prefix(root)
+                .unwrap()
+                .to_string_lossy()
+                .into_owned();
+            if shown == "target" || shown == ".git" {
+                continue;
+            }
+            if path.is_dir() {
+                walk(root, &path, out);
+            }
+            out.insert(shown);
+        }
+    }
+    let root = root();
+    let mut out = BTreeSet::new();
+    walk(&root, &root, &mut out);
+    out
 }
 
 /// Every markdown file the link check covers: README.md and docs/**.

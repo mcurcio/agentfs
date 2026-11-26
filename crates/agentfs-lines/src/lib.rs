@@ -3,7 +3,7 @@
 //! line's bytes, aligned across saves by git's histogram diff
 //! (`agentfs-align`). It reads the images it is given, which may be files,
 //! and starts no process itself: a diff's `git` child is started by the
-//! spawner its caller passes. docs/library/core.md explains its use.
+//! spawner its caller passes. docs/library/engine.md explains its use.
 //!
 //! A file's bytes have one home: its blob, its checkout or the journal frames
 //! that hold them. A [`LineMap`] says how those bytes divide into lines and names
@@ -22,11 +22,15 @@
 use std::cmp::Reverse;
 use std::collections::BTreeMap;
 use std::fmt;
+#[cfg(feature = "io")]
 use std::fs::File;
 use std::hash::Hash;
 use std::io;
+#[cfg(feature = "io")]
 use std::os::unix::fs::FileExt;
+#[cfg(feature = "io")]
 use std::path::Path;
+#[cfg(feature = "io")]
 use std::process::{Child, Command};
 
 pub use agentfs_align::Hunk;
@@ -94,11 +98,13 @@ impl Image for Vec<u8> {
 }
 
 /// A file read as an image; its length is taken once, at open.
+#[cfg(feature = "io")]
 pub struct FileImage {
     file: File,
     len: u64,
 }
 
+#[cfg(feature = "io")]
 impl FileImage {
     /// Opens `path` for reading.
     ///
@@ -112,6 +118,7 @@ impl FileImage {
     }
 }
 
+#[cfg(feature = "io")]
 impl FileImage {
     /// An open file, its length taken now.
     ///
@@ -124,6 +131,7 @@ impl FileImage {
     }
 }
 
+#[cfg(feature = "io")]
 impl Image for FileImage {
     fn len(&self) -> u64 {
         self.len
@@ -379,7 +387,7 @@ pub struct Line<V> {
 }
 
 /// A map expanded line by line, with every version's ancestor: the form the
-/// landing rules (`tree_actor::referee`) work on. Its size is its file's line
+/// landing rules (`agentfs-referee`) work on. Its size is its file's line
 /// count, so only a take builds one.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Expanded<V> {
@@ -1016,6 +1024,7 @@ impl<V: Id> LineMap<V> {
     /// # Errors
     ///
     /// As [`LineMap::align`].
+    #[cfg(feature = "io")]
     pub fn align_bytes_with(
         &self,
         old: &[u8],
@@ -1162,6 +1171,7 @@ pub fn render(sources: &[&dyn Image], pieces: &[Piece]) -> io::Result<Vec<u8>> {
 /// # Errors
 ///
 /// The diff's.
+#[cfg(feature = "io")]
 pub fn histogram_with(
     old: &[u8],
     new: &[u8],
@@ -1190,6 +1200,7 @@ pub fn histogram_with(
 /// # Errors
 ///
 /// The diff's.
+#[cfg(feature = "io")]
 pub fn histogram_files_with(
     old: &Path,
     new: &Path,

@@ -1,11 +1,12 @@
-//! The workflows, the CI scripts and the Dockerfile.
+//! The workflows (their runners, test runner and path filters), the CI
+//! scripts and the Dockerfile.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use agentfs_repo::workspace::Workspace;
 
-use crate::{files_under, markdown_files, root};
+use crate::{files_under, markdown_files, path_problem, repository_paths, root};
 
 /// The runner every CI job uses. Pinned, not `-latest`, so a
 /// new image cannot change the kernel, FUSE, kind or nginx under the
@@ -403,6 +404,104 @@ fn dockerfile_stubs_every_workspace_member() {
         problems.is_empty(),
         "the Dockerfile's dependency-cache stage misses workspace members:\n{}",
         problems.join("\n")
+    );
+}
+
+/// Each entry of a `paths:` or `paths-ignore:` list in `text` (a
+/// workflow), with its line: unquoted, a leading `!` stripped. The key may
+/// carry an `&anchor`; comments are skipped.
+fn path_filters(text: &str) -> Vec<(usize, String)> {
+    let indent = |line: &str| line.len() - line.trim_start().len();
+    let mut out = Vec::new();
+    let mut list: Option<usize> = None;
+    for (n, line) in text.lines().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        if let Some(key) = list {
+            match trimmed.strip_prefix("- ") {
+                Some(entry) if indent(line) >= key => {
+                    let entry = entry.split(" #").next().unwrap_or("").trim();
+                    let entry = entry.trim_matches(|c| c == '\'' || c == '"');
+                    let entry = entry.strip_prefix('!').unwrap_or(entry);
+                    out.push((n + 1, entry.to_owned()));
+                    continue;
+                }
+                _ => list = None,
+            }
+        }
+        let key = trimmed
+            .strip_prefix("paths:")
+            .or_else(|| trimmed.strip_prefix("paths-ignore:"))
+            .map(str::trim);
+        if key.is_some_and(|rest| rest.is_empty() || rest.starts_with('&')) {
+            list = Some(indent(line));
+        }
+    }
+    out
+}
+
+/// Every path filter of the workflows names something that exists: a
+/// filter left naming a moved file never fires, and its workflow silently
+/// stops running for the change it was meant for.
+#[test]
+fn workflow_path_filters_name_what_exists() {
+    let paths = repository_paths();
+    let mut problems = Vec::new();
+    let mut entries = 0;
+    let mut files = Vec::new();
+    files_under(&root().join(".github/workflows"), &mut files);
+    files.sort();
+    for file in files
+        .iter()
+        .filter(|p| p.extension().is_some_and(|e| e == "yml" || e == "yaml"))
+    {
+        let text = std::fs::read_to_string(file).unwrap();
+        let name = file.file_name().unwrap().to_string_lossy();
+        for (line, entry) in path_filters(&text) {
+            entries += 1;
+            if let Some(problem) = path_problem(&entry, &paths) {
+                problems.push(format!("{name}:{line}: {problem}"));
+            }
+        }
+    }
+    assert!(
+        entries > 20,
+        "only {entries} path filters read: is the scan broken?"
+    );
+    assert!(problems.is_empty(), "{}", problems.join("\n"));
+}
+
+#[test]
+fn a_path_filter_naming_nothing_is_found() {
+    let text = "on:\n  push:\n    paths: &paths\n      - crates/**\n      # a comment\n      \
+                - 'Cargo.*'\n      - \"!ci/gone/**\"\n      - ci/lib.sh # why\n  pull_request:\n    \
+                paths: *paths\n    paths-ignore:\n      - docs/x.md\njobs:\n  - name: y\n";
+    assert_eq!(
+        path_filters(text),
+        [
+            (4, "crates/**".to_owned()),
+            (6, "Cargo.*".to_owned()),
+            (7, "ci/gone/**".to_owned()),
+            (8, "ci/lib.sh".to_owned()),
+            (12, "docs/x.md".to_owned()),
+        ]
+    );
+    let paths: BTreeSet<String> = ["crates", "crates/a.rs", "Cargo.toml", "ci", "ci/lib.sh"]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+    let problems: Vec<String> = path_filters(text)
+        .iter()
+        .filter_map(|(_, entry)| path_problem(entry, &paths))
+        .collect();
+    assert_eq!(
+        problems,
+        [
+            "ci/gone/**: no path starts with \"ci/gone/\"",
+            "docs/x.md: no such path",
+        ]
     );
 }
 

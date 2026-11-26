@@ -560,7 +560,11 @@ base it applies to and the commands that recorded the fixture.
 
 The fixture of finding 51 is the library without the shows-the-same guard of a sync's fast-forward (introduced in
 `6049b1b`, fixed in `e9ab747`), on `finding_51_a_sync_that_cannot_show_the_upstreams_commit_merges`: the model
-fails it at call 15, the fork's sync, where the engine's fork lost its saved line.
+fails it at call 15, the fork's sync, where the engine's fork lost its saved line. Its `.patch` hunk is re-cut
+against today's guard, the free function `shows_the_same` in agentfs-engine's `tree_actor/history/take.rs`, and the
+trace is not yet re-recorded on it: that the fixture still reproduces the regression on today's engine is unverified.
+With the re-cut hunk applied, `todays_library_differs_from_the_regression_only_at_its_call` did not finish in 750 s
+(about 10 s with the fix). The re-record is this page's "Re-record" step above, through `ci/model-docker.sh`.
 
 The fixtures `pieces-shorter-run-306` and `-414` are the library before a take placed each line from a source whose
 run holds it, on seeds 306 and 414 of `random_interleavings_rounds_phase1_scope` (found by the full sweep, outside

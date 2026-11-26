@@ -112,7 +112,7 @@ pub enum Blocker {
     QueuesNotEmpty(Vec<TreeId>),
 }
 
-/// The pure release judgement of facts asked at that moment (docs/library/core.md, VO1 and VO4).
+/// The pure release judgement of facts asked at that moment (docs/library/domains.md, VO1 and VO4).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReleaseVerdict {
     /// At least one blocker.
@@ -139,7 +139,7 @@ pub enum IoKind {
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum VolumeError {
-    /// A fork launcher (docs/library/core.md, VO6).
+    /// A fork launcher (docs/library/domains.md, VO6).
     #[error("only the volume's own launcher may do this")]
     NotPermitted,
     /// `stage` at a location `ensure` never created: mount never creates.
@@ -156,6 +156,10 @@ pub enum VolumeError {
     Busy,
     #[error("the volume's state could not be made durable: {0:?}")]
     NotDurable(IoKind),
+    /// The state area could not be read: its path and the I/O failure.
+    /// Nothing was written.
+    #[error("the volume's state area could not be read: {0}")]
+    Unreadable(String),
     /// The operator's rules hold one the volume does not build: refused
     /// before anything was written. Carries the refusal, naming the file and
     /// line.
@@ -199,7 +203,8 @@ pub trait Volume {
     ///
     /// # Errors
     ///
-    /// `NotPermitted` for a fork launcher; the refusals above; `NotDurable`.
+    /// `NotPermitted` for a fork launcher; the refusals above; `Unreadable`,
+    /// `NotDurable`.
     fn ensure(
         &mut self,
         spec: VolumeSpec,

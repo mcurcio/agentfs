@@ -1,8 +1,9 @@
-# The filesystem: `agentfs-fuse` and `agentfs`
+# The filesystem: `agentfs-fuse` and `agentfs-cli`
 
 The filesystem layer turns file calls into records. It is a FUSE filesystem
 over a real backing directory. Every change a workload makes through the
-mount is recorded, through [`agentfs-core`](core.md), before the call
+mount is recorded, through [`agentfs-core`](core.md) or, on a tree view,
+[`agentfs-engine`](engine.md), before the call
 returns, or the call fails.
 
 There are three ways to integrate at this layer:
@@ -631,7 +632,7 @@ See [telemetry](../telemetry.md).
 ## Tree views
 
 `init`, `mount`, `host` and `fork end` run the tree views over a git-backed tree
-library (`agentfs_core::tree_actor`), with their own state format, mounting
+library (`agentfs_engine::tree_actor`), with their own state format, mounting
 directories and regular files with their recorded modes ([trees](../trees.md)).
 
 ```sh
@@ -652,8 +653,10 @@ is unmounted, or the open fork under `--fork-key`; it never creates a volume.
 Each view is a client of its tree: the command rebinds the client a killed mount
 left (same launcher, tree, label and access), else attaches one, then ends its
 launcher's other clients and drops the ended forks nothing holds, and detaches
-each client as its view ends ([trees](../trees.md#clients)). One dispatcher
-hands each domain event to its consumer after the call that caused it:
+each client as its view ends ([trees](../trees.md#clients)). The volume is
+composed by the service ([`agentfs-service`](service.md)), whose one
+dispatcher hands each domain event to its consumer after the call that
+caused it:
 `LastDetached` to Trees (an unkeyed fork ends), `ForkDropped` to Clients (its
 writer claim is released), and each landing the view host takes makes Trees
 judge the drops again ([forks](../trees.md#forks-keys-end-and-the-drop)).
@@ -783,7 +786,7 @@ another process holds the volume.
 ### The view host
 
 `tree_view::ViewHost` serves one volume's views through its sessions
-(`agentfs_core::session::Sessions`) and implements the `Views` port:
+(`agentfs_engine::session::Sessions`) and implements the `Views` port:
 
 ```rust
 use std::sync::Arc;

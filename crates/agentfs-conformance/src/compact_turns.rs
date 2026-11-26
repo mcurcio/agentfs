@@ -12,7 +12,7 @@ use std::io::{self, BufRead, BufReader, Write};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::thread::JoinHandle;
 
-use agentfs_core::tree_actor::{CompactGate, Gap};
+use agentfs_engine::tree_actor::{CompactGate, Gap};
 
 /// The line that ends [`answer_fifos`]' thread, written to `at` by the
 /// harness itself: no gap has this name.

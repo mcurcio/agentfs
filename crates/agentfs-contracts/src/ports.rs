@@ -1,5 +1,5 @@
 //! The ports the domains reach their adapters through (docs/target-architecture/
-//! system.md, "Deployment compositions and crate layout"). agentfs-core
+//! system.md, "Deployment compositions and crate layout"). agentfs-engine
 //! implements them over the tree actor: every write here is one journal step,
 //! the volume's one commit point, and each event is a commit on a row chain
 //! beside the tree it concerns (`refs/agentfs/{volume,trees/<tree>,clients/<tree>}`).
@@ -49,7 +49,7 @@ pub trait StateArea {
     ///
     /// # Errors
     ///
-    /// `NotDurable` for a read that failed.
+    /// `Unreadable` for a read that failed.
     fn inspect(&self) -> Result<Found, VolumeError>;
 
     /// Under the state area's lock, inspects again: still `Nothing`, writes the
@@ -62,7 +62,7 @@ pub trait StateArea {
     ///
     /// # Errors
     ///
-    /// `Busy`, `OtherFormat`, `NotDurable`.
+    /// `Busy`, `OtherFormat`, `Unreadable`, `NotDurable`.
     fn create(
         &mut self,
         name: &VolumeName,
@@ -190,7 +190,7 @@ pub struct ClientRow {
 pub struct TreeClients {
     pub tree: TreeId,
     pub attached: Vec<Audited<ClientRow>>,
-    /// A fork's one writer, for life (docs/library/core.md, C4): kept after its client ends, removed
+    /// A fork's one writer, for life (docs/library/domains.md, C4): kept after its client ends, removed
     /// only at `ForkDropped`.
     pub writer_claim: Option<Audited<ClientId>>,
 }

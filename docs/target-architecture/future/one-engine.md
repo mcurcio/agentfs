@@ -6,7 +6,7 @@ own architect and design gate, one layer down. M1 (volumes, clients, forks and t
 M2 (directories, metadata and links), M3 (operator rules and the untracked area), M7 (the `agentfs` binary's
 `init` and `mount`, so the sidecar, the Docker examples and the CLI) and M8 (the CSI driver, through `agentfs host`)
 are built and described in [tree views](../../trees.md), [the CSI driver](../../csi.md) and the
-[library](../../library/core.md#git-backed-tree-views). The commit that lands the last milestone (M9) deletes this page and
+[library](../../library/engine.md#git-backed-tree-views). The commit that lands the last milestone (M9) deletes this page and
 moves the behaviour into the library and operator docs.
 
 ## Today
@@ -121,7 +121,7 @@ manual trigger. Only a milestone that changes save or land logic needs the full 
 **M1. Volumes and their lifecycle.** Built. Volume (`ensure`, `stage`, `unstage`, the Stop drain and the release
 verdict), Clients (attach, rebind, detach, sessions, one writer per fork), Views (the view host) and Trees (create
 with settings and a key, end, drop) are in [tree views](../../trees.md); their invariants are in the
-[library](../../library/core.md#domain-invariants). A volume gets its UUID at create, zero remotes is a valid volume,
+[library](../../library/domains.md#domain-invariants). A volume gets its UUID at create, zero remotes is a valid volume,
 other users reach the tree mount, and every commit carries the "where" trailers. The tracer and the release figures
 run in `image.yml` ([tracer](#tracer), [performance](../../performance.md#tree-views-release-build)), and
 `phase-1.yml` runs on every PR. Left to later milestones: a start point from another volume's line
@@ -161,7 +161,8 @@ publisher, each volume's refs under its own prefix, and history a mirror's reade
 claim are reused, re-homed under Replication, and recorded in architecture.md's "Technology choices". Its gate
 decides the published name's key, what a rename does to the old remote ref, the prefix's form, and whether a
 volume's name may change ([root branch name](root-branch-name.md), which M4 deletes; git-model's
-`refs/agentfs/<volume>/` stands for that prefix until then). Gate: a short run.
+`refs/agentfs/<volume>/` stands for that prefix until then). Its crates, agentfs-replication and
+agentfs-transport, are in [the crate split](crate-split.md). Gate: a short run.
 
 **M5. Keep operating.** Telemetry, alarms, liveness and restart in place
 ([tree-view telemetry](tree-view-telemetry.md), [health](../domains/health.md)). Its gate lists each of today's 12
@@ -262,7 +263,9 @@ sidecar and Docker jobs (image's `e2e (kind cluster)`, hermes' `sidecar` and `fe
 `serve-git` (rebuilt on trees by M6), its CSI entry points and one-shot commands, and every
 [deferred extra](#deferred-extras) it still serves. Adapters the tree engine uses stay where M4 and M5 re-homed
 them. Recording-only docs, runbooks, alert rules and CI jobs go, as M5's list and the deferred table say. This page
-goes; its deferred table moves to [the target architecture's index](../README.md) first. Gate: ci and image.
+goes; its deferred table moves to [the target architecture's index](../README.md) first. What the deletion ends in
+the crates (agentfs-repo's `NOT_REEXPORTED`, `ci/check-deps.sh`'s refusal of the recording engine, the front's `fuse`
+feature) is in [the crate split](crate-split.md), which goes with it. Gate: ci and image.
 
 ## Order
 
@@ -316,10 +319,10 @@ commit moves this table to [the target architecture's index](../README.md), so n
 | Moving a volume between nodes | a new volume on another node, started from the old one's branch, by the moving runbook | example 10; f8's `e2e-csi-move` | [Volume](../domains/volume.md) (the start point) | refused by the CSI driver from M8 (`startFrom`; the moving runbook copies files by hand); dropped at M9 until its slice lands |
 | `startFrom` and `start accept` | a CSI start class: a volume whose history begins at another volume's commit; `StartBranchMoved` while that branch moves | example 10; f8's `e2e-csi-move` | [Volume](../domains/volume.md) (`StartPoint::Line`, the start record) | refused by the CSI driver from M8 (`startFrom is not built on tree volumes`); only the empty start is built; dropped at M9 until its slice lands |
 | The fork overlay | the sandbox overlay (`mount --sandbox-overlay` until M7): a second mount that shows a fork's workload only recordable files and keeps the rest in a private tmp layer | example 12; `crates/agentfs-fuse/src/overlay/tests.rs` | [The system](../system.md) (the overlay becomes a fork), [Overlay gaps](sandbox-overlay-gaps.md) | offered by no launcher from M7: its flags, manifests and chart values are deleted; `agentfs-fuse` keeps it until M9; dropped at M9 until its slice lands |
-| `fork deliver` | a finished fork's change handed to a receiver as an inbox patch, a branch, a command or a webhook | example 8; `crates/agentfs/tests/cli/cli_fork_deliver.rs` | [Fork delivery](fork-delivery.md) | no launcher from M8: CSI fork claims land in their source and publish no change; dropped at M9 until its slice lands |
-| Unlinked forks | a fork that never delivers to its source and pushes only to its own remotes | example 5's `link: unlinked` class; `crates/agentfs/tests/cli/cli_fork.rs`, `crates/agentfs-csi/tests/grpc.rs` | [Fork delivery](fork-delivery.md) | `fork create` refuses a tree volume from M7; refused by the CSI driver from M8 (`unlinked forks are not built`); dropped at M9 until its slice lands |
+| `fork deliver` | a finished fork's change handed to a receiver as an inbox patch, a branch, a command or a webhook | example 8; `crates/agentfs-cli/tests/cli/cli_fork_deliver.rs` | [Fork delivery](fork-delivery.md) | no launcher from M8: CSI fork claims land in their source and publish no change; dropped at M9 until its slice lands |
+| Unlinked forks | a fork that never delivers to its source and pushes only to its own remotes | example 5's `link: unlinked` class; `crates/agentfs-cli/tests/cli/cli_fork.rs`, `crates/agentfs-csi/tests/grpc.rs` | [Fork delivery](fork-delivery.md) | `fork create` refuses a tree volume from M7; refused by the CSI driver from M8 (`unlinked forks are not built`); dropped at M9 until its slice lands |
 | Recording without a mount | `agentfs run` (the commit and push loops with no mount), `record` and `flush` (named paths of the backing tree) | the recording engine's Rust tests (`cli_record.rs`, `cli_push.rs`) | [Recording without a mount](recording-without-a-mount.md) | `run`, `record` and `flush` refuse a tree volume from M7, and the migration Job copies through `mount -- COMMAND`; dropped at M9 until its slice lands |
-| Checkpoint and the change line | an integrator cuts one commit per change intent on `refs/agentfs/<volume>/change-line`; a remote may get only that line | `crates/agentfs/tests/cli/cli_checkpoint.rs` | [Checkpoints and patch notices](integrator-hooks.md) | `checkpoint` refuses a tree volume from M7; dropped at M9 until its slice lands |
+| Checkpoint and the change line | an integrator cuts one commit per change intent on `refs/agentfs/<volume>/change-line`; a remote may get only that line | `crates/agentfs-cli/tests/cli/cli_checkpoint.rs` | [Checkpoints and patch notices](integrator-hooks.md) | `checkpoint` refuses a tree volume from M7; dropped at M9 until its slice lands |
 | Patch notices | the `patch-notify` hook and the `agentfs.patchNotifyUrl` webhook, sent when the queue's verdicts change | `cli_patch.rs` | [Checkpoints and patch notices](integrator-hooks.md) | not built on tree volumes from M7: a patch setting is logged and alarmed; dropped at M9 until its slice lands |
 | Database groups | `agentfs.commit=fsync` and `agentfs.group`: a database and its journal recorded whole at `fsync` | `cli_record.rs`, `cli_restore.rs` | [Open files and groups](files-open-groups.md) | not built on tree volumes from M7: the attributes refuse the volume, naming the line; dropped at M9 until its slice lands |
 | State areas on NFS | a CLI or sidecar state area on an NFS 4.1 export, its lock reaching other clients | nothing in CI | [State on NFS](state-on-nfs.md) | not built on tree volumes from M7; dropped at M9 until its slice lands |

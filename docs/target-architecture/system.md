@@ -5,7 +5,7 @@ views, tree storage and lifecycle, replication, the volume, health, telemetry, v
 their contracts and events in Rust surfaces. The commit that lands a slice of it deletes the part it builds and moves
 the behaviour into the library or operator docs. Built (M1): the contracts crate, the Volume, Clients and Trees
 domains over their ports, their rows as event commits, and the composition root's event dispatch, described in
-[the library](../library/core.md#rows-and-domain-events) and [docs/trees.md](../trees.md); the sketches below of
+[the library](../library/domains.md#rows-and-domain-events) and [docs/trees.md](../trees.md); the sketches below of
 those parts stand only where they go beyond what is built.
 
 [git-model.md](git-model.md) is the one source of truth for trees as branches, saves, locks, the queue and its
@@ -75,7 +75,7 @@ Telemetry receives every event and is left off the picture.
 
 Built in `agentfs-contracts`, and not repeated here: `TreeId` (`Root` or `Fork(ForkId)`), `ClientId` (launcher,
 tree, label and ordinal, which names its writer alone), `Principal` (`Client`, `Launcher` or `Agentfs`), `Stamp` and
-`Audited<T>` (stamped by the store), the names and the pod context ([library](../library/core.md#rows-and-domain-events)).
+`Audited<T>` (stamped by the store), the names and the pod context ([library](../library/domains.md#rows-and-domain-events)).
 What follows goes beyond them.
 
 ```rust
@@ -121,7 +121,7 @@ another (`OtherFamily(Version)`) before any domain is called.
 Built: a domain publishes its event once its step is durable, and the composition root's in-process queue hands each
 to its consumers after the call that caused it returns. Delivery is not durable: at boot every consumer judges again
 from facts it asks (Trees' settle, Clients' reconcile, Volume's re-judgement), so a crash between a step and its
-delivery loses no reaction ([library](../library/core.md#rows-and-domain-events)). The built events (`Attached`,
+delivery loses no reaction ([library](../library/domains.md#rows-and-domain-events)). The built events (`Attached`,
 `Rebound`, `AttachmentEnded`, `LastDetached`, `ClaimReleased`, `ForkCreated`, `ForkEnded`, `ForkDropped`,
 `VolumeStaged`, `VolumeDraining`, `VolumeReleased`) and their consumers are in [docs/trees.md](../trees.md). Not
 built: handing each event to `Telemetry::emit`; Replication consuming `ForkEnded` and `ForkDropped` (a carried remote

@@ -2,7 +2,7 @@
 //! validation with the error codes csi-sanity expects, CreateVolume's
 //! refusals, a recording-format volume refused by DeleteVolume and
 //! NodePublish, ValidateVolumeCapabilities, and the server's stop. The
-//! real `agentfs` binary is driven by crates/agentfs/tests/csi_trees.rs.
+//! real `agentfs` binary is driven by crates/agentfs-cli/tests/csi_trees.rs.
 
 use std::collections::HashMap;
 use std::fs;

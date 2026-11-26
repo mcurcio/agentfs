@@ -1,0 +1,69 @@
+[package]
+name = "agentfs-engine"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "The tree engine of agentfs, the recording engine's sibling"
+
+[package.metadata.agentfs]
+rank = "engine"
+
+[dependencies]
+# The shared kernel: values (the tree identity among them), capabilities and
+# the ports the engine's adapters implement.
+agentfs-contracts = { version = "0.1.0", path = "../agentfs-contracts" }
+# The leaves both engines share: failpoints, the operating system, git.
+agentfs-failpoints = { version = "0.1.0", path = "../agentfs-failpoints" }
+agentfs-git = { version = "0.1.0", path = "../agentfs-git" }
+agentfs-os = { version = "0.1.0", path = "../agentfs-os" }
+# The git program's isolated environment (tree_git's `git` children).
+agentfs-align = { version = "0.1.0", path = "../agentfs-align" }
+# Line maps: which version wrote each line of a tree's files (tree_actor).
+agentfs-lines = { version = "0.1.0", path = "../agentfs-lines" }
+# The landing rules, the queue and the values they read (tree_actor's takes).
+agentfs-referee = { version = "0.1.0", path = "../agentfs-referee" }
+# The Rules domain: where each new name of a tree lives (tree_actor's untracked areas).
+agentfs-rules = { version = "0.1.0", path = "../agentfs-rules" }
+crc32fast = "1.5.2"
+# No transport: the engine opens no remote.
+git2 = { version = "0.21.0", default-features = false }
+# Persistent (structurally shared) ordered maps: a tree view's state crosses
+# from the builder to History and the actor as a snapshot whose clone is
+# O(1), and a large file map's pieces (docs/trees.md, "File maps").
+imbl = "7"
+libc = "0.2.190"
+# The API only: the binary picks the SDK and exporters.
+opentelemetry = { version = "0.33.1", default-features = false, features = ["trace", "metrics", "logs"] }
+rustix = { version = "1.1.5", features = ["fs", "process"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+# The release fingerprint of history's verification notes.
+sha2 = "0.11"
+thiserror = "2.0.21"
+# A new volume's id (RFC 9562 version 4), made in state_area.rs only.
+uuid = { version = "1", default-features = false, features = ["std", "v4"] }
+# `test-util` only: makes the test-only surface `pub` (`visibility::make`).
+visibility = { version = "0.1.1", optional = true }
+
+[dev-dependencies]
+# Itself with `test-util`: its own tests/ reach the test-only surface.
+agentfs-engine = { path = ".", features = ["test-util"] }
+# The Volume domain over the real state area (tests/it/state_area.rs).
+agentfs-volume = { version = "0.1.0", path = "../agentfs-volume" }
+# The Trees domain over the store adapter (tests/it/tree_store.rs).
+agentfs-trees = { version = "0.1.0", path = "../agentfs-trees" }
+# The Clients domain over the store adapter and sessions (tests/it/tree_clients.rs).
+agentfs-clients = { version = "0.1.0", path = "../agentfs-clients" }
+# The in-memory metric reader of the telemetry tests.
+agentfs-test-metrics = { version = "0.0.0", path = "../agentfs-test-metrics" }
+tempfile = "3.27.0"
+
+[features]
+# Test builds only: failpoints on the durable path (`failpoints`). Never in a release or image.
+failpoints = ["agentfs-failpoints/failpoints"]
+# Test builds only: the items only the workspace's tests and test builds call
+# (docs/library/engine.md, "Test builds"). Off by default; the library never
+# turns it on.
+test-util = ["dep:visibility"]

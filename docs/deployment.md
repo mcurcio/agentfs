@@ -569,7 +569,7 @@ The rule files become `/data/state/history.git/info/exclude` and
   built at every boot.
 
 What the rules leave out stays in the volume, in its untracked area:
-Hermes reads and writes it like any other file. `crates/agentfs/tests/cli/deploy_examples.rs`
+Hermes reads and writes it like any other file. `crates/agentfs-cli/tests/cli/deploy_examples.rs`
 checks these files against a representative layout in every CI run,
 through the tree engine's own rule set. Check the profile layout against
 the Hermes version you run.

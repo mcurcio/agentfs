@@ -30,8 +30,8 @@ use std::sync::Arc;
 
 use agentfs_contracts::host::TreeRef;
 use agentfs_contracts::name::ForkKey;
-use agentfs_contracts::ports::Found;
-use agentfs_core::tree_actor;
+use agentfs_contracts::ports::{Found, StateArea as _};
+use agentfs_engine::state_area::TreeStateArea;
 use tokio::sync::Mutex;
 use tonic::{Request, Response, Status};
 
@@ -75,8 +75,9 @@ impl ControllerService {
 
 /// What a state area holds; a failure to read it is `INTERNAL`.
 pub(crate) fn inspect(layout: &Layout, handle: &str) -> Result<Found, Error> {
-    let state = layout.state(handle);
-    tree_actor::inspect(&state).map_err(|e| Error::io(format!("reading {}", state.display()), e))
+    TreeStateArea::at(&layout.state(handle))
+        .inspect()
+        .map_err(|e| Error::Internal(e.to_string()))
 }
 
 /// What a recording-format volume is told: it is never served or deleted.

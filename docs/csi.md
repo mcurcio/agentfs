@@ -532,7 +532,7 @@ Each node keeps its volumes under its own `--base-path`, on its own disk.
   (static PV attributes and every refusal), layout, records, the host client
   and the supervisor with a fake launcher and mounter (one pod per claim,
   restarts with backoff and views replayed, reconcile after a plugin restart).
-- **The real binary** (`crates/agentfs/tests/csi_trees.rs`): the Controller and
+- **The real binary** (`crates/agentfs-cli/tests/csi_trees.rs`): the Controller and
   Node services over a gRPC socket with real `agentfs init` and `agentfs host`
   children. Without root: CreateVolume makes a tree volume with the templated
   name, its profile included and its rules installed; DeleteVolume drains it

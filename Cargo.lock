@@ -45,16 +45,36 @@ version = "0.1.0"
 dependencies = [
  "agentfs-clients",
  "agentfs-contracts",
+ "agentfs-engine",
+ "agentfs-rules",
+ "agentfs-service",
+ "agentfs-trees",
+ "agentfs-volume",
+ "tempfile",
+]
+
+[[package]]
+name = "agentfs-align"
+version = "0.1.0"
+dependencies = [
+ "thiserror",
+]
+
+[[package]]
+name = "agentfs-cli"
+version = "0.1.0"
+dependencies = [
+ "agentfs-contracts",
  "agentfs-core",
  "agentfs-csi",
+ "agentfs-engine",
  "agentfs-failpoints",
  "agentfs-fuse",
  "agentfs-git",
  "agentfs-os",
  "agentfs-repo",
  "agentfs-rules",
- "agentfs-trees",
- "agentfs-volume",
+ "agentfs-service",
  "anyhow",
  "clap",
  "git2",
@@ -83,13 +103,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "agentfs-align"
-version = "0.1.0"
-dependencies = [
- "thiserror",
-]
-
-[[package]]
 name = "agentfs-clients"
 version = "0.1.0"
 dependencies = [
@@ -101,7 +114,7 @@ name = "agentfs-conformance"
 version = "0.0.0"
 dependencies = [
  "agentfs-contracts",
- "agentfs-core",
+ "agentfs-engine",
  "agentfs-model",
  "agentfs-trees",
  "libc",
@@ -124,17 +137,13 @@ dependencies = [
 name = "agentfs-core"
 version = "0.1.0"
 dependencies = [
- "agentfs-align",
- "agentfs-clients",
  "agentfs-contracts",
  "agentfs-failpoints",
  "agentfs-git",
- "agentfs-lines",
  "agentfs-os",
  "agentfs-repo",
  "agentfs-rules",
- "agentfs-trees",
- "agentfs-volume",
+ "agentfs-test-metrics",
  "base64 0.23.1",
  "bstr",
  "crc32fast",
@@ -145,7 +154,6 @@ dependencies = [
  "gix-parallel",
  "hyper",
  "hyper-util",
- "imbl",
  "libc",
  "opentelemetry",
  "opentelemetry_sdk",
@@ -168,7 +176,6 @@ dependencies = [
  "tonic-prost-build",
  "tower",
  "ureq",
- "uuid",
 ]
 
 [[package]]
@@ -176,7 +183,7 @@ name = "agentfs-csi"
 version = "0.1.0"
 dependencies = [
  "agentfs-contracts",
- "agentfs-core",
+ "agentfs-engine",
  "agentfs-fuse",
  "agentfs-os",
  "agentfs-repo",
@@ -200,6 +207,38 @@ dependencies = [
 ]
 
 [[package]]
+name = "agentfs-engine"
+version = "0.1.0"
+dependencies = [
+ "agentfs-align",
+ "agentfs-clients",
+ "agentfs-contracts",
+ "agentfs-engine",
+ "agentfs-failpoints",
+ "agentfs-git",
+ "agentfs-lines",
+ "agentfs-os",
+ "agentfs-referee",
+ "agentfs-rules",
+ "agentfs-test-metrics",
+ "agentfs-trees",
+ "agentfs-volume",
+ "crc32fast",
+ "git2",
+ "imbl",
+ "libc",
+ "opentelemetry",
+ "rustix",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror",
+ "uuid",
+ "visibility",
+]
+
+[[package]]
 name = "agentfs-failpoints"
 version = "0.1.0"
 dependencies = [
@@ -215,6 +254,7 @@ version = "0.1.0"
 dependencies = [
  "agentfs-contracts",
  "agentfs-core",
+ "agentfs-engine",
  "agentfs-failpoints",
  "agentfs-os",
  "agentfs-rules",
@@ -271,6 +311,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "agentfs-referee"
+version = "0.1.0"
+dependencies = [
+ "agentfs-contracts",
+ "agentfs-lines",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
 name = "agentfs-repo"
 version = "0.0.0"
 dependencies = [
@@ -291,6 +342,27 @@ dependencies = [
  "gix-parallel",
  "tempfile",
  "thiserror",
+]
+
+[[package]]
+name = "agentfs-service"
+version = "0.1.0"
+dependencies = [
+ "agentfs-clients",
+ "agentfs-contracts",
+ "agentfs-engine",
+ "agentfs-trees",
+ "agentfs-volume",
+ "tempfile",
+ "thiserror",
+]
+
+[[package]]
+name = "agentfs-test-metrics"
+version = "0.0.0"
+dependencies = [
+ "opentelemetry",
+ "opentelemetry_sdk",
 ]
 
 [[package]]
@@ -4076,6 +4148,17 @@ name = "version_check"
 version = "0.9.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
+
+[[package]]
+name = "visibility"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d674d135b4a8c1d7e813e2f8d1c9a58308aee4a680323066025e53132218bd91"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+]
 
 [[package]]
 name = "walkdir"

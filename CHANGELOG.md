@@ -12,6 +12,29 @@ design was reviewed on 2026-10-12.
 
 ### Changed
 
+- **The landing rules are a crate of their own, `agentfs-referee`.** `land`,
+  `sync`, `touches`, the queue's order and locks, and the values they read
+  (`EventNumber`, `LineVersion`, `MergeFileIdentity`, `NameHistory`) moved
+  out of the tree engine, with their own error (`agentfs_referee::Error`,
+  mapped into the engine's as before) and their tests, which run in seconds.
+  The crate and the four domains are `no_std` outside their tests, from the
+  ranks the workspace manifest marks `no_std = true`, which agentfs-repo
+  checks; `agentfs-lines`' file and process half is its default feature `io`,
+  which the landing rules build without (`ci/check-deps.sh`)
+  (docs/library/referee.md).
+- **Each library item has one path.** An entry's metadata (`Kind`, `Perm`,
+  `Attrs`, `Meta`) is the shared kernel's, `agentfs::contracts::meta`, and a
+  tree's identity is `agentfs::contracts::TreeId` only: the engine no longer
+  re-exports them, and agentfs-repo refuses a crate the library re-exports
+  that re-exports another crate's item. A permission that is not four octal
+  digits is `NotAPerm`. The engine's `Error::Reconcile` is `Error::Lines`.
+  `History::wait_checkpointed`, `wait_compacted`, `wait_compactor` and
+  `stages::holds_on_this_thread` are behind the engine's `test-util`
+  feature (docs/library/engine.md, "Test builds").
+- **The CLI's package is `agentfs-cli`.** Its directory is `crates/agentfs-cli`
+  and its binary is still `agentfs`; build it from source with
+  `cargo build --release -p agentfs-cli`. The package `agentfs` is the
+  library crate (below).
 - **`agentfs init` and `mount` run the tree engine.** `agentfs trees` is gone:
   `init --volume NAME [--include FILE]... [--owner UID:GID]` creates or finds a
   tree volume (`<name> <id> created|found`), `mount ROOT` serves it (with every
@@ -102,6 +125,30 @@ design was reviewed on 2026-10-12.
 
 ### Added
 
+- **`agentfs-service`: a working volume from the library.** A consumer
+  serves a tree volume through `agentfs::service`: its composition root
+  mints a `Launcher`'s capabilities, `init` makes or finds the volume,
+  `Domains::stage` serves it with the operator settings it read, and
+  `unstage` drains it until it is released. The binary's `init`, `mount`,
+  `host` and `fork end` use the same crate, the only one that composes the
+  domains (docs/library/service.md). `agentfs init` now prints a failed
+  recovery as `error: <reason>`, and a recovery that finds another format
+  with the same message as a create that finds one. `agentfs fork end`
+  prints a state area it cannot open in the Volume domain's words
+  (`opening tree state: no volume here: create it first ...`), exit status
+  unchanged.
+- **`agentfs-engine`'s `test-util` feature.** The engine's items only tests
+  call (creating a volume with a hand-made id, opening one around the
+  service, the compaction gate, opening the git store directly) are behind it, off by default, and the library
+  crate `agentfs` never turns it on; the row writes and a client's end are
+  crate-private (docs/library/engine.md, "Test builds").
+- **The library crate `agentfs`.** The one crate a consumer depends on: the
+  tree engine, the shared kernel and the Volume, Clients, Trees and Rules
+  domains under one name (`agentfs::engine`, `agentfs::contracts`, ...), with
+  a doctest that opens a tree volume through it. It does not re-export the
+  recording engine or the FUSE layer. No crate of the workspace depends on it
+  (docs/library/agentfs.md). The domains' contract and invariants are on
+  their own page, docs/library/domains.md.
 - **`AgentfsNotBuilt`.** An example alert rule, a warning while
   `agentfs_not_built` counts a configured operator setting whose capability
   tree volumes do not build yet, labelled by capability. The telemetry,

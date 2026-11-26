@@ -1,0 +1,17 @@
+[package]
+name = "agentfs-test-metrics"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Tests only: an OpenTelemetry meter over the SDK's in-memory exporter, and the point of a metric by name and attributes"
+publish = false
+
+[package.metadata.agentfs]
+rank = "tests"
+
+[dependencies]
+opentelemetry = { version = "0.33.1", default-features = false, features = ["metrics"] }
+# The SDK's meter provider and its in-memory exporter.
+opentelemetry_sdk = { version = "0.33.1", default-features = false, features = ["metrics", "testing"] }

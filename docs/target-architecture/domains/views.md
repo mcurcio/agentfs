@@ -104,7 +104,7 @@ Clients ends its attachments, which drops their waiting opens.
 ## 5. Public contract
 
 Built, and not repeated here: the `Views` trait (`open(at, binding, options)`, `close`) and `ViewError` in
-`agentfs_contracts::views`, and the session a view's calls cross (`agentfs_core::session::TreeSession`: write-opens,
+`agentfs_contracts::views`, and the session a view's calls cross (`agentfs_engine::session::TreeSession`: write-opens,
 writes, `fsync`, path calls and closes, each naming no client and no tree), described in the
 [filesystem layer](../../library/filesystem.md#tree-views) and [docs/trees.md](../../trees.md#the-view). What follows
 goes beyond them.

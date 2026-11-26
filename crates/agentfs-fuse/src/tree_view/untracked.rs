@@ -1,6 +1,6 @@
 //! A view's untracked half (docs/library/filesystem.md, "Tree views"): the
 //! tree's files the rules leave out, served from its untracked area
-//! (`agentfs_core::tree_actor::UntrackedArea`) as ordinary Linux files. No
+//! (`agentfs_engine::tree_actor::UntrackedArea`) as ordinary Linux files. No
 //! call here is journaled, gated by the lag gate or made under the actor's
 //! lock; each change holds the area against a fork's copy while it runs.
 //!
@@ -18,7 +18,8 @@ use std::path::Path;
 use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use agentfs_core::tree_actor::{AreaWrite, Meta, UntrackedArea};
+use agentfs_contracts::meta::Meta;
+use agentfs_engine::tree_actor::{AreaWrite, UntrackedArea};
 use fuser::{Errno, FileAttr, FileType, INodeNo, TimeOrNow};
 use rustix::fs::{AtFlags, Mode, OFlags, RenameFlags, Stat, Timespec, Timestamps};
 

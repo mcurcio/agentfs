@@ -123,7 +123,7 @@ On Linux 5.6+ with `/dev/fuse`, as root, in a clone of this repository
 ([building](docs/development.md#building) lists what the build needs):
 
 ```sh
-cargo build --release -p agentfs
+cargo build --release -p agentfs-cli
 export PATH=$PWD/target/release:$PATH
 agentfs --state /data/state init --volume demo
 # Serve /workspace, run one command in it, then stop.
@@ -250,7 +250,7 @@ The documentation is published at <https://mcurcio.github.io/agentfs/>;
 | [Configuration](docs/configuration.md) | Every setting, attribute, flag and environment variable |
 | [Runbooks](docs/README.md#runbooks) | One procedure per failure mode |
 | [Guarantees](docs/guarantees.md), [Recording](docs/recording.md), [Remotes](docs/remotes.md) | What agentfs promises, what the recording engine records and when, and how it pushes |
-| [Library](docs/library/core.md) | Building on `agentfs-core`, `agentfs-fuse` and `agentfs-csi` |
+| [Library](docs/library/agentfs.md), [recording engine](docs/library/core.md) | Building on the library crate `agentfs` (the tree engine, the shared kernel and the domains), `agentfs-core`, `agentfs-fuse` and `agentfs-csi` |
 | [Architecture](docs/architecture.md) | The crates and modules, and how a change flows through them |
 
 ## Status and roadmap

@@ -142,7 +142,7 @@ host on the node. Three locks order its calls, each named for what it orders:
   stopped.
 
 - **Ensure** runs `agentfs init` and installs the profile's rule files
-  (`agentfs_core::operator_settings::install_rules`) into
+  (`agentfs_engine::operator_settings::install_rules`) into
   `state/history.git/info/`. It refuses while the volume is served, since its
   settings change only while it is not.
 - **Starting a host** installs the rule files again, spawns `agentfs host`

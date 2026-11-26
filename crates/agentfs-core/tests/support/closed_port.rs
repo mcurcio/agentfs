@@ -10,7 +10,7 @@
 //! the value is dropped.
 //!
 //! Shared by `crates/agentfs-core` and (through `#[path]`)
-//! `crates/agentfs/tests`.
+//! `crates/agentfs-cli/tests`.
 
 #![allow(dead_code)]
 

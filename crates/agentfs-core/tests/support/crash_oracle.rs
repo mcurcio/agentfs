@@ -19,7 +19,7 @@
 //!   holds exactly the head.
 //!
 //! Shared by `crates/agentfs-core/tests` and (through `#[path]`)
-//! `crates/agentfs/tests`.
+//! `crates/agentfs-cli/tests`.
 
 #![allow(dead_code)]
 

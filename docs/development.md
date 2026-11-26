@@ -38,9 +38,9 @@ and Ubuntu); `ssh` is agentfs's own transport on russh with ring, with no
 OpenSSL or libssh2:
 
 ```sh
-cargo build -p agentfs --features https      # https:// remotes and https LFS servers
-cargo build -p agentfs --features ssh        # ssh:// and scp-like remotes (russh)
-cargo build -p agentfs --features https,ssh  # both
+cargo build -p agentfs-cli --features https      # https:// remotes and https LFS servers
+cargo build -p agentfs-cli --features ssh        # ssh:// and scp-like remotes (russh)
+cargo build -p agentfs-cli --features https,ssh  # both
 ```
 
 A third, `otlp-tls`, exports telemetry to `https://` collectors (rustls on
@@ -57,10 +57,24 @@ The FUSE layer uses fuser's pure-Rust mount code, so building needs no
 libfuse or pkg-config; running a mount needs `/dev/fuse` (and `fusermount3`
 from the `fuse3` package for a non-root daemon).
 
-Tests only: `cargo nextest run --workspace --features agentfs/failpoints` adds
+Tests only: `cargo nextest run --workspace --features agentfs-cli/failpoints` adds
 the crash-injection failpoints (`AGENTFS_FAILPOINTS`
 in the [configuration reference](configuration.md)). Never ship such a
 build: its `--version` ends in `+failpoints`.
+
+Beside it, `agentfs-engine`'s `test-util` feature makes the engine's
+test-only surface `pub` ([engine](library/engine.md#test-builds)). It is off
+by default and the library crate `agentfs` never turns it on. The engine's
+own tests get it through a dev-dependency on the engine itself, the FUSE
+layer's and the binary's tests through their dev-dependencies, the binary's
+`failpoints` build through that feature, and `agentfs-conformance` through
+its dependency. A workspace-wide build therefore has it on: build the
+library alone, as a consumer does, with
+`cargo clippy -p agentfs-engine -p agentfs-service -p agentfs --lib` and
+`cargo test --doc -p agentfs`. That build refuses a call to the test-only
+surface from production code. Which `pub` items only tests call is not
+checked: an item goes behind the feature when a reading of its callers
+(`grep`) finds only tests.
 
 The container image:
 
@@ -73,7 +87,10 @@ docker build -t agentfs:dev .                 # https, ssh and otlp-tls features
 `cargo nextest run` runs every test in a process of its own, several at
 once, so a test never shares globals, an allocator or counters with
 another. nextest does not run doctests: `cargo test --doc` does, for a
-package with a library (`agentfs` is a binary only and has none). AGENTS.md
+package with a library (`agentfs-cli` is a binary only and has none). The
+library crate `agentfs` has no tests but its doctest, so its gate is
+`cargo test --doc -p agentfs`: `cargo nextest run -p agentfs` fails with
+exit status 4, "no tests to run". AGENTS.md
 gives the pinned nextest release and how to install it.
 
 [`.config/nextest.toml`](../.config/nextest.toml) holds two profiles. Both
@@ -95,24 +112,28 @@ slowest test of ci.yml's test job, and the two `tree_stages` tests 42 s to
 78 s. To run CI's sizes locally:
 
 ```sh
-AGENTFS_TEST_VOLUMES=full cargo nextest run -p agentfs-core --test tree_batch_alloc --test tree_stages
+AGENTFS_TEST_VOLUMES=full cargo nextest run -p agentfs-engine --test tree_batch_alloc --test tree_stages
 ```
 
 `cargo test --no-run` is still used where a script builds a test program
 and then runs it itself: `ci/fuse-tests.sh` runs it under sudo with
 libtest's flags, and `ci/model-digest.sh` and `ci/replay-seeds.sh` run one
-process per seed. Each says so in a comment.
+process per seed. Each says so in a comment. A name filter given to a
+libtest program run directly is not otherwise checked: libtest exits 0
+when it matches nothing. So each such run in `ci/fuse-tests.sh` reads its
+output and fails when it ran no test (`0 passed`) or not the count it
+expects.
 
 ### Test programs
 
 Cargo links one program per file in a crate's `tests/`. To link fewer,
-`agentfs-core` and `agentfs` put the integration tests that can share a
-process in one program each, a module per file: `tests/it/` and
-`tests/cli/`. Run one file's tests by its module:
+`agentfs-engine`, `agentfs-core` and `agentfs-cli` put the integration tests
+that can share a process in one program each, a module per file:
+`tests/it/` and `tests/cli/`. Run one file's tests by its module:
 
 ```sh
-cargo nextest run -p agentfs-core --test it tree_actor::
-cargo nextest run -p agentfs --test cli cli_fork::
+cargo nextest run -p agentfs-engine --test it tree_actor::
+cargo nextest run -p agentfs-cli --test cli cli_fork::
 ```
 
 A test file stays a program of its own when it needs the process to
@@ -162,7 +183,7 @@ Measured on 2026-11-24 in a container with 4 shared CPUs and 16 GB, at
 | `cargo test -p agentfs-core`, run only | 233 s | 217 s | 218 s |
 | One edit in `tree_actor/recording/`, then `cargo test -p agentfs-core --no-run` | 27 s | 16 s | 9 s |
 | One edit in `volume.rs`, the same | 29 s | 15 s | 9 s |
-| `cargo test -p agentfs`, its build and run | 143 s | 101 s | 85 s |
+| `cargo test -p agentfs-cli`, its build and run | 143 s | 101 s | 85 s |
 | Of which the run | 32 s | 25 s | 16 s |
 | Target directory at the end | 33 GB | 12 GB | 8.0 GB |
 
@@ -183,24 +204,59 @@ with those volumes a tenth of the size:
 | `tree_batch_alloc`, its one test | 65 s | 30 s alone, 32 s in the full run |
 | `tree_stages`, its 15 tests | 57 s | 4.4 s alone |
 | `agentfs-core`'s unit tests | 46 s | beside the rest |
-| `agentfs`'s tests, run only (no doctests: binary only) | 15 s | 17 s |
+| `agentfs-cli`'s tests, run only (no doctests: binary only) | 15 s | 17 s |
 | `agentfs-core`'s test programs built from an empty target directory | 128 s | 119 s |
-| `agentfs`'s, the same | 86 s | 88 s |
+| `agentfs-cli`'s, the same | 86 s | 88 s |
 
 No profile setting changed between the two columns, so the build times
 differ by noise only. nextest alone, on the "Before" tests, ran
 `agentfs-core` in 128 s: `tree_batch_alloc` took 81 s and each of the two
 10,000-file `tree_stages` tests 42 s, beside the other tests. Smaller
-volumes took the run to 75 s. Under nextest a package's run lasts about as
-long as its slowest test. For `agentfs-core` that is `tree_batch_alloc`
-(about 30 s locally), which builds a 10,000-file volume and must have its
-process to itself; CI runs it at full size (above), and its run lasts
-about as long. `agentfs`'s run gains nothing: most of its tests are in one program
+volumes took the run to 75 s. Under nextest a package's run lasts at least
+as long as its slowest test. For the tree engine (in `agentfs-core` then,
+`agentfs-engine` now) that is `tree_batch_alloc` (about 30 s locally),
+which builds a 10,000-file volume and must have its process to itself; CI
+runs it at full size (above), and its run lasts about as long. `agentfs-cli`'s run gains nothing: most of its tests are in one program
 (`tests/cli/`), which already ran them several at a time (14 s), and its
 slowest test takes about 5 s.
 
+The two engines are two packages, and neither depends on the other, so an
+edit in one rebuilds and runs only its own tests. Measured on 2026-11-25 in
+a container with 4 CPUs and 15 GB, at cargo's default jobs, with every test
+program built first, after touching one file:
+
+| Step | Build | Run | Tests |
+|---|---|---|---|
+| `tree_actor/recording/mod.rs`, then `cargo nextest run -p agentfs-engine` | 25 s | 64 s | 475 |
+| `volume.rs`, then `cargo nextest run -p agentfs-core` | 23 s | 20 s | 761 |
+
+The tree engine's run is bound by its four CPUs more than by its slowest
+test, `tree_batch_alloc` (about 33 s).
+
 The checks over the whole repository (`agentfs-repo`) build no engine: its
-library depends only on serde and serde_json. Measured on 2026-11-25 in a
+library depends only on serde and serde_json. Its checks of the crates
+(`tests/repo/crates.rs`): dependencies follow the
+[ranks](architecture.md#ranks); the crate `agentfs` only re-exports the
+ranks it uses; only `agentfs-service`, the crate `agentfs` and the tests
+depend on the domains the service composes; every `failpoints` feature is
+forwarded; every cargo command the repository writes down names what the
+workspace has; every failpoint hit is listed; the tree engine starts
+`git` only through `counted`, and neither the line maps nor the landing
+rules start a process; each library of a rank marked `no_std = true` is
+`no_std` outside its tests (`the_pure_ranks_are_no_std`): its `src/lib.rs`
+holds `#![cfg_attr(not(test), no_std)]` and no file of its `src` declares
+`extern crate std`; and each item of the library has one path
+(`the_library_gives_each_item_one_path`): no source of a crate the crate
+`agentfs` re-exports holds a statement starting `pub use`, `pub type` or
+`pub extern crate` that names another crate, an item of it or the whole
+crate (`pub use agentfs_contracts as kernel;`), written `agentfs_<name>` at
+the start of a path or `::agentfs_<name>`, test modules included. Not read by that check: a private import
+re-exported through `self::` or `crate::` (`use agentfs_contracts::TreeId;
+pub use self::TreeId as T;`), a crate alias (`use agentfs_contracts as c;
+pub use c::TreeId;`), and a macro that expands to one. rustdoc's JSON
+output, which resolves items, would read them, but it is nightly-only. The
+leaves (`agentfs-lines`, `agentfs-git` and the rest) are not read: the
+crate `agentfs` does not re-export them. Measured on 2026-11-25 in a
 container with 4 CPUs and 15 GB:
 
 | Step | Time |
@@ -210,21 +266,90 @@ container with 4 CPUs and 15 GB:
 | After an edit to a page under `docs/` | 1.0 s |
 | Of which the run, its 29 tests | 0.6 s |
 
+What the checks of the crates, `ci/check-deps.sh` and clippy's bans do not
+read, beside each:
+
+- **Purity** (`the_pure_ranks_are_no_std`, the compiler, and
+  `ci/check-deps.sh`'s `ok   referee alone` and `ok   referee`). A `no_std`
+  crate still calls what its dependencies make `pub`: I/O through a
+  dependency's API is not read, but for `agentfs-lines`' I/O half, its `io`
+  feature, which `check-deps.sh` refuses in what the landing rules link and
+  whose use fails their build alone (`cargo check -p agentfs-referee
+  --lib`). Also not read: an `extern crate` of another std-linked crate's
+  re-export of std (none in the graph today). A local `cargo clippy -p
+  agentfs-referee --all-targets` turns `io` on through the crate's
+  dev-dependency, so only that build alone refuses a call into it.
+- **Cargo commands** (`cargo_commands_name_what_the_workspace_has`). A
+  stale `cargo test` or `cargo nextest run -p agentfs`, meant for the
+  binary, is in form a right use of the library crate, and so is one in
+  markdown: not refused. Prose naming a package ("`agentfs` is a binary
+  only") is read by no check: a rename's own work greps for it.
+- **Paths under `crates/`** (`crate_paths_name_what_exists`). Every tracked
+  file is read but the records of past work (`vendor/`, `.claude/handoff/`,
+  the errata, `CHANGELOG.md`, `OWNER-GUIDANCE.md`, the patches). In Rust it
+  reads whole-line comments only: a comment after code, a `/* */` comment
+  and string literals are left to the compiler and the tests that open
+  them.
+- **The front** (`the_front_only_reexports_the_ranks_it_uses`, which
+  refuses anything in its `src/lib.rs` but comments and `pub use <crate> as
+  <module>;` and requires one module for each library of the ranks its rank
+  uses but `agentfs-core`). Not read: what each re-exported crate makes
+  `pub`.
+- **Composition** (`only_the_service_composes_the_domains`). Not read:
+  dev-dependencies and the `tests` rank, so `agentfs-conformance` composes
+  Trees itself (`mounted.rs`), as a test may; and a consumer outside the
+  workspace.
+- **What the library links** (`check-deps.sh`'s `ok   library` and `ok
+  library features`). It refuses the recording engine, which shares the
+  rank `engine` with the tree engine, so the ranks cannot. Not read: a
+  consumer that depends on `agentfs-engine` by name with `test-util`, and
+  which `pub` items only tests call (an item goes behind `test-util` when a
+  reading of its callers finds only tests).
+- **A library making its own `Meter`.** clippy bans
+  `opentelemetry::global::meter*`, `MeterProvider::{meter,
+  meter_with_scope}` and `Meter::new` but in the binary's `otel::meter_of`
+  and agentfs-test-metrics. Not checked: a library building an SDK
+  provider.
+- **clippy's bans of `TreeGit::open` and `TreeGit::init`** carry
+  `allow-invalid = true`, as the paths resolve only under `test-util`: a
+  rename or move of either drops its ban without a word. Not checked.
+- **One crate's documentation per name.** agentfs-cli's binary has `doc =
+  false`, so `cargo doc --workspace` does not write the binary's pages over
+  the library crate's (both are `agentfs`). Not checked: no gate runs
+  `cargo doc --workspace`.
+
+The landing rules are a crate of their own, `agentfs-referee`, whose tests
+build and run without the engine. Measured on 2026-11-25 in a container
+with 4 CPUs and 15 GB, at cargo's default jobs:
+
+| Step | Time |
+|---|---|
+| `cargo nextest run -p agentfs-referee`, from an empty target directory | 14 s |
+| The same again, nothing changed | 2.7 s |
+| After touching one of its files | 2.4 s |
+| Of which the run, its 43 tests | 1.4 s to 2.3 s |
+
 ## CI
 
 Every push runs [`.github/workflows/ci.yml`](../.github/workflows/ci.yml):
 
 - **lint:** rustfmt, clippy with default and all features, and
   [`ci/check-deps.sh`](../ci/check-deps.sh): what C and crypto each feature
-  set links.
+  set of the binary links, and that the library crate `agentfs` links no
+  recording engine, FUSE, OpenTelemetry SDK, TLS or SSH and turns on no
+  `test-util` or `failpoints` feature; and that the landing rules
+  (`agentfs-referee`) build alone, without `agentfs-lines`' `io` feature,
+  and link no git, libc, rustix or OpenTelemetry. Then the library as a consumer builds
+  it, without `test-util`: clippy of `agentfs-engine`, `agentfs-service`
+  and `agentfs`'s libraries, and `agentfs`'s doctest.
 - **test:** the workspace tests under nextest's `ci` profile, then the
   doctests with `cargo test --doc`, with default and all features. They
   include `restore` and `revert` without a mount
-  ([`cli_restore.rs`](../crates/agentfs/tests/cli/cli_restore.rs)), and the
+  ([`cli_restore.rs`](../crates/agentfs-cli/tests/cli/cli_restore.rs)), and the
   `.gitmodules` checks against the runner's `git` (the parser against
   `git config --list`, the checks against `git fsck`), Git LFS through the
   CLI with local and `file://` remotes and `git lfs pull` of a clone
-  ([`cli_lfs.rs`](../crates/agentfs/tests/cli/cli_lfs.rs)), and the managed
+  ([`cli_lfs.rs`](../crates/agentfs-cli/tests/cli/cli_lfs.rs)), and the managed
   `.gitattributes` block against `git check-attr`.
 - **e2e telemetry** ([`ci/e2e-telemetry.sh`](../ci/e2e-telemetry.sh)): a
   tree volume whose operator settings name a remote and a patch source,
@@ -241,7 +366,7 @@ Every push runs [`.github/workflows/ci.yml`](../.github/workflows/ci.yml):
   mount still succeeds.
 - **e2e FUSE mount** ([`ci/fuse-tests.sh`](../ci/fuse-tests.sh)): real
   mounts as root running the `#[ignore]`d tests in
-  [`crates/agentfs/tests/launcher_mount.rs`](../crates/agentfs/tests/launcher_mount.rs):
+  [`crates/agentfs-cli/tests/launcher_mount.rs`](../crates/agentfs-cli/tests/launcher_mount.rs):
   `agentfs mount -- COMMAND` (the command's write recorded, its exit status
   the mount's), the operator settings' `not built:` lines, `probe` on a
   live and a stale view, and a restart after `kill -9` under each
@@ -257,7 +382,7 @@ Every push runs [`.github/workflows/ci.yml`](../.github/workflows/ci.yml):
   twice or out of order, no empty commit, journal and `pending/` empty,
   the remote at the head, one saved diverged head at most, and
   `git fsck --full --strict` on every repository.
-  [`crash_daemon.rs`](../crates/agentfs/tests/crash_daemon.rs) kills
+  [`crash_daemon.rs`](../crates/agentfs-cli/tests/crash_daemon.rs) kills
   `record`, `push`, `run`, `serve-history`, a `record --history-service`
   front and `patch apply` at their failpoints. The `test (all)` job runs
   both as well.
@@ -270,7 +395,7 @@ Every push runs [`.github/workflows/ci.yml`](../.github/workflows/ci.yml):
 - **docs:** checks the documentation against the code: every git config
   key agentfs reads (`config::KEYS`, filled by a test that records every
   read), every operator attribute, every flag and environment variable of
-  `agentfs` and `agentfs-csi` (walking their clap definitions) and every
+  `agentfs-cli` and `agentfs-csi` (walking their clap definitions) and every
   OpenTelemetry variable is documented in
   [configuration.md](configuration.md), and nothing documented is
   gone; every module is in [architecture.md](architecture.md)'s map;
@@ -394,14 +519,14 @@ them to where they run. The CI jobs are described above.
 | Nested repositories: a clone, a bare clone and `git init` at the root behave as documented, and nesting deletes nothing from history | the unit tests of `agentfs-rules` (names inside a nested repository stay untracked); not tested through a mount or a front |
 | Remotes: interval pushes reach two remotes, and an unreachable remote, a refused push and a non-fast-forward each raise an alarm while the filesystem keeps working | the unit tests of `push.rs`, `cli_push.rs`, the `crash` job's diverged remote |
 | Pre-commit checks: a path git's fsck or a remote limit would refuse is not recorded, and raises an alarm | the unit tests of `checks.rs` (the recording engine) |
-| Shared repositories: two volumes push on their own refs without contending, a rival writer is detected as divergence, identities follow the templates | the unit tests of `push.rs`, `crates/agentfs/tests/cli/cli_identity.rs` |
-| Recovery: a file and a whole commit are restored, and the restore is recorded | `crates/agentfs/tests/cli/cli_restore.rs` |
+| Shared repositories: two volumes push on their own refs without contending, a rival writer is detected as divergence, identities follow the templates | the unit tests of `push.rs`, `crates/agentfs-cli/tests/cli/cli_identity.rs` |
+| Recovery: a file and a whole commit are restored, and the restore is recorded | `crates/agentfs-cli/tests/cli/cli_restore.rs` |
 | Telemetry: the metrics are exported and move as expected | `cli_telemetry.rs` without a collector; `ci/e2e-telemetry.sh` (a tree mount's `agentfs.not_built`) against a real collector. The export of these counters is not tested, though the behaviour each counts is: `agentfs.history_service.superseded` and `.resyncs`, `agentfs.fuse.create_as_caller_fallbacks` and `.racy_rechecks`, `agentfs.reconcile.records` and `.failures`, `agentfs.nested.gitdir_heuristic` |
 | Performance of tree views is recorded for the many-file create and the other release workloads on XFS and ext4 | `ci/e2e-trees-tracer.sh --figures` in the `image` workflow ([performance.md](performance.md#tree-views-release-build)) |
-| LFS content is readable through `git clone` plus `git lfs pull` | `crates/agentfs/tests/cli/cli_lfs.rs` |
+| LFS content is readable through `git clone` plus `git lfs pull` | `crates/agentfs-cli/tests/cli/cli_lfs.rs` |
 | The patch queue: a conflicting patch is set aside and the rest go on, the volume mounts, and a crash and replay never applies a patch twice | the unit tests of `agentfs_core::patch`, `cli_patch.rs` |
 | Several pods on one node (the recording engine): each pod's changes carry its own committer identity and history keeps every boundary | `history_service.rs` |
-| A CSI claim serves one pod, its saves carry that pod's trailers, a crashed host comes back live | `crates/agentfs/tests/csi_trees.rs`, `ci/e2e-csi.sh` on kind |
+| A CSI claim serves one pod, its saves carry that pod's trailers, a crashed host comes back live | `crates/agentfs-cli/tests/csi_trees.rs`, `ci/e2e-csi.sh` on kind |
 | A `ReadWriteMany` claim, `onDelete: delete` and `startFrom` are refused | `ci/e2e-csi.sh`, `ci/e2e-csi-move.sh` and the unit tests of `agentfs-csi` |
 | Forks: a recording fork publishes one change create-only and a refused publish stays refused; a CSI fork claim of a claim in use lands in its source, and a fork of a fork claim is refused | `fork/tests.rs`, `cli_fork.rs`, `cli_fork_deliver.rs`, `ci/e2e-csi-forks.sh`, `ci/e2e-csi-fork-of-fork.sh` |
 

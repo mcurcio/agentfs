@@ -1,0 +1,106 @@
+[package]
+name = "agentfs-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "agentfs command-line tool and daemon"
+
+[package.metadata.agentfs]
+rank = "filesystem"
+
+[[bin]]
+name = "agentfs"
+path = "src/main.rs"
+# Not documented: rustdoc writes a crate's pages under its name, and the
+# library crate `agentfs` has this one (cargo's output collision, #6313).
+doc = false
+
+[dependencies]
+agentfs-contracts = { version = "0.1.0", path = "../agentfs-contracts" }
+agentfs-core = { version = "0.1.0", path = "../agentfs-core" }
+agentfs-engine = { version = "0.1.0", path = "../agentfs-engine" }
+agentfs-failpoints = { version = "0.1.0", path = "../agentfs-failpoints" }
+agentfs-fuse = { version = "0.1.0", path = "../agentfs-fuse" }
+# The `git` program's environment (serve_git.rs).
+agentfs-git = { version = "0.1.0", path = "../agentfs-git" }
+# The allocator, listening sockets and confined access.
+agentfs-os = { version = "0.1.0", path = "../agentfs-os" }
+# One volume composed: its domains on one store (launcher/).
+agentfs-service = { version = "0.1.0", path = "../agentfs-service" }
+anyhow = "1.0.104"
+clap = { version = "4.6.7", features = ["derive", "env"] }
+signal-hook = "0.4.5"
+opentelemetry = { version = "0.33.1", default-features = false, features = ["trace", "metrics", "logs"] }
+opentelemetry_sdk = { version = "0.33.1", default-features = false, features = ["trace", "metrics", "logs"] }
+# OTLP over http/protobuf, http/json (a blocking client) and gRPC (tonic):
+# pure Rust, no protoc, no C.
+opentelemetry-otlp = { version = "0.33.1", default-features = false, features = ["http-proto", "http-json", "grpc-tonic", "reqwest-blocking-client", "trace", "metrics", "logs"] }
+# The runtime the gRPC exporter runs on (one worker, started only for gRPC).
+tokio = { version = "1.53", default-features = false, features = ["rt-multi-thread", "time"] }
+# TLS to the collector (the `otlp-tls` feature): rustls on ring, for the
+# HTTP exporters through reqwest and for gRPC through tonic. Pure Rust plus
+# ring's C and assembly; no OpenSSL, no aws-lc.
+reqwest = { version = "0.13", default-features = false, features = ["blocking", "rustls-no-provider"], optional = true }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"], optional = true }
+rustls-native-certs = { version = "0.8", optional = true }
+rustls-pki-types = { version = "1.15", features = ["std"], optional = true }
+tonic = { version = "0.14", default-features = false, features = ["tls-ring", "tls-native-roots"], optional = true }
+# The restore thread's id (`thread`), signals in tests (`process`), and
+# `agentfs host`'s check that its standard input is a stream socket (`net`).
+rustix = { version = "1.1.5", features = ["fs", "net", "process", "thread"] }
+# close(2) and its errno in the FUSE tests (a front failing a boundary with
+# EIO).
+libc = "0.2.190"
+# The control socket's JSON-lines protocol.
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+thiserror = "2.0.21"
+# serve-git's HTTP/1.1 server in front of `git http-backend` (bead
+# agentfs-mia.9): synchronous, a thread per request, no
+# async runtime.
+tiny_http = "0.12.0"
+# serve-git's pre-receive hook reads the pushed (quarantined) objects.
+git2 = { version = "0.21.0", default-features = false }
+
+[dev-dependencies]
+# The engine's test-only surface: the store read by cli_verify.rs and the
+# compaction gate's variable in reference_tests.rs.
+agentfs-engine = { version = "0.1.0", path = "../agentfs-engine", features = ["test-util"] }
+# The markdown reader of the documentation tests (src/reference_tests.rs).
+agentfs-repo = { version = "0.0.0", path = "../agentfs-repo" }
+# The tree engine's rule set, for the deploy examples' rule files
+# (deploy_examples.rs).
+agentfs-rules = { version = "0.1.0", path = "../agentfs-rules" }
+# Drives the real `agentfs init` and `agentfs host` through the CSI
+# driver's services over a gRPC socket (csi_trees.rs), with its client
+# over a Unix socket.
+agentfs-csi = { version = "0.1.0", path = "../agentfs-csi" }
+hyper-util = { version = "0.1.21", features = ["tokio"] }
+tower = { version = "0.5.3", features = ["util"] }
+tokio = { version = "1.53", features = ["rt-multi-thread", "macros", "time", "net", "sync", "io-util"] }
+# Decodes OTLP payloads in the fake collector of the telemetry test.
+opentelemetry-proto = { version = "0.33.1", default-features = false, features = ["gen-tonic", "with-serde", "trace", "metrics", "logs"] }
+# The fake gRPC collector.
+tonic = { version = "0.14", default-features = false, features = ["server", "router"] }
+prost = "0.14"
+tempfile = "3.27.0"
+# A port that refuses connections and that no other test can be handed
+# (agentfs-core/tests/support/closed_port.rs).
+socket2 = "0.6.5"
+
+[features]
+# Push to https:// remotes (links OpenSSL).
+https = ["agentfs-core/https"]
+# Push to ssh:// and scp-like remotes (agentfs's russh transport with
+# ring; no OpenSSL).
+ssh = ["agentfs-core/ssh"]
+# OTLP export to https:// collectors, with a CA bundle and client
+# certificates (rustls on ring).
+otlp-tls = ["dep:reqwest", "dep:rustls", "dep:rustls-native-certs", "dep:rustls-pki-types", "dep:tonic", "opentelemetry-otlp/tls-ring"]
+# Test builds only: failpoints on the durable path,
+# set by AGENTFS_FAILPOINTS. `--version` says `+failpoints`. Never in a
+# release or image. The engine's test-util is for the compaction gate
+# (`launcher::upkeep`).
+failpoints = ["agentfs-core/failpoints", "agentfs-engine/failpoints", "agentfs-engine/test-util", "agentfs-failpoints/failpoints", "agentfs-fuse/failpoints"]

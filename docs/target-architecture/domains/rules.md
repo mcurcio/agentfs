@@ -2,7 +2,7 @@
 
 **Partly built.** The operator's rule files, what a tree records, the untracked area and moves across it are built:
 [trees](../../trees.md#rules-and-the-untracked-area) describes them, and
-[the library](../../library/core.md#rules-and-the-untracked-area) the pure crate `agentfs-rules`. This page proposes
+[the library](../../library/engine.md#rules-and-the-untracked-area) the pure crate `agentfs-rules`. This page proposes
 the rest: view profiles, database groups, size and store hints, rule-set versions across view hosts, tree rule files,
 and bare-repository detection. A tree volume refuses at open any attribute these would read, naming its line. The
 git model ([git-model.md](../git-model.md)) wins wherever the two disagree. Rust sketches show surfaces only. The

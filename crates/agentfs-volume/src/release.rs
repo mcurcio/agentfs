@@ -1,7 +1,8 @@
-//! The release verdict, pure (docs/library/core.md, VO1 and VO4): every blocker, from facts
+//! The release verdict, pure (docs/library/domains.md, VO1 and VO4): every blocker, from facts
 //! asked at judgement time, and a [`Cleared`] only when there is none.
 
 use agentfs_contracts::volume::{Blocker, Disposition, ReleaseFacts, ReleaseVerdict, VolumeState};
+use alloc::vec::Vec;
 
 /// Proof that nothing blocks release: only [`decide`] builds one, and only a
 /// `Cleared` moves the volume to `Released`.

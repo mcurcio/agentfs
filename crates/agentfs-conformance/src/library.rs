@@ -2,14 +2,13 @@
 
 use crate::compact_turns::Turns;
 use crate::engine_names::EngineNames;
+use agentfs_contracts::TreeId as EngineTree;
 use agentfs_contracts::clients::FileOwner;
+use agentfs_contracts::meta::{Attrs, Kind as EngineKind, Meta as EngineMeta, Perm};
 use agentfs_contracts::name::{VolumeName, WriterLabel};
 use agentfs_contracts::pod::{PodContext, WriterAt};
 use agentfs_contracts::volume::{VolumeId, VolumeIdentity};
-use agentfs_core::tree_actor::{
-    self, Attrs, Error, Kind as EngineKind, Perm, RenameMode, TreeActor, TreeId as EngineTree,
-    Upkeep,
-};
+use agentfs_engine::tree_actor::{self, Error, RenameMode, TreeActor, Upkeep};
 use agentfs_model::calls::{CallError, Caller, Kind, Meta, Took, TreeCalls, TreeId};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -31,7 +30,7 @@ pub(crate) const fn attrs(m: &Meta) -> Attrs {
 }
 
 /// The library's metadata of an entry in the model's terms.
-pub(crate) fn model_meta(m: &tree_actor::Meta) -> Meta {
+pub(crate) fn model_meta(m: &EngineMeta) -> Meta {
     Meta {
         kind: match m.kind {
             EngineKind::File => Kind::File,

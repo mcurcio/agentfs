@@ -30,6 +30,12 @@ jobs:
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: clippy (all features)
         run: cargo clippy --workspace --all-targets --locked --all-features -- -D warnings
+      # A workspace-wide build turns the engine's test-util on (through
+      # agentfs-conformance): these two build the library as a consumer does.
+      - name: clippy (the library as a consumer builds it)
+        run: cargo clippy --locked -p agentfs-engine -p agentfs-service -p agentfs --lib -- -D warnings
+      - name: the front's doctest without test-util
+        run: cargo test --doc --locked -p agentfs
       - name: linked C and crypto per feature set
         run: ci/check-deps.sh
       - name: the model's safety net (corpus runner, digest compare, mount refusal, stall alarm)
@@ -60,7 +66,7 @@ jobs:
       - name: config keys read = config::KEYS
         run: cargo nextest run --locked -p agentfs-core --lib config::tests::every_config_read_is_registered
       - name: agentfs flags and environment variables
-        run: cargo nextest run --locked -p agentfs --bin agentfs reference_tests plan_reads_only_env_vars
+        run: cargo nextest run --locked -p agentfs-cli --bin agentfs reference_tests plan_reads_only_env_vars
       - name: agentfs-csi flags and environment variables
         run: cargo nextest run --locked -p agentfs-csi --bin agentfs-csi reference_tests
 
@@ -98,7 +104,7 @@ jobs:
       - run: rustup toolchain install # the release rust-toolchain.toml pins
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: sudo apt-get update && sudo apt-get install -y fuse3 jq
-      - run: cargo build --locked -p agentfs --features otlp-tls
+      - run: cargo build --locked -p agentfs-cli --features otlp-tls
       - name: start collector
         run: |
           mkdir -p "$RUNNER_TEMP/otel" && chmod 777 "$RUNNER_TEMP/otel"
@@ -182,7 +188,7 @@ jobs:
       # The tree views mount with FUSE allow_other by default.
       - run: echo user_allow_other | sudo tee -a /etc/fuse.conf
       - uses: ./.github/actions/pinned-git
-      - run: cargo build --locked -p agentfs
+      - run: cargo build --locked -p agentfs-cli
       - run: ci/e2e-trees.sh
       - run: ci/e2e-trees-ordering.sh
 
@@ -204,7 +210,7 @@ jobs:
         run: |
           GOBIN="$RUNNER_TEMP/bin" go install github.com/kubernetes-csi/csi-test/v5/cmd/csi-sanity@v5.6.0
           echo "CSI_SANITY=$RUNNER_TEMP/bin/csi-sanity" >>"$GITHUB_ENV"
-      - run: cargo build --locked --release -p agentfs -p agentfs-csi
+      - run: cargo build --locked --release -p agentfs-cli -p agentfs-csi
       - run: ci/csi-sanity.sh
       - name: driver logs
         if: failure()

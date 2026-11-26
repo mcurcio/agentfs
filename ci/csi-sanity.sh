@@ -10,7 +10,7 @@
 # PATH (`go install github.com/kubernetes-csi/csi-test/v5/cmd/csi-sanity@v5.6.0`);
 # reproducible on any such host:
 #
-#   cargo build --release -p agentfs -p agentfs-csi && ci/csi-sanity.sh
+#   cargo build --release -p agentfs-cli -p agentfs-csi && ci/csi-sanity.sh
 #
 # AGENTFS_BIN and AGENTFS_CSI_BIN name the binaries (default: release).
 
@@ -25,7 +25,7 @@ CSI_SANITY=${CSI_SANITY:-$(command -v csi-sanity || true)}
 HERE=$(cd "$(dirname "$0")" && pwd)
 AGENTFS_CSI_BIN=${AGENTFS_CSI_BIN:-$PWD/target/release/agentfs-csi}
 for bin in "$AGENTFS_BIN" "$AGENTFS_CSI_BIN"; do
-  [ -x "$bin" ] || fail "$bin is missing: cargo build --release -p agentfs -p agentfs-csi"
+  [ -x "$bin" ] || fail "$bin is missing: cargo build --release -p agentfs-cli -p agentfs-csi"
 done
 
 W=$(mktemp -d)

@@ -790,7 +790,7 @@ cffc114. Two cells for one figure are two runs. All times in ms.
   so this leg checks that order on one view; the core's wait between two
   saves of one file decided on different threads is checked by
   `a_queued_close_waits_for_the_earlier_landing`
-  (`crates/agentfs-core/src/tree_actor/call_path.rs`).
+  (`crates/agentfs-engine/src/tree_actor/call_path.rs`).
 - **A client's open of a file with several pending saves folds them off
   the volume's lock, on its own view.** Such an open reads every call of
   those saves back from the journal and replays them, at each open; the

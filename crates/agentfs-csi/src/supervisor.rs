@@ -71,11 +71,11 @@ use std::time::{Duration, Instant};
 use agentfs_contracts::host::{Refusal, RefusalKind, Reply, Request, TreeRef, ViewRequest};
 use agentfs_contracts::name::{ClientLabel, ForkKey};
 use agentfs_contracts::pod::PodContext;
-use agentfs_contracts::ports::Found;
+use agentfs_contracts::ports::{Found, StateArea as _};
 use agentfs_contracts::tree::TreeId;
 use agentfs_contracts::trees::ForkSettings;
-use agentfs_core::operator_settings::{RuleFiles, install_rules};
-use agentfs_core::tree_actor;
+use agentfs_engine::operator_settings::{RuleFiles, install_rules};
+use agentfs_engine::state_area::TreeStateArea;
 use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard, watch};
 
 use crate::error::Error;
@@ -1270,7 +1270,7 @@ fn recording_volumes(layout: &Layout) -> Vec<(String, PathBuf)> {
             continue;
         }
         if matches!(
-            tree_actor::inspect(&layout.state(&handle)),
+            TreeStateArea::at(&layout.state(&handle)).inspect(),
             Ok(Found::Other)
         ) {
             out.push((handle, entry.path()));

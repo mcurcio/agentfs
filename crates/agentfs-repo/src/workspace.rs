@@ -35,6 +35,10 @@ pub struct Rank {
     pub name: String,
     /// The ranks this rank's packages may depend on.
     pub uses: Vec<String>,
+    /// Whether its code is pure: each library of the rank is `no_std`
+    /// outside its tests, so it cannot name the file system, a process or
+    /// the network (`no_std = true`).
+    pub no_std: bool,
 }
 
 /// A member package of the workspace.
@@ -122,6 +126,7 @@ impl Workspace {
             .map(|r| Rank {
                 name: r.name,
                 uses: r.uses,
+                no_std: r.no_std,
             })
             .collect();
         let members = raw
@@ -196,6 +201,8 @@ struct RawRank {
     name: String,
     #[serde(default)]
     uses: Vec<String>,
+    #[serde(default)]
+    no_std: bool,
 }
 
 #[derive(Deserialize)]
@@ -240,7 +247,8 @@ mod tests {
         let me = ws.member("agentfs-repo").expect("agentfs-repo is a member");
         assert_eq!(me.dir, Path::new("crates/agentfs-repo"));
         assert_eq!(me.rank.as_deref(), Some("tests"));
-        assert!(ws.rank("tests").is_some());
+        assert!(ws.rank("tests").is_some_and(|r| !r.no_std));
+        assert!(ws.rank("landing-rules").is_some_and(|r| r.no_std));
         assert!(root().join("Cargo.toml").is_file());
         let core = ws.member("agentfs-core").expect("agentfs-core is a member");
         assert!(core.features.contains_key("failpoints"));
@@ -249,12 +257,14 @@ mod tests {
                 .iter()
                 .any(|d| d.name == "tempfile" && d.kind == DependencyKind::Dev)
         );
-        assert!(
-            ws.member("agentfs")
-                .unwrap()
-                .targets
-                .iter()
-                .any(|t| t.name == "agentfs" && t.kinds.iter().any(|k| k == "bin"))
-        );
+        let cli = ws.member("agentfs-cli").expect("agentfs-cli is a member");
+        assert_eq!(cli.dir, Path::new("crates/agentfs-cli"));
+        let bins: Vec<&str> = cli
+            .targets
+            .iter()
+            .filter(|t| t.kinds.iter().any(|k| k == "bin"))
+            .map(|t| t.name.as_str())
+            .collect();
+        assert_eq!(bins, ["agentfs"]);
     }
 }

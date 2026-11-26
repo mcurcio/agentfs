@@ -1,14 +1,27 @@
 #!/usr/bin/env bash
-# Checks what C and crypto the agentfs binary links, per feature set:
-# the default build is pure Rust apart from libgit2 (no
-# OpenSSL, no ring, no aws-lc); `otlp-tls` adds ring and rustls only; `ssh`
-# adds russh with ring and never OpenSSL or libssh2; only `https` brings
-# OpenSSL.
+# Checks what the agentfs binary and the library crate `agentfs` link.
+# The binary, per feature set: the default build is pure Rust apart from
+# libgit2 (no OpenSSL, no ring, no aws-lc); `otlp-tls` adds ring and rustls
+# only; `ssh` adds russh with ring and never OpenSSL or libssh2; only `https`
+# brings OpenSSL. The library: no recording engine, no FUSE, no
+# OpenTelemetry SDK or exporter, no TLS and no libssh2, and no crate of the
+# workspace with a test build's feature (test-util, failpoints) turned on.
+# The landing rules (agentfs-referee): built alone, so agentfs-lines' I/O
+# half (its `io` feature) is off and a call into it does not compile; and
+# what they link holds no git, no operating-system binding, no
+# OpenTelemetry and never that feature.
+# The recording engine is refused here, not by the ranks: its rank is the
+# tree engine's, until M9 deletes it (docs/development.md, "Build settings").
+# The ranks refuse the FUSE layer.
 set -euo pipefail
 
 packages() { # cargo-tree-args...
-  cargo tree --locked -p agentfs -e normal --prefix none --format '{p}' "$@" |
+  cargo tree --locked -p agentfs-cli -e normal --prefix none --format '{p}' "$@" |
     awk '{print $1}' | sort -u
+}
+
+library() {
+  cargo tree --locked -p agentfs -e normal --prefix none --format '{p}' | awk '{print $1}' | sort -u
 }
 
 fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
@@ -34,3 +47,22 @@ check "otlp-tls" 'aws-lc-rs|aws-lc-sys|openssl|openssl-sys|native-tls' 'rustls' 
 check "ssh" 'aws-lc-rs|aws-lc-sys|openssl|openssl-sys|native-tls|libssh2-sys' 'russh' --features ssh
 check "ssh" 'aws-lc-rs|aws-lc-sys|openssl|openssl-sys|native-tls|libssh2-sys' 'ring' --features ssh
 check "image features" 'aws-lc-rs|aws-lc-sys' 'ring' --features https,ssh,otlp-tls
+
+all=$(library)
+found=$(grep -Ex "agentfs-core|fuser|opentelemetry_sdk|opentelemetry-otlp|$NO_TLS|libssh2-sys" <<<"$all" || true)
+[ -z "$found" ] || fail "library links $(echo "$found" | tr '\n' ' ')"
+echo "ok   library"
+
+features=$(cargo tree --locked -p agentfs -e normal,features --prefix none --format '{p}')
+found=$(grep -E '^agentfs-[a-z-]+ feature "(test-util|failpoints)"' <<<"$features" | sort -u || true)
+[ -z "$found" ] || fail "library turns on $(echo "$found" | tr '\n' ' ')"
+echo "ok   library features"
+
+cargo check --locked --quiet -p agentfs-referee --lib || fail "referee alone does not build"
+echo "ok   referee alone"
+
+referee=$(cargo tree --locked -p agentfs-referee -e normal,features --prefix none --format '{p}')
+found=$(grep -E '^(git2|libgit2-sys|libc|rustix|opentelemetry[a-z_-]*) |^agentfs-lines feature "io"' <<<"$referee" |
+  sed 's/ (\*)$//' | sort -u || true)
+[ -z "$found" ] || fail "referee links $(echo "$found" | tr '\n' ' ')"
+echo "ok   referee"

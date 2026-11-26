@@ -1,31 +1,38 @@
 [workspace]
 resolver = "3"
 exclude = ["vendor/fuser"]
-members = ["crates/agentfs-align", "crates/agentfs-lines", "crates/agentfs-failpoints", "crates/agentfs-os", "crates/agentfs-git", "crates/agentfs-rules", "crates/agentfs-contracts", "crates/agentfs-volume", "crates/agentfs-clients", "crates/agentfs-trees", "crates/agentfs-core", "crates/agentfs-fuse", "crates/agentfs", "crates/agentfs-csi", "crates/agentfs-model", "crates/agentfs-conformance", "crates/agentfs-repo"]
+members = ["crates/agentfs-align", "crates/agentfs-lines", "crates/agentfs-failpoints", "crates/agentfs-os", "crates/agentfs-git", "crates/agentfs-rules", "crates/agentfs-referee", "crates/agentfs-contracts", "crates/agentfs-volume", "crates/agentfs-clients", "crates/agentfs-trees", "crates/agentfs-engine", "crates/agentfs-core", "crates/agentfs-service", "crates/agentfs", "crates/agentfs-fuse", "crates/agentfs-cli", "crates/agentfs-csi", "crates/agentfs-model", "crates/agentfs-conformance", "crates/agentfs-test-metrics", "crates/agentfs-repo"]
 
 [workspace.package]
+# The product's one version, which every published package takes: it is
+# written into what agentfs records and reports (history's verification
+# notes, the LFS user agent, the telemetry scope, the CSI vendor version).
+version = "0.1.0"
 edition = "2024"
 # File::lock and its family (agentfs_os::file_lock).
 rust-version = "1.89"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/mcurcio/agentfs"
 
-# The ranks of the workspace's packages (docs/architecture.md, "Ranks"),
-# each listed after every rank it uses. Each package names its own in
-# `[package.metadata.agentfs] rank`. A normal or build dependency on another
-# member must be in a rank its own rank `uses`; a rank's packages depend on
-# one another only where it uses itself. Dev-dependencies are exempt.
-# crates/agentfs-repo checks it.
+# The ranks of the workspace's packages, each listed after every rank it
+# uses; each package names its own in `[package.metadata.agentfs] rank`.
+# `no_std = true` marks a rank of pure code: each of its libraries is
+# `no_std` outside its tests.
+# What a rank permits: docs/architecture.md, "Ranks" (crates/agentfs-repo
+# checks it).
 [workspace.metadata.agentfs]
 ranks = [
     { name = "line-identity", uses = ["line-identity"] },
     { name = "leaf", uses = ["line-identity", "leaf"] },
     { name = "shared-kernel", uses = [] },
-    { name = "domain", uses = ["shared-kernel"] },
-    { name = "engine", uses = ["line-identity", "leaf", "shared-kernel", "domain"] },
-    { name = "filesystem", uses = ["leaf", "shared-kernel", "domain", "engine", "filesystem"] },
+    { name = "domain", uses = ["shared-kernel"], no_std = true },
+    { name = "landing-rules", uses = ["line-identity", "shared-kernel"], no_std = true },
+    { name = "engine", uses = ["line-identity", "leaf", "shared-kernel", "domain", "landing-rules"] },
+    { name = "service", uses = ["shared-kernel", "domain", "engine"] },
+    { name = "filesystem", uses = ["leaf", "shared-kernel", "domain", "engine", "service", "filesystem"] },
     { name = "kubernetes", uses = ["leaf", "shared-kernel", "engine", "filesystem"] },
-    { name = "tests", uses = ["line-identity", "leaf", "shared-kernel", "domain", "engine", "filesystem", "kubernetes", "tests"] },
+    { name = "umbrella", uses = ["shared-kernel", "domain", "engine", "service"] },
+    { name = "tests", uses = ["line-identity", "leaf", "shared-kernel", "domain", "landing-rules", "engine", "service", "filesystem", "kubernetes", "tests"] },
 ]
 
 [patch.crates-io]

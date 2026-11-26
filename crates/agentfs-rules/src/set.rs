@@ -4,7 +4,10 @@
 //! paths: a tracked path stays recorded whatever they say, so the caller
 //! asks only when it makes a name.
 
-use std::fmt;
+use alloc::borrow::ToOwned;
+use alloc::string::String;
+use alloc::vec::Vec;
+use core::fmt;
 
 use crate::operator::{AttrState, OperatorRules};
 

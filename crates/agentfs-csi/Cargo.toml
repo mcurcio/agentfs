@@ -1,6 +1,6 @@
 [package]
 name = "agentfs-csi"
-version = "0.1.0"
+version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -13,9 +13,10 @@ rank = "kubernetes"
 [dependencies]
 # The view host's control messages, names and pod contexts.
 agentfs-contracts = { version = "0.1.0", path = "../agentfs-contracts" }
-# Only what reads a state area without serving it (tree_actor::inspect),
-# and installs the operator's rule files.
-agentfs-core = { version = "0.1.0", path = "../agentfs-core" }
+# Only what reads a state area without serving it (TreeStateArea's
+# inspect, through the StateArea port), and installs the operator's rule
+# files.
+agentfs-engine = { version = "0.1.0", path = "../agentfs-engine" }
 # The allocator, atomic JSON, the network filesystem check and the
 # listening socket.
 agentfs-os = { version = "0.1.0", path = "../agentfs-os" }

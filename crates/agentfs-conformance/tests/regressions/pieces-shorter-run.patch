@@ -4,6 +4,8 @@ agentfs-lines' lib.rs). Without it, `pieces` merged every source's runs into one
 list and looked only in the last run starting at or before a line, so a shorter
 run of the same versions from a later source hid the head's whole run.
 Base: the commit that adds this file; this hunk set is the reverse of its fix.
+Its first hunk's context re-cut 2026-11-25 for the `io` feature's attribute on
+the `std::fs::File` import; the lines it removes are unchanged.
 git: the release in ci/git-release.
 Re-record (crates/agentfs-model/VERIFYING.md, "A regression found on the engine")
 in a scratch worktree with this applied. Give it fresh volumes, since --record
@@ -32,7 +34,7 @@ one made independently on main 9045165 byte for byte (cmp).
 -use std::cmp::Reverse;
  use std::collections::BTreeMap;
  use std::fmt;
- use std::fs::File;
+ #[cfg(feature = "io")]
 @@ -1026,8 +1025,8 @@
      Ok((image.read_at(&mut b, at)? == 1).then_some(b[0]))
  }

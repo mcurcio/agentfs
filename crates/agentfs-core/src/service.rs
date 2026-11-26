@@ -1362,12 +1362,12 @@ mod tests {
         h.telemetry.observe_volume(&state, &settings);
         let service = Service::spawn(com, pushers, events, None, PausedClock::new()).unwrap();
         record(&rec, dir.path(), "a");
-        assert_eq!(h.gauge_u64(names::JOURNAL_BACKLOG, &[]), Some(1));
+        assert_eq!(h.metrics.gauge_u64(names::JOURNAL_BACKLOG, &[]), Some(1));
         let report = shutdown_watched(service, Duration::from_secs(5));
         report.final_commit.unwrap();
 
-        assert_eq!(h.sum(names::COMMIT_COUNT, &[]), Some(1));
-        assert_eq!(h.gauge_u64(names::JOURNAL_BACKLOG, &[]), Some(0));
+        assert_eq!(h.metrics.sum(names::COMMIT_COUNT, &[]), Some(1));
+        assert_eq!(h.metrics.gauge_u64(names::JOURNAL_BACKLOG, &[]), Some(0));
         let head = local_head(&state).unwrap();
         let commits = h.spans(spans::COMMIT);
         assert_eq!(
