@@ -15,7 +15,7 @@ rank = "leaf"
 agentfs-failpoints = { version = "0.1.0", path = "../agentfs-failpoints" }
 # mallopt, and shutdown(2) of a listening socket: bindings only, no C build.
 libc = "0.2.190"
-rustix = { version = "1.1.5", features = ["fs"] }
+rustix = { version = "1.1.5", features = ["fs", "process"] }
 serde = "1.0.229"
 serde_json = "1.0.154"
 thiserror = "2.0.21"
