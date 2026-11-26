@@ -1889,8 +1889,10 @@ fn production(source: &str) -> &str {
                 .skip(1)
                 .map(str::trim_start)
                 .find(|line| !line.is_empty() && !line.starts_with("#["));
+            // Past its visibility: `pub`, or `pub(...)` of any path.
             let item = item.map(|line| {
-                line.strip_prefix("pub(crate) ")
+                line.strip_prefix("pub(")
+                    .and_then(|rest| rest.split_once(") ").map(|(_, item)| item))
                     .or_else(|| line.strip_prefix("pub "))
                     .unwrap_or(line)
             });
@@ -1923,16 +1925,53 @@ fn starts_in(source: &str) -> Vec<&'static str> {
     STARTS.into_iter().filter(|s| text.contains(s)).collect()
 }
 
-/// The tree engine starts each `git` child through
-/// `agentfs_git::git_cli::counted`, the one site that counts it: none of
-/// its production sources (agentfs-engine's `src`), nor the line maps'
-/// (`agentfs-lines`, which take the spawner from their caller), nor the
-/// landing rules' (`agentfs-referee`, which start none), starts a
-/// process itself, but the history's repack task, whose `git repack` is not
-/// on the actor's path and stays uncounted, so each operation's count of
-/// Git children stays exact. `counted` is git_cli's one `.spawn()`.
+/// The two starts of a lease holder the tree engine makes: each `git` child
+/// of its store through `TreeGit::start` (counted), and the repack's
+/// uncounted `git` (docs/library/engine.md).
+const HOLDER_STARTS: [&str; 2] = ["agentfs_git::git_cli::counted)", "Command::spawn)"];
+
+/// `source`'s production text with every start of a lease holder
+/// (`spawn_with(<arg>, <spawner>)`, a spawner of [`HOLDER_STARTS`]) taken
+/// out, and how many of each were.
+fn without_holder_starts(source: &str) -> (String, [usize; 2]) {
+    const CALL: &str = "spawn_with(";
+    let mut text = production(source).to_owned();
+    let mut found = [0; 2];
+    let mut from = 0;
+    while let Some(at) = text[from..].find(CALL).map(|i| from + i) {
+        // The call up to its first `)`, the spawner's own when it is one.
+        let end = text[at..].find(')').map(|close| at + close + 1);
+        let which = end.and_then(|end| {
+            let (_, spawner) = text[at + CALL.len()..end].split_once(',')?;
+            HOLDER_STARTS
+                .iter()
+                .position(|s| spawner.trim_start() == *s)
+        });
+        match (end, which) {
+            (Some(end), Some(i)) => {
+                text.replace_range(at..end, "");
+                found[i] += 1;
+                from = at;
+            }
+            _ => from = at + CALL.len(),
+        }
+    }
+    (text, found)
+}
+
+/// Every process the tree engine starts is a holder of the volume's lease,
+/// started through `agentfs_os::inherited_lock::InheritedLock::spawn_with`
+/// (docs/library/engine.md): in its production sources (agentfs-engine's
+/// `src`, the repack task's included), and in the line maps' (`agentfs-lines`,
+/// which take the spawner from their caller) and the landing rules'
+/// (`agentfs-referee`, which start none), once each `spawn_with(<arg>,
+/// agentfs_git::git_cli::counted)` and `spawn_with(<arg>, Command::spawn)` is
+/// taken out, nothing starts a process and no `git_cli::counted` is named.
+/// The counted start is made once (`TreeGit::start`) and the uncounted one
+/// once (the repack's), so each operation's count of Git children stays
+/// exact. `counted` is git_cli's one `.spawn()`.
 #[test]
-fn the_tree_engine_starts_git_only_through_counted() {
+fn the_tree_engine_starts_processes_only_as_lease_holders() {
     let workspace = Workspace::load();
     let root = root();
     let dir = |name: &str| root.join(&workspace.member(name).unwrap().dir);
@@ -1941,14 +1980,24 @@ fn the_tree_engine_starts_git_only_through_counted() {
     files_under(&src, &mut files);
     files_under(&dir("agentfs-lines").join("src"), &mut files);
     files_under(&dir("agentfs-referee").join("src"), &mut files);
-    let repack = src.join("tree_actor/history/repack.rs");
     let mut problems = Vec::new();
-    for file in files.iter().filter(|f| **f != repack) {
+    let mut holders = [0; 2];
+    for file in &files {
         let source = std::fs::read_to_string(file).unwrap();
-        for start in starts_in(&source) {
+        let (rest, found) = without_holder_starts(&source);
+        for (total, n) in holders.iter_mut().zip(found) {
+            *total += n;
+        }
+        let shown = file.strip_prefix(&root).unwrap_or(file).display();
+        for start in starts_in(&rest) {
             problems.push(format!(
-                "{} starts a process with `{start}` outside git_cli::counted",
-                file.strip_prefix(&root).unwrap_or(file).display()
+                "{shown} starts a process with `{start}`, not as a holder of the lease \
+                 (InheritedLock::spawn_with)"
+            ));
+        }
+        if rest.contains("git_cli::counted") {
+            problems.push(format!(
+                "{shown} names git_cli::counted outside InheritedLock::spawn_with"
             ));
         }
     }
@@ -1958,6 +2007,11 @@ fn the_tree_engine_starts_git_only_through_counted() {
         files.len()
     );
     assert!(problems.is_empty(), "{}", problems.join("\n"));
+    assert_eq!(
+        holders,
+        [1, 1],
+        "the counted start is TreeGit::start's alone, the uncounted one the repack's"
+    );
     let git_cli = std::fs::read_to_string(dir("agentfs-git").join("src/git_cli.rs")).unwrap();
     assert_eq!(
         production(&git_cli).matches(".spawn()").count(),
@@ -1987,6 +2041,27 @@ fn a_process_started_outside_counted_is_found() {
         starts_in("#[cfg(test)]\nconst X: u8 = 0;\nfn f() { cmd.output(); }"),
         [".output()"]
     );
+    assert!(starts_in("#[cfg(test)]\npub(in crate::a) mod tests { s.output() }").is_empty());
+    // A holder's start is taken out; any other start, or `counted` named
+    // outside one, is left to be found.
+    let holder = "self.lease.spawn_with(cmd, agentfs_git::git_cli::counted)";
+    assert_eq!(
+        without_holder_starts(holder),
+        ("self.lease.".to_owned(), [1, 0])
+    );
+    let repack = "lease.spawn_with(&mut cmd, Command::spawn).map_err(e)?;";
+    let (rest, found) = without_holder_starts(repack);
+    assert_eq!((rest.as_str(), found), ("lease..map_err(e)?;", [0, 1]));
+    assert!(starts_in(&rest).is_empty());
+    let (rest, found) = without_holder_starts("histogram_files_with(&a, &b, Command::spawn)");
+    assert_eq!(found, [0, 0]);
+    assert_eq!(starts_in(&rest), ["Command::spawn"]);
+    let (rest, _) =
+        without_holder_starts("histogram_files_with(&a, &b, agentfs_git::git_cli::counted)");
+    assert!(rest.contains("git_cli::counted"));
+    let (rest, found) = without_holder_starts("lease.spawn_with(&mut cmd, |c| c.spawn())");
+    assert_eq!(found, [0, 0]);
+    assert_eq!(starts_in(&rest), [".spawn()"]);
 }
 
 /// The line that makes a library `no_std` outside its tests, which each

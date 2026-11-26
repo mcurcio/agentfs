@@ -848,7 +848,8 @@ impl BuildState {
                         let old = t.lines.get(&open.object).ok_or_else(|| disagrees(seq))?;
                         let appended = recorded.only_extends(base.len());
                         let before_len = base.len();
-                        let lines = saved_lines(ctx.root, old, base, &map, appended, event)?;
+                        let lines =
+                            saved_lines(ctx.root, ctx.repo, old, base, &map, appended, event)?;
                         t.lines.insert(open.object, Arc::new(lines));
                         t.bytes.insert(open.object, saved_map(map, seq));
                         batch.files.insert((id, open.object));
@@ -949,6 +950,7 @@ impl BuildState {
                         let mut versions = Versions::of(event);
                         let lines = align(
                             ctx.root,
+                            ctx.repo,
                             t.lines.get(&replaced).ok_or(Error::Format)?,
                             t.bytes.get(&replaced).ok_or(Error::Format)?,
                             t.bytes.get(&object).ok_or(Error::Format)?,
@@ -1049,6 +1051,7 @@ impl BuildState {
                 let lines = match existing {
                     Some(object) => saved_lines(
                         ctx.root,
+                        ctx.repo,
                         t.lines.get(&object).ok_or_else(|| disagrees(seq))?,
                         t.bytes.get(&object).ok_or_else(|| disagrees(seq))?,
                         &map,
@@ -1062,6 +1065,7 @@ impl BuildState {
                         batch.moved.insert(id);
                         saved_lines(
                             ctx.root,
+                            ctx.repo,
                             &Lines::default(),
                             &FileMap::empty(),
                             &map,
@@ -1409,8 +1413,11 @@ pub(in crate::tree_actor) struct Context<'a> {
 /// histogram alignment, reading both maps a line at a time. Only when the two
 /// differ and `before` has bytes are they written to files for `git diff`, in
 /// the state area's `align/` (never memory or `/tmp`), and removed after.
+/// `git diff` starts as every git of `repo` does ([`TreeGit::start`]): it
+/// holds the volume's lease, and the end of the lease's children ends it.
 fn align(
     root: &Path,
+    repo: &TreeGit,
     old: &Lines,
     before: &FileMap,
     after: &FileMap,
@@ -1426,7 +1433,7 @@ fn align(
                 let mut file = std::fs::File::create(path)?;
                 std::io::copy(&mut map.reader(), &mut file)?;
             }
-            histogram_files_with(&a, &b, agentfs_git::git_cli::counted)
+            histogram_files_with(&a, &b, |cmd| repo.start(cmd))
         })();
         let _ = std::fs::remove_file(&a);
         let _ = std::fs::remove_file(&b);
@@ -1441,6 +1448,7 @@ fn align(
 /// close's save and a replace both build their lines here.
 fn saved_lines(
     root: &Path,
+    repo: &TreeGit,
     old: &Lines,
     before: &FileMap,
     after: &FileMap,
@@ -1452,7 +1460,7 @@ fn saved_lines(
         let added = Window::new(after, before.len(), after.len() - before.len());
         return Ok(old.append(&added, |n| versions.take(n))?);
     }
-    align(root, old, before, after, &mut versions)
+    align(root, repo, old, before, after, &mut versions)
 }
 
 /// The builder thread's own state.

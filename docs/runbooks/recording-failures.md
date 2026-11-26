@@ -280,7 +280,7 @@ fails ([6](#6-a-tree-volumes-history-is-not-built)).
 
 | Exit and message | Meaning and fix |
 |---|---|
-| 75, `the volume is busy: another process holds its state area` | Another `mount`, `init` or `fork end` holds the state area's lock. Stop it, or wait for its drain to finish |
+| 75, `the volume is busy: another process holds its state area` | Another `mount`, `host`, `init` or `fork end` holds the state area's lock, or a killed one's git children still do (each holds the lease until it dies of its parent-death signal). Stop it, or wait for its drain to finish; a host that exited 3 has freed it already |
 | 1, ``no volume here: run `agentfs init --volume NAME` first`` | `mount` never creates a volume: run `init` first |
 | 1, `the volume here is "<a>", not "<b>"` or `another volume is here` | The state area belongs to another volume; nothing was written. Point the launcher at the right state area, or fix the name |
 | 1, `this fork has had its writer` | The fork's one read-write client has been used (C4 in the [library](../library/domains.md#domain-invariants)). Mount it with `--fork-read-only`, or use a new key. A writer killed rather than unmounted comes back with the same launcher, tree, label and access |

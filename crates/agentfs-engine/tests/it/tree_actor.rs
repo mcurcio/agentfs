@@ -2596,3 +2596,51 @@ fn a_kill_after_a_write_returned_keeps_it() {
     let v = trees::reopen_after_kill(&dir);
     assert_eq!(v.read(TreeId::Root, "a").unwrap(), b"kept");
 }
+
+/// Ending a volume's git children (`Recording::end_git_children`, what
+/// `agentfs host` does before it exits 3) refuses every git start after it:
+/// a step that needs git (a fork's sync asks git whose history holds whose)
+/// answers `ENOTCONN`, and no git child is started. A write after it is
+/// still recorded; the Recording's drop returns, and the next open builds
+/// history that holds every write (principle 1: the end is a crash's).
+#[test]
+fn ended_git_children_refuse_git_and_the_next_open_builds_every_write() {
+    let tmp = tempfile::tempdir().unwrap();
+    let rec = agentfs_engine::tree_actor::Recording::create(
+        tmp.path(),
+        &trees::identity(),
+        None,
+        &PodContext::default(),
+    )
+    .unwrap();
+    let fork = {
+        let mut v = rec.actor().unwrap();
+        put(&mut v, ROOT, "a", b"base\n");
+        let fork = rowless_fork(&mut v);
+        put(&mut v, ROOT, "a", b"parent\n");
+        fork
+    };
+    rec.settle().unwrap();
+    rec.end_git_children().unwrap();
+    let started = agentfs_git::git_cli::children();
+    let error = rec.actor().unwrap().take_next(fork).unwrap_err();
+    assert_eq!(error.errno(), libc::ENOTCONN, "{error}");
+    assert_eq!(
+        agentfs_git::git_cli::children(),
+        started,
+        "a git child started after the end"
+    );
+    put(&mut rec.actor().unwrap(), ROOT, "b", b"after\n");
+    drop(rec);
+
+    let rec =
+        agentfs_engine::tree_actor::Recording::open(tmp.path(), &PodContext::default()).unwrap();
+    rec.settle().unwrap();
+    for (name, bytes) in [("a", "parent\n"), ("b", "after\n")] {
+        let shown = git(
+            tmp.path(),
+            &["show", &format!("{ROOT}:files/{}", fanned(name))],
+        );
+        assert_eq!(String::from_utf8_lossy(&shown.stdout), bytes, "{name}");
+    }
+}

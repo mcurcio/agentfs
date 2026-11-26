@@ -4,7 +4,7 @@
 //! rolls the small packs up, one run at a time, with the memory bounds of
 //! every repack ([`agentfs_git::git_cli::PACK_CONFIG`]). It runs
 //! beside `git fast-import`, as a git server repacks beside receive-pack,
-//! never under the builder's lease and never stopping it. Only a built
+//! never blocking the builder and never stopping it. Only a built
 //! event starts a run ([`History::wait_batch_end`]), not a failed batch or a
 //! wake; events that come while a run is in progress are one more run after
 //! it, not one each.
@@ -57,9 +57,10 @@
 //! its temporary pack (`tmp_*`); the task lists those at each batch end and
 //! removes, at the next, each still there as the same file ([`sweep`]).
 //!
-//! **A stop.** A stop kills a run in progress, with every process it
-//! started (its own process group), but lets an expiry finish. git writes
-//! a pack under a temporary name and renames it in, index last, so a killed
+//! **A stop.** A stop kills a run in progress, its one process (git holds
+//! the volume's lease, as every process the engine starts does, so it
+//! starts none: `agentfs_os::inherited_lock`), but lets an expiry finish.
+//! git writes a pack under a temporary name and renames it in, index last, so a killed
 //! run leaves at most a temporary file, which the next start removes
 //! (history/mod.rs, `clean_packs`), or a whole new pack the index does not
 //! prefer, whose packs a later run rolls up again. A stale
@@ -80,21 +81,23 @@
 //! at the latest when the volume stops. Loose objects (the verification
 //! notes `git notes` writes) are not rolled up.
 //!
-//! The children are not counted with the actor's Git children
-//! ([`agentfs_git::git_cli::counted`]): they are not on the actor's path, and a
-//! count a background task adds to would not tell what an operation started.
+//! The children hold the volume's lease, so the end of the lease's children
+//! (`Recording::end_git_children`) ends them too, but they are not counted
+//! with the actor's Git children ([`agentfs_git::git_cli::children`]): they
+//! are not on the actor's path, and a count a background task adds to would
+//! not tell what an operation started.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::fs::File;
 use std::io::{self, Read, Write};
 use std::os::unix::fs::MetadataExt;
-use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use agentfs_git::git_cli::PACK_CONFIG;
+use agentfs_os::inherited_lock::InheritedLock;
 
 use super::built::{Ends, History};
 use crate::tree_actor::stages::{Timer, Which};
@@ -252,14 +255,19 @@ impl Repacker {
     /// # Errors
     ///
     /// The thread could not be started.
-    pub(in crate::tree_actor) fn start(history: History, git_dir: PathBuf) -> io::Result<Self> {
+    pub(in crate::tree_actor) fn start(
+        history: History,
+        git_dir: PathBuf,
+        lease: Arc<InheritedLock>,
+    ) -> io::Result<Self> {
         let child = Arc::new(Mutex::new(Slot::default()));
         // Before the volume is served: an index left naming a pack an
         // expiry deleted goes, then what the last process's last roll-up
         // superseded goes. A failure is said, the index dropped, and the
         // volume served (keep operating).
         let mut memory = Memory::default();
-        let started = repair(&git_dir).and_then(|()| expire(&program(&git_dir), &git_dir, &child));
+        let started =
+            repair(&git_dir).and_then(|()| expire(&program(&git_dir), &git_dir, &child, &lease));
         if let Err(error) = started {
             eprintln!("tree RepackFailed: {error}");
             memory.midx = in_doubt(&git_dir);
@@ -267,7 +275,7 @@ impl Repacker {
         let slot = Arc::clone(&child);
         let thread = std::thread::Builder::new()
             .name("tree-repack".into())
-            .spawn(move || run(&history, &git_dir, &slot, memory))?;
+            .spawn(move || run(&history, &git_dir, &slot, &lease, memory))?;
         Ok(Self { thread, child })
     }
 
@@ -278,10 +286,12 @@ impl Repacker {
         {
             let mut slot = lock(&self.child);
             slot.stopped = true;
-            if let Some(child) = &slot.child
-                && !slot.finishing
+            let finishing = slot.finishing;
+            if let Some(child) = &mut slot.child
+                && !finishing
             {
-                kill_group(child);
+                // Unreaped, so its pid is still its own.
+                let _ = child.kill();
             }
         }
         let _ = self.thread.join();
@@ -298,7 +308,13 @@ fn lock(slot: &Mutex<Slot>) -> MutexGuard<'_, Slot> {
 /// in progress are one more run after it, not one each. A failed run is
 /// logged when it differs from the last and tried again at the next built
 /// event (keep operating).
-fn run<E: BatchEvents>(events: &E, git_dir: &Path, slot: &Mutex<Slot>, mut memory: Memory) {
+fn run<E: BatchEvents>(
+    events: &E,
+    git_dir: &Path,
+    slot: &Mutex<Slot>,
+    lease: &InheritedLock,
+    mut memory: Memory,
+) {
     let pack_dir = git_dir.join("objects").join("pack");
     let mut last: Option<String> = None;
     // Listed before the counts are read: a batch that ends between the two
@@ -313,7 +329,7 @@ fn run<E: BatchEvents>(events: &E, git_dir: &Path, slot: &Mutex<Slot>, mut memor
             .map(|()| Ran::Done(()))
             .map_err(io_error("sweeping", &pack_dir));
         if ran.is_ok() && now.built > seen.built {
-            ran = run_once(&program(git_dir), git_dir, slot, &mut memory);
+            ran = run_once(&program(git_dir), git_dir, slot, lease, &mut memory);
         }
         match ran {
             Ok(Ran::Done(())) => last = None,
@@ -342,9 +358,10 @@ fn run_once(
     git: &Path,
     git_dir: &Path,
     slot: &Mutex<Slot>,
+    lease: &InheritedLock,
     memory: &mut Memory,
 ) -> Result<Ran<()>, TaskError> {
-    let ran = steps(git, git_dir, slot, memory);
+    let ran = steps(git, git_dir, slot, lease, memory);
     if let Err(error) = &ran
         && !matches!(error, TaskError::NoRoom { .. })
     {
@@ -358,6 +375,7 @@ fn steps(
     git: &Path,
     git_dir: &Path,
     slot: &Mutex<Slot>,
+    lease: &InheritedLock,
     memory: &mut Memory,
 ) -> Result<Ran<()>, TaskError> {
     match memory.midx {
@@ -376,7 +394,7 @@ fn steps(
                 .map(|name| format!("--preferred-pack={name}.pack"));
             let mut write = vec!["multi-pack-index", "write"];
             write.extend(preferred.as_deref());
-            if command(git, git_dir, slot, &write, None, false)? == Ran::Stopped {
+            if command(git, git_dir, slot, lease, &write, None, false)? == Ran::Stopped {
                 return Ok(Ran::Stopped);
             }
             sync_store(git_dir)?;
@@ -385,12 +403,12 @@ fn steps(
         }
         Midx::Trusted { pending } => {
             if pending {
-                if expire(git, git_dir, slot)? == Ran::Stopped {
+                if expire(git, git_dir, slot, lease)? == Ran::Stopped {
                     return Ok(Ran::Stopped);
                 }
                 memory.midx = Midx::Trusted { pending: false };
             }
-            match roll_up_once(git, git_dir, slot, &mut memory.rolled)? {
+            match roll_up_once(git, git_dir, slot, lease, &mut memory.rolled)? {
                 Ran::Done(rolled) => memory.midx = Midx::Trusted { pending: rolled },
                 Ran::Stopped => return Ok(Ran::Stopped),
             }
@@ -425,12 +443,18 @@ fn program(git_dir: &Path) -> PathBuf {
 /// `git multi-pack-index expire`: deletes the packs in which the
 /// multi-pack index finds no object, those the last roll-up superseded.
 /// Nothing when there is no index.
-fn expire(git: &Path, git_dir: &Path, slot: &Mutex<Slot>) -> Result<Ran<()>, TaskError> {
+fn expire(
+    git: &Path,
+    git_dir: &Path,
+    slot: &Mutex<Slot>,
+    lease: &InheritedLock,
+) -> Result<Ran<()>, TaskError> {
     Ok(
         match command(
             git,
             git_dir,
             slot,
+            lease,
             &["multi-pack-index", "expire"],
             None,
             true,
@@ -620,6 +644,7 @@ fn roll_up_once(
     git: &Path,
     git_dir: &Path,
     slot: &Mutex<Slot>,
+    lease: &InheritedLock,
     rolled: &mut Option<String>,
 ) -> Result<Ran<bool>, TaskError> {
     let _timer = Timer::start(Which::Repack);
@@ -642,7 +667,7 @@ fn roll_up_once(
         });
     }
     let names: Vec<&str> = by_size[..n].iter().map(|(_, name)| name.as_str()).collect();
-    roll(git, git_dir, slot, &names, rolled)
+    roll(git, git_dir, slot, lease, &names, rolled)
 }
 
 /// Writes the packs `names` into one new pack, which `rolled` then names,
@@ -652,6 +677,7 @@ fn roll(
     git: &Path,
     git_dir: &Path,
     slot: &Mutex<Slot>,
+    lease: &InheritedLock,
     names: &[&str],
     rolled: &mut Option<String>,
 ) -> Result<Ran<bool>, TaskError> {
@@ -664,6 +690,7 @@ fn roll(
         git,
         git_dir,
         slot,
+        lease,
         &PACK_OBJECTS,
         Some(input.as_bytes()),
         false,
@@ -678,7 +705,7 @@ fn roll(
     *rolled = Some(format!("pack-{hash}"));
     let preferred = format!("--preferred-pack=pack-{hash}.pack");
     let write = ["multi-pack-index", "write", preferred.as_str()];
-    if command(git, git_dir, slot, &write, None, false)? == Ran::Stopped {
+    if command(git, git_dir, slot, lease, &write, None, false)? == Ran::Stopped {
         return Ok(Ran::Stopped);
     }
     // The new pack's name is durable before any pack it rolled up can go.
@@ -708,15 +735,17 @@ fn packs(dir: &Path) -> Result<Packs, TaskError> {
 }
 
 /// Runs one `git <FSYNC> <PACK_CONFIG> <args>` on `git_dir`, `input` on its
-/// stdin, and returns its stdout. git runs in a process group of its own so
-/// a stop kills every process it started, unless it is `finishing` (an
-/// expiry), which a stop waits for. The child is reaped only after
-/// the slot lets go of it, so a stop never signals a process id reused
-/// since.
+/// stdin, and returns its stdout. git holds the volume's lease, as every
+/// process the engine starts does ([`InheritedLock::spawn_with`]), so it
+/// starts no process of its own: a stop kills the one process, unless it is
+/// `finishing` (an expiry), which a stop waits for. The child is reaped
+/// only after the slot lets go of it, so a stop never signals a process id
+/// reused since.
 fn command(
     git: &Path,
     git_dir: &Path,
     slot: &Mutex<Slot>,
+    lease: &InheritedLock,
     args: &[&str],
     input: Option<&[u8]>,
     finishing: bool,
@@ -735,24 +764,11 @@ fn command(
             Stdio::null()
         })
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .process_group(0);
-    // git dies with this process; a pack it was writing is a temporary file.
-    let parent = std::process::id();
-    // SAFETY: pre_exec runs after fork, before exec; prctl and getppid are
-    // async-signal-safe.
-    unsafe {
-        cmd.pre_exec(move || {
-            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) == -1 {
-                return Err(io::Error::last_os_error());
-            }
-            if u32::try_from(libc::getppid()).ok() != Some(parent) {
-                return Err(io::Error::from_raw_os_error(libc::ECHILD));
-            }
-            Ok(())
-        });
-    }
-    let mut child = cmd.spawn().map_err(TaskError::Spawn)?;
+        .stderr(Stdio::piped());
+    // git dies with this thread; a pack it was writing is a temporary file.
+    let mut child = lease
+        .spawn_with(&mut cmd, Command::spawn)
+        .map_err(TaskError::Spawn)?;
     let stdin = child.stdin.take();
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
@@ -760,8 +776,7 @@ fn command(
     held.child = Some(child);
     held.finishing = finishing;
     drop(held);
-    // Until every process of the group has let go of the pipes: they have
-    // exited or were killed. stderr is read beside stdout so neither fills.
+    // Until git has let go of the pipes: it has exited or was killed. stderr is read beside stdout so neither fills.
     let (out, err) = std::thread::scope(|scope| {
         let err = scope.spawn(|| {
             let mut buf = Vec::new();
@@ -781,7 +796,7 @@ fn command(
         (out, err.join().unwrap_or_default())
     });
     // Exited, not yet reaped. Should this fail, the reap below waits instead.
-    let _ = exited(pid);
+    let _ = agentfs_os::inherited_lock::exited(pid);
     let mut held = lock(slot);
     let status = match held.child.take() {
         Some(mut child) => child.wait().map_err(TaskError::Spawn)?,
@@ -805,43 +820,6 @@ fn command(
     Ok(Ran::Done(out))
 }
 
-/// Waits until child `pid` has exited, leaving it unreaped (`WNOWAIT`): its
-/// process id and group stay its own until [`Child::wait`].
-fn exited(pid: u32) -> io::Result<()> {
-    let id = libc::id_t::from(pid);
-    loop {
-        // SAFETY: `info` is a valid, writable siginfo_t; waitid has no other
-        // preconditions.
-        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
-        let r = unsafe {
-            libc::waitid(
-                libc::P_PID,
-                id,
-                &raw mut info,
-                libc::WEXITED | libc::WNOWAIT,
-            )
-        };
-        if r == 0 {
-            return Ok(());
-        }
-        let e = io::Error::last_os_error();
-        if e.kind() != io::ErrorKind::Interrupted {
-            return Err(e);
-        }
-    }
-}
-
-/// Kills `child`'s process group, which it leads: git and every process it
-/// started. The child is unreaped, so the group is still its own.
-fn kill_group(child: &Child) {
-    if let Ok(pid) = libc::pid_t::try_from(child.id()) {
-        // SAFETY: kill has no memory preconditions; a negative pid names the group.
-        unsafe {
-            libc::kill(-pid, libc::SIGKILL);
-        }
-    }
-}
-
 #[cfg(test)]
 pub(in crate::tree_actor) mod tests {
     use std::collections::BTreeSet;
@@ -855,6 +833,7 @@ pub(in crate::tree_actor) mod tests {
     use crate::tree_actor::history::built::BuiltSnapshot;
     use crate::tree_actor::test_support::{ATTRS, new_actor, reopen, rowless_fork, writer};
     use agentfs_contracts::TreeId;
+    use agentfs_os::file_lock::{FileLock, Mode};
 
     /// The program the task runs instead of git when the git directory holds it.
     pub(in crate::tree_actor) const WRAPPER: &str = "repack-git";
@@ -1095,8 +1074,19 @@ exec git "$@""#;
     }
 
     /// One roll-up, as a run makes it.
-    fn repack_once(git: &Path, git_dir: &Path, slot: &Mutex<Slot>) -> Result<Ran<bool>, TaskError> {
-        roll_up_once(git, git_dir, slot, &mut None)
+    fn repack_once(
+        git: &Path,
+        git_dir: &Path,
+        slot: &Mutex<Slot>,
+        lease: &InheritedLock,
+    ) -> Result<Ran<bool>, TaskError> {
+        roll_up_once(git, git_dir, slot, lease, &mut None)
+    }
+
+    /// A lease of a test's own, over an unnamed temporary file.
+    fn lease() -> InheritedLock {
+        let file = tempfile::tempfile().unwrap();
+        InheritedLock::new(FileLock::wait(file, Mode::Exclusive).unwrap())
     }
 
     fn rolled(ran: Ran<bool>) -> bool {
@@ -1108,8 +1098,9 @@ exec git "$@""#;
 
     fn expire_now(git_dir: &Path) {
         let slot = Mutex::new(Slot::default());
+        let lease = lease();
         assert_eq!(
-            expire(Path::new("git"), git_dir, &slot).unwrap(),
+            expire(Path::new("git"), git_dir, &slot, &lease).unwrap(),
             Ran::Done(())
         );
     }
@@ -1147,8 +1138,9 @@ exec git "$@""#;
         let objects = all_objects(&git_dir);
 
         let slot = Mutex::new(Slot::default());
+        let lease = lease();
         assert!(rolled(
-            repack_once(Path::new("git"), &git_dir, &slot).unwrap()
+            repack_once(Path::new("git"), &git_dir, &slot, &lease).unwrap()
         ));
         let after = listed(&git_dir);
         assert!(after.is_superset(&before), "a roll-up deletes nothing");
@@ -1180,8 +1172,9 @@ exec git "$@""#;
         batches(&mut v, 0, 8);
         let seen = listed(&git_dir);
         let slot = Mutex::new(Slot::default());
+        let lease = lease();
         assert!(rolled(
-            repack_once(Path::new("git"), &git_dir, &slot).unwrap()
+            repack_once(Path::new("git"), &git_dir, &slot, &lease).unwrap()
         ));
         for pack in &seen {
             for ext in ["idx", "pack"] {
@@ -1209,15 +1202,16 @@ exec git "$@""#;
         let set = listed(&git_dir);
         let names: Vec<&str> = set.iter().map(String::as_str).collect();
         let slot = Mutex::new(Slot::default());
+        let lease = lease();
         let git = Path::new("git");
         assert!(rolled(
-            roll(git, &git_dir, &slot, &names, &mut None).unwrap()
+            roll(git, &git_dir, &slot, &lease, &names, &mut None).unwrap()
         ));
         let first: BTreeSet<String> = listed(&git_dir).difference(&set).cloned().collect();
         assert_eq!(first.len(), 1, "{first:?}");
         // The same packs again: the same pack, already in the store.
         assert!(rolled(
-            roll(git, &git_dir, &slot, &names, &mut None).unwrap()
+            roll(git, &git_dir, &slot, &lease, &names, &mut None).unwrap()
         ));
         let second: BTreeSet<String> = listed(&git_dir).difference(&set).cloned().collect();
         assert_eq!(second, first, "the same packs roll up to the same name");
@@ -1252,7 +1246,8 @@ exec git "$@""#;
             let (held, git_dir) = (held.clone(), git_dir.clone());
             std::thread::spawn(move || {
                 let slot = Mutex::new(Slot::default());
-                repack_once(&held, &git_dir, &slot).unwrap()
+                let lease = lease();
+                repack_once(&held, &git_dir, &slot, &lease).unwrap()
             })
         };
         wait_written(&held);
@@ -1300,8 +1295,9 @@ exec git "$@""#;
         assert!(objects.contains(&blob));
 
         let slot = Mutex::new(Slot::default());
+        let lease = lease();
         assert!(rolled(
-            repack_once(Path::new("git"), &git_dir, &slot).unwrap()
+            repack_once(Path::new("git"), &git_dir, &slot, &lease).unwrap()
         ));
         expire_now(&git_dir);
         assert!(listed(&git_dir).len() < 5, "{:?}", listed(&git_dir));
@@ -1369,8 +1365,9 @@ exec git "$@""#;
         let before = listed(&git_dir);
         // The task's state at a stop: a roll-up, no built event after it.
         let slot = Mutex::new(Slot::default());
+        let lease = lease();
         assert!(rolled(
-            repack_once(Path::new("git"), &git_dir, &slot).unwrap()
+            repack_once(Path::new("git"), &git_dir, &slot, &lease).unwrap()
         ));
         drop(v);
         fsck(&git_dir, "after the stop");
@@ -1404,8 +1401,9 @@ exec git "$@""#;
         let reachable = read_reachable(&git_dir);
         let before = listed(&git_dir);
         let slot = Mutex::new(Slot::default());
+        let lease = lease();
         assert!(rolled(
-            repack_once(Path::new("git"), &git_dir, &slot).unwrap()
+            repack_once(Path::new("git"), &git_dir, &slot, &lease).unwrap()
         ));
         drop(v);
         let named = indexed(&git_dir).expect("the index reads");
@@ -1449,8 +1447,9 @@ exec git "$@""#;
         let v = reopen(tmp.path());
         assert!(!lock.exists());
         let slot = Mutex::new(Slot::default());
+        let lease = lease();
         assert!(rolled(
-            repack_once(Path::new("git"), &git_dir, &slot).unwrap()
+            repack_once(Path::new("git"), &git_dir, &slot, &lease).unwrap()
         ));
         drop(v);
         fsck(&git_dir, "after the stop");
@@ -1548,11 +1547,15 @@ exec git "$@""#;
         let fails = tmp.path().join("fails");
         script(&fails, "echo broken >&2; exit 3");
         let slot = Mutex::new(Slot::default());
-        let error = expire(&fails, tmp.path(), &slot).unwrap_err();
+        let lease = lease();
+        let error = expire(&fails, tmp.path(), &slot, &lease).unwrap_err();
         assert!(error.to_string().contains("broken"), "{error}");
         // A stop asked first: nothing starts.
         lock(&slot).stopped = true;
-        assert_eq!(expire(&fails, tmp.path(), &slot).unwrap(), Ran::Stopped);
+        assert_eq!(
+            expire(&fails, tmp.path(), &slot, &lease).unwrap(),
+            Ran::Stopped
+        );
     }
 
     /// A wrapper that logs each command's arguments to `$0.log`, then runs
@@ -1690,7 +1693,8 @@ exec git "$@""#;
             })
         };
         let slot = Mutex::new(Slot::default());
-        run(&script, &git_dir, &slot, Memory::default());
+        let lease = lease();
+        run(&script, &git_dir, &slot, &lease, Memory::default());
         assert_eq!(script.ends.lock().unwrap().2, 4);
         assert_eq!(read_reachable(&git_dir), reachable);
         git_reads_everything(&git_dir, "after the expiry");
@@ -1725,7 +1729,8 @@ exec git "$@""#;
             })
         };
         let slot = Mutex::new(Slot::default());
-        run(&script, &git_dir, &slot, Memory::default());
+        let lease = lease();
+        run(&script, &git_dir, &slot, &lease, Memory::default());
         assert_eq!(script.ends.lock().unwrap().2, 3);
         assert_eq!(read_reachable(&git_dir), reachable);
         fsck(&git_dir, "after the sweep");
@@ -1759,7 +1764,8 @@ exec git "$@""#;
             }),
         ));
         let slot = Mutex::new(Slot::default());
-        run(&script, &git_dir, &slot, Memory::default());
+        let lease = lease();
+        run(&script, &git_dir, &slot, &lease, Memory::default());
         assert_eq!(script.ends.lock().unwrap().2, 4);
     }
 
@@ -1773,8 +1779,9 @@ exec git "$@""#;
         std::fs::write(git_dir.join(FREE), b"1000").unwrap();
         let git = Path::new("git");
         let slot = Mutex::new(Slot::default());
+        let lease = lease();
         let mut memory = Memory::default();
-        let error = run_once(git, &git_dir, &slot, &mut memory).unwrap_err();
+        let error = run_once(git, &git_dir, &slot, &lease, &mut memory).unwrap_err();
         assert!(
             matches!(error, TaskError::NoRoom { free: 1000, .. }),
             "{error}"
@@ -1783,7 +1790,7 @@ exec git "$@""#;
         assert_eq!(entries(&git_dir), before, "a roll-up without room wrote");
         std::fs::remove_file(git_dir.join(FREE)).unwrap();
         assert_eq!(
-            run_once(git, &git_dir, &slot, &mut memory).unwrap(),
+            run_once(git, &git_dir, &slot, &lease, &mut memory).unwrap(),
             Ran::Done(())
         );
         assert_eq!(memory.midx, Midx::Trusted { pending: true });
@@ -1844,9 +1851,10 @@ exec git "$@""#;
         let before = listed(&git_dir);
         let git = Path::new("git");
         let slot = Mutex::new(Slot::default());
+        let lease = lease();
         let mut memory = Memory::default();
         assert_eq!(
-            run_once(git, &git_dir, &slot, &mut memory).unwrap(),
+            run_once(git, &git_dir, &slot, &lease, &mut memory).unwrap(),
             Ran::Done(())
         );
         assert_eq!(memory.midx, Midx::Trusted { pending: true });
@@ -1857,7 +1865,7 @@ exec git "$@""#;
 
         let full = tmp.path().join("full-git");
         script(&full, EXPIRY_FULL);
-        run_once(&full, &git_dir, &slot, &mut memory).unwrap_err();
+        run_once(&full, &git_dir, &slot, &lease, &mut memory).unwrap_err();
         assert!(
             !listed(&git_dir).is_superset(&before),
             "the expiry deleted packs before it failed"
@@ -1874,7 +1882,7 @@ exec git "$@""#;
         let reachable = read_reachable(&git_dir);
         for _ in 0..4 {
             assert_eq!(
-                run_once(git, &git_dir, &slot, &mut memory).unwrap(),
+                run_once(git, &git_dir, &slot, &lease, &mut memory).unwrap(),
                 Ran::Done(())
             );
             git_reads_everything(&git_dir, "after a run");
@@ -1905,8 +1913,9 @@ exec git "$@""#;
         std::fs::write(&lock, b"").unwrap();
         let git = Path::new("git");
         let slot = Mutex::new(Slot::default());
+        let lease = lease();
         let mut memory = Memory::default();
-        run_once(git, &git_dir, &slot, &mut memory).unwrap_err();
+        run_once(git, &git_dir, &slot, &lease, &mut memory).unwrap_err();
         assert_eq!(memory.midx, Midx::InDoubt);
         assert!(!lock.exists(), "the stale lock is kept");
         let roll_up = memory.rolled.clone().expect("the roll-up's pack is known");
@@ -1923,7 +1932,7 @@ exec git "$@""#;
         // The rewrite, then the expiry (and maybe a roll-up).
         for _ in 0..2 {
             assert_eq!(
-                run_once(git, &git_dir, &slot, &mut memory).unwrap(),
+                run_once(git, &git_dir, &slot, &lease, &mut memory).unwrap(),
                 Ran::Done(())
             );
         }
@@ -1934,7 +1943,7 @@ exec git "$@""#;
             "the roll-up's inputs are left: {left:?}"
         );
         assert_eq!(
-            run_once(git, &git_dir, &slot, &mut memory).unwrap(),
+            run_once(git, &git_dir, &slot, &lease, &mut memory).unwrap(),
             Ran::Done(())
         );
         midx_verify(&git_dir);

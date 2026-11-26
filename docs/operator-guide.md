@@ -24,6 +24,12 @@ Section numbers below refer to this page.
   passing through the daemon; files opened for writing always go through
   the daemon. Without it everything still works, through the
   daemon.
+- **Seccomp filter mode** (`CONFIG_SECCOMP_FILTER`) for tree volumes. Every
+  git child of a tree volume holds its lease and runs under a seccomp filter
+  that refuses it any fork, so a stopped `agentfs host` frees the volume when
+  it exits ([library/engine](library/engine.md)). Distribution kernels have
+  it, and Kubernetes' `RuntimeDefault` profile allows it. Without it every
+  git child of a tree volume fails to start.
 - **`/dev/fuse`**, and the privileges a mount other containers see
   needs (section 11).
 - **Run as root** for multi-user volumes. What the daemon does is decided

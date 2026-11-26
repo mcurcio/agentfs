@@ -44,6 +44,7 @@ use agentfs_contracts::meta::{Kind, Meta, Perm};
 use agentfs_contracts::{NotATree, TreeId};
 use agentfs_os::file_lock::{FileLock, Mode};
 use agentfs_os::fsutil::sync_dir;
+use agentfs_os::inherited_lock::InheritedLock;
 use agentfs_referee::EventNumber;
 pub(crate) use call_path::ActorGuard;
 pub use call_path::{Closing, PathStep, Progress, Recording, SavePending, SaveToDecide, Then};
@@ -449,7 +450,9 @@ pub struct TreeActor {
     areas: untracked::Areas,
     /// The flagged commits by state, which the alarm's gauge reads.
     verification: Verification,
-    _lock: Arc<FileLock>,
+    /// The state area's lease, which every process the engine starts for
+    /// this volume holds ([`InheritedLock::spawn_with`]).
+    lease: Arc<InheritedLock>,
 }
 
 /// A take's bytes in chunks of at most `journal::TAKE_CHUNK`, recorded before it.
@@ -571,10 +574,10 @@ fn read_rules(root: &Path) -> Result<agentfs_rules::RuleSet> {
     )?)
 }
 
-fn lock_area(root: &Path) -> Result<Arc<FileLock>> {
-    Ok(Arc::new(
+fn lock_area(root: &Path) -> Result<Arc<InheritedLock>> {
+    Ok(Arc::new(InheritedLock::new(
         FileLock::try_take(&root.join(LOCK), Mode::Exclusive)?.ok_or(Error::Busy)?,
-    ))
+    )))
 }
 
 /// Writes `bytes` to `name` whole: a temporary file, fsynced, renamed into place.
@@ -850,7 +853,7 @@ impl TreeActor {
     )]
     fn start_history(
         root: &Path,
-        lock: &Arc<FileLock>,
+        lock: &Arc<InheritedLock>,
         frames: &[journal::Frame],
         opened: &Published,
         (built_log, entries): (BuiltLog, Vec<built_log::BuiltEntry>),
@@ -1072,7 +1075,7 @@ impl TreeActor {
     /// Recovers the locked state area of a volume of this format.
     fn serve(
         root: PathBuf,
-        lock: Arc<FileLock>,
+        lock: Arc<InheritedLock>,
         identity: VolumeIdentity,
         service: PodContext,
         upkeep: Upkeep,
@@ -1148,7 +1151,7 @@ impl TreeActor {
             rules,
             areas: untracked::Areas::new(&root),
             verification,
-            _lock: lock,
+            lease: Arc::clone(&lock),
         };
         // After the builder, and once the volume stops it on any error below.
         volume.compactor = Some(Compactor::start(
@@ -1163,6 +1166,7 @@ impl TreeActor {
         volume.repacker = Some(Repacker::start(
             volume.history.clone(),
             root.join("history.git"),
+            lock,
         )?);
         volume.areas.sweep(&volume.trees())?;
         for (handle, open) in folded.opens {
@@ -1212,6 +1216,11 @@ impl TreeActor {
     /// The operator's rules, read when the volume opened.
     pub fn rules(&self) -> &Arc<agentfs_rules::RuleSet> {
         &self.rules
+    }
+
+    /// The state area's lease, which every git child of the volume holds.
+    fn lease(&self) -> &Arc<InheritedLock> {
+        &self.lease
     }
 
     /// `tree`'s untracked area, made if it has none.

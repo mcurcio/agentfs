@@ -46,7 +46,9 @@ use crate::pod_args::PodArgs;
 const EXIT_USAGE: u8 = 2;
 
 /// Exit status of a host stopped with views open: they are left stale for
-/// the next host, and the volume is not released.
+/// the next host, and the volume is not released. The host has ended its
+/// git children first ([`Serving::abandon`]), so the volume's lease is free
+/// once it has exited.
 const EXIT_LEFT_OPEN: u8 = 3;
 
 /// `agentfs host`'s flags.
@@ -91,7 +93,9 @@ fn control_channel() -> Option<UnixStream> {
 /// Exits 0 once the volume is released, 1 for a refusal at boot or a
 /// stopped actor, 2 without a control channel or after a malformed line,
 /// 3 when stopped with views open (left stale), 75 while another process
-/// holds the volume.
+/// holds the volume. At each status it makes itself (0, 1, 2, 3) the host
+/// leaves no process holding the volume's lease, so the lease is free when
+/// its exit is reaped (docs/library/filesystem.md, "Exit status").
 ///
 /// # Errors
 ///

@@ -202,7 +202,10 @@ one writer survives the crash. The parent closing its end (EOF), SIGTERM or
 SIGINT stops the host: with no view open it drains the volume and exits 0 once
 it is released ([lifecycle](#volume-lifecycle)); with views open it exits 3 at
 once and leaves them stale, as a crash does, for the next host to rebind and
-stack over. The last view ending does not stop it. The
+stack over. Before that exit it ends its git children, as a crash ends them,
+so the volume is free for the next host once the exit is reaped; what the
+journal holds and history lacks is built at the next open. The last view
+ending does not stop it. The
 messages and refusals are in
 [library/filesystem](library/filesystem.md#the-view-host-command).
 

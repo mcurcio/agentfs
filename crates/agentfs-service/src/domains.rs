@@ -245,7 +245,9 @@ impl Domains {
     /// As `Recording::end_git_children`: the lease is then free only once
     /// those processes have exited. The domains are forgotten all the same.
     pub fn abandon(self) -> std::io::Result<()> {
-        todo!("page exit-3-reap")
+        let ended = self.sessions.recording().end_git_children();
+        std::mem::forget(self);
+        ended
     }
 
     /// Whether Volume has released the volume (`VolumeReleased` consumed).

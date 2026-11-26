@@ -384,6 +384,9 @@ pub struct Recording {
     history: History,
     /// The operator's rules, read once at open, reached without the actor's lock.
     rules: Arc<agentfs_rules::RuleSet>,
+    /// The state area's lease, reached without the actor's lock: its
+    /// children are ended through it ([`Recording::end_git_children`]).
+    lease: Arc<agentfs_os::inherited_lock::InheritedLock>,
     /// The gate thread, joined at drop: it holds the store (and the state
     /// area's lease) until the builder has stopped.
     gate: Option<std::thread::JoinHandle<()>>,
@@ -447,6 +450,7 @@ impl Recording {
         let durability = Arc::clone(actor.durability());
         let history = actor.history().clone();
         let rules = Arc::clone(actor.rules());
+        let lease = Arc::clone(actor.lease());
         let gate = history.clone();
         let owner = agentfs_failpoints::owner();
         let gate = std::thread::Builder::new()
@@ -460,6 +464,7 @@ impl Recording {
             durability,
             history,
             rules,
+            lease,
             gate: Some(gate),
             #[cfg(test)]
             in_decide: Mutex::new(None),
@@ -557,7 +562,7 @@ impl Recording {
     /// A signal or a wait the kernel refused
     /// (`agentfs_os::inherited_lock::InheritedLock::end_children`).
     pub fn end_git_children(&self) -> std::io::Result<()> {
-        todo!("page exit-3-reap")
+        self.lease.end_children()
     }
 
     /// The operator's rules, read when the volume opened: where each new

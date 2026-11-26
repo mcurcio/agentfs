@@ -13,16 +13,14 @@
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
 use std::io::{self, BufRead, Read, Write};
-use std::os::fd::{AsRawFd, BorrowedFd};
 use std::os::unix::ffi::OsStringExt;
 use std::os::unix::fs::PermissionsExt;
-use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::process::{Child, Command, Output, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use agentfs_os::file_lock::FileLock;
+use agentfs_os::inherited_lock::InheritedLock;
 use git2::{ErrorCode, ObjectType, Oid, Repository};
 use thiserror::Error;
 
@@ -106,7 +104,8 @@ pub struct RefUpdate {
 #[derive(Clone, Debug)]
 pub struct TreeGit {
     path: PathBuf,
-    lease: Option<Arc<FileLock>>,
+    /// The volume's lease, which every git child started here holds.
+    lease: Arc<InheritedLock>,
     store: Arc<Store>,
 }
 
@@ -129,18 +128,22 @@ impl std::fmt::Debug for Store {
 
 impl TreeGit {
     /// Initialize a bare repository. For an actor, use `init_with_lease`.
+    /// Its git children hold a shared lock on the sibling `<path>.lease`.
     #[cfg(any(test, feature = "test-util"))]
     pub fn init(path: impl AsRef<Path>) -> Result<Self> {
-        Self::init_inner(path.as_ref(), None)
+        Self::init_inner(path.as_ref(), test_lease(path.as_ref())?)
     }
 
     /// Initialize while retaining the actor's exclusive lock across Git children.
     #[cfg_attr(feature = "test-util", visibility::make(pub))]
-    pub(crate) fn init_with_lease(path: impl AsRef<Path>, lease: Arc<FileLock>) -> Result<Self> {
-        Self::init_inner(path.as_ref(), Some(lease))
+    pub(crate) fn init_with_lease(
+        path: impl AsRef<Path>,
+        lease: Arc<InheritedLock>,
+    ) -> Result<Self> {
+        Self::init_inner(path.as_ref(), lease)
     }
 
-    fn init_inner(path: &Path, lease: Option<Arc<FileLock>>) -> Result<Self> {
+    fn init_inner(path: &Path, lease: Arc<InheritedLock>) -> Result<Self> {
         std::fs::create_dir_all(path)?;
         let repo = Self {
             path: std::fs::canonicalize(path)?,
@@ -152,24 +155,51 @@ impl TreeGit {
         Ok(repo)
     }
 
-    /// Open a repository. For an actor, use `open_with_lease`.
+    /// Open a repository. For an actor, use `open_with_lease`. Its git
+    /// children hold a shared lock on the sibling `<path>.lease`.
     #[cfg(any(test, feature = "test-util"))]
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
-        Self::open_inner(path.as_ref(), None)
+        Self::open_inner(path.as_ref(), test_lease(path.as_ref())?)
     }
 
     /// Keeps the path and the actor's lock across Git children. Runs no git and
     /// checks no format: after a crash `write_config` comes first.
     #[cfg_attr(feature = "test-util", visibility::make(pub))]
-    pub(crate) fn open_with_lease(path: impl AsRef<Path>, lease: Arc<FileLock>) -> Result<Self> {
-        Self::open_inner(path.as_ref(), Some(lease))
+    pub(crate) fn open_with_lease(
+        path: impl AsRef<Path>,
+        lease: Arc<InheritedLock>,
+    ) -> Result<Self> {
+        Self::open_inner(path.as_ref(), lease)
     }
 
-    fn open_inner(path: &Path, lease: Option<Arc<FileLock>>) -> Result<Self> {
+    fn open_inner(path: &Path, lease: Arc<InheritedLock>) -> Result<Self> {
         Ok(Self {
             path: std::fs::canonicalize(path)?,
             lease,
             store: Arc::default(),
+        })
+    }
+
+    /// Starts `cmd` as a holder of the volume's lease, counted
+    /// ([`agentfs_git::git_cli::children`]): every process the engine starts
+    /// on this repository's behalf starts here
+    /// ([`InheritedLock::spawn_with`]). After the lease's holder has ended
+    /// its children, refused with `ENOTCONN`.
+    pub(crate) fn start(&self, cmd: &mut Command) -> io::Result<Child> {
+        self.lease.spawn_with(cmd, agentfs_git::git_cli::counted)
+    }
+
+    /// `result`, unless the lease's children have been ended: then any
+    /// failure is the end's (a refused start, or a git it killed), and
+    /// reads `ENOTCONN` raw, the errno a view answers once its server has
+    /// ended.
+    fn unless_ended<T>(&self, result: Result<T>) -> Result<T> {
+        result.map_err(|e| {
+            if self.lease.ended() {
+                Error::Io(io::Error::from_raw_os_error(libc::ENOTCONN))
+            } else {
+                e
+            }
         })
     }
 
@@ -364,7 +394,17 @@ impl TreeGit {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        let mut child = agentfs_git::git_cli::counted(&mut cmd)?;
+        self.unless_ended(self.read_commit_messages(cmd, input, &mut visit))
+    }
+
+    /// [`TreeGit::for_each_commit_message`]'s `git log`, `cmd`, fed `input`.
+    fn read_commit_messages(
+        &self,
+        mut cmd: Command,
+        input: String,
+        visit: &mut impl FnMut(Oid, &[u8]),
+    ) -> Result<()> {
+        let mut child = self.start(&mut cmd)?;
         let piped = || io::Error::other("git log's pipes were not set up");
         let stdin = child.stdin.take().ok_or_else(piped)?;
         let stdout = child.stdout.take().ok_or_else(piped)?;
@@ -381,7 +421,7 @@ impl TreeGit {
             });
             // `stdout` is dropped when this returns, so a child still writing
             // after a bad record ends on a closed pipe instead of blocking.
-            let read = read_records(stdout, &mut record, &mut visit);
+            let read = read_records(stdout, &mut record, visit);
             let join = |what| io::Error::other(format!("git log's {what} thread panicked"));
             (
                 read,
@@ -400,7 +440,7 @@ impl TreeGit {
         // The last record ends at the end of the output: whole only once the
         // child has succeeded.
         if !record.is_empty() {
-            visit_record(&record, &mut visit)?;
+            visit_record(&record, visit)?;
         }
         Ok(())
     }
@@ -453,9 +493,6 @@ impl TreeGit {
     fn command(&self, bare: bool) -> Command {
         let mut cmd = agentfs_align::isolated("git");
         cmd.arg("-c").arg("core.hooksPath=/dev/null");
-        if let Some(lease) = &self.lease {
-            attach_lease(&mut cmd, lease);
-        }
         cmd.env("GIT_TERMINAL_PROMPT", "0").current_dir(&self.path);
         if bare {
             cmd.env("GIT_DIR", &self.path);
@@ -463,10 +500,26 @@ impl TreeGit {
         cmd
     }
 
+    /// Runs `cmd` with nothing on stdin and collects both streams; the
+    /// status is the caller's.
+    fn output(&self, mut cmd: Command) -> Result<Output> {
+        cmd.stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        Ok(self.start(&mut cmd)?.wait_with_output()?)
+    }
+
     fn run(&self, args: &[&str], input: Option<&[u8]>, bare: bool) -> Result<Output> {
         let mut cmd = self.command(bare);
         cmd.args(args);
-        run_command(cmd, input)
+        if input.is_some() {
+            cmd.stdin(Stdio::piped());
+        } else {
+            cmd.stdin(Stdio::null());
+        }
+        cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+        let started = self.start(&mut cmd).map_err(Error::from);
+        self.unless_ended(started.and_then(|child| run_command(child, input)))
     }
 
     /// Starts `git fast-import` on this repository, its stdin piped and its
@@ -489,7 +542,7 @@ impl TreeGit {
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
-        Ok(agentfs_git::git_cli::counted(&mut cmd)?)
+        Ok(self.start(&mut cmd)?)
     }
 
     /// Makes objects stored by another writer since this handle last looked
@@ -518,14 +571,15 @@ impl TreeGit {
         self.run(&["check-ref-format", name], None, true)?;
         let mut cmd = self.command(true);
         cmd.args(["rev-parse", "--verify", "--quiet", name]);
-        let out = output(cmd)?;
-        if out.status.success() {
-            Ok(Some(parse_oid(trim(&out.stdout))?))
-        } else if out.status.code() == Some(1) {
-            Ok(None)
-        } else {
-            Err(classify(&out.stderr))
-        }
+        self.unless_ended(self.output(cmd).and_then(|out| {
+            if out.status.success() {
+                Ok(Some(parse_oid(trim(&out.stdout))?))
+            } else if out.status.code() == Some(1) {
+                Ok(None)
+            } else {
+                Err(classify(&out.stderr))
+            }
+        }))
     }
 
     /// List references beneath a prefix, in Git's reference order.
@@ -648,11 +702,13 @@ impl TreeGit {
             .stdin(Stdio::null())
             .stdout(Stdio::from(file.try_clone()?))
             .stderr(Stdio::piped());
-        let out = agentfs_git::git_cli::counted(&mut cmd)?.wait_with_output()?;
-        if !out.status.success() {
-            return Err(classify(&out.stderr));
-        }
-        Ok(())
+        self.unless_ended((|| {
+            let out = self.start(&mut cmd)?.wait_with_output()?;
+            if !out.status.success() {
+                return Err(classify(&out.stderr));
+            }
+            Ok(())
+        })())
     }
 
     /// Read immediate tree entries with raw names, in the tree's order.
@@ -809,12 +865,11 @@ impl TreeGit {
             &ancestor.to_string(),
             &descendant.to_string(),
         ]);
-        let out = output(cmd)?;
-        match out.status.code() {
+        self.unless_ended(self.output(cmd).and_then(|out| match out.status.code() {
             Some(0) => Ok(true),
             Some(1) => Ok(false),
             _ => Err(classify(&out.stderr)),
-        }
+        }))
     }
     /// Make a private cache directory the exact tree, without Git filters.
     /// With `previous`, the tree the directory holds now, only entries that
@@ -964,14 +1019,6 @@ fn sync_initialized_repository(path: &Path) -> io::Result<()> {
     Ok(())
 }
 
-// Run with nothing on stdin and collect both streams; the status is the caller's.
-fn output(mut cmd: Command) -> io::Result<Output> {
-    cmd.stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    agentfs_git::git_cli::counted(&mut cmd)?.wait_with_output()
-}
-
 /// Where each record of `git log --format=%x01%H%n%B` starts.
 const RECORD_START: u8 = 1;
 
@@ -1018,16 +1065,10 @@ fn visit_record(record: &[u8], visit: &mut impl FnMut(Oid, &[u8])) -> Result<()>
     Ok(())
 }
 
-// Spawn, feed stdin and wait. The exit status wins over a failed stdin write: a
-// git that died of a full disk also breaks the pipe, and stderr says why.
-fn run_command(mut cmd: Command, input: Option<&[u8]>) -> Result<Output> {
-    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
-    if input.is_some() {
-        cmd.stdin(Stdio::piped());
-    } else {
-        cmd.stdin(Stdio::null());
-    }
-    let mut child = agentfs_git::git_cli::counted(&mut cmd)?;
+// Feed a started child's stdin (piped when there is `input`) and wait. The exit
+// status wins over a failed stdin write: a git that died of a full disk also
+// breaks the pipe, and stderr says why.
+fn run_command(mut child: Child, input: Option<&[u8]>) -> Result<Output> {
     let (output, write_result) = std::thread::scope(|scope| {
         let writer = input.map(|bytes| {
             let mut stdin = child.stdin.take().expect("piped stdin");
@@ -1122,38 +1163,18 @@ fn parse_oid(bytes: &[u8]) -> Result<Oid> {
     Oid::from_str(text).map_err(|_| Error::Invalid("object id".into()))
 }
 
-// Only tree Git subprocesses inherit this one descriptor. The Arc keeps the
-// FileLock alive through synchronous waits, so its Drop cannot explicitly
-// unlock while a child is active. On a crash the kernel retains the lock on
-// the shared open file until the child exits, even before PDEATHSIG arrives.
-fn attach_lease(cmd: &mut Command, lease: &FileLock) {
-    attach_lease_signal(cmd, lease, libc::SIGKILL);
-}
-
-fn attach_lease_signal(cmd: &mut Command, lease: &FileLock, signal: i32) {
-    let fd = lease.file().as_raw_fd();
-    #[cfg(target_os = "linux")]
-    let parent = unsafe { libc::getpid() };
-    // SAFETY: pre_exec runs after fork, before exec; it uses only async-signal-
-    // safe syscalls and the fd remains open because the caller owns the lease.
-    unsafe {
-        cmd.pre_exec(move || {
-            #[cfg(target_os = "linux")]
-            {
-                if libc::prctl(libc::PR_SET_PDEATHSIG, signal) == -1 {
-                    return Err(io::Error::last_os_error());
-                }
-                if libc::getppid() != parent {
-                    return Err(io::Error::from_raw_os_error(libc::ECHILD));
-                }
-            }
-            let borrowed = BorrowedFd::borrow_raw(fd);
-            let mut flags = rustix::io::fcntl_getfd(borrowed)?;
-            flags.remove(rustix::io::FdFlags::CLOEXEC);
-            rustix::io::fcntl_setfd(borrowed, flags)?;
-            Ok(())
-        });
-    }
+/// The lease of a store opened outside an actor (tests): a shared lock on
+/// the sibling `<path>.lease`, so that any number of them may be open.
+#[cfg(any(test, feature = "test-util"))]
+fn test_lease(path: &Path) -> io::Result<Arc<InheritedLock>> {
+    use agentfs_os::file_lock::{FileLock, Mode};
+    let mut name = path.as_os_str().to_owned();
+    name.push(".lease");
+    let file = FileLock::open(Path::new(&name))?;
+    Ok(Arc::new(InheritedLock::new(FileLock::wait(
+        file,
+        Mode::Shared,
+    )?)))
 }
 
 #[cfg(test)]
@@ -1178,158 +1199,7 @@ mod classify_tests {
 #[allow(clippy::disallowed_methods, reason = "a test makes a store of its own")]
 mod tests {
     use super::*;
-    use agentfs_os::file_lock::Mode;
-    use std::time::{Duration, Instant};
 
-    // Invoked as a separate test process by the lifecycle test below.
-    #[test]
-    fn lease_child_process() {
-        let Some(root) = std::env::var_os("AGENTFS_TREE_LEASE_TEST") else {
-            return;
-        };
-        let root = PathBuf::from(root);
-        let lease = FileLock::try_take(&root.join("actor.lock"), Mode::Exclusive)
-            .unwrap()
-            .unwrap();
-        let mut command = agentfs_align::isolated("git");
-        command
-            .env("GIT_TERMINAL_PROMPT", "0")
-            .args(["upload-pack", "--stateless-rpc"])
-            .arg(root.join("repo.git"))
-            // The test driver retains the write end even after this helper is
-            // killed, so Git cannot exit on EOF before the death signal.
-            .stdin(Stdio::inherit())
-            .stdout(Stdio::null())
-            .stderr(Stdio::from(
-                std::fs::File::create(root.join("git.stderr")).unwrap(),
-            ));
-        let signal = if std::env::var_os("AGENTFS_TREE_LEASE_STOP").is_some() {
-            libc::SIGSTOP
-        } else {
-            libc::SIGKILL
-        };
-        attach_lease_signal(&mut command, &lease, signal);
-        let mut child = command.spawn().unwrap();
-        std::fs::write(root.join("pid.tmp"), child.id().to_string()).unwrap();
-        std::fs::rename(root.join("pid.tmp"), root.join("pid")).unwrap();
-        child.wait().unwrap();
-    }
-
-    fn run_death_case(stop: bool) {
-        let temp = tempfile::tempdir().unwrap();
-        TreeGit::init(temp.path().join("repo.git")).unwrap();
-        let mut command = Command::new(std::env::current_exe().unwrap());
-        command
-            .args([
-                "--exact",
-                "tree_git::tests::lease_child_process",
-                "--nocapture",
-            ])
-            .env("AGENTFS_TREE_LEASE_TEST", temp.path())
-            .env_remove("AGENTFS_TREE_LEASE_STOP")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::null())
-            .stderr(Stdio::from(
-                std::fs::File::create(temp.path().join("helper.stderr")).unwrap(),
-            ));
-        if stop {
-            command.env("AGENTFS_TREE_LEASE_STOP", "1");
-        }
-        let mut parent = command.spawn().unwrap();
-        let keep_stdin = parent.stdin.take().unwrap();
-        let diagnostic = || {
-            format!(
-                "helper stderr: {}; git stderr: {}",
-                std::fs::read_to_string(temp.path().join("helper.stderr")).unwrap_or_default(),
-                std::fs::read_to_string(temp.path().join("git.stderr")).unwrap_or_default(),
-            )
-        };
-        let pidfile = temp.path().join("pid");
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while !pidfile.exists() && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        let pid: i32 = std::fs::read_to_string(pidfile)
-            .unwrap_or_else(|err| panic!("helper did not publish Git pid: {err}; {}", diagnostic()))
-            .parse()
-            .unwrap();
-        // Wait until Git has entered its blocking read; merely spawning it
-        // does not prove it survived startup or is still attached to stdin.
-        let deadline = Instant::now() + Duration::from_secs(10);
-        loop {
-            let status = std::fs::read_to_string(format!("/proc/{pid}/status"))
-                .unwrap_or_else(|err| panic!("Git exited before ready: {err}; {}", diagnostic()));
-            if status.lines().any(|line| line.starts_with("State:\tS")) {
-                break;
-            }
-            assert!(
-                !status.lines().any(|line| line.starts_with("State:\tZ")),
-                "Git exited before ready; {}",
-                diagnostic()
-            );
-            assert!(
-                Instant::now() < deadline,
-                "Git did not become ready; {}",
-                diagnostic()
-            );
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        parent.kill().unwrap();
-        parent.wait().unwrap();
-        if stop {
-            let deadline = Instant::now() + Duration::from_secs(10);
-            loop {
-                let status =
-                    std::fs::read_to_string(format!("/proc/{pid}/status")).unwrap_or_else(|err| {
-                        panic!("Git exited before lease check: {err}; {}", diagnostic())
-                    });
-                if status.lines().any(|line| line.starts_with("State:\tT")) {
-                    break;
-                }
-                assert!(
-                    Instant::now() < deadline,
-                    "Git did not receive parent death signal"
-                );
-                std::thread::sleep(Duration::from_millis(10));
-            }
-            assert!(
-                FileLock::try_take(&temp.path().join("actor.lock"), Mode::Exclusive)
-                    .unwrap()
-                    .is_none()
-            );
-            assert_eq!(unsafe { libc::kill(pid, libc::SIGKILL) }, 0);
-        }
-        let deadline = Instant::now() + Duration::from_secs(10);
-        loop {
-            if FileLock::try_take(&temp.path().join("actor.lock"), Mode::Exclusive)
-                .unwrap()
-                .is_some()
-            {
-                break;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "Git retained lease after parent death"
-            );
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        drop(keep_stdin);
-        // A zombie has exited even if the system has not yet reaped it.
-        let deadline = Instant::now() + Duration::from_secs(10);
-        loop {
-            let status = std::fs::read_to_string(format!("/proc/{pid}/status"));
-            if status.is_err()
-                || status
-                    .unwrap()
-                    .lines()
-                    .any(|line| line.starts_with("State:\tZ"))
-            {
-                break;
-            }
-            assert!(Instant::now() < deadline, "Git did not exit");
-            std::thread::sleep(Duration::from_millis(10));
-        }
-    }
     /// Each commit two tips reach (one a merge, the other reached from it
     /// too) is visited once, with its message's exact bytes; a tip that is
     /// no commit fails.
@@ -1376,13 +1246,5 @@ mod tests {
                 .is_err()
         );
         assert_eq!(none, 0);
-    }
-
-    #[test]
-    fn killed_parent_leaves_lease_until_git_exits() {
-        // Stop on parent death to inspect the lease, then exercise the actual
-        // SIGKILL production path separately.
-        run_death_case(true);
-        run_death_case(false);
     }
 }

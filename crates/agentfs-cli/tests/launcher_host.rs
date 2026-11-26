@@ -131,9 +131,9 @@ impl Volume {
     }
 
     /// The volume's lease, taken once whoever holds it lets go. End every
-    /// host that may hold it before taking this guard: a host's end waits
-    /// for the lease ([`Host::wait`]), which never comes while the guard
-    /// lives.
+    /// host that may hold it before taking this guard: a host's end checks
+    /// or waits for the lease ([`Host::wait`]), which fails or never comes
+    /// while the guard lives.
     fn lease(&self) -> FileLock {
         lease(&self.lease_path()).unwrap()
     }
@@ -280,23 +280,29 @@ impl Host {
         self.wait();
     }
 
-    /// Reaps the host, waits until the lease it may have held is free
-    /// (taken and let go at once), and returns its exit status and what it
-    /// logged. Every end of a host in this harness comes here.
+    /// Reaps the host and returns its exit status and what it logged.
+    /// Every end of a host in this harness comes here.
     ///
-    /// The lease is shared with the host's tree Git children, which keep it
-    /// until each has exited, and the host's exit does not wait for them
-    /// when it does not drain (exit 3, exit 2 with a view open, a kill): a
-    /// host started before then exits 75, as the launcher's contract says.
-    /// The host takes the lease before its hello, so a host may hold it
-    /// without having written one; only one that exited 75 ([`BUSY`]) never
-    /// took it, and it skips the wait, which would never end while the
-    /// other holder keeps the lease.
+    /// At each status the host makes itself (0, 1, 2, 3) it has ended every
+    /// process that shares its lease, so the lease is free the moment it is
+    /// reaped (docs/library/filesystem.md, "Exit status"): taken at once,
+    /// or the test fails. One that exited 75 ([`BUSY`]) never took it, and
+    /// is not checked. A host that died of a signal (a kill) or a panic
+    /// (101) ended nothing: its tree Git children keep the lease until each
+    /// dies of its parent-death signal, so the lease is waited for.
     fn wait(&mut self) -> (ExitStatus, String) {
         let status = self.child.wait().unwrap();
         self.ended = true;
-        if status.code() != Some(BUSY) {
-            drop(lease(&self.lease).unwrap());
+        match status.code() {
+            Some(BUSY) => {}
+            Some(0..=3) => {
+                let free = FileLock::try_take(&self.lease, Mode::Exclusive).unwrap();
+                if free.is_none() {
+                    let log = self.log.take().unwrap().join().unwrap();
+                    panic!("the host exited {status} with its lease held: {log}");
+                }
+            }
+            _ => drop(lease(&self.lease).unwrap()),
         }
         (status, self.log.take().unwrap().join().unwrap())
     }
@@ -875,46 +881,102 @@ fn a_stop_with_views_open_leaves_them_for_the_next_host() {
     assert!(v.messages("f").contains("Agentfs-Pod: p1"));
 }
 
-/// (m) A host's end in this harness waits for its lease: a host stopped
-/// with a view open while its builder still packs what the view wrote
-/// exits 3, its Git children keeping the lease until each has exited, and
-/// [`Host::eof`] returns only once the lease is free. Each round ends the
-/// host right after a burst of files, which leaves the builder packing
-/// them; the window is a race, so the rounds repeat it.
+/// A child of `host` that holds the volume's lease (an fd of it links to
+/// `lock`), stopped (SIGSTOP), by its pidfd: none while no such child runs.
+/// The pidfd is taken before its fds are read, and the stop through it
+/// succeeds only while that process lives, so the fds read were its own.
+fn stop_a_holder(host: u32, lock: &Path) -> Option<OwnedFd> {
+    let tasks = std::fs::read_dir(format!("/proc/{host}/task")).ok()?;
+    for task in tasks.flatten() {
+        let children = std::fs::read_to_string(task.path().join("children")).unwrap_or_default();
+        for pid in children.split_whitespace().filter_map(|p| p.parse().ok()) {
+            let Some(pid) = rustix::process::Pid::from_raw(pid) else {
+                continue;
+            };
+            let Ok(pidfd) = rustix::process::pidfd_open(pid, rustix::process::PidfdFlags::empty())
+            else {
+                continue;
+            };
+            let Ok(fds) = std::fs::read_dir(format!("/proc/{}/fd", pid.as_raw_nonzero())) else {
+                continue;
+            };
+            let holds = fds
+                .flatten()
+                .any(|fd| std::fs::read_link(fd.path()).is_ok_and(|to| to == lock));
+            if holds
+                && rustix::process::pidfd_send_signal(&pidfd, rustix::process::Signal::STOP).is_ok()
+            {
+                return Some(pidfd);
+            }
+        }
+    }
+    None
+}
+
+/// Detaches the stale layer at its path when dropped, so a round that fails
+/// (in [`Host::wait`] too) leaves no mount.
+struct Detach<'a>(&'a Path);
+
+impl Drop for Detach<'_> {
+    fn drop(&mut self) {
+        let _ = agentfs_fuse::stale::detach_stale_layers(self.0, 1);
+    }
+}
+
+/// (m) A host stopped with a view open ends every process that shares its
+/// lease before it exits 3, so the lease is free the moment it is reaped
+/// ([`Host::wait`] checks it). Each round, on one volume, stops a host while
+/// one of its git children holds the lease, stopped (SIGSTOP) so it cannot
+/// end on its own: only the host's end of its children frees the lease.
+/// What every round wrote is in history once a last host has drained.
 #[test]
 #[ignore = "needs root and /dev/fuse: ci/fuse-tests.sh"]
 fn a_stopped_hosts_lease_is_free_when_its_end_returns() {
-    const ROUNDS: usize = 20;
-    let Some(mut v) = Volume::mounted() else {
+    const ROUNDS: usize = 10;
+    /// Files a round writes, at most, before one of the host's git children
+    /// is found holding the lease.
+    const MAX_FILES: usize = 10_000;
+    let Some(v) = Volume::mounted() else {
         return;
     };
+    let lock = std::fs::canonicalize(v.lease_path()).unwrap();
     let data = vec![b'x'; 64 << 10];
     for round in 0..ROUNDS {
-        if round > 0 {
-            v = Volume::new();
-        }
-        let a = mkdir(&v, "a");
+        let at = mkdir(&v, &format!("r{round}"));
         let mut host = v.host(&[]);
         host.hello();
+        let (label, name, uid) = (
+            format!("a{round}"),
+            format!("p{round}"),
+            format!("u{round}"),
+        );
         assert!(matches!(
-            host.ask(&open(TreeRef::Root, &a, "a", pod("ns", "p1", "u1"))),
+            host.ask(&open(TreeRef::Root, &at, &label, pod("ns", &name, &uid))),
             Reply::Opened { .. }
         ));
-        for i in 0..64 {
-            std::fs::write(a.join(format!("f{i}")), &data).unwrap();
-        }
+        let _detach = Detach(&at);
+        let stopped = (0..MAX_FILES).find_map(|i| {
+            std::fs::write(at.join(format!("f{round}-{i}")), &data).unwrap();
+            stop_a_holder(host.child.id(), &lock)
+        });
         let (status, log) = host.eof();
-        let free = FileLock::try_take(&v.lease_path(), Mode::Exclusive)
-            .unwrap()
-            .is_some();
-        // Detached before any assertion, so a red round leaves no mount.
-        let detached = agentfs_fuse::stale::detach_stale_layers(&a, 1);
-        assert_eq!(status.code(), Some(3), "round {round}: {log}");
+        let detached = agentfs_fuse::stale::detach_stale_layers(&at, 1);
         assert!(
-            free,
-            "round {round}: the lease is held after the host's end returned"
+            stopped.is_some(),
+            "round {round}: no git child held the lease in {MAX_FILES} writes"
         );
+        assert_eq!(status.code(), Some(3), "round {round}: {log}");
         assert_eq!(detached.unwrap(), 1, "round {round}");
+    }
+    let mut host = v.host(&[]);
+    host.hello();
+    let (status, log) = host.eof();
+    assert_eq!(status.code(), Some(0), "{log}");
+    for round in 0..ROUNDS {
+        assert!(
+            !v.messages(&format!("f{round}-0")).is_empty(),
+            "round {round}'s first file is not in history"
+        );
     }
 }
 

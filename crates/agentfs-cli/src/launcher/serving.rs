@@ -221,16 +221,31 @@ impl<T> Serving<T> {
         self.left
     }
 
-    /// After a [`Self::leave`]: forgets the view host without unmounting
-    /// anything, and answers how many views were open. Every change a view
-    /// took is in the journal already (docs/trees.md, "Recording and
-    /// durability"); the process's exit closes each view's kernel channel.
+    /// After a [`Self::leave`]: ends the volume's own processes and forgets
+    /// the domains ([`Domains::abandon`]), forgets the view host without
+    /// unmounting anything, and answers how many views were open. Every
+    /// change a view took is in the journal already (docs/trees.md,
+    /// "Recording and durability"); the process's exit closes each view's
+    /// kernel channel and frees the volume's lease. An end that failed is
+    /// logged (`tree AbandonIncomplete`): the lease is then free only once
+    /// each git child has exited.
     pub(super) fn abandon(self) -> usize {
-        let open = self.views.len();
-        // Dropping the view host would unmount its views, and dropping the
-        // domains would wait on the sessions it holds.
-        std::mem::forget(self);
-        open
+        let Serving {
+            domains,
+            host,
+            views,
+            triggers,
+            ..
+        } = self;
+        if let Err(e) = domains.abandon() {
+            eprintln!(
+                "tree AbandonIncomplete: {e}: the volume's lease is free once each of its git \
+                 children has exited"
+            );
+        }
+        // Dropping the view host would unmount its views.
+        std::mem::forget((host, triggers));
+        views.len()
     }
 
     /// The next trigger; `None` once every sender is gone.
