@@ -5,7 +5,12 @@ description: >-
   their SHA-256s, are kept in the Actions cache under a key made of those pins
   (ci/install-kind.sh --cache-key), so a job downloads them only on a miss. A kind built
   from Go's module proxy, when the release download is refused, is not saved. Run it
-  after checkout.
+  after checkout. With check-fallback, it also builds that kind into
+  $RUNNER_TEMP/kind-fallback, as a refused download would, and fails when it cannot.
+inputs:
+  check-fallback:
+    description: Also build kind the way a refused release download does, and fail if that breaks.
+    default: 'false'
 runs:
   using: composite
   steps:
@@ -30,3 +35,18 @@ runs:
       with:
         path: ${{ runner.temp }}/kind/bin
         key: ${{ steps.key.outputs.key }}
+    # The fallback runs only when GitHub refuses the release, so one job
+    # drills it on every run: kind from Go's module proxy, beside the cached
+    # kubectl, and not the release's binary.
+    - if: inputs.check-fallback == 'true'
+      shell: bash
+      run: |
+        drill=$RUNNER_TEMP/kind-fallback
+        mkdir -p "$drill/bin"
+        cp "$RUNNER_TEMP/kind/bin/kubectl" "$drill/bin/"
+        GITHUB_ACTIONS= KIND_URL=http://127.0.0.1:9/refused ci/install-kind.sh "$drill" >/dev/null
+        if ci/install-kind.sh --verified "$drill"; then
+          echo "::error title=kind fallback::the drill installed the release binary, not a Go build" >&2
+          exit 1
+        fi
+        "$drill/bin/kind" version

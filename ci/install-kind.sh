@@ -9,7 +9,8 @@
 #   ci/install-kind.sh <dir>             install; prints KIND_NODE_IMAGE=...
 #   ci/install-kind.sh --cache-key       the cache key: the pins below
 #   ci/install-kind.sh --verified <dir>  exits 0 when <dir>/bin holds the
-#                                        release binaries, by SHA-256
+#                                        release binaries, by SHA-256, and
+#                                        nothing else
 #
 # A binary already in <dir>/bin, restored from the cache, is kept when its
 # SHA-256 is the pinned one; otherwise it is downloaded and checked, and a
@@ -21,7 +22,8 @@
 # action does not cache it. kubectl comes only from dl.k8s.io: its main
 # package lives in k8s.io/kubernetes, whose replace directives `go install`
 # refuses, so the cache is its one shelter. KIND_URL overrides the kind
-# release URL, to try the fallback.
+# release URL, to try the fallback: the kind action's check-fallback does,
+# in helm.yml's lint job.
 #
 # Prints, for $GITHUB_ENV or `export`:
 #   KIND_NODE_IMAGE   the kindest/node image for this kind release, by digest
@@ -96,7 +98,8 @@ case "${1:-}" in
     ;;
   --verified)
     dir=${2:?install directory}
-    have "$KIND_SHA256" "$dir/bin/kind" && have "$KUBECTL_SHA256" "$dir/bin/kubectl"
+    have "$KIND_SHA256" "$dir/bin/kind" && have "$KUBECTL_SHA256" "$dir/bin/kubectl" &&
+      [ "$(ls -A "$dir/bin")" = "$(printf 'kind\nkubectl')" ]
     exit
     ;;
 esac

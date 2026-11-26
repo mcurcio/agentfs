@@ -42,8 +42,10 @@ jobs:
         with:
           version: ${{ env.CT_VERSION }}
           uv_version: 0.13.1
-      - name: install kind and kubectl
+      - name: install kind and kubectl, and drill its Go fallback
         uses: ./.github/actions/kind
+        with:
+          check-fallback: true
       - name: install helm-docs
         run: |
           ci/install-helm-docs.sh "$RUNNER_TEMP/helm-docs"

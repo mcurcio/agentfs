@@ -608,8 +608,8 @@ evidence. CI scripts judge the build:
   sets up buildx or creates a kind cluster around these helpers, or a job
   that pulls without the action. The examples and charts users run keep
   Docker Hub as their default.
-- **Outside tools have one home each, and a refused host does not fail
-  CI.** Debian packages come from
+- **Outside tools have one home each, and neither kind's release download
+  nor the runner's third-party apt sources can fail CI.** Debian packages come from
   [`ci/apt-install.sh`](../ci/apt-install.sh) `<packages>`, which runs
   `apt-get update` and `apt-get install` against the runner's Ubuntu
   archive alone (`/etc/apt/sources.list.d/ubuntu.sources`), never the
@@ -625,14 +625,27 @@ evidence. CI scripts judge the build:
   kind release, the script builds kind at the same version with `go
   install` from Go's module proxy, which checks every module against Go's
   checksum database (sum.golang.org) in place of the release's SHA-256,
-  and raises a warning on the run. That build is not cached: only binaries
-  that match the release checksums are. kubectl has no fallback, because
+  and raises a warning on the run. That build is not cached: only a
+  directory holding exactly the two release binaries is. helm.yml's lint
+  job drills the fallback on every run (the action's `check-fallback`),
+  so a runner image without Go breaks it in the open, not in an outage. kubectl has no fallback, because
   its main package is in `k8s.io/kubernetes`, which `go install` cannot
   build; the cache is what shelters it from dl.k8s.io. A bad checksum
   always fails. A test (`ci_installs_outside_tools_through_their_homes`)
-  refuses an `apt-get` outside `ci/apt-install.sh`, a kind or kubectl
-  download outside `ci/install-kind.sh`, and a workflow that runs the
-  script without the action.
+  refuses `apt-get`, `apt` or `aptitude` outside `ci/apt-install.sh`
+  (lines a shell reads from a heredoc included), a kind or kubectl
+  download outside `ci/install-kind.sh`, a workflow that runs the script
+  without the action, and a heredoc that never ends, which would hide the
+  lines after it. Other outside hosts can still fail a job when they
+  refuse, with no cache or fallback yet: dl.k8s.io for kubectl on a cache
+  miss; get.helm.sh through `azure/setup-helm`; GitHub releases for
+  Prometheus, helm-docs, resvg, mdBook and the tools
+  `taiki-e/install-action` fetches; kernel.org for git on a cache miss of
+  the pinned-git action; raw.githubusercontent.com in
+  `ci/install-replay-log.sh`; proxy.golang.org and sum.golang.org for
+  csi-sanity and for kind's fallback itself; Docker Hub's mirror for
+  images; and the Python packages of chart-testing. The next refusal
+  among them extends this pattern to its host.
 - **The image is published after the kind jobs pass.** The `image`
   workflow publishes to `ghcr.io/mcurcio/agentfs` as the commit sha and
   `latest`, only from main and only after both kind end-to-end jobs

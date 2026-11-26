@@ -262,12 +262,60 @@ const KIND_HOME: &str = "ci/install-kind.sh";
 /// verified.
 const KIND_ACTION: &str = ".github/actions/kind/action.yml";
 
+/// The heredoc a line of shell opens, if any: its terminator, and whether
+/// a shell reads it (`bash <<EOF`, `sudo sh -s <<EOF`), so its lines are
+/// commands. A `<<` is a heredoc only when a word that starts with a letter
+/// or `_` follows it, outside `$((...))` and `((...))`, and never in Python,
+/// where it is a shift; `<<<` is a here-string.
+fn heredoc_opened(name: &str, code: &str) -> Option<(String, bool)> {
+    if name.ends_with(".py") {
+        return None;
+    }
+    let mut from = 0;
+    while let Some(found) = code[from..].find("<<") {
+        let at = from + found;
+        from = at + 2;
+        let rest = &code[at + 2..];
+        if rest.starts_with('<') {
+            from += 1;
+            continue;
+        }
+        let before = &code[..at];
+        if before.matches("((").count() > before.matches("))").count() {
+            continue;
+        }
+        let word = rest
+            .strip_prefix('-')
+            .unwrap_or(rest)
+            .trim_start()
+            .trim_start_matches(['\'', '"']);
+        if !word.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_') {
+            continue;
+        }
+        let word: String = word
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+            .collect();
+        let command = before
+            .rsplit(['|', ';', '&', '(', '`'])
+            .next()
+            .unwrap_or("");
+        let shell = command
+            .split_whitespace()
+            .any(|w| matches!(w.rsplit('/').next(), Some("bash" | "sh" | "dash")));
+        return Some((word, shell));
+    }
+    None
+}
+
 /// What, in one CI file (`name`, from the repository's root), installs an
-/// outside tool other than through its home: an `apt-get` outside
-/// [`APT_HOME`] (a heredoc's lines, a container's build, are not the
-/// runner's), a download of kind or kubectl outside [`KIND_HOME`], and a
-/// run of [`KIND_HOME`] in a workflow outside [`KIND_ACTION`]. A path
-/// filter naming a home is no run of it; comments are skipped.
+/// outside tool other than through its home: apt (`apt-get`, `apt`,
+/// `aptitude`) outside [`APT_HOME`] (a heredoc's lines, a container's
+/// build, are not the runner's, unless a shell reads them), a download of
+/// kind or kubectl outside [`KIND_HOME`], and a run of [`KIND_HOME`] in a
+/// workflow outside [`KIND_ACTION`]. A path filter naming a home is no run
+/// of it; comments are skipped. A heredoc that never ends is a problem too,
+/// as the scan cannot tell what follows it.
 fn outside_tool_problems(name: &str, text: &str) -> Vec<String> {
     let workflow = name.starts_with(".github/");
     let filters: BTreeSet<usize> = if workflow {
@@ -276,42 +324,35 @@ fn outside_tool_problems(name: &str, text: &str) -> Vec<String> {
         BTreeSet::new()
     };
     let mut problems = Vec::new();
-    let mut heredoc: Option<String> = None;
+    // The open heredoc: its terminator, its first line, and whether its
+    // lines are scanned.
+    let mut heredoc: Option<(String, usize, bool)> = None;
     for (n, line) in text.lines().enumerate() {
         let code = line.trim();
-        if let Some(end) = &heredoc {
+        if let Some((end, _, scanned)) = &heredoc {
+            let scanned = *scanned;
             if code == end {
                 heredoc = None;
+                continue;
             }
-            continue;
+            if !scanned {
+                continue;
+            }
         }
         if code.starts_with('#') {
             continue;
         }
-        if let Some(at) = code.find("<<") {
-            let word: String = code[at + 2..]
-                .trim_start_matches('-')
-                .trim_start()
-                .trim_start_matches(['\'', '"'])
-                .chars()
-                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
-                .collect();
-            if !word.is_empty() {
-                heredoc = Some(word);
-            }
+        if heredoc.is_none() {
+            heredoc = heredoc_opened(name, code).map(|(end, shell)| (end, n + 1, shell));
         }
         let at = format!("{name}:{}", n + 1);
-        let words: Vec<&str> = code
-            .split(|c: char| !(c.is_ascii_alphanumeric() || c == '-' || c == '_'))
-            .filter(|w| !w.is_empty())
-            .collect();
-        let apt = words.contains(&"apt-get")
-            || words
-                .windows(2)
-                .any(|w| w[0] == "apt" && matches!(w[1], "update" | "install"));
+        let apt = code
+            .split(|c: char| c.is_whitespace() || "|;&()`'\"".contains(c))
+            .filter_map(|w| w.rsplit('/').next())
+            .any(|w| matches!(w, "apt-get" | "apt" | "aptitude"));
         if apt && name != APT_HOME {
             problems.push(format!(
-                "{at}: apt-get outside {APT_HOME}; run {APT_HOME} <packages>"
+                "{at}: apt outside {APT_HOME}; run {APT_HOME} <packages>"
             ));
         }
         let downloads = [
@@ -332,6 +373,11 @@ fn outside_tool_problems(name: &str, text: &str) -> Vec<String> {
                 KIND_ACTION.trim_end_matches("/action.yml")
             ));
         }
+    }
+    if let Some((end, first, _)) = heredoc {
+        problems.push(format!(
+            "{name}:{first}: a heredoc whose terminator {end} never comes; the scan cannot read past it"
+        ));
     }
     problems
 }
@@ -379,6 +425,15 @@ fn outside_tools_outside_their_homes_are_found() {
             "          command -v jq || sudo apt-get install -y jq",
         ),
         (workflow, "      - run: sudo apt update"),
+        (workflow, "      - run: sudo apt -y install fuse3"),
+        (workflow, "          sudo apt \\\n            install -y x"),
+        ("ci/x.sh", "echo $((1 << 2))\nsudo apt-get update\n"),
+        ("ci/x.sh", "sudo bash <<EOF\napt-get update\nEOF\n"),
+        ("ci/x.sh", "sudo sh -s <<'EOF'\napt-get update\nEOF\n"),
+        ("ci/x.sh", "sudo aptitude update"),
+        ("ci/x.sh", "sudo -E apt-get update"),
+        ("ci/x.sh", "/usr/bin/apt-get install -y x"),
+        ("ci/x.sh", "cat <<EOF\nno end\n"),
         ("ci/install-git.sh", "sudo apt-get install -y gcc"),
         (
             "ci/x.sh",
@@ -424,6 +479,16 @@ fn outside_tools_outside_their_homes_are_found() {
         (
             "ci/dev-image.sh",
             "docker build - <<'DOCKERFILE'\nRUN apt-get update \\\n && apt-get install -y git\nDOCKERFILE\n",
+        ),
+        (
+            "ci/x.sh",
+            "head -c $(((64 << 20) - 1)) /dev/zero\nx=$((1 << n))\ngrep y <<<\"$z\"\n",
+        ),
+        ("ci/x.py", "MIB = 1 << 20\nSHIFT = 1 << n\n"),
+        (APT_HOME, "sources=/etc/apt/sources.list.d/ubuntu.sources"),
+        (
+            "ci/x.sh",
+            "\"$(dirname \"$0\")/apt-install.sh\" gcc\nrm -rf /var/lib/apt/lists\n",
         ),
     ] {
         assert_eq!(
