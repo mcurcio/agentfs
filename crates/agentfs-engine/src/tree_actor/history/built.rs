@@ -141,21 +141,39 @@ pub(in crate::tree_actor) struct Inner {
     /// Tests: runs at each batch's start and once it has read the record it
     /// builds through ([`History::batch_read`]).
     #[cfg(test)]
-    batch_read: Mutex<Option<BatchRead>>,
+    batch_read: Hook<Option<RecordNo>>,
+    /// Tests: runs once a batch has fed its packer, before the packer
+    /// finishes ([`History::batch_packing`]).
+    #[cfg(test)]
+    batch_packing: Hook<()>,
     /// Tests: runs once a step's record is appended and applied
     /// ([`History::step_recorded`]).
     #[cfg(test)]
-    step_recorded: Mutex<Option<StepRecorded>>,
+    step_recorded: Hook<RecordNo>,
 }
 
-/// Tests: a hook given each step once its record is appended and applied.
+/// Tests: a hook a test sets, given each `A` where it is called.
 #[cfg(test)]
-type StepRecorded = Box<dyn FnMut(RecordNo) + Send>;
+type Hook<A> = Mutex<Option<Box<dyn FnMut(A) + Send>>>;
 
-/// Tests: a hook given `None` at each batch's start and the record it
-/// builds through once read.
+/// Tests: sets `slot`'s hook.
 #[cfg(test)]
-type BatchRead = Box<dyn FnMut(Option<RecordNo>) + Send>;
+fn set_hook<A>(slot: &Hook<A>, hook: impl FnMut(A) + Send + 'static) {
+    *slot.lock().unwrap_or_else(PoisonError::into_inner) = Some(Box::new(hook));
+}
+
+/// Tests: runs `slot`'s hook, if one is set, on `arg`, outside the slot's
+/// lock, so the hook may set another.
+#[cfg(test)]
+fn call_hook<A>(slot: &Hook<A>, arg: A) {
+    let hook = slot.lock().unwrap_or_else(PoisonError::into_inner).take();
+    if let Some(mut hook) = hook {
+        hook(arg);
+        slot.lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get_or_insert(hook);
+    }
+}
 
 /// History's state, behind one lock. Every change notifies `changed`.
 struct State {
@@ -380,6 +398,8 @@ impl History {
                 #[cfg(test)]
                 batch_read: Mutex::new(None),
                 #[cfg(test)]
+                batch_packing: Mutex::new(None),
+                #[cfg(test)]
                 step_recorded: Mutex::new(None),
             }),
         })
@@ -575,31 +595,29 @@ impl History {
         &self,
         hook: impl FnMut(Option<RecordNo>) + Send + 'static,
     ) {
-        *self
-            .inner
-            .batch_read
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner) = Some(Box::new(hook));
+        set_hook(&self.inner.batch_read, hook);
     }
 
     /// Tests: the builder's batch starts (`None`) or has read `through`
     /// ([`History::on_batch_read`]).
     #[cfg(test)]
     pub(in crate::tree_actor) fn batch_read(&self, through: Option<RecordNo>) {
-        let hook = self
-            .inner
-            .batch_read
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .take();
-        if let Some(mut hook) = hook {
-            hook(through);
-            self.inner
-                .batch_read
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .get_or_insert(hook);
-        }
+        call_hook(&self.inner.batch_read, through);
+    }
+
+    /// Tests: `hook` runs once a batch has fed its packer (`git
+    /// fast-import`, still running) every object, before it closes the
+    /// packer's input: a batch held there holds its packer mid-pack.
+    #[cfg(test)]
+    pub(in crate::tree_actor) fn on_batch_packing(&self, hook: impl FnMut(()) + Send + 'static) {
+        set_hook(&self.inner.batch_packing, hook);
+    }
+
+    /// Tests: the builder's batch has fed its packer
+    /// ([`History::on_batch_packing`]).
+    #[cfg(test)]
+    pub(in crate::tree_actor) fn batch_packing(&self) {
+        call_hook(&self.inner.batch_packing, ());
     }
 
     /// Tests: `hook` runs under the actor's lock once a step's record is
@@ -610,31 +628,14 @@ impl History {
         &self,
         hook: impl FnMut(RecordNo) + Send + 'static,
     ) {
-        *self
-            .inner
-            .step_recorded
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner) = Some(Box::new(hook));
+        set_hook(&self.inner.step_recorded, hook);
     }
 
     /// Tests: step `step`'s record is appended and applied
     /// ([`History::on_step_recorded`]).
     #[cfg(test)]
     pub(in crate::tree_actor) fn step_recorded(&self, step: RecordNo) {
-        let hook = self
-            .inner
-            .step_recorded
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .take();
-        if let Some(mut hook) = hook {
-            hook(step);
-            self.inner
-                .step_recorded
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .get_or_insert(hook);
-        }
+        call_hook(&self.inner.step_recorded, step);
     }
 
     /// Tests: returns once the builder waits for work with nothing wanted
@@ -793,12 +794,14 @@ impl History {
     }
 
     /// A batch that started at request count `at` failed: waiters that asked
-    /// at or before it get the error.
+    /// at or before it get the error. A failure once the volume's git
+    /// children have been ended ([`TreeGit::ended`]) is that end's, a stop
+    /// as a crash's: no alarm is logged.
     pub(in crate::tree_actor) fn failed_event(&self, error: BuildError, at: u64) {
         let mut state = self.state();
         state.failed_at = at;
         state.gate.failed();
-        if state.failed.as_ref() != Some(&error) {
+        if state.failed.as_ref() != Some(&error) && !self.inner.repo.ended() {
             eprintln!("tree HistoryBuildFailed: {error}");
         }
         state.failed = Some(error);

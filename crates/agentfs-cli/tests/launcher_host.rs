@@ -10,7 +10,7 @@
 //! that name nothing it holds are answered by id, and a stopped host's
 //! lease free once its end returns.
 
-use std::io::{BufRead, BufReader, Read as _, Write as _};
+use std::io::{BufRead, BufReader, Write as _};
 use std::os::fd::OwnedFd;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
@@ -108,10 +108,18 @@ impl Volume {
             .stdout(Stdio::null())
             .stderr(Stdio::piped());
         let mut child = cmd.spawn().unwrap();
-        let mut stderr = child.stderr.take().unwrap();
+        let stderr = child.stderr.take().unwrap();
+        let (logging, logged) = std::sync::mpsc::channel();
         let log = std::thread::spawn(move || {
             let mut all = String::new();
-            let _ = stderr.read_to_string(&mut all);
+            let mut stderr = BufReader::new(stderr);
+            let mut bytes = Vec::new();
+            while stderr.read_until(b'\n', &mut bytes).is_ok_and(|n| n > 0) {
+                let line = String::from_utf8_lossy(&bytes).into_owned();
+                all.push_str(&line);
+                let _ = logging.send(line);
+                bytes.clear();
+            }
             all
         });
         Host {
@@ -119,6 +127,7 @@ impl Volume {
             reader: BufReader::new(ours.try_clone().unwrap()),
             control: Some(ours),
             log: Some(log),
+            logged,
             next: 1,
             lease: self.lease_path(),
             ended: false,
@@ -196,6 +205,8 @@ struct Host {
     control: Option<UnixStream>,
     reader: BufReader<UnixStream>,
     log: Option<JoinHandle<String>>,
+    /// Each line the host logs, as it logs it ([`Host::logs`]).
+    logged: std::sync::mpsc::Receiver<String>,
     /// The next request's id.
     next: u64,
     /// The volume's lease file.
@@ -264,13 +275,25 @@ impl Host {
     }
 
     /// Shuts this test's end for writing (EOF; the reader is a clone of
-    /// the same socket): the host drains and exits. Returns once its lease
-    /// is free ([`Host::wait`]).
+    /// the same socket): the host drains and exits. Returns once it has
+    /// exited ([`Host::wait`]).
     fn eof(&mut self) -> (ExitStatus, String) {
+        self.shut();
+        self.wait()
+    }
+
+    /// Shuts this test's end for writing, as [`Host::eof`] does, without
+    /// waiting for the host.
+    fn shut(&mut self) {
         if let Some(control) = self.control.take() {
             control.shutdown(std::net::Shutdown::Write).unwrap();
         }
-        self.wait()
+    }
+
+    /// Returns once the host has logged a line holding `text`, while it
+    /// still runs: `false` if it ended its log first.
+    fn logs(&self, text: &str) -> bool {
+        self.logged.iter().any(|line| line.contains(text))
     }
 
     /// SIGKILL: the host's views are left stale. Returns once its lease is
@@ -923,12 +946,28 @@ impl Drop for Detach<'_> {
     }
 }
 
+/// Whether the process of `pidfd` has exited: its pidfd reads ready.
+fn has_exited(pidfd: &OwnedFd) -> bool {
+    let mut poll = libc::pollfd {
+        fd: std::os::fd::AsRawFd::as_raw_fd(pidfd),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // SAFETY: one valid pollfd, and no wait.
+    let ready = unsafe { libc::poll(&raw mut poll, 1, 0) };
+    assert!(ready >= 0, "{}", std::io::Error::last_os_error());
+    ready == 1
+}
+
 /// (m) A host stopped with a view open ends every process that shares its
 /// lease before it exits 3, so the lease is free the moment it is reaped
-/// ([`Host::wait`] checks it). Each round, on one volume, stops a host while
-/// one of its git children holds the lease, stopped (SIGSTOP) so it cannot
-/// end on its own: only the host's end of its children frees the lease.
-/// What every round wrote is in history once a last host has drained.
+/// ([`Host::wait`] checks it), and calls none of what that end kills a
+/// failure. Each round, on one volume, stops a host while one of its git
+/// children holds the lease, stopped (SIGSTOP) so it cannot end on its own:
+/// once the host logs that it stopped with views open, while it still
+/// runs, that child has exited, which only the host's end of its children
+/// does (its parent-death signal comes only at the host's exit). Every file
+/// each round wrote is in history once a last host has drained.
 #[test]
 #[ignore = "needs root and /dev/fuse: ci/fuse-tests.sh"]
 fn a_stopped_hosts_lease_is_free_when_its_end_returns() {
@@ -941,6 +980,8 @@ fn a_stopped_hosts_lease_is_free_when_its_end_returns() {
     };
     let lock = std::fs::canonicalize(v.lease_path()).unwrap();
     let data = vec![b'x'; 64 << 10];
+    // How many files each round wrote.
+    let mut written = Vec::with_capacity(ROUNDS);
     for round in 0..ROUNDS {
         let at = mkdir(&v, &format!("r{round}"));
         let mut host = v.host(&[]);
@@ -957,26 +998,44 @@ fn a_stopped_hosts_lease_is_free_when_its_end_returns() {
         let _detach = Detach(&at);
         let stopped = (0..MAX_FILES).find_map(|i| {
             std::fs::write(at.join(format!("f{round}-{i}")), &data).unwrap();
-            stop_a_holder(host.child.id(), &lock)
+            stop_a_holder(host.child.id(), &lock).map(|holder| (i + 1, holder))
         });
-        let (status, log) = host.eof();
+        let Some((files, holder)) = stopped else {
+            panic!("round {round}: no git child held the lease in {MAX_FILES} writes");
+        };
+        written.push(files);
+        host.shut();
+        assert!(
+            host.logs("stopped with 1 view(s) open"),
+            "round {round}: the host did not stop with its view open"
+        );
+        let ended = has_exited(&holder);
+        let (status, log) = host.wait();
         let detached = agentfs_fuse::stale::detach_stale_layers(&at, 1);
         assert!(
-            stopped.is_some(),
-            "round {round}: no git child held the lease in {MAX_FILES} writes"
+            ended,
+            "round {round}: a git child still held the lease once the host had stopped: {log}"
         );
         assert_eq!(status.code(), Some(3), "round {round}: {log}");
+        for alarm in ["HistoryBuildFailed", "RepackFailed"] {
+            assert!(
+                !log.contains(alarm),
+                "round {round}: the end raised {alarm}: {log}"
+            );
+        }
         assert_eq!(detached.unwrap(), 1, "round {round}");
     }
     let mut host = v.host(&[]);
     host.hello();
     let (status, log) = host.eof();
     assert_eq!(status.code(), Some(0), "{log}");
-    for round in 0..ROUNDS {
-        assert!(
-            !v.messages(&format!("f{round}-0")).is_empty(),
-            "round {round}'s first file is not in history"
-        );
+    for (round, files) in written.iter().enumerate() {
+        for i in 0..*files {
+            assert!(
+                !v.messages(&format!("f{round}-{i}")).is_empty(),
+                "round {round}'s file {i} is not in history"
+            );
+        }
     }
 }
 

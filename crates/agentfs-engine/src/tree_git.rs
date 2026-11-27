@@ -189,13 +189,22 @@ impl TreeGit {
         self.lease.spawn_with(cmd, agentfs_git::git_cli::counted)
     }
 
-    /// `result`, unless the lease's children have been ended: then any
-    /// failure is the end's (a refused start, or a git it killed), and
-    /// reads `ENOTCONN` raw, the errno a view answers once its server has
-    /// ended.
+    /// Whether the lease's holder has ended its children
+    /// ([`InheritedLock::end_children`]): a git failure from then on is the
+    /// end's (a refused start, or a git it killed), a stop and not a fault
+    /// of the store. The one judge of it for the store's users: this
+    /// store's calls ([`TreeGit::unless_ended`]), the builder's batch
+    /// (`History::failed_event`) and the repack.
+    pub(crate) fn ended(&self) -> bool {
+        self.lease.ended()
+    }
+
+    /// `result`, unless the lease's children have been ended
+    /// ([`TreeGit::ended`]): then any failure is the end's, and reads
+    /// `ENOTCONN` raw, the errno a view answers once its server has ended.
     fn unless_ended<T>(&self, result: Result<T>) -> Result<T> {
         result.map_err(|e| {
-            if self.lease.ended() {
+            if self.ended() {
                 Error::Io(io::Error::from_raw_os_error(libc::ENOTCONN))
             } else {
                 e
@@ -1199,6 +1208,38 @@ mod classify_tests {
 #[allow(clippy::disallowed_methods, reason = "a test makes a store of its own")]
 mod tests {
     use super::*;
+
+    /// A git the end of the lease's children killed in flight answers
+    /// `ENOTCONN` raw, as a refused start does, not the failure git's death
+    /// would classify as. The git (`hash-object` of a FIFO) is held in its
+    /// open of the FIFO until the test opens the other end, the event that
+    /// says it runs; the test never writes, so it runs until killed.
+    #[test]
+    fn a_git_the_end_kills_in_flight_answers_enotconn() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = TreeGit::init(temp.path().join("repo.git")).unwrap();
+        let fifo = temp.path().join("held");
+        rustix::fs::mknodat(
+            rustix::fs::CWD,
+            &fifo,
+            rustix::fs::FileType::Fifo,
+            rustix::fs::Mode::from_raw_mode(0o600),
+            0,
+        )
+        .unwrap();
+        let reading = {
+            let (repo, fifo) = (repo.clone(), fifo.clone());
+            std::thread::spawn(move || {
+                let path = fifo.to_str().unwrap();
+                repo.run(&["hash-object", path], None, true).map(drop)
+            })
+        };
+        // Returns once git has opened the FIFO to read it.
+        let _writer = std::fs::OpenOptions::new().write(true).open(&fifo).unwrap();
+        repo.lease.end_children().unwrap();
+        let error = crate::tree_actor::Error::from(reading.join().unwrap().unwrap_err());
+        assert_eq!(error.errno(), libc::ENOTCONN, "{error}");
+    }
 
     /// Each commit two tips reach (one a merge, the other reached from it
     /// too) is visited once, with its message's exact bytes; a tip that is

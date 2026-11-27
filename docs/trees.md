@@ -200,10 +200,11 @@ a key. A view at a stale mount of its own source is stacked over it
 the launcher, tree, label and access is left from a crashed host, so a fork's
 one writer survives the crash. The parent closing its end (EOF), SIGTERM or
 SIGINT stops the host: with no view open it drains the volume and exits 0 once
-it is released ([lifecycle](#volume-lifecycle)); with views open it exits 3 at
-once and leaves them stale, as a crash does, for the next host to rebind and
-stack over. Before that exit it ends its git children, as a crash ends them,
-so the volume is free for the next host once the exit is reaped; what the
+it is released ([lifecycle](#volume-lifecycle)); with views open it exits 3
+and leaves them stale, as a crash does, for the next host to rebind and stack
+over. Before that exit it ends its git children, as a crash ends them, and
+waits for each to exit, so the volume is free for the next host once the exit
+is reaped ([exit status](library/filesystem.md#the-view-host-command)); what the
 journal holds and history lacks is built at the next open. The last view
 ending does not stop it. The
 messages and refusals are in

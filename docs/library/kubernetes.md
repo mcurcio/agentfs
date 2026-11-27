@@ -167,8 +167,8 @@ host on the node. Three locks order its calls, each named for what it orders:
   doubling to `Backoff::max`, back to 1 s after a minute of uptime) while
   records of the volume remain, with every view replayed: no event says a
   crashed host would start now, and the backoff throttles a crash loop. A
-  start that exits 75 (`Next::Lease`: another process holds the volume's
-  lease, such as a killed host's git children until they die) is tried again
+  start that exits 75 (another process holds the volume's lease, such as a
+  killed host's git children until they die) is tried again
   once `TreeStateArea::wait_for_lease` returns, on a thread of its own and
   outside the volume's start lock, so an unpublish never waits on another
   process ([library/engine](engine.md)). A start that fails otherwise is tried

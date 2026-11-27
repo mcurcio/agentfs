@@ -82,7 +82,9 @@
 //! notes `git notes` writes) are not rolled up.
 //!
 //! The children hold the volume's lease, so the end of the lease's children
-//! (`Recording::end_git_children`) ends them too, but they are not counted
+//! (`Recording::end_git_children`) ends them too, and the task takes that
+//! end as a stop: a git it killed is no failed run, so no alarm is logged
+//! and no index dropped. They are not counted
 //! with the actor's Git children ([`agentfs_git::git_cli::children`]): they
 //! are not on the actor's path, and a count a background task adds to would
 //! not tell what an operation started.
@@ -766,9 +768,12 @@ fn command(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     // git dies with this thread; a pack it was writing is a temporary file.
-    let mut child = lease
-        .spawn_with(&mut cmd, Command::spawn)
-        .map_err(TaskError::Spawn)?;
+    let mut child = match lease.spawn_with(&mut cmd, Command::spawn) {
+        Ok(child) => child,
+        // Refused: the lease's children were ended, a stop.
+        Err(_) if lease.ended() => return Ok(Ran::Stopped),
+        Err(e) => return Err(TaskError::Spawn(e)),
+    };
     let stdin = child.stdin.take();
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
@@ -802,7 +807,9 @@ fn command(
         Some(mut child) => child.wait().map_err(TaskError::Spawn)?,
         None => return Ok(Ran::Stopped),
     };
-    if held.stopped {
+    // The end of the lease's children (`Recording::end_git_children`) is a
+    // stop as the task's own is: a git it killed is no failed run.
+    if held.stopped || lease.ended() {
         return Ok(Ran::Stopped);
     }
     drop(held);
@@ -1554,6 +1561,34 @@ exec git "$@""#;
         lock(&slot).stopped = true;
         assert_eq!(
             expire(&fails, tmp.path(), &slot, &lease).unwrap(),
+            Ran::Stopped
+        );
+    }
+
+    /// A git the end of the lease's children kills is a stop, as the
+    /// task's own is, not a failed run (which would drop the index and log
+    /// an alarm); a start after the end is a stop too.
+    #[test]
+    fn a_run_the_end_kills_is_a_stop() {
+        let tmp = tempfile::tempdir().unwrap();
+        let held = tmp.path().join("held");
+        hold(&held);
+        script(
+            &held,
+            r#"echo written > "$0.written"; read x < "$0.release"; exit 3"#,
+        );
+        let slot = Arc::new(Mutex::new(Slot::default()));
+        let lease = Arc::new(lease());
+        let running = {
+            let (held, dir) = (held.clone(), tmp.path().to_owned());
+            let (slot, lease) = (Arc::clone(&slot), Arc::clone(&lease));
+            std::thread::spawn(move || expire(&held, &dir, &slot, &lease))
+        };
+        wait_written(&held);
+        lease.end_children().unwrap();
+        assert_eq!(running.join().unwrap().unwrap(), Ran::Stopped);
+        assert_eq!(
+            expire(&held, tmp.path(), &slot, &lease).unwrap(),
             Ran::Stopped
         );
     }

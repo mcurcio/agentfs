@@ -35,13 +35,24 @@ use rustix::process::{Pid, PidfdFlags, Signal, WaitId, WaitIdOptions};
 
 use crate::file_lock::FileLock;
 
-/// The signal a holder gets when the thread that started it ends. Tests
-/// stop it instead, so that a child outlives its holder and its share of
-/// the lock can be seen.
-#[cfg(not(test))]
+/// The signal a holder gets when the thread that started it ends.
 const DEATH_SIGNAL: libc::c_int = libc::SIGKILL;
+
+/// Tests: the death signal the next spawns arm, [`DEATH_SIGNAL`] unless a
+/// holder process of the tests stops its children instead (SIGSTOP), so
+/// that a child outlives its holder and its share of the lock can be seen.
 #[cfg(test)]
-const DEATH_SIGNAL: libc::c_int = libc::SIGSTOP;
+static TEST_DEATH_SIGNAL: std::sync::atomic::AtomicI32 =
+    std::sync::atomic::AtomicI32::new(DEATH_SIGNAL);
+
+/// The death signal a spawn arms: [`DEATH_SIGNAL`], or in tests
+/// [`TEST_DEATH_SIGNAL`].
+fn death_signal() -> libc::c_int {
+    #[cfg(test)]
+    return TEST_DEATH_SIGNAL.load(std::sync::atomic::Ordering::Relaxed);
+    #[cfg(not(test))]
+    DEATH_SIGNAL
+}
 
 /// A lock held by this process and shared with each child started through
 /// it. Dropping it ends every child that still holds the lock
@@ -99,6 +110,7 @@ impl InheritedLock {
             return Err(io::Error::from_raw_os_error(libc::ENOTCONN));
         }
         let fd = self.lock.file().as_raw_fd();
+        let death = death_signal() as libc::c_ulong;
         // SAFETY: getpid has no preconditions.
         let parent = unsafe { libc::getpid() };
         // SAFETY: the closure runs in the child between its fork and its
@@ -107,7 +119,7 @@ impl InheritedLock {
         // across the start: `self` owns the lock's file.
         unsafe {
             command.pre_exec(move || {
-                if libc::prctl(libc::PR_SET_PDEATHSIG, DEATH_SIGNAL as libc::c_ulong) == -1 {
+                if libc::prctl(libc::PR_SET_PDEATHSIG, death) == -1 {
                     return Err(io::Error::last_os_error());
                 }
                 // The starting thread ended before the death signal was
@@ -389,11 +401,13 @@ mod tests {
         command
     }
 
-    /// This test binary re-run as a holder (`MODE` set): "end" and "hold"
-    /// take the lock in `DIR`, start two `cat`s of the driver's pipe
+    /// This test binary re-run as a holder (`MODE` set): "end", "hold" and
+    /// "die" take the lock in `DIR`, start two `cat`s of the driver's pipe
     /// through it and print their pids; "end" then ends them and exits
-    /// without a drop, "hold" waits to be killed. "fork" is itself a
-    /// holder: it makes a thread, then tries to start a process.
+    /// without a drop, "hold" and "die" wait to be killed. "end" and "hold"
+    /// arm SIGSTOP as the children's death signal, so they outlive the
+    /// holder; "die" arms the production one ([`DEATH_SIGNAL`]). "fork" is
+    /// itself a holder: it makes a thread, then tries to start a process.
     #[test]
     fn holder_process() {
         let Some(mode) = std::env::var_os(MODE) else {
@@ -404,6 +418,9 @@ mod tests {
             let refused = Command::new("true").spawn().map(|_| ()).unwrap_err();
             assert_eq!(refused.raw_os_error(), Some(libc::EPERM), "{refused}");
             std::process::exit(0);
+        }
+        if mode != "die" {
+            TEST_DEATH_SIGNAL.store(libc::SIGSTOP, std::sync::atomic::Ordering::Relaxed);
         }
         let dir = PathBuf::from(std::env::var_os(DIR).unwrap());
         let lock = InheritedLock::new(take(&dir.join("lock")));
@@ -482,7 +499,7 @@ mod tests {
 
     /// (a) The end leaves the lock free at the holder's exit, though the
     /// holder exits without a drop and its children would outlive it
-    /// (their death signal stops them in tests).
+    /// (the holder arms SIGSTOP as their death signal).
     #[test]
     fn a_holder_that_ends_its_children_leaves_the_lock_free_at_its_exit() {
         let dir = tempfile::tempdir().unwrap();
@@ -512,6 +529,31 @@ mod tests {
         holder.kill_children();
         assert!(held, "the lock was free while the children ran");
         FileLock::wait(FileLock::open(&path).unwrap(), Mode::Exclusive).unwrap();
+    }
+
+    /// (i) The production death signal ends a killed holder's children,
+    /// so the lock is free once they have died, though nothing else ends
+    /// them (the driver keeps their pipe open). Without the signal the wait
+    /// never ends: [`HANG`] bounds it.
+    #[test]
+    fn a_killed_holders_children_die_of_the_death_signal() {
+        const HANG: std::time::Duration = std::time::Duration::from_secs(60);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("lock");
+        let mut holder = Holder::start("die", dir.path());
+        assert_eq!(holder.children.len(), 2);
+        holder.process.kill().unwrap();
+        holder.process.wait().unwrap();
+        let (freed, free) = std::sync::mpsc::channel();
+        let file = FileLock::open(&path).unwrap();
+        std::thread::spawn(move || {
+            let _ = freed.send(FileLock::wait(file, Mode::Exclusive).map(drop));
+        });
+        let waited = free.recv_timeout(HANG);
+        holder.kill_children();
+        waited
+            .expect("the children outlived their killed holder")
+            .unwrap();
     }
 
     /// (c) After the end no child starts, and the spawner is not called.

@@ -262,3 +262,18 @@ docs/library/{kubernetes.md,engine.md}.
   inherited-lock and exit-3-reap, (2) csi-lease-wait, (3) and (5) exit-3-reap, (4) all three.
   Each slice is green alone: inherited-lock has no consumer, and exit-3-reap holds every
   consumer of the lease type.
+
+## Errata (fix round, 2026-11-27)
+
+The full entries are in `.claude/errata.md` ("exit 3 frees the volume, review fix round").
+
+1. Spec defect in "Red test (e)": SIGSTOP does not keep a holder alive past the host's exit, since the
+   parent-death signal is SIGKILL. The test now checks, at the host's `stopped with` log line, that the
+   holder has exited already.
+2. "`#[cfg(test)]` only: a death signal of SIGSTOP": replaced by a run-time choice in the tests'
+   holder process, so the production SIGKILL is tested.
+3. The frozen doc of `end_git_children` expected `tree HistoryBuildFailed`: the end is now a stop for the
+   builder and the repack (`TreeGit::ended`), with no alarm and no index drop.
+4. `output` is a method, not a free fn. ECHILD: `wait_exit` returns it, as the frozen `exited` doc says;
+   only `end_children` accepts it. `end_children` signals all before waiting. Test (e) uses a label and pod
+   per round and a detach guard. Reconcile passes `Never` through.

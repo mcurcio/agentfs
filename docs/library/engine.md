@@ -46,9 +46,9 @@ recovers one and never creates (`Error::NotCreated`, `Error::Format` for
 another format). `service` is the pod
 context of the process that serves it, which its own commits carry. It holds
 an exclusive lease on its state area (`Error::LeaseHeld` if another process
-holds it; only taking the lease answers it, so a start's exit 75 always means
-the lease, and `Error::Busy` is a call refused while something it waits for is
-in flight). Every process the engine starts for the volume holds the lease with it:
+holds it; only taking the lease answers it, so an `agentfs host` start's exit
+75 means the lease, and `Error::Busy` is a call refused while something it
+waits for is in flight). Every process the engine starts for the volume holds the lease with it:
 its git children (the builder's `git fast-import` and its alignment's `git
 diff`, a read's git, the repack's git), each started through
 `agentfs_os::inherited_lock::InheritedLock::spawn_with` (`TreeGit::start`, a
@@ -59,10 +59,11 @@ filter refuses every fork, so a git command that forked would fail loudly
 ends them (SIGKILL), and returns once each has exited: then no process the
 engine started holds the lease, and none starts. A call that needs git after
 it answers `ENOTCONN` (`Error::TreeGit` of an I/O error), as does one whose git
-it killed. Dropping the Recording after it makes the journal durable, ends at
-most one batch as failed (`tree HistoryBuildFailed`) and unlocks the lease;
-what the journal holds and history lacks is built at the next open, as after a
-crash. `agentfs host` makes it, through the service's `Domains::abandon`,
+it killed. A batch or a repack run it ends is a stop, as a crash's: neither
+logs an alarm (`tree HistoryBuildFailed`, `tree RepackFailed`), and the repack
+drops no index (`TreeGit::ended` is the one judge). Dropping the Recording
+after it makes the journal durable and unlocks the lease; what the journal
+holds and history lacks is built at the next open, as after a crash. `agentfs host` makes it, through the service's `Domains::abandon`,
 before it exits 3 ([library/filesystem](filesystem.md#the-view-host-command)).
 `state_area::TreeStateArea` offers it to the Volume domain as its
 `StateArea` port, whose `inspect` reads what a state area holds (`Found`)

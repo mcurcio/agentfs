@@ -1578,6 +1578,8 @@ impl Builder {
         }
         let marks = match batch.feed.take() {
             Some(feed) => {
+                #[cfg(test)]
+                self.history.batch_packing();
                 let _timer = Timer::start(Which::Objects);
                 feed.finish()?
             }
