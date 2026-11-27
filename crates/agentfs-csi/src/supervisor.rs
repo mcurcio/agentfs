@@ -22,12 +22,17 @@
 //! - **Stopping a host** closes its control channel, whatever clones of its
 //!   client other tasks hold: the host sees EOF. With no view open (every
 //!   stop the supervisor asks for) it drains and exits 0 once Volume has
-//!   released the volume; with views open (the plugin's shutdown) it exits
-//!   3 at once and leaves them stale for the next host.
+//!   released the volume; with views open (the plugin's shutdown) it ends
+//!   its git children, exits 3 and leaves the views stale for the next host.
 //! - **A host that exits unasked** is started again after a backoff while
-//!   the volume is not idle, with every view replayed. A start that fails
-//!   is tried again with backoff. These delays are the only timers, beside
-//!   the launcher's bounded wait for a child's last log lines.
+//!   the volume is not idle, with every view replayed: no event says a
+//!   crashed host would start now, and the backoff throttles a crash loop.
+//!   A start that exits 75 (another process holds the volume's lease, such
+//!   as a killed host's git children until they die) is tried again once
+//!   the lease is free: the supervisor waits on the lease, not a timer. A
+//!   start that fails otherwise is tried again with backoff. These delays
+//!   are the only timers, beside the launcher's bounded wait for a child's
+//!   last log lines.
 //! - **Release** (DeleteVolume) starts the volume's host with no view and
 //!   stops it: its exit 0 is Volume's release verdict.
 //! - **Forks** (a fork claim's CreateVolume and DeleteVolume) are created
@@ -76,7 +81,7 @@ use agentfs_contracts::tree::TreeId;
 use agentfs_contracts::trees::ForkSettings;
 use agentfs_engine::operator_settings::{RuleFiles, install_rules};
 use agentfs_engine::state_area::TreeStateArea;
-use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard, watch};
+use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard, oneshot, watch};
 
 use crate::error::Error;
 use crate::host_client::{HostClient, HostGone, StartError};
@@ -181,18 +186,40 @@ struct Started {
     dropped: usize,
 }
 
-/// A host that did not start; nothing of it runs. `permanent`: trying
-/// again cannot help (another protocol version).
+/// What a host that did not start waits for before its next start.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Next {
+    /// Nothing: trying again cannot help (another protocol version).
+    Never,
+    /// The volume's lease free: the start exited 75, so another process held it.
+    Lease,
+    /// A backoff delay: a failure no event ends (a crash, a full disk, PID pressure).
+    Backoff,
+}
+
+impl Next {
+    /// What a log line of a failed start says comes next, the backoff
+    /// being `delay`.
+    fn then(self, delay: Duration) -> String {
+        match self {
+            Self::Never => String::new(),
+            Self::Lease => "; trying again once its state area's lease is free".to_owned(),
+            Self::Backoff => format!("; trying again in {delay:?}"),
+        }
+    }
+}
+
+/// A host that did not start; nothing of it runs.
 struct NotStarted {
     error: Error,
-    permanent: bool,
+    next: Next,
 }
 
 impl From<Error> for NotStarted {
     fn from(error: Error) -> Self {
         Self {
             error,
-            permanent: false,
+            next: Next::Backoff,
         }
     }
 }
@@ -246,6 +273,22 @@ fn exists(path: &Path) -> bool {
 async fn wait_exit(exited: &mut watch::Receiver<Option<Exit>>) -> Exit {
     let waited = exited.wait_for(Option::is_some).await.ok().and_then(|e| *e);
     waited.or(*exited.borrow()).unwrap_or(Exit::Code(-1))
+}
+
+/// Returns once no process holds the volume's lease at `state`:
+/// `TreeStateArea::wait_for_lease` on a std::thread of its own, answered over
+/// a tokio oneshot: never `spawn_blocking`, whose pool the runtime's shutdown
+/// waits for. A wait that never ends keeps its thread.
+async fn lease_free(state: PathBuf) -> io::Result<()> {
+    let (tx, rx) = oneshot::channel();
+    std::thread::Builder::new()
+        .name("lease-wait".into())
+        .spawn(move || {
+            // The receiver gone: the restart was dropped, nothing waits.
+            let _ = tx.send(TreeStateArea::at(&state).wait_for_lease());
+        })?;
+    rx.await
+        .map_err(|_| io::Error::other("the lease wait ended without an answer"))?
 }
 
 /// The error a host's refusal is to the CO.
@@ -555,24 +598,28 @@ impl Supervisor {
                          v{plugin}: the node plugin's image and its agentfs binary must be of \
                          one release; not tried again"
                     )),
-                    permanent: true,
+                    next: Next::Never,
                 });
             }
             Err(StartError::Gone(HostGone)) => {
                 let exit = wait_exit(&mut exited).await;
                 let log = launcher::recent(&recent_log);
                 return Err(match exit {
-                    Exit::Code(75) => Error::Unavailable(format!(
-                        "volume {volume} is busy: another process holds its state area"
-                    )),
+                    Exit::Code(75) => NotStarted {
+                        error: Error::Unavailable(format!(
+                            "volume {volume} is busy: another process holds its state area"
+                        )),
+                        next: Next::Lease,
+                    },
                     Exit::Code(1 | 2) => Error::FailedPrecondition(format!(
                         "the host of volume {volume} refused to start ({exit}):\n{log}"
-                    )),
+                    ))
+                    .into(),
                     _ => Error::Unavailable(format!(
                         "the host of volume {volume} exited before it served ({exit}):\n{log}"
-                    )),
-                }
-                .into());
+                    ))
+                    .into(),
+                });
             }
         };
         let served = if hello.volume == name {
@@ -713,15 +760,29 @@ impl Supervisor {
             eprintln!("[host {volume}] exited: {exit}; restarting in {delay:?}");
             delay
         };
-        self.restart(volume, delay).await;
+        self.restart(volume, Next::Backoff, delay).await;
     }
 
-    /// Starts the volume's host again after `delay` while the volume is not
-    /// idle, and keeps trying with backoff while that fails, unless trying
-    /// again cannot help.
-    async fn restart(self: Arc<Self>, volume: String, mut delay: Duration) {
+    /// Starts the volume's host again once `next` allows (after `delay`, or
+    /// once its lease is free) while the volume is not idle, and keeps
+    /// trying while that fails, as each failed start says, unless trying
+    /// again cannot help. The lease is awaited outside the start lock: an
+    /// unpublish never waits on another process.
+    async fn restart(self: Arc<Self>, volume: String, mut next: Next, mut delay: Duration) {
         loop {
-            tokio::time::sleep(delay).await;
+            match next {
+                Next::Never => return,
+                Next::Backoff => tokio::time::sleep(delay).await,
+                Next::Lease => {
+                    if let Err(e) = lease_free(self.layout().state(&volume)).await {
+                        eprintln!(
+                            "volume {volume}: waiting for its state area's lease: {e}; trying \
+                             again in {delay:?}"
+                        );
+                        tokio::time::sleep(delay).await;
+                    }
+                }
+            }
             let _start = self.lock_start(&volume).await;
             let idle = {
                 let using = self.using();
@@ -735,18 +796,15 @@ impl Supervisor {
                     self.stop_if_idle(&volume).await;
                     return;
                 }
-                Err(NotStarted {
-                    error,
-                    permanent: true,
-                }) => {
-                    eprintln!("starting the host of volume {volume} again: {error}");
-                    return;
-                }
-                Err(NotStarted { error, .. }) => {
-                    delay = next_backoff(Some(delay), Duration::ZERO, &self.cfg.backoff);
+                Err(not) => {
+                    next = not.next;
+                    if next == Next::Backoff {
+                        delay = next_backoff(Some(delay), Duration::ZERO, &self.cfg.backoff);
+                    }
                     eprintln!(
-                        "starting the host of volume {volume} again: {error}; trying again in \
-                         {delay:?}"
+                        "starting the host of volume {volume} again: {}{}",
+                        not.error,
+                        next.then(delay)
                     );
                 }
             }
@@ -1182,18 +1240,13 @@ impl Supervisor {
                     report.dropped += started.dropped;
                     self.stop_if_idle(&volume).await;
                 }
-                Err(NotStarted {
-                    error,
-                    permanent: true,
-                }) => {
-                    eprintln!("starting the host of volume {volume}: {error}");
-                }
-                Err(NotStarted { error, .. }) => {
+                Err(NotStarted { error, next }) => {
                     let delay = self.cfg.backoff.initial;
                     eprintln!(
-                        "starting the host of volume {volume}: {error}; trying again in {delay:?}"
+                        "starting the host of volume {volume}: {error}{}",
+                        next.then(delay)
                     );
-                    tokio::spawn(Arc::clone(self).restart(volume.clone(), delay));
+                    tokio::spawn(Arc::clone(self).restart(volume.clone(), next, delay));
                 }
             }
         }
@@ -1208,8 +1261,8 @@ impl Supervisor {
     }
 
     /// Stops every host: each one's channel is closed, whatever clones the
-    /// tasks still running hold (EOF: with views open it exits 3 at once),
-    /// and its exit awaited.
+    /// tasks still running hold (EOF: with views open it ends its git
+    /// children and exits 3), and its exit awaited.
     pub async fn shutdown(&self) {
         self.shutting_down.store(true, Ordering::Relaxed);
         let hosts: Vec<(String, Host)> = self.hosts().drain().collect();

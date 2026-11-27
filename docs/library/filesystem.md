@@ -690,13 +690,16 @@ that controls it over its standard input, a Unix socket`). No socket path
 exists, so only the parent can reach it. The parent closing its end (EOF) is
 a stop, as SIGTERM and SIGINT are, so a host never outlives its parent. With
 no view open the host drains and exits 0 once Volume releases the volume. With
-a view open it exits 3 at once, logging `stopped with N view(s) open`: each
+a view open it exits 3, logging `stopped with N view(s) open`: each
 view's mount is left stale and its client attached, as a crash leaves them,
 because the views belong to pods the parent does not own; the next host
 rebinds each client and stacks over each mount. Every change a view took is in
-the journal already. A drain logs `tree DrainBlocked` with the clients of
-other launchers it waits for: only their own launcher ends them. The last view
-ending does not stop the host.
+the journal already. Before it logs that line it ends the volume's own
+processes, its git children, as a crash ends them, and waits for each to exit,
+so the volume's lease is free once the parent has reaped it
+(**Exit status**, below). A drain logs `tree DrainBlocked` with the
+clients of other launchers it waits for: only their own launcher ends them.
+The last view ending does not stop the host.
 
 **Boot.** As `mount`'s, under `--launcher ID`: the volume found (exit 1 for
 another format, 75 while another process holds it) and checked against
@@ -780,8 +783,17 @@ source is always stacked over.
 
 **Exit status.** 0 once the volume is released; 1 for a refusal at boot or a
 stopped actor; 2 without a control channel or after a malformed line; 3 when
-stopped with views open (left stale, the volume not released); 75 while
-another process holds the volume.
+stopped with views open (left stale, the volume not released, its processes
+ended); 75 while another process holds the volume, a killed host's git
+children among them until each has exited. At each status the host makes
+itself (0, 1, 2, 3) no process the engine started holds the volume's lease, so
+the lease is free when its exit is reaped, unless a process the host started
+outside the engine (a `fusermount3`) was between its fork and its exec
+([library/core](core.md#locks-and-sockets)). A host killed by a signal, or one that
+panicked (101), ended nothing: its git children die of their parent-death
+signal after it, and the lease is free once each has exited. An end the kernel
+refused is logged (`tree AbandonIncomplete`), and the lease is then free once
+each git child has exited.
 
 ### The view host
 

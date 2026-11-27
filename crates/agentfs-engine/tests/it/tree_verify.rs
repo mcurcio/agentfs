@@ -363,7 +363,7 @@ fn verify_refuses_a_held_volume() {
     let v = new_actor(tmp.path());
     let held = verify_flagged(tmp.path(), &PodContext::default(), None);
     assert!(
-        matches!(held, Err(agentfs_engine::tree_actor::Error::Busy)),
+        matches!(held, Err(agentfs_engine::tree_actor::Error::LeaseHeld)),
         "{held:?}"
     );
     drop(v);

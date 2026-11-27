@@ -24,7 +24,7 @@ module; [trees](../trees.md) says what a tree view does and promises.
 |---|---|---|
 | Git-backed tree views | `tree_actor`, `state_area` | `TreeActor`, `TreeStateArea` (the Volume domain's `StateArea` port; its `inspect` reads what a state area holds) |
 | The domains' rows over a tree volume | `store`, `tree_actor` | `TreeStore` (the `VolumeStore`, `ForkStore`, `ClientStore` and `QueueFacts` ports), `Chain`, `RowDomain`, `RowWrite`, `RowEvent` |
-| Line identity across saves | `agentfs_lines`, a leaf the library crate does not re-export: depend on `agentfs-lines` by name | `LineMap` (runs of lines, never bytes), `LineMap::align` (git's histogram diff over two `Image`s, read a line at a time), `LineMap::align_bytes_with`, `histogram_with` and `histogram_files_with` (the diff's `git` child started by the spawner passed: the tree engine passes `agentfs_git::git_cli::counted`), `LineMap::append`, `LineMap::expand` (line by line, for the landing rules), `pieces` (where a merged file's lines are in its sources): the line-map library, generic over the caller's numbered version (`Id`) |
+| Line identity across saves | `agentfs_lines`, a leaf the library crate does not re-export: depend on `agentfs-lines` by name | `LineMap` (runs of lines, never bytes), `LineMap::align` (git's histogram diff over two `Image`s, read a line at a time), `LineMap::align_bytes_with`, `histogram_with` and `histogram_files_with` (the diff's `git` child started by the spawner passed: the tree engine passes `TreeGit::start`, a holder of the lease counted by `agentfs_git::git_cli`), `LineMap::append`, `LineMap::expand` (line by line, for the landing rules), `pieces` (where a merged file's lines are in its sources): the line-map library, generic over the caller's numbered version (`Id`) |
 | The landing rules the engine's takes carry out | `agentfs_referee`, which the library crate does not re-export: the engine is its one user ([page](referee.md)) | `land`, `sync`, `undecided` through the `Landed` port, `touches`, the queue's `eligible` and `cut`, and the values they read (`EventNumber`, `LineVersion`, `MergeFileIdentity`, `NameHistory`) |
 | OpenTelemetry instruments | `telemetry` | `observe_process`, `observe_unverified`, on a `Meter` the caller makes |
 
@@ -45,10 +45,35 @@ stages through the service, whose state area opens with `Recording::open_with`)
 recovers one and never creates (`Error::NotCreated`, `Error::Format` for
 another format). `service` is the pod
 context of the process that serves it, which its own commits carry. It holds
-an exclusive lease on its state area (`Error::Busy` if another process holds
-it). `state_area::TreeStateArea` offers it to the Volume domain as its
+an exclusive lease on its state area (`Error::LeaseHeld` if another process
+holds it; only taking the lease answers it, so an `agentfs host` start's exit
+75 means the lease, and `Error::Busy` is a call refused while something it
+waits for is in flight). Every process the engine starts for the volume holds the lease with it:
+its git children (the builder's `git fast-import` and its alignment's `git
+diff`, a read's git, the repack's git), each started through
+`agentfs_os::inherited_lock::InheritedLock::spawn_with` (`TreeGit::start`, a
+repo test's rule). A holder cannot start a process of its own: a seccomp
+filter refuses every fork, so a git command that forked would fail loudly
+("cannot fork"); none of those the engine runs does.
+`Recording::end_git_children()` ends every one of them at once, as a crash
+ends them (SIGKILL), and returns once each has exited: then no process the
+engine started holds the lease, and none starts. A call that needs git after
+it answers `ENOTCONN` (`Error::TreeGit` of an I/O error), as does one whose git
+it killed. A batch or a repack run it ends is a stop, as a crash's: neither
+logs an alarm (`tree HistoryBuildFailed`, `tree RepackFailed`), and the repack
+drops no index (`TreeGit::ended` is the one judge). Dropping the Recording
+after it makes the journal durable and unlocks the lease; what the journal
+holds and history lacks is built at the next open, as after a crash. `agentfs host` makes it, through the service's `Domains::abandon`,
+before it exits 3 ([library/filesystem](filesystem.md#the-view-host-command)).
+`state_area::TreeStateArea` offers it to the Volume domain as its
 `StateArea` port, whose `inspect` reads what a state area holds (`Found`)
 without the lease, takes no lock and writes nothing: `TreeStateArea::at(root).inspect()`.
+`TreeStateArea::at(root).wait_for_lease()` returns once no process holds the
+lease: it takes the lease, blocking, which is the event that every holder is
+gone (a killed server's git children included), and lets it go at once. The
+CSI supervisor waits on it before it starts a host again after one exited 75
+([library/kubernetes](kubernetes.md)); a harness waits on it after a kill. It
+blocks its thread.
 A read that failed is `agentfs_contracts::volume::VolumeError::Unreadable`,
 naming the path and the I/O failure. Its recorded calls are `write_open`, `write`, `truncate`,
 `sync`, `close`, `mkdir`, `rmdir`, `symlink`, `rename`, `unlink`, `set_meta`,
@@ -504,7 +529,7 @@ its build would (`ok   library features`). With it:
   `Recording::{create_with, open_with}`, `TreeGit::{open_with_lease,
   init_with_lease}`, and `tree_actor::CompactGate`.
 - Present only with it: `TreeActor::{create, open}`, `Recording::{create,
-  open}`, `tree_actor::wait_for_lease`, `TreeGit::{open, init}`,
+  open}`, `TreeGit::{open, init}`,
   `Upkeep::gated`, and `tree_actor::COMPACT_GATE_VAR`, `ChannelGate` and
   `Gap`.
 - Present only with it, compaction's waits and the lock's count:

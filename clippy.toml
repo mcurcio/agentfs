@@ -16,6 +16,16 @@ disallowed-methods = [
     { path = "nix::fcntl::flock", reason = "take file locks through agentfs_os::file_lock::FileLock", allow-invalid = true },
     { path = "nix::fcntl::Flock", reason = "take file locks through agentfs_os::file_lock::FileLock", allow-invalid = true },
 
+    # A child process shares a lock only through the one gate that ends it:
+    # every call that clears close-on-exec or copies a descriptor onto
+    # another number is the inherited lock's. Hence a holder's end leaves no
+    # unregistered process on the lock.
+    { path = "rustix::io::fcntl_setfd", reason = "a child shares a file lock only through agentfs_os::inherited_lock::InheritedLock::spawn_with", allow-invalid = true },
+    { path = "rustix::io::dup2", reason = "a child shares a file lock only through agentfs_os::inherited_lock::InheritedLock::spawn_with", allow-invalid = true },
+    { path = "rustix::io::dup3", reason = "a child shares a file lock only through agentfs_os::inherited_lock::InheritedLock::spawn_with", allow-invalid = true },
+    { path = "libc::dup2", reason = "a child shares a file lock only through agentfs_os::inherited_lock::InheritedLock::spawn_with", allow-invalid = true },
+    { path = "libc::dup3", reason = "a child shares a file lock only through agentfs_os::inherited_lock::InheritedLock::spawn_with", allow-invalid = true },
+
     # Every listening Unix socket goes through
     # agentfs_os::listening_socket::Listener, which shuts the socket down
     # when it is stopped or dropped: a listener only closed goes on taking

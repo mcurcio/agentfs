@@ -44,6 +44,7 @@ use agentfs_contracts::meta::{Kind, Meta, Perm};
 use agentfs_contracts::{NotATree, TreeId};
 use agentfs_os::file_lock::{FileLock, Mode};
 use agentfs_os::fsutil::sync_dir;
+use agentfs_os::inherited_lock::InheritedLock;
 use agentfs_referee::EventNumber;
 pub(crate) use call_path::ActorGuard;
 pub use call_path::{Closing, PathStep, Progress, Recording, SavePending, SaveToDecide, Then};
@@ -151,22 +152,8 @@ const INITIALIZING: &str = "initializing";
 /// The state area's lease file, under the state area: an exclusive `flock`
 /// held by the serving process and shared with its tree Git children, which
 /// outlive a killed holder until their parent-death signal lands.
-const LOCK: &str = "actor.lock";
+pub(crate) const LOCK: &str = "actor.lock";
 
-/// Returns once no process holds the state area's lease: taking it, blocking,
-/// is the event that every holder is gone (a killed server's Git children
-/// included); it is released at once. What a harness waits on before it
-/// reopens a volume whose server it killed.
-///
-/// # Errors
-///
-/// A failed open or lock of the lease file.
-#[cfg(any(test, feature = "test-util"))]
-pub fn wait_for_lease(root: &Path) -> io::Result<()> {
-    let file = FileLock::open(&root.join(LOCK))?;
-    drop(FileLock::wait(file, Mode::Exclusive)?);
-    Ok(())
-}
 type Result<T> = std::result::Result<T, Error>;
 
 #[derive(Debug, thiserror::Error)]
@@ -181,8 +168,14 @@ pub enum Error {
     Json(#[from] serde_json::Error),
     #[error(transparent)]
     Lines(#[from] agentfs_lines::Error),
+    /// A call refused while something it must wait for is in flight
+    /// (`EBUSY`): never the lease's.
     #[error("tree volume is busy")]
     Busy,
+    /// Another process holds the state area's lease (`EBUSY`): only
+    /// `lock_area` answers it, so a start's exit 75 always means the lease.
+    #[error("the volume is busy: another process holds its state area")]
+    LeaseHeld,
     #[error("not a tree state area (or unsupported format)")]
     Format,
     #[error("tree supports git-safe UTF-8 names only")]
@@ -273,7 +266,7 @@ impl Error {
             Self::ReadOnly => libc::EROFS,
             Self::Name => libc::EINVAL,
             Self::TooLarge => libc::EFBIG,
-            Self::Busy => libc::EBUSY,
+            Self::Busy | Self::LeaseHeld => libc::EBUSY,
             Self::Untracked { .. } => libc::EXDEV,
             Self::Rules(_) => libc::EINVAL,
             Self::Durable(e) => e.errno(),
@@ -443,7 +436,9 @@ pub struct TreeActor {
     areas: untracked::Areas,
     /// The flagged commits by state, which the alarm's gauge reads.
     verification: Verification,
-    _lock: Arc<FileLock>,
+    /// The state area's lease, which every process the engine starts for
+    /// this volume holds ([`InheritedLock::spawn_with`]).
+    lease: Arc<InheritedLock>,
 }
 
 /// A take's bytes in chunks of at most `journal::TAKE_CHUNK`, recorded before it.
@@ -537,7 +532,6 @@ pub fn rules_dir(state: &Path) -> PathBuf {
     state.join("history.git").join("info")
 }
 
-/// The state area's exclusive lock: [`Error::Busy`] while another holds it.
 /// The operator's rules: `history.git/info/exclude` and
 /// `history.git/info/attributes`, a missing file empty, built into the rule
 /// set every new name is judged by (docs/trees.md, "Rules and the untracked
@@ -565,10 +559,11 @@ fn read_rules(root: &Path) -> Result<agentfs_rules::RuleSet> {
     )?)
 }
 
-fn lock_area(root: &Path) -> Result<Arc<FileLock>> {
-    Ok(Arc::new(
-        FileLock::try_take(&root.join(LOCK), Mode::Exclusive)?.ok_or(Error::Busy)?,
-    ))
+/// The state area's exclusive lock: [`Error::LeaseHeld`] while another holds it.
+fn lock_area(root: &Path) -> Result<Arc<InheritedLock>> {
+    Ok(Arc::new(InheritedLock::new(
+        FileLock::try_take(&root.join(LOCK), Mode::Exclusive)?.ok_or(Error::LeaseHeld)?,
+    )))
 }
 
 /// Writes `bytes` to `name` whole: a temporary file, fsynced, renamed into place.
@@ -669,7 +664,7 @@ impl TreeActor {
     ///
     /// # Errors
     ///
-    /// [`Error::Exists`] for any other directory, [`Error::Busy`] while another
+    /// [`Error::Exists`] for any other directory, [`Error::LeaseHeld`] while another
     /// holds the state area, and any failed write.
     #[cfg(any(test, feature = "test-util"))]
     pub fn create(
@@ -844,7 +839,7 @@ impl TreeActor {
     )]
     fn start_history(
         root: &Path,
-        lock: &Arc<FileLock>,
+        lock: &Arc<InheritedLock>,
         frames: &[journal::Frame],
         opened: &Published,
         (built_log, entries): (BuiltLog, Vec<built_log::BuiltEntry>),
@@ -1066,7 +1061,7 @@ impl TreeActor {
     /// Recovers the locked state area of a volume of this format.
     fn serve(
         root: PathBuf,
-        lock: Arc<FileLock>,
+        lock: Arc<InheritedLock>,
         identity: VolumeIdentity,
         service: PodContext,
         upkeep: Upkeep,
@@ -1142,7 +1137,7 @@ impl TreeActor {
             rules,
             areas: untracked::Areas::new(&root),
             verification,
-            _lock: lock,
+            lease: Arc::clone(&lock),
         };
         // After the builder, and once the volume stops it on any error below.
         volume.compactor = Some(Compactor::start(
@@ -1157,6 +1152,7 @@ impl TreeActor {
         volume.repacker = Some(Repacker::start(
             volume.history.clone(),
             root.join("history.git"),
+            lock,
         )?);
         volume.areas.sweep(&volume.trees())?;
         for (handle, open) in folded.opens {
@@ -1206,6 +1202,11 @@ impl TreeActor {
     /// The operator's rules, read when the volume opened.
     pub fn rules(&self) -> &Arc<agentfs_rules::RuleSet> {
         &self.rules
+    }
+
+    /// The state area's lease, which every git child of the volume holds.
+    fn lease(&self) -> &Arc<InheritedLock> {
+        &self.lease
     }
 
     /// `tree`'s untracked area, made if it has none.
@@ -2574,7 +2575,9 @@ mod tests {
             .parse()
             .unwrap();
         // The killed process's git children share its lease until they die.
-        wait_for_lease(tmp.path()).unwrap();
+        crate::state_area::TreeStateArea::at(tmp.path())
+            .wait_for_lease()
+            .unwrap();
         let frames = frames_of(tmp.path());
         assert!(
             matches!(frames[0].0.entry, Entry::Checkpoint { .. }),

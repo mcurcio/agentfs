@@ -23,7 +23,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use agentfs_os::file_lock::FileLock;
+use agentfs_os::inherited_lock::InheritedLock;
 use git2::Oid;
 
 use super::pointers::Pointers;
@@ -343,13 +343,19 @@ pub(in crate::tree_actor) fn remove_stale_locks(gitdir: &Path) -> io::Result<()>
 }
 
 /// Creates a volume's Git store: the one place that does (clippy.toml).
-pub(in crate::tree_actor) fn init_store(git_dir: &Path, lease: Arc<FileLock>) -> Result<TreeGit> {
+pub(in crate::tree_actor) fn init_store(
+    git_dir: &Path,
+    lease: Arc<InheritedLock>,
+) -> Result<TreeGit> {
     #[expect(clippy::disallowed_methods, reason = "History's store is made here")]
     Ok(TreeGit::init_with_lease(git_dir, lease)?)
 }
 
 /// Opens a volume's Git store for History: the one place that does.
-pub(in crate::tree_actor) fn open_store(git_dir: &Path, lease: Arc<FileLock>) -> Result<TreeGit> {
+pub(in crate::tree_actor) fn open_store(
+    git_dir: &Path,
+    lease: Arc<InheritedLock>,
+) -> Result<TreeGit> {
     #[expect(clippy::disallowed_methods, reason = "History's store is opened here")]
     Ok(TreeGit::open_with_lease(git_dir, lease)?)
 }

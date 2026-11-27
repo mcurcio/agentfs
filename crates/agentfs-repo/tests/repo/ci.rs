@@ -254,6 +254,251 @@ fn workflows_pull_docker_hub_through_the_mirror() {
     assert!(problems.is_empty(), "{}", problems.join("\n"));
 }
 
+/// The one home of CI's apt-get: it reads only the runner's Ubuntu archive.
+const APT_HOME: &str = "ci/apt-install.sh";
+/// The one home of kind's and kubectl's downloads and pins.
+const KIND_HOME: &str = "ci/install-kind.sh";
+/// The one runner of [`KIND_HOME`] in a workflow, which caches what it
+/// verified.
+const KIND_ACTION: &str = ".github/actions/kind/action.yml";
+
+/// The heredoc a line of shell opens, if any: its terminator, and whether
+/// a shell reads it (`bash <<EOF`, `sudo sh -s <<EOF`), so its lines are
+/// commands. A `<<` is a heredoc only when a word that starts with a letter
+/// or `_` follows it, outside `$((...))` and `((...))`, and never in Python,
+/// where it is a shift; `<<<` is a here-string.
+fn heredoc_opened(name: &str, code: &str) -> Option<(String, bool)> {
+    if name.ends_with(".py") {
+        return None;
+    }
+    let mut from = 0;
+    while let Some(found) = code[from..].find("<<") {
+        let at = from + found;
+        from = at + 2;
+        let rest = &code[at + 2..];
+        if rest.starts_with('<') {
+            from += 1;
+            continue;
+        }
+        let before = &code[..at];
+        if before.matches("((").count() > before.matches("))").count() {
+            continue;
+        }
+        let word = rest
+            .strip_prefix('-')
+            .unwrap_or(rest)
+            .trim_start()
+            .trim_start_matches(['\'', '"']);
+        if !word.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_') {
+            continue;
+        }
+        let word: String = word
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+            .collect();
+        let command = before
+            .rsplit(['|', ';', '&', '(', '`'])
+            .next()
+            .unwrap_or("");
+        let shell = command
+            .split_whitespace()
+            .any(|w| matches!(w.rsplit('/').next(), Some("bash" | "sh" | "dash")));
+        return Some((word, shell));
+    }
+    None
+}
+
+/// What, in one CI file (`name`, from the repository's root), installs an
+/// outside tool other than through its home: apt (`apt-get`, `apt`,
+/// `aptitude`) outside [`APT_HOME`] (a heredoc's lines, a container's
+/// build, are not the runner's, unless a shell reads them), a download of
+/// kind or kubectl outside [`KIND_HOME`], and a run of [`KIND_HOME`] in a
+/// workflow outside [`KIND_ACTION`]. A path filter naming a home is no run
+/// of it; comments are skipped. A heredoc that never ends is a problem too,
+/// as the scan cannot tell what follows it.
+fn outside_tool_problems(name: &str, text: &str) -> Vec<String> {
+    let workflow = name.starts_with(".github/");
+    let filters: BTreeSet<usize> = if workflow {
+        path_filters(text).into_iter().map(|(n, _)| n).collect()
+    } else {
+        BTreeSet::new()
+    };
+    let mut problems = Vec::new();
+    // The open heredoc: its terminator, its first line, and whether its
+    // lines are scanned.
+    let mut heredoc: Option<(String, usize, bool)> = None;
+    for (n, line) in text.lines().enumerate() {
+        let code = line.trim();
+        if let Some((end, _, scanned)) = &heredoc {
+            let scanned = *scanned;
+            if code == end {
+                heredoc = None;
+                continue;
+            }
+            if !scanned {
+                continue;
+            }
+        }
+        if code.starts_with('#') {
+            continue;
+        }
+        if heredoc.is_none() {
+            heredoc = heredoc_opened(name, code).map(|(end, shell)| (end, n + 1, shell));
+        }
+        let at = format!("{name}:{}", n + 1);
+        let apt = code
+            .split(|c: char| c.is_whitespace() || "|;&()`'\"".contains(c))
+            .filter_map(|w| w.rsplit('/').next())
+            .any(|w| matches!(w, "apt-get" | "apt" | "aptitude"));
+        if apt && name != APT_HOME {
+            problems.push(format!(
+                "{at}: apt outside {APT_HOME}; run {APT_HOME} <packages>"
+            ));
+        }
+        let downloads = [
+            "kubernetes-sigs/kind/releases",
+            "sigs.k8s.io/kind",
+            "dl.k8s.io",
+        ];
+        if name != KIND_HOME && downloads.iter().any(|d| code.contains(d)) {
+            problems.push(format!("{at}: kind or kubectl fetched outside {KIND_HOME}"));
+        }
+        if workflow
+            && name != KIND_ACTION
+            && code.contains(KIND_HOME)
+            && !filters.contains(&(n + 1))
+        {
+            problems.push(format!(
+                "{at}: {KIND_HOME} run directly; use `uses: ./{}`",
+                KIND_ACTION.trim_end_matches("/action.yml")
+            ));
+        }
+    }
+    if let Some((end, first, _)) = heredoc {
+        problems.push(format!(
+            "{name}:{first}: a heredoc whose terminator {end} never comes; the scan cannot read past it"
+        ));
+    }
+    problems
+}
+
+/// CI installs the outside tools whose hosts have refused it through one
+/// home each (docs/development.md, "Runners, images and runbooks"): Debian
+/// packages through `ci/apt-install.sh`, which reads only the Ubuntu
+/// archive, and kind and kubectl through the kind action, which caches the
+/// binaries `ci/install-kind.sh` verified.
+#[test]
+fn ci_installs_outside_tools_through_their_homes() {
+    let root = root();
+    let mut files = Vec::new();
+    files_under(&root.join(".github"), &mut files);
+    files_under(&root.join("ci"), &mut files);
+    files.sort();
+    let mut problems = Vec::new();
+    let (mut apt, mut kind) = (0, 0);
+    for path in &files {
+        let Ok(text) = std::fs::read_to_string(path) else {
+            continue;
+        };
+        let name = path.strip_prefix(&root).unwrap_or(path).to_string_lossy();
+        apt += text.matches("apt-install.sh").count();
+        kind += text.matches("uses: ./.github/actions/kind").count();
+        problems.extend(outside_tool_problems(&name, &text));
+    }
+    assert!(
+        apt > 10 && kind > 5,
+        "only {apt} apt-install.sh and {kind} kind action uses found: is the scan broken?"
+    );
+    assert!(problems.is_empty(), "{}", problems.join("\n"));
+}
+
+#[test]
+fn outside_tools_outside_their_homes_are_found() {
+    let workflow = ".github/workflows/x.yml";
+    for (name, bad) in [
+        (
+            workflow,
+            "      - run: sudo apt-get update && sudo apt-get install -y fuse3",
+        ),
+        (
+            workflow,
+            "          command -v jq || sudo apt-get install -y jq",
+        ),
+        (workflow, "      - run: sudo apt update"),
+        (workflow, "      - run: sudo apt -y install fuse3"),
+        (workflow, "          sudo apt \\\n            install -y x"),
+        ("ci/x.sh", "echo $((1 << 2))\nsudo apt-get update\n"),
+        ("ci/x.sh", "sudo bash <<EOF\napt-get update\nEOF\n"),
+        ("ci/x.sh", "sudo sh -s <<'EOF'\napt-get update\nEOF\n"),
+        ("ci/x.sh", "sudo aptitude update"),
+        ("ci/x.sh", "sudo -E apt-get update"),
+        ("ci/x.sh", "/usr/bin/apt-get install -y x"),
+        ("ci/x.sh", "cat <<EOF\nno end\n"),
+        ("ci/install-git.sh", "sudo apt-get install -y gcc"),
+        (
+            "ci/x.sh",
+            "curl -fsSLo kind https://github.com/kubernetes-sigs/kind/releases/download/v1/kind-linux-amd64",
+        ),
+        ("ci/x.sh", "go install sigs.k8s.io/kind@v0.33.0"),
+        (
+            workflow,
+            "          curl -LO https://dl.k8s.io/release/v1/bin/linux/amd64/kubectl",
+        ),
+        (
+            workflow,
+            "          ci/install-kind.sh \"$RUNNER_TEMP/kind\" >>\"$GITHUB_ENV\"",
+        ),
+        (
+            ".github/actions/y/action.yml",
+            "      run: ci/install-kind.sh \"$RUNNER_TEMP/kind\"",
+        ),
+    ] {
+        assert!(
+            !outside_tool_problems(name, bad).is_empty(),
+            "{name}: {bad}"
+        );
+    }
+    for (name, good) in [
+        (workflow, "      - run: ci/apt-install.sh fuse3 jq"),
+        (workflow, "      # sudo apt-get update reads every source"),
+        (
+            workflow,
+            "on:\n  push:\n    paths:\n      - ci/install-kind.sh\njobs:\n",
+        ),
+        (workflow, "      - uses: ./.github/actions/kind"),
+        (APT_HOME, "sudo apt-get \"${only_ubuntu[@]}\" update"),
+        (KIND_HOME, "go install \"sigs.k8s.io/kind@$KIND_VERSION\""),
+        (
+            KIND_ACTION,
+            "      run: ci/install-kind.sh \"$RUNNER_TEMP/kind\" >>\"$GITHUB_ENV\"",
+        ),
+        (
+            "ci/kind-cluster.sh",
+            ": \"${KIND_NODE_IMAGE:?run ci/install-kind.sh first}\"",
+        ),
+        (
+            "ci/dev-image.sh",
+            "docker build - <<'DOCKERFILE'\nRUN apt-get update \\\n && apt-get install -y git\nDOCKERFILE\n",
+        ),
+        (
+            "ci/x.sh",
+            "head -c $(((64 << 20) - 1)) /dev/zero\nx=$((1 << n))\ngrep y <<<\"$z\"\n",
+        ),
+        ("ci/x.py", "MIB = 1 << 20\nSHIFT = 1 << n\n"),
+        (APT_HOME, "sources=/etc/apt/sources.list.d/ubuntu.sources"),
+        (
+            "ci/x.sh",
+            "\"$(dirname \"$0\")/apt-install.sh\" gcc\nrm -rf /var/lib/apt/lists\n",
+        ),
+    ] {
+        assert_eq!(
+            outside_tool_problems(name, good),
+            Vec::<String>::new(),
+            "{name}: {good}"
+        );
+    }
+}
+
 /// Every shell script under `ci/` registers its EXIT cleanup with `on_exit`
 /// (`ci/lib.sh`), which runs it only in the shell that set it: under bash
 /// 5.2 a bare `trap ... EXIT` also runs in a forked child that gets a fatal

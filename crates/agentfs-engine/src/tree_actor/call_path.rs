@@ -384,6 +384,9 @@ pub struct Recording {
     history: History,
     /// The operator's rules, read once at open, reached without the actor's lock.
     rules: Arc<agentfs_rules::RuleSet>,
+    /// The state area's lease, reached without the actor's lock: its
+    /// children are ended through it ([`Recording::end_git_children`]).
+    lease: Arc<agentfs_os::inherited_lock::InheritedLock>,
     /// The gate thread, joined at drop: it holds the store (and the state
     /// area's lease) until the builder has stopped.
     gate: Option<std::thread::JoinHandle<()>>,
@@ -447,6 +450,7 @@ impl Recording {
         let durability = Arc::clone(actor.durability());
         let history = actor.history().clone();
         let rules = Arc::clone(actor.rules());
+        let lease = Arc::clone(actor.lease());
         let gate = history.clone();
         let owner = agentfs_failpoints::owner();
         let gate = std::thread::Builder::new()
@@ -460,6 +464,7 @@ impl Recording {
             durability,
             history,
             rules,
+            lease,
             gate: Some(gate),
             #[cfg(test)]
             in_decide: Mutex::new(None),
@@ -532,6 +537,33 @@ impl Recording {
         upkeep: Upkeep,
     ) -> Result<Arc<Self>, Error> {
         Self::serve(TreeActor::open_with(root, service, upkeep)?)
+    }
+
+    /// Ends every git child of the volume (the builder's packer and its
+    /// alignment's `git diff`, a read's git, the repack's) at once, as a
+    /// crash ends them (SIGKILL), and returns once each has exited. Every
+    /// process the engine starts holds the volume's lease and starts no
+    /// process of its own (`agentfs_os::inherited_lock::InheritedLock`), so
+    /// when it returns none holds the lease, and none starts after it. For
+    /// a process that ends without a drain (`agentfs host` stopped with
+    /// views open): its exit then frees the lease, unless a process it
+    /// started outside the engine is between its fork and its exec.
+    ///
+    /// After it, a call that needs git answers `Error::TreeGit(Io)` with
+    /// `ENOTCONN`, the errno a view answers once its server has ended; a
+    /// git that it killed reads the same. A batch or a repack run that it
+    /// ends is a stop, not a failure: neither logs an alarm, and the repack
+    /// drops no index. Dropping the Recording after it makes the journal
+    /// durable, stops the builder and unlocks the lease.
+    /// What the journal holds and history lacks is built at the next open,
+    /// as after a crash (docs/trees.md, "Recording and durability").
+    ///
+    /// # Errors
+    ///
+    /// A signal or a wait the kernel refused
+    /// (`agentfs_os::inherited_lock::InheritedLock::end_children`).
+    pub fn end_git_children(&self) -> std::io::Result<()> {
+        self.lease.end_children()
     }
 
     /// The operator's rules, read when the volume opened: where each new
@@ -1515,6 +1547,79 @@ mod tests {
             heard.iter().all(|r| matches!(r, Err(Error::Stopped))),
             "each waiter hears the stop, and only it: {heard:?}"
         );
+    }
+
+    /// Principle 1 at the end of the git children: a batch whose packer
+    /// (`git fast-import`) the end kills mid-pack loses no write. The
+    /// Recording is forgotten after the end, as `agentfs host` forgets it
+    /// before it exits 3, and a copy of its state area, what that exit
+    /// leaves, opens and builds every write into history.
+    #[test]
+    fn a_packer_the_end_kills_mid_pack_loses_no_write() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (dir, copy) = (tmp.path().join("state"), tmp.path().join("copy"));
+        let rec = Recording::serve(new_actor(&dir)).unwrap();
+        rec.settle().unwrap();
+        // The first batch that packs waits there, its packer running,
+        // until `resume` is dropped; every later one passes.
+        let (packing, packs) = mpsc::channel::<()>();
+        let (resume, held) = mpsc::channel::<()>();
+        let hook = Mutex::new((packing, held));
+        rec.history().on_batch_packing(move |()| {
+            if let Ok(hook) = hook.lock() {
+                let _ = hook.0.send(());
+                let _ = hook.1.recv();
+            }
+        });
+        let names: Vec<String> = (0..8).map(|i| format!("f{i}")).collect();
+        {
+            let mut actor = rec.actor().unwrap();
+            for name in &names {
+                let h = actor
+                    .write_open(TreeId::Root, name, &writer("w"), Some(ATTRS))
+                    .unwrap();
+                actor.write(h, 0, name.as_bytes(), false).unwrap();
+                actor.close(h).unwrap();
+            }
+        }
+        packs
+            .recv_timeout(HANG)
+            .expect("a batch reaches its packer");
+        rec.end_git_children().unwrap();
+        drop(resume);
+        // The killed batch has failed: a settle hears it, or the refused
+        // retry after it.
+        assert!(rec.settle().is_err(), "a batch built after the end");
+        std::mem::forget(rec);
+
+        let copied = std::process::Command::new("cp")
+            .arg("-a")
+            .arg(&dir)
+            .arg(&copy)
+            .status()
+            .unwrap();
+        assert!(copied.success());
+        let v = super::super::test_support::reopen(&copy);
+        v.settle().unwrap();
+        for name in &names {
+            let rev = format!(
+                "{}:{}",
+                TreeId::Root,
+                super::super::history::format::file_path(name)
+            );
+            let shown = std::process::Command::new("git")
+                .arg("--git-dir")
+                .arg(copy.join("history.git"))
+                .args(["show", &rev])
+                .output()
+                .unwrap();
+            assert_eq!(
+                String::from_utf8_lossy(&shown.stdout),
+                *name,
+                "{name} is not in history: {}",
+                String::from_utf8_lossy(&shown.stderr)
+            );
+        }
     }
 
     /// The other ordering: the stop finds a settle waiting for the

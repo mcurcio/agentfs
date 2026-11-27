@@ -14,6 +14,7 @@ on:
       - ci/alerts-prometheusrule.sh
       - ci/e2e-alerts.sh
       - ci/install-prometheus.sh
+      - ci/apt-install.sh
       - ci/lib.sh
       - .github/workflows/alerts.yml
       - crates/agentfs-core/src/telemetry.rs
@@ -60,7 +61,7 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: ci/install-prometheus.sh "$RUNNER_TEMP/prom"
       # The tree mount is --no-allow-other: fusermount3 is enough.
-      - run: sudo apt-get update && sudo apt-get install -y fuse3
+      - run: ci/apt-install.sh fuse3
       - run: cargo build --locked -p agentfs-cli
       - run: ci/e2e-alerts.sh
         env:

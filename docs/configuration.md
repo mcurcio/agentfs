@@ -903,13 +903,12 @@ section. A subcommand with its own subcommands lists them after it.
   context, close it, reconcile, create or end a keyed fork. A fork that
   needs a landing approval is refused (not built). The launcher closing its
   end (EOF), SIGTERM or SIGINT drains it as `mount` drains; the last view
-  ending does not. Exit 0 once the volume is released; 1 for no volume,
-  another name or another format, or after a recording failure stopped it;
-  2 when its standard input is not a Unix stream socket (`error: agentfs
-  host is run by a launcher that controls it over its standard input, a
-  Unix socket`, the state area untouched) or after a malformed request
-  line; 75 while another process holds the volume. It never creates a
-  volume.
+  ending does not. When its standard input is not a Unix stream socket it
+  exits 2 (`error: agentfs host is run by a launcher that controls it over
+  its standard input, a Unix socket`), the state area untouched. Its exit
+  statuses are in
+  [library/filesystem](library/filesystem.md#the-view-host-command)
+  ("Exit status"). It never creates a volume.
 - `front`: a front of a history service: a FUSE mount of a backing tree
   whose records go to the service. No launcher starts it: the CSI driver runs
   `agentfs host` on tree volumes ([csi](csi.md)).

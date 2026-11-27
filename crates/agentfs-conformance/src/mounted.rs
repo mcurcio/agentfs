@@ -597,7 +597,8 @@ impl TreeCalls for Mounted {
             // Its tree Git children share its lease and die of their
             // parent-death signal after it: taking the lease, blocking, is
             // the event that every holder is gone.
-            agentfs_engine::tree_actor::wait_for_lease(&self.state)
+            agentfs_engine::state_area::TreeStateArea::at(&self.state)
+                .wait_for_lease()
                 .map_err(|e| io_fail("lease", &e))?;
         }
         for (fd, _) in std::mem::take(&mut self.opens) {

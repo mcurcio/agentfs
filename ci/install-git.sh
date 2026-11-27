@@ -12,8 +12,7 @@ release=$(sed -n 1p "$pin")
 sum=$(sed -n 2p "$pin")
 build=$(mktemp -d)
 on_exit 'rm -rf "$build"'
-sudo apt-get update
-sudo apt-get install -y gcc make zlib1g-dev libcurl4-openssl-dev libexpat1-dev
+"$(dirname "$0")/apt-install.sh" gcc make zlib1g-dev libcurl4-openssl-dev libexpat1-dev
 curl -fsSL -o "$build/git.tar.xz" "https://www.kernel.org/pub/software/scm/git/git-$release.tar.xz"
 echo "$sum  $build/git.tar.xz" | sha256sum -c -
 tar -xJf "$build/git.tar.xz" -C "$build"

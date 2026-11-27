@@ -65,6 +65,7 @@ thread. Its calls:
 | `end_keyed(key)` | Ends the keyed fork under `key`; it drops once nothing holds it |
 | `keyed(key)` | The fork under `key` and its phase, whatever the phase; never makes one |
 | `unstage(views)` | The drain begins (below); answers `Unstaged` |
+| `abandon()` | The stop with no drain, which consumes the domains (below) |
 | `released()` | Whether Volume has released the volume |
 | `stopped()` | Whether the tree actor has stopped after a recording failure |
 
@@ -121,6 +122,17 @@ consumers:
 When Volume releases the volume at once, nothing was attached, so steps 1
 to 3 find nothing to do. A second `unstage`, or one that failed, answers
 `Unstaged::Unchanged`. The answer is `#[must_use]`.
+
+## The stop with no drain
+
+`abandon()` takes the domains by value and leaves the volume as a crash
+leaves it: staged, its clients attached. It first ends the engine's own
+processes (`Recording::end_git_children`, [engine](engine.md)), then forgets
+the domains, so no drop runs and nothing waits on a session. Once the caller's
+process exits, the volume's lease is free. Its error is the end's (a signal or
+a wait the kernel refused): the domains are forgotten all the same, and the
+lease is free once each git child has exited. `agentfs host` calls it when it
+is stopped with views open, then exits 3.
 
 ## Costs
 

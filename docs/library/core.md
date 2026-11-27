@@ -339,6 +339,25 @@ child process spawned by any thread shares an open file from its fork until
 its exec, and a lock released only by closing would stay held for that whole
 window. Nothing else in agentfs calls `flock`: `clippy.toml` disallows it.
 
+`agentfs_os::inherited_lock::InheritedLock` wraps a `FileLock` that the
+holder shares with the child processes it starts. Its file is private: a
+child gets the lock only through `spawn_with(&mut command, spawner)`, which
+keeps the lock's descriptor open across the child's exec and registers the
+child by a pidfd. Before its exec the child also gets SIGKILL when the
+starting thread ends (`PR_SET_PDEATHSIG`), and a seccomp filter under which
+it can make threads but cannot fork: `clone` without `CLONE_THREAD`, `fork`
+and `vfork` fail with `EPERM`, and `clone3` answers `ENOSYS`, so glibc falls
+back to `clone`. The lock therefore never reaches a grandchild, and
+`end_children()` (SIGKILL to each registered child, then a wait for its exit
+that leaves it for its starter to reap) leaves no process but the holder on
+the lock. A spawn after the end is refused with `ENOTCONN`, and a drop ends
+the children before it unlocks. `inherited_lock::exited(pid)` is the same
+wait without a reap for one child. The filter is written for x86_64 and
+aarch64 and needs a kernel with seccomp filter mode. A process started any
+other way still shares every open file of its parent, this lock's among
+them, from its fork to its exec: the lock is free at the holder's exit once
+no such start is in flight.
+
 `lock::StateLock::acquire(&state, "command", wait)` takes the
 state-area lock, `meta/lock`. It is exclusive and the kernel releases it
 when the holder exits, even after `kill -9`. The file also holds a one-line

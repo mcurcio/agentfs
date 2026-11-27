@@ -24,7 +24,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - run: rustup toolchain install # the release rust-toolchain.toml pins
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-      - run: sudo apt-get update && sudo apt-get install -y libssl-dev pkg-config
+      - run: ci/apt-install.sh libssl-dev pkg-config
       - run: cargo fmt --all --check
       - name: clippy (default features)
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
@@ -83,7 +83,7 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           key: ${{ matrix.features }}
-      - run: sudo apt-get update && sudo apt-get install -y libssl-dev pkg-config
+      - run: ci/apt-install.sh libssl-dev pkg-config
       # cli_lfs.rs runs `git lfs pull` when git-lfs is installed; make sure.
       # The model and the library align lines with the image's release of git.
       - uses: ./.github/actions/pinned-git
@@ -103,7 +103,7 @@ jobs:
       - uses: ./.github/actions/docker-hub-mirror
       - run: rustup toolchain install # the release rust-toolchain.toml pins
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-      - run: sudo apt-get update && sudo apt-get install -y fuse3 jq
+      - run: ci/apt-install.sh fuse3 jq
       - run: cargo build --locked -p agentfs-cli --features otlp-tls
       - name: start collector
         run: |
@@ -139,7 +139,7 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           key: fuse
-      - run: sudo apt-get update && sudo apt-get install -y fuse3 sqlite3 jq attr
+      - run: ci/apt-install.sh fuse3 sqlite3 jq attr
       - name: enable user_allow_other, show the kernel
         run: |
           echo user_allow_other | sudo tee -a /etc/fuse.conf
@@ -167,7 +167,7 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           key: crash
-      - run: sudo apt-get update && sudo apt-get install -y fuse3 jq
+      - run: ci/apt-install.sh fuse3 jq
       - uses: taiki-e/install-action@fe3acb53a98b62c772db35de75ce0e4595e7ca8c # v2.90.8
         with:
           tool: cargo-nextest@0.9.152
@@ -184,7 +184,7 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           key: trees
-      - run: sudo apt-get update && sudo apt-get install -y fuse3
+      - run: ci/apt-install.sh fuse3
       # The tree views mount with FUSE allow_other by default.
       - run: echo user_allow_other | sudo tee -a /etc/fuse.conf
       - uses: ./.github/actions/pinned-git
@@ -205,7 +205,7 @@ jobs:
         with:
           go-version: stable
           cache: false
-      - run: sudo apt-get update && sudo apt-get install -y fuse3
+      - run: ci/apt-install.sh fuse3
       - name: install csi-sanity (pinned)
         run: |
           GOBIN="$RUNNER_TEMP/bin" go install github.com/kubernetes-csi/csi-test/v5/cmd/csi-sanity@v5.6.0

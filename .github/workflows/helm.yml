@@ -42,13 +42,15 @@ jobs:
         with:
           version: ${{ env.CT_VERSION }}
           uv_version: 0.13.1
-      - name: install kubectl and helm-docs
+      - name: install kind and kubectl, and drill its Go fallback
+        uses: ./.github/actions/kind
+        with:
+          check-fallback: true
+      - name: install helm-docs
         run: |
-          ci/install-kind.sh "$RUNNER_TEMP/kind" >/dev/null
-          echo "$RUNNER_TEMP/kind/bin" >>"$GITHUB_PATH"
           ci/install-helm-docs.sh "$RUNNER_TEMP/helm-docs"
           echo "$RUNNER_TEMP/helm-docs/bin" >>"$GITHUB_PATH"
-          python3 -c 'import yaml' || sudo apt-get install -y python3-yaml
+          python3 -c 'import yaml' || ci/apt-install.sh python3-yaml
       - name: helm lint
         run: |
           helm version
@@ -98,11 +100,9 @@ jobs:
         run: |
           sudo modprobe fuse
           ls -l /dev/fuse
-          sudo apt-get update && sudo apt-get install -y nginx fcgiwrap
+          ci/apt-install.sh nginx fcgiwrap
       - name: install kind and kubectl
-        run: |
-          ci/install-kind.sh "$RUNNER_TEMP/kind" >>"$GITHUB_ENV"
-          echo "$RUNNER_TEMP/kind/bin" >>"$GITHUB_PATH"
+        uses: ./.github/actions/kind
       - name: create the cluster
         run: |
           ci/kind-cluster.sh agentfs-csi ci/kind/cluster.yaml 120s

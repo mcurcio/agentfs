@@ -93,11 +93,9 @@ jobs:
           sudo modprobe fuse
           ls -l /dev/fuse
           uname -a
-          sudo apt-get update && sudo apt-get install -y nginx fcgiwrap
+          ci/apt-install.sh nginx fcgiwrap
       - name: install kind and kubectl
-        run: |
-          ci/install-kind.sh "$RUNNER_TEMP/kind" >>"$GITHUB_ENV"
-          echo "$RUNNER_TEMP/kind/bin" >>"$GITHUB_PATH"
+        uses: ./.github/actions/kind
       - name: create the cluster
         run: |
           ci/kind-cluster.sh agentfs-e2e ci/kind/cluster.yaml 120s
@@ -134,11 +132,9 @@ jobs:
           sudo modprobe fuse
           ls -l /dev/fuse
           uname -a
-          sudo apt-get update && sudo apt-get install -y nginx fcgiwrap
+          ci/apt-install.sh nginx fcgiwrap
       - name: install kind and kubectl
-        run: |
-          ci/install-kind.sh "$RUNNER_TEMP/kind" >>"$GITHUB_ENV"
-          echo "$RUNNER_TEMP/kind/bin" >>"$GITHUB_PATH"
+        uses: ./.github/actions/kind
       - name: create the cluster
         run: |
           ci/kind-cluster.sh agentfs-csi ci/kind/cluster.yaml 120s
@@ -185,7 +181,7 @@ jobs:
         run: |
           sudo modprobe fuse
           ls -l /dev/fuse
-          command -v mkfs.xfs || { sudo apt-get update && sudo apt-get install -y xfsprogs; }
+          command -v mkfs.xfs || ci/apt-install.sh xfsprogs
           docker load -i "$RUNNER_TEMP/agentfs-image.tar"
       - run: ci/e2e-trees-tracer.sh --figures ${{ matrix.fs }}
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -217,11 +213,9 @@ jobs:
         run: |
           sudo modprobe fuse
           ls -l /dev/fuse
-          sudo apt-get update && sudo apt-get install -y nginx fcgiwrap
+          ci/apt-install.sh nginx fcgiwrap
       - name: install kind and kubectl
-        run: |
-          ci/install-kind.sh "$RUNNER_TEMP/kind" >>"$GITHUB_ENV"
-          echo "$RUNNER_TEMP/kind/bin" >>"$GITHUB_PATH"
+        uses: ./.github/actions/kind
       - name: create the cluster
         run: |
           docker load -i "$RUNNER_TEMP/agentfs-image.tar"
